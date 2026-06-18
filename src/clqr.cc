@@ -185,6 +185,17 @@ Matrix Symmetrize(const Matrix& a) {
   return out;
 }
 
+bool IsIdentity(const Matrix& a, double tolerance) {
+  if (a.rows() != a.cols()) return false;
+  for (std::size_t row = 0; row < a.rows(); ++row) {
+    for (std::size_t col = 0; col < a.cols(); ++col) {
+      const double expected = row == col ? 1.0 : 0.0;
+      if (std::abs(a(row, col) - expected) > tolerance) return false;
+    }
+  }
+  return true;
+}
+
 void AddDiagnostic(NewtonKktDiagnostics* diagnostics, const std::string& message) {
   if (diagnostics == nullptr) return;
   diagnostics->messages.push_back(message);
@@ -320,22 +331,6 @@ WorkingState Initialize(const Problem& problem) {
   state.problem.terminal_E = problem.terminal_E;
   state.problem.terminal_e = problem.terminal_e;
 
-  if (!state.problem.stages.empty()) {
-    Stage& first = state.problem.stages.front();
-    AppendStateConstraints(first, Identity(problem.initial_state.size()),
-                           Scale(problem.initial_state, -1.0));
-  } else if (problem.initial_state.size() > 0) {
-    if (state.problem.terminal_E.rows() == 0) {
-      state.problem.terminal_E = Identity(problem.initial_state.size());
-      state.problem.terminal_e = Scale(problem.initial_state, -1.0);
-    } else {
-      state.problem.terminal_E =
-          VerticalConcat(state.problem.terminal_E, Identity(problem.initial_state.size()));
-      state.problem.terminal_e =
-          Concat(state.problem.terminal_e, Scale(problem.initial_state, -1.0));
-    }
-  }
-
   const std::size_t num_states = problem.stages.size() + 1;
   state.state_maps.resize(num_states);
   for (std::size_t i = 0; i < num_states; ++i) {
@@ -353,6 +348,17 @@ WorkingState Initialize(const Problem& problem) {
     state.control_maps[i].offset = Vector(m);
   }
   return state;
+}
+
+LinearParametrization ReducedInitialState(const Problem& original, const StateMap& map,
+                                          double tolerance) {
+  if (IsIdentity(map.linear, tolerance) && MaxAbs(map.offset) <= tolerance) {
+    LinearParametrization out;
+    out.offset = original.initial_state;
+    out.basis = Matrix(original.initial_state.size(), 0);
+    return out;
+  }
+  return ParametrizeLinearSystem(map.linear, original.initial_state - map.offset, tolerance);
 }
 
 AffineStateBasis StateBasis(const Matrix& E, const Vector& e, std::size_t n,
@@ -550,6 +556,14 @@ bool AnyMixedConstraints(const WorkingProblem& problem) {
   return false;
 }
 
+bool AnyOriginalConstraints(const Problem& problem) {
+  if (problem.terminal_E.rows() > 0) return true;
+  for (const Stage& stage : problem.stages) {
+    if (stage.C.rows() > 0 || stage.E.rows() > 0) return true;
+  }
+  return false;
+}
+
 bool EliminateState(WorkingState& state, double tolerance, std::string* error,
                     NewtonKktDiagnostics* diagnostics) {
   if (!AnyStateConstraints(state.problem)) return false;
@@ -657,18 +671,21 @@ struct ReducedSolution {
   std::vector<Vector> u;
 };
 
-ReducedSolution SolveUnconstrained(const WorkingProblem& problem, double tolerance,
+ReducedSolution SolveUnconstrained(const std::vector<Stage>& stages,
+                                   const Matrix& terminal_Q,
+                                   const Vector& terminal_q,
+                                   const Vector& initial_state, double tolerance,
                                    NewtonKktDiagnostics* diagnostics) {
-  const std::size_t N = problem.stages.size();
+  const std::size_t N = stages.size();
   std::vector<Matrix> P(N + 1);
   std::vector<Vector> p(N + 1);
   std::vector<Matrix> K(N);
   std::vector<Vector> k(N);
-  P[N] = problem.terminal_Q;
-  p[N] = problem.terminal_q;
+  P[N] = terminal_Q;
+  p[N] = terminal_q;
   for (std::size_t rev = 0; rev < N; ++rev) {
     const std::size_t i = N - 1 - rev;
-    const Stage& s = problem.stages[i];
+    const Stage& s = stages[i];
     const Vector pc = p[i + 1] + P[i + 1] * s.c;
     const Matrix Hxx = s.Q + Transpose(s.A) * P[i + 1] * s.A;
     const Matrix Huu = s.R + Transpose(s.B) * P[i + 1] * s.B;
@@ -687,12 +704,10 @@ ReducedSolution SolveUnconstrained(const WorkingProblem& problem, double toleran
   ReducedSolution sol;
   sol.x.resize(N + 1);
   sol.u.resize(N);
-  sol.x[0] = Vector(problem.stages.empty() ? problem.terminal_Q.rows()
-                                           : problem.stages.front().A.cols());
+  sol.x[0] = initial_state;
   for (std::size_t i = 0; i < N; ++i) {
     sol.u[i] = K[i] * sol.x[i] + k[i];
-    sol.x[i + 1] = problem.stages[i].A * sol.x[i] + problem.stages[i].B * sol.u[i] +
-                   problem.stages[i].c;
+    sol.x[i + 1] = stages[i].A * sol.x[i] + stages[i].B * sol.u[i] + stages[i].c;
   }
   return sol;
 }
@@ -831,6 +846,23 @@ Solution Recover(const Problem& original, const WorkingState& state,
   return out;
 }
 
+Solution RecoverUnmapped(const Problem& original, const ReducedSolution& reduced,
+                         double tolerance, const NewtonKktDiagnostics& diagnostics) {
+  Solution out;
+  out.status = SolveStatus::kOptimal;
+  out.message = "optimal";
+  ApplyDiagnostics(diagnostics, &out);
+  out.states = reduced.x;
+  out.controls = reduced.u;
+  out.objective = Objective(original, out.states, out.controls);
+  std::string error;
+  if (!RecoverMultipliers(original, &out, tolerance, &error)) {
+    out.status = SolveStatus::kNumericalFailure;
+    out.message = error;
+  }
+  return out;
+}
+
 }  // namespace
 
 const char* StatusName(SolveStatus status) {
@@ -852,6 +884,19 @@ Solution Solve(const Problem& problem, const SolveOptions& options) {
   NewtonKktDiagnostics diagnostics;
   try {
     ValidateProblem(problem);
+    if (!AnyOriginalConstraints(problem)) {
+      try {
+        ReducedSolution reduced =
+            SolveUnconstrained(problem.stages, problem.terminal_Q, problem.terminal_q,
+                               problem.initial_state, options.tolerance, &diagnostics);
+        return RecoverUnmapped(problem, reduced, options.tolerance, diagnostics);
+      } catch (const std::runtime_error& e) {
+        out.status = SolveStatus::kNumericalFailure;
+        out.message = e.what();
+        ApplyDiagnostics(diagnostics, &out);
+        return out;
+      }
+    }
     WorkingState state = Initialize(problem);
     std::string error;
     for (int pass = 0; pass < options.max_elimination_passes; ++pass) {
@@ -873,9 +918,23 @@ Solution Solve(const Problem& problem, const SolveOptions& options) {
         return out;
       }
     }
+    LinearParametrization initial =
+        ReducedInitialState(problem, state.state_maps.front(), options.tolerance);
+    if (initial.inconsistent) {
+      out.status = SolveStatus::kInfeasible;
+      out.message = "initial state is inconsistent with state equality constraints";
+      ApplyDiagnostics(diagnostics, &out);
+      return out;
+    }
+    if (state.state_maps.front().linear.cols() < state.state_maps.front().linear.rows()) {
+      diagnostics.singular = true;
+      AddDiagnostic(&diagnostics, "initial state makes node 0 state constraints redundant");
+    }
     try {
       ReducedSolution reduced =
-          SolveUnconstrained(state.problem, options.tolerance, &diagnostics);
+          SolveUnconstrained(state.problem.stages, state.problem.terminal_Q,
+                             state.problem.terminal_q, initial.offset, options.tolerance,
+                             &diagnostics);
       return Recover(problem, state, reduced, options.tolerance, diagnostics);
     } catch (const std::runtime_error& e) {
       out.status = SolveStatus::kNumericalFailure;
