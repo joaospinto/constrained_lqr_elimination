@@ -1,7 +1,9 @@
 #include "clqr/clqr.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -11,13 +13,31 @@ namespace {
 
 using clqr::Matrix;
 using clqr::Problem;
-using clqr::Solution;
+using clqr::SolutionView;
 using clqr::Solve;
 using clqr::SolveStatus;
 using clqr::Stage;
 using clqr::Vector;
+using clqr::VectorView;
+using clqr::Workspace;
 
 constexpr double kTol = 1e-7;
+
+struct Solution {
+  SolveStatus status = SolveStatus::kInvalidInput;
+  std::string message;
+  std::vector<Vector> states;
+  std::vector<Vector> controls;
+  Vector initial_multiplier;
+  std::vector<Vector> dynamics_multipliers;
+  std::vector<Vector> mixed_multipliers;
+  std::vector<Vector> state_multipliers;
+  Vector terminal_state_multiplier;
+  bool newton_kkt_singular = false;
+  bool newton_kkt_wrong_inertia = false;
+  std::string newton_kkt_diagnostic;
+  double objective = 0.0;
+};
 
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -40,6 +60,58 @@ void ExpectVectorNear(const Vector& actual, const Vector& expected, double tol,
   for (std::size_t i = 0; i < actual.size(); ++i) {
     ExpectNear(actual[i], expected[i], tol, message + "[" + std::to_string(i) + "]");
   }
+}
+
+void ExpectVectorViewNear(const VectorView& actual, const Vector& expected, double tol,
+                          const std::string& message) {
+  Expect(actual.size == expected.size(), message + " size mismatch");
+  for (std::size_t i = 0; i < actual.size; ++i) {
+    ExpectNear(actual[i], expected[i], tol, message + "[" + std::to_string(i) + "]");
+  }
+}
+
+Vector CopyVectorView(const VectorView& view) {
+  Vector out(view.size);
+  for (std::size_t i = 0; i < view.size; ++i) out[i] = view[i];
+  return out;
+}
+
+Solution CopySolutionView(const SolutionView& view) {
+  Solution out;
+  out.status = view.status;
+  out.message = view.message;
+  out.states.resize(view.state_count);
+  for (std::size_t i = 0; i < view.state_count; ++i) out.states[i] = CopyVectorView(view.states[i]);
+  out.controls.resize(view.control_count);
+  for (std::size_t i = 0; i < view.control_count; ++i) {
+    out.controls[i] = CopyVectorView(view.controls[i]);
+  }
+  out.initial_multiplier = CopyVectorView(view.initial_multiplier);
+  out.dynamics_multipliers.resize(view.dynamics_multiplier_count);
+  for (std::size_t i = 0; i < view.dynamics_multiplier_count; ++i) {
+    out.dynamics_multipliers[i] = CopyVectorView(view.dynamics_multipliers[i]);
+  }
+  out.mixed_multipliers.resize(view.mixed_multiplier_count);
+  for (std::size_t i = 0; i < view.mixed_multiplier_count; ++i) {
+    out.mixed_multipliers[i] = CopyVectorView(view.mixed_multipliers[i]);
+  }
+  out.state_multipliers.resize(view.state_multiplier_count);
+  for (std::size_t i = 0; i < view.state_multiplier_count; ++i) {
+    out.state_multipliers[i] = CopyVectorView(view.state_multipliers[i]);
+  }
+  out.terminal_state_multiplier = CopyVectorView(view.terminal_state_multiplier);
+  out.objective = view.objective;
+  out.newton_kkt_singular = view.newton_kkt_singular;
+  out.newton_kkt_wrong_inertia = view.newton_kkt_wrong_inertia;
+  out.newton_kkt_diagnostic = view.newton_kkt_diagnostic;
+  return out;
+}
+
+Solution SolveWithWorkspace(const Problem& p,
+                            const clqr::SolveOptions& options = clqr::SolveOptions{}) {
+  Workspace workspace;
+  workspace.Reserve(p, options);
+  return CopySolutionView(Solve(p, workspace, options));
 }
 
 void ExpectDiagnostics(const Solution& sol, bool singular, bool wrong_inertia,
@@ -422,7 +494,7 @@ Problem BaseProblem() {
 
 void CheckAgainstKkt(const Problem& p, const std::string& name,
                      bool expect_singular = false, bool expect_wrong_inertia = false) {
-  Solution sol = Solve(p);
+  Solution sol = SolveWithWorkspace(p);
   Expect(sol.status == SolveStatus::kOptimal, name + " solver status: " + sol.message);
   ExpectDiagnostics(sol, expect_singular, expect_wrong_inertia, name);
   DenseKktSolution kkt = SolveKkt(p);
@@ -436,6 +508,62 @@ void CheckAgainstKkt(const Problem& p, const std::string& name,
 }
 
 void UnconstrainedMatchesKkt() { CheckAgainstKkt(BaseProblem(), "unconstrained"); }
+
+void WorkspaceUnconstrainedMatchesKkt() {
+  Problem p = GeneratedFeasibleProblem(321, 4, 3, 2, 0, ConstraintMode::kUnconstrained);
+  constexpr std::size_t kBytes = Workspace::RequiredBytesUniform(4, 3, 2);
+  static_assert(kBytes > 0, "workspace size must be positive");
+  Expect(Workspace::RequiredBytes(p) == kBytes, "constexpr workspace byte count");
+
+  alignas(std::max_align_t) std::array<unsigned char, kBytes> memory{};
+  Workspace workspace(memory.data(), memory.size());
+  SolutionView view = Solve(p, workspace);
+  Solution copied = CopySolutionView(view);
+  DenseKktSolution kkt = SolveKkt(p);
+  Expect(view.status == SolveStatus::kOptimal, std::string("workspace status: ") + view.message);
+  Expect(view.state_count == kkt.x.size(), "workspace state count");
+  Expect(view.control_count == kkt.u.size(), "workspace control count");
+  for (std::size_t i = 0; i < view.state_count; ++i) {
+    ExpectVectorViewNear(view.states[i], kkt.x[i], kTol, "workspace state " + std::to_string(i));
+  }
+  for (std::size_t i = 0; i < view.control_count; ++i) {
+    ExpectVectorViewNear(view.controls[i], kkt.u[i], kTol,
+                         "workspace control " + std::to_string(i));
+  }
+  ExpectNear(MaxKktResidual(p, copied), 0.0, kTol, "workspace full KKT residual");
+
+  std::vector<unsigned char> too_small(Workspace::RequiredBytes(p) - 1);
+  Workspace small_workspace(too_small.data(), too_small.size());
+  SolutionView small = Solve(p, small_workspace);
+  Expect(small.status == SolveStatus::kInvalidInput, "undersized workspace status");
+}
+
+void WorkspaceConstrainedMatchesKkt() {
+  const std::vector<Problem> problems = {
+      GeneratedFeasibleProblem(410, 4, 3, 2, 1, ConstraintMode::kStateOnly),
+      GeneratedFeasibleProblem(411, 4, 3, 2, 2, ConstraintMode::kFullMixed),
+      GeneratedFeasibleProblem(412, 5, 3, 2, 1, ConstraintMode::kTerminalState),
+  };
+  for (std::size_t case_index = 0; case_index < problems.size(); ++case_index) {
+    const Problem& p = problems[case_index];
+    Workspace workspace;
+    workspace.Reserve(p);
+    SolutionView view = Solve(p, workspace);
+    Solution copied = CopySolutionView(view);
+    const std::string name = "workspace constrained " + std::to_string(case_index);
+    Expect(view.status == SolveStatus::kOptimal,
+           name + " status: " + std::string(view.message));
+    DenseKktSolution kkt = SolveKkt(p);
+    for (std::size_t i = 0; i < view.state_count; ++i) {
+      ExpectVectorViewNear(view.states[i], kkt.x[i], kTol, name + " state " + std::to_string(i));
+    }
+    for (std::size_t i = 0; i < view.control_count; ++i) {
+      ExpectVectorViewNear(view.controls[i], kkt.u[i], kTol,
+                           name + " control " + std::to_string(i));
+    }
+    ExpectNear(MaxKktResidual(p, copied), 0.0, kTol, name + " full KKT residual");
+  }
+}
 
 void MixedConstraintMatchesKkt() {
   Problem p = BaseProblem();
@@ -539,7 +667,7 @@ void SingularReducedHessianReported() {
   p.terminal_E = Matrix(0, 1);
   p.terminal_e = Vector(0);
 
-  Solution sol = Solve(p);
+  Solution sol = SolveWithWorkspace(p);
   Expect(sol.status == SolveStatus::kNumericalFailure, "singular reduced Hessian status");
   ExpectDiagnostics(sol, true, false, "singular reduced Hessian");
 }
@@ -548,7 +676,7 @@ void InfeasibleConstraintDetected() {
   Problem p = BaseProblem();
   p.stages[0].E = Matrix(2, 2, {1.0, 0.0, 1.0, 0.0});
   p.stages[0].e = Vector{-1.0, -2.0};
-  Solution sol = Solve(p);
+  Solution sol = SolveWithWorkspace(p);
   Expect(sol.status == SolveStatus::kInfeasible, "infeasible status");
 }
 
@@ -556,6 +684,8 @@ void InfeasibleConstraintDetected() {
 
 int main() {
   UnconstrainedMatchesKkt();
+  WorkspaceUnconstrainedMatchesKkt();
+  WorkspaceConstrainedMatchesKkt();
   MixedConstraintMatchesKkt();
   RankDeficientMixedConstraintMatchesKkt();
   StateConstraintMatchesKkt();

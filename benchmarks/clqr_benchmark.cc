@@ -111,7 +111,9 @@ void RunCase(const std::string& name, const clqr::Problem& problem, int iteratio
   clqr::SolveOptions options;
   options.tolerance = 1e-9;
 
-  clqr::Solution warmup = clqr::Solve(problem, options);
+  clqr::Workspace workspace;
+  workspace.Reserve(problem);
+  clqr::SolutionView warmup = clqr::Solve(problem, workspace, options);
   if (warmup.status != clqr::SolveStatus::kOptimal) {
     std::cout << name << ",status=warmup_failed,message=\"" << warmup.message << "\"\n";
     return;
@@ -124,17 +126,17 @@ void RunCase(const std::string& name, const clqr::Problem& problem, int iteratio
   int wrong_inertia_count = 0;
   for (int i = 0; i < iterations; ++i) {
     const auto start = std::chrono::steady_clock::now();
-    clqr::Solution solution = clqr::Solve(problem, options);
+    clqr::SolutionView view = clqr::Solve(problem, workspace, options);
     const auto end = std::chrono::steady_clock::now();
-    if (solution.status != clqr::SolveStatus::kOptimal) {
-      std::cout << name << ",status=failed,message=\"" << solution.message << "\"\n";
+    if (view.status != clqr::SolveStatus::kOptimal) {
+      std::cout << name << ",status=failed,message=\"" << view.message << "\"\n";
       return;
     }
     const double elapsed_us = std::chrono::duration<double, std::micro>(end - start).count();
     times_us.push_back(elapsed_us);
-    checksum += solution.objective;
-    singular_count += solution.newton_kkt_singular ? 1 : 0;
-    wrong_inertia_count += solution.newton_kkt_wrong_inertia ? 1 : 0;
+    checksum += view.objective;
+    singular_count += view.newton_kkt_singular ? 1 : 0;
+    wrong_inertia_count += view.newton_kkt_wrong_inertia ? 1 : 0;
   }
 
   std::vector<double> sorted_times = times_us;
@@ -171,14 +173,13 @@ int main(int argc, char** argv) {
   int seed = 1;
   for (const Dimensions& dim : dimensions) {
     for (std::size_t constraints = 0; constraints <= 2; ++constraints) {
-      const std::string name = "N=" + std::to_string(dim.horizon) +
-                               " n=" + std::to_string(dim.states) +
-                               " m=" + std::to_string(dim.controls) +
-                               " p=" + std::to_string(constraints) + " mixed";
-      RunCase(name,
-              MakeFeasibleMixedProblem(seed, dim.horizon, dim.states, dim.controls,
-                                       constraints),
-              dim.base_iterations * scale);
+      clqr::Problem problem =
+          MakeFeasibleMixedProblem(seed, dim.horizon, dim.states, dim.controls, constraints);
+      const std::string base_name = "N=" + std::to_string(dim.horizon) +
+                                    " n=" + std::to_string(dim.states) +
+                                    " m=" + std::to_string(dim.controls) +
+                                    " p=" + std::to_string(constraints);
+      RunCase(base_name, problem, dim.base_iterations * scale);
       ++seed;
     }
   }

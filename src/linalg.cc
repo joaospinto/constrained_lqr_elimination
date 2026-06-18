@@ -6,10 +6,12 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_set>
+#include <utility>
 
 namespace clqr {
 namespace {
+
+thread_local WorkspaceArena* active_workspace_arena = nullptr;
 
 void Check(bool condition, const char* message) {
   if (!condition) {
@@ -19,9 +21,15 @@ void Check(bool condition, const char* message) {
 
 }  // namespace
 
+WorkspaceArena* ActiveWorkspaceArena() { return active_workspace_arena; }
+
+void SetActiveWorkspaceArena(WorkspaceArena* arena) { active_workspace_arena = arena; }
+
 Vector::Vector(std::size_t size) : data_(size, 0.0) {}
 
 Vector::Vector(std::initializer_list<double> values) : data_(values) {}
+
+void Vector::reserve(std::size_t size) { data_.reserve(size); }
 
 void Vector::resize(std::size_t size) { data_.assign(size, 0.0); }
 
@@ -33,6 +41,8 @@ Matrix::Matrix(std::size_t rows, std::size_t cols,
     : rows_(rows), cols_(cols), data_(values) {
   Check(data_.size() == rows * cols, "matrix initializer has wrong size");
 }
+
+void Matrix::reserve(std::size_t rows, std::size_t cols) { data_.reserve(rows * cols); }
 
 void Matrix::resize(std::size_t rows, std::size_t cols) {
   rows_ = rows;
@@ -156,7 +166,7 @@ Vector Concat(const Vector& a, const Vector& b) {
   return out;
 }
 
-Matrix Rows(const Matrix& a, const std::vector<std::size_t>& rows) {
+Matrix Rows(const Matrix& a, const WorkspaceVector<std::size_t>& rows) {
   Matrix out(rows.size(), a.cols());
   for (std::size_t i = 0; i < rows.size(); ++i) {
     for (std::size_t j = 0; j < a.cols(); ++j) out(i, j) = a(rows[i], j);
@@ -164,7 +174,7 @@ Matrix Rows(const Matrix& a, const std::vector<std::size_t>& rows) {
   return out;
 }
 
-Matrix Cols(const Matrix& a, const std::vector<std::size_t>& cols) {
+Matrix Cols(const Matrix& a, const WorkspaceVector<std::size_t>& cols) {
   Matrix out(a.rows(), cols.size());
   for (std::size_t i = 0; i < a.rows(); ++i) {
     for (std::size_t j = 0; j < cols.size(); ++j) out(i, j) = a(i, cols[j]);
@@ -172,18 +182,24 @@ Matrix Cols(const Matrix& a, const std::vector<std::size_t>& cols) {
   return out;
 }
 
-Vector Entries(const Vector& a, const std::vector<std::size_t>& rows) {
+Vector Entries(const Vector& a, const WorkspaceVector<std::size_t>& rows) {
   Vector out(rows.size());
   for (std::size_t i = 0; i < rows.size(); ++i) out[i] = a[rows[i]];
   return out;
 }
 
-Matrix RemoveRows(const Matrix& a, const std::vector<std::size_t>& remove) {
-  std::unordered_set<std::size_t> removed(remove.begin(), remove.end());
-  Matrix out(a.rows() - removed.size(), a.cols());
+Matrix RemoveRows(const Matrix& a, const WorkspaceVector<std::size_t>& remove) {
+  Matrix out(a.rows() - remove.size(), a.cols());
   std::size_t row = 0;
   for (std::size_t i = 0; i < a.rows(); ++i) {
-    if (removed.find(i) != removed.end()) continue;
+    bool removed = false;
+    for (std::size_t index : remove) {
+      if (index == i) {
+        removed = true;
+        break;
+      }
+    }
+    if (removed) continue;
     for (std::size_t j = 0; j < a.cols(); ++j) out(row, j) = a(i, j);
     ++row;
   }
@@ -293,6 +309,8 @@ Matrix SolveLinearSystem(Matrix a, Matrix b, double tolerance) {
 
 RrefResult Rref(Matrix a, std::size_t pivot_column_limit, double tolerance) {
   RrefResult result;
+  result.pivot_columns.reserve(std::min(a.rows(), pivot_column_limit));
+  result.pivot_rows.reserve(std::min(a.rows(), pivot_column_limit));
   std::size_t pivot_row = 0;
   const std::size_t limit = std::min(pivot_column_limit, a.cols());
   for (std::size_t col = 0; col < limit && pivot_row < a.rows(); ++col) {
@@ -324,7 +342,7 @@ RrefResult Rref(Matrix a, std::size_t pivot_column_limit, double tolerance) {
   for (double& value : a.data()) {
     if (IsNearlyZero(value, tolerance)) value = 0.0;
   }
-  result.matrix = a;
+  result.matrix = std::move(a);
   return result;
 }
 

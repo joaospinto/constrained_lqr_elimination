@@ -94,17 +94,17 @@ clqr::Stage ReadStage(nb::handle object) {
   return stage;
 }
 
-auto VectorToNumpy(const clqr::Vector& x) {
-  double* data = new double[x.size()];
-  for (std::size_t i = 0; i < x.size(); ++i) data[i] = x[i];
+auto VectorViewToNumpy(const clqr::VectorView& x) {
+  double* data = new double[x.size];
+  for (std::size_t i = 0; i < x.size; ++i) data[i] = x[i];
   nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<double*>(p); });
   return nb::ndarray<nb::numpy, double, nb::ndim<1>>(
-      data, {static_cast<unsigned long>(x.size())}, owner);
+      data, {static_cast<unsigned long>(x.size)}, owner);
 }
 
-nb::list VectorListToPython(const std::vector<clqr::Vector>& vectors) {
+nb::list VectorViewListToPython(const clqr::VectorView* vectors, std::size_t count) {
   nb::list out;
-  for (const clqr::Vector& vector : vectors) out.append(VectorToNumpy(vector));
+  for (std::size_t i = 0; i < count; ++i) out.append(VectorViewToNumpy(vectors[i]));
   return out;
 }
 
@@ -138,19 +138,25 @@ nb::dict Solve(nb::object problem_object, double tolerance = 1e-9,
     clqr::SolveOptions options;
     options.tolerance = tolerance;
     options.max_elimination_passes = max_elimination_passes;
-    clqr::Solution solution = clqr::Solve(cproblem, options);
+    clqr::Workspace workspace;
+    workspace.Reserve(cproblem, options);
+    clqr::SolutionView solution = clqr::Solve(cproblem, workspace, options);
 
     step = "build result";
     nb::dict result;
     nb::str status(clqr::StatusName(solution.status));
-    nb::str message(solution.message.c_str());
-    nb::str newton_kkt_diagnostic(solution.newton_kkt_diagnostic.c_str());
+    nb::str message(solution.message);
+    nb::str newton_kkt_diagnostic(solution.newton_kkt_diagnostic);
     nb::float_ objective(solution.objective);
-    nb::list states = VectorListToPython(solution.states);
-    nb::list controls = VectorListToPython(solution.controls);
-    nb::list dynamics_multipliers = VectorListToPython(solution.dynamics_multipliers);
-    nb::list mixed_multipliers = VectorListToPython(solution.mixed_multipliers);
-    nb::list state_multipliers = VectorListToPython(solution.state_multipliers);
+    nb::list states = VectorViewListToPython(solution.states, solution.state_count);
+    nb::list controls = VectorViewListToPython(solution.controls, solution.control_count);
+    nb::list dynamics_multipliers =
+        VectorViewListToPython(solution.dynamics_multipliers,
+                               solution.dynamics_multiplier_count);
+    nb::list mixed_multipliers =
+        VectorViewListToPython(solution.mixed_multipliers, solution.mixed_multiplier_count);
+    nb::list state_multipliers =
+        VectorViewListToPython(solution.state_multipliers, solution.state_multiplier_count);
     Set(result, "status", status);
     Set(result, "message", message);
     result[nb::str("newton_kkt_singular")] = nb::bool_(solution.newton_kkt_singular);
@@ -160,12 +166,12 @@ nb::dict Solve(nb::object problem_object, double tolerance = 1e-9,
     Set(result, "objective", objective);
     Set(result, "states", states);
     Set(result, "controls", controls);
-    result[nb::str("initial_multiplier")] = VectorToNumpy(solution.initial_multiplier);
+    result[nb::str("initial_multiplier")] = VectorViewToNumpy(solution.initial_multiplier);
     Set(result, "dynamics_multipliers", dynamics_multipliers);
     Set(result, "mixed_multipliers", mixed_multipliers);
     Set(result, "state_multipliers", state_multipliers);
     result[nb::str("terminal_state_multiplier")] =
-        VectorToNumpy(solution.terminal_state_multiplier);
+        VectorViewToNumpy(solution.terminal_state_multiplier);
     return result;
   } catch (const std::exception& e) {
     throw std::runtime_error("clqr.solve failed during " + step + ": " + e.what());

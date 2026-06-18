@@ -25,6 +25,13 @@ cc_test(
     copts = ["-std=c++17", "-Wall", "-Wextra", "-Wpedantic"],
 )
 
+cc_test(
+    name = "workspace_allocation_test",
+    srcs = ["tests/workspace_allocation_test.cc"],
+    deps = [":clqr"],
+    copts = ["-std=c++17", "-Wall", "-Wextra", "-Wpedantic"],
+)
+
 nanobind_extension(
     name = "_clqr",
     srcs = ["python/clqr_module.cc"],
