@@ -147,11 +147,20 @@ nb::dict Solve(nb::object problem_object, double tolerance = 1e-9,
     nb::float_ objective(solution.objective);
     nb::list states = VectorListToPython(solution.states);
     nb::list controls = VectorListToPython(solution.controls);
+    nb::list dynamics_multipliers = VectorListToPython(solution.dynamics_multipliers);
+    nb::list mixed_multipliers = VectorListToPython(solution.mixed_multipliers);
+    nb::list state_multipliers = VectorListToPython(solution.state_multipliers);
     Set(result, "status", status);
     Set(result, "message", message);
     Set(result, "objective", objective);
     Set(result, "states", states);
     Set(result, "controls", controls);
+    result[nb::str("initial_multiplier")] = VectorToNumpy(solution.initial_multiplier);
+    Set(result, "dynamics_multipliers", dynamics_multipliers);
+    Set(result, "mixed_multipliers", mixed_multipliers);
+    Set(result, "state_multipliers", state_multipliers);
+    result[nb::str("terminal_state_multiplier")] =
+        VectorToNumpy(solution.terminal_state_multiplier);
     return result;
   } catch (const std::exception& e) {
     throw std::runtime_error("clqr.solve failed during " + step + ": " + e.what());

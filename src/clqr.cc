@@ -34,6 +34,32 @@ struct WorkingState {
   std::vector<ControlMap> control_maps;
 };
 
+struct RectangularSolve {
+  Vector x;
+  bool inconsistent = false;
+  std::size_t rank = 0;
+};
+
+struct LinearParametrization {
+  Matrix basis;
+  Vector offset;
+  bool inconsistent = false;
+};
+
+struct AffineSet {
+  Matrix basis;
+  Vector offset;
+};
+
+struct StageMultiplierMap {
+  AffineSet future_y;
+  Matrix local_basis;
+  Vector local_offset;
+  std::size_t future_parameter_size = 0;
+  std::size_t mixed_size = 0;
+  std::size_t state_size = 0;
+};
+
 struct AffineStateBasis {
   Matrix T;
   Vector offset;
@@ -50,6 +76,95 @@ void Check(bool condition, const std::string& message) {
 Matrix VectorAsColumn(const Vector& v) {
   Matrix out(v.size(), 1);
   for (std::size_t i = 0; i < v.size(); ++i) out(i, 0) = v[i];
+  return out;
+}
+
+RectangularSolve SolveRectangularRref(const Matrix& a, const Vector& b, double tolerance) {
+  Check(a.rows() == b.size(), "rectangular solve rhs shape mismatch");
+  RectangularSolve out;
+  out.x = Vector(a.cols());
+  if (a.cols() == 0) {
+    out.inconsistent = MaxAbs(b) > tolerance;
+    return out;
+  }
+  Matrix augmented(a.rows(), a.cols() + 1);
+  for (std::size_t i = 0; i < a.rows(); ++i) {
+    for (std::size_t j = 0; j < a.cols(); ++j) augmented(i, j) = a(i, j);
+    augmented(i, a.cols()) = b[i];
+  }
+  RrefResult rref = Rref(augmented, a.cols(), tolerance);
+  out.rank = rref.pivot_columns.size();
+  for (std::size_t i = 0; i < rref.pivot_columns.size(); ++i) {
+    out.x[rref.pivot_columns[i]] = rref.matrix(rref.pivot_rows[i], a.cols());
+  }
+  for (std::size_t row = 0; row < rref.matrix.rows(); ++row) {
+    bool zero_lhs = true;
+    for (std::size_t col = 0; col < a.cols(); ++col) {
+      if (!IsNearlyZero(rref.matrix(row, col), tolerance)) {
+        zero_lhs = false;
+        break;
+      }
+    }
+    if (zero_lhs && !IsNearlyZero(rref.matrix(row, a.cols()), tolerance)) {
+      out.inconsistent = true;
+      break;
+    }
+  }
+  return out;
+}
+
+Vector Slice(const Vector& x, std::size_t offset, std::size_t size) {
+  Vector out(size);
+  for (std::size_t i = 0; i < size; ++i) out[i] = x[offset + i];
+  return out;
+}
+
+LinearParametrization ParametrizeLinearSystem(const Matrix& a, const Vector& b,
+                                              double tolerance) {
+  Check(a.rows() == b.size(), "linear parametrization rhs shape mismatch");
+  LinearParametrization out;
+  if (a.cols() == 0) {
+    out.offset = Vector(0);
+    out.basis = Matrix(0, 0);
+    out.inconsistent = MaxAbs(b) > tolerance;
+    return out;
+  }
+  Matrix augmented(a.rows(), a.cols() + 1);
+  for (std::size_t i = 0; i < a.rows(); ++i) {
+    for (std::size_t j = 0; j < a.cols(); ++j) augmented(i, j) = a(i, j);
+    augmented(i, a.cols()) = b[i];
+  }
+  RrefResult rref = Rref(augmented, a.cols(), tolerance);
+  std::unordered_set<std::size_t> pivot_set(rref.pivot_columns.begin(),
+                                            rref.pivot_columns.end());
+  std::vector<std::size_t> free_cols;
+  for (std::size_t col = 0; col < a.cols(); ++col) {
+    if (pivot_set.find(col) == pivot_set.end()) free_cols.push_back(col);
+  }
+  out.offset = Vector(a.cols());
+  out.basis = Matrix(a.cols(), free_cols.size());
+  for (std::size_t j = 0; j < free_cols.size(); ++j) out.basis(free_cols[j], j) = 1.0;
+  for (std::size_t pivot_index = 0; pivot_index < rref.pivot_columns.size(); ++pivot_index) {
+    const std::size_t pivot_col = rref.pivot_columns[pivot_index];
+    const std::size_t row = rref.pivot_rows[pivot_index];
+    out.offset[pivot_col] = rref.matrix(row, a.cols());
+    for (std::size_t free_index = 0; free_index < free_cols.size(); ++free_index) {
+      out.basis(pivot_col, free_index) = -rref.matrix(row, free_cols[free_index]);
+    }
+  }
+  for (std::size_t row = 0; row < rref.matrix.rows(); ++row) {
+    bool zero_lhs = true;
+    for (std::size_t col = 0; col < a.cols(); ++col) {
+      if (!IsNearlyZero(rref.matrix(row, col), tolerance)) {
+        zero_lhs = false;
+        break;
+      }
+    }
+    if (zero_lhs && !IsNearlyZero(rref.matrix(row, a.cols()), tolerance)) {
+      out.inconsistent = true;
+      break;
+    }
+  }
   return out;
 }
 
@@ -508,8 +623,110 @@ ReducedSolution SolveUnconstrained(const WorkingProblem& problem, double toleran
   return sol;
 }
 
+bool RecoverMultipliers(const Problem& original, Solution* out, double tolerance,
+                        std::string* error) {
+  const std::size_t N = original.stages.size();
+  out->dynamics_multipliers.assign(N, Vector());
+  out->mixed_multipliers.assign(N, Vector());
+  out->state_multipliers.assign(N, Vector());
+
+  if (N == 0) {
+    const std::size_t n = original.terminal_Q.rows();
+    const std::size_t pt = original.terminal_E.rows();
+    Matrix k(n, n + pt);
+    for (std::size_t row = 0; row < n; ++row) k(row, row) = 1.0;
+    for (std::size_t row = 0; row < n; ++row) {
+      for (std::size_t col = 0; col < pt; ++col) k(row, n + col) = original.terminal_E(col, row);
+    }
+    Vector rhs = Scale(original.terminal_Q * out->states[0] + original.terminal_q, -1.0);
+    RectangularSolve solve = SolveRectangularRref(k, rhs, tolerance);
+    if (solve.inconsistent) {
+      *error = "inconsistent terminal multiplier recovery";
+      return false;
+    }
+    out->initial_multiplier = Slice(solve.x, 0, n);
+    out->terminal_state_multiplier = Slice(solve.x, n, pt);
+    return true;
+  }
+
+  AffineSet future_y;
+  future_y.basis = Scale(Transpose(original.terminal_E), -1.0);
+  future_y.offset = Scale(original.terminal_Q * out->states[N] + original.terminal_q, -1.0);
+  std::vector<StageMultiplierMap> maps(N);
+  for (std::size_t rev = 0; rev < N; ++rev) {
+    const std::size_t i = N - 1 - rev;
+    const Stage& s = original.stages[i];
+    const std::size_t n = s.A.cols();
+    const std::size_t m = s.B.cols();
+    const std::size_t mixed = s.C.rows();
+    const std::size_t state = s.E.rows();
+    const std::size_t future_params = future_y.basis.cols();
+
+    Matrix u_system(m, future_params + mixed + state);
+    for (std::size_t row = 0; row < m; ++row) {
+      for (std::size_t col = 0; col < future_params; ++col) {
+        double value = 0.0;
+        for (std::size_t r = 0; r < s.B.rows(); ++r) value -= s.B(r, row) * future_y.basis(r, col);
+        u_system(row, col) = value;
+      }
+    }
+    for (std::size_t row = 0; row < m; ++row) {
+      for (std::size_t col = 0; col < mixed; ++col) u_system(row, future_params + col) = s.D(col, row);
+    }
+    Vector u_rhs = Scale(Transpose(s.M) * out->states[i] + s.R * out->controls[i] + s.r,
+                         -1.0) +
+                   Transpose(s.B) * future_y.offset;
+    LinearParametrization local = ParametrizeLinearSystem(u_system, u_rhs, tolerance);
+    if (local.inconsistent) {
+      *error = "inconsistent stage multiplier recovery at stage " + std::to_string(i);
+      return false;
+    }
+
+    Matrix prev_from_local(n, future_params + mixed + state);
+    for (std::size_t row = 0; row < n; ++row) {
+      for (std::size_t col = 0; col < future_params; ++col) {
+        double value = 0.0;
+        for (std::size_t r = 0; r < s.A.rows(); ++r) value += s.A(r, row) * future_y.basis(r, col);
+        prev_from_local(row, col) = value;
+      }
+      for (std::size_t col = 0; col < mixed; ++col) prev_from_local(row, future_params + col) = -s.C(col, row);
+      for (std::size_t col = 0; col < state; ++col) {
+        prev_from_local(row, future_params + mixed + col) = -s.E(col, row);
+      }
+    }
+    Vector prev_offset = Scale(s.Q * out->states[i] + s.M * out->controls[i] + s.q,
+                               -1.0) +
+                         Transpose(s.A) * future_y.offset;
+
+    maps[i].future_y = future_y;
+    maps[i].local_basis = local.basis;
+    maps[i].local_offset = local.offset;
+    maps[i].future_parameter_size = future_params;
+    maps[i].mixed_size = mixed;
+    maps[i].state_size = state;
+
+    future_y.basis = prev_from_local * local.basis;
+    future_y.offset = prev_offset + prev_from_local * local.offset;
+  }
+
+  Vector parameter(future_y.basis.cols());
+  out->initial_multiplier = future_y.offset;
+  for (std::size_t i = 0; i < N; ++i) {
+    const StageMultiplierMap& map = maps[i];
+    Vector local = map.local_offset + map.local_basis * parameter;
+    Vector future_parameter = Slice(local, 0, map.future_parameter_size);
+    out->dynamics_multipliers[i] = map.future_y.offset + map.future_y.basis * future_parameter;
+    out->mixed_multipliers[i] = Slice(local, map.future_parameter_size, map.mixed_size);
+    out->state_multipliers[i] =
+        Slice(local, map.future_parameter_size + map.mixed_size, map.state_size);
+    parameter = future_parameter;
+  }
+  out->terminal_state_multiplier = parameter;
+  return true;
+}
+
 Solution Recover(const Problem& original, const WorkingState& state,
-                 const ReducedSolution& reduced) {
+                 const ReducedSolution& reduced, double tolerance) {
   Solution out;
   out.status = SolveStatus::kOptimal;
   out.message = "optimal";
@@ -524,6 +741,11 @@ Solution Recover(const Problem& original, const WorkingState& state,
                       state.control_maps[i].offset;
   }
   out.objective = Objective(original, out.states, out.controls);
+  std::string error;
+  if (!RecoverMultipliers(original, &out, tolerance, &error)) {
+    out.status = SolveStatus::kNumericalFailure;
+    out.message = error;
+  }
   return out;
 }
 
@@ -565,7 +787,7 @@ Solution Solve(const Problem& problem, const SolveOptions& options) {
       }
     }
     ReducedSolution reduced = SolveUnconstrained(state.problem, options.tolerance);
-    return Recover(problem, state, reduced);
+    return Recover(problem, state, reduced, options.tolerance);
   } catch (const std::invalid_argument& e) {
     out.status = SolveStatus::kInvalidInput;
     out.message = e.what();

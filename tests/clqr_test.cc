@@ -1,5 +1,6 @@
 #include "clqr/clqr.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -39,6 +40,52 @@ void ExpectVectorNear(const Vector& actual, const Vector& expected, double tol,
   for (std::size_t i = 0; i < actual.size(); ++i) {
     ExpectNear(actual[i], expected[i], tol, message + "[" + std::to_string(i) + "]");
   }
+}
+
+double MaxAbsVector(const Vector& x) {
+  double out = 0.0;
+  for (std::size_t i = 0; i < x.size(); ++i) out = std::max(out, std::abs(x[i]));
+  return out;
+}
+
+void Accumulate(Matrix matrix, Vector multiplier, Vector* into) {
+  Expect(matrix.rows() == multiplier.size(), "accumulate multiplier size mismatch");
+  Expect(matrix.cols() == into->size(), "accumulate target size mismatch");
+  Vector term = Transpose(matrix) * multiplier;
+  for (std::size_t i = 0; i < into->size(); ++i) (*into)[i] += term[i];
+}
+
+double MaxKktStationarityResidual(const Problem& p, const Solution& sol) {
+  const std::size_t N = p.stages.size();
+  double residual = 0.0;
+  if (N == 0) {
+    Vector grad = p.terminal_Q * sol.states[0] + p.terminal_q + sol.initial_multiplier;
+    Accumulate(p.terminal_E, sol.terminal_state_multiplier, &grad);
+    return MaxAbsVector(grad);
+  }
+  for (std::size_t i = 0; i < N; ++i) {
+    const Stage& s = p.stages[i];
+    Vector x_grad = s.Q * sol.states[i] + s.M * sol.controls[i] + s.q -
+                    Transpose(s.A) * sol.dynamics_multipliers[i];
+    if (i == 0) {
+      x_grad = x_grad + sol.initial_multiplier;
+    } else {
+      x_grad = x_grad + sol.dynamics_multipliers[i - 1];
+    }
+    Accumulate(s.C, sol.mixed_multipliers[i], &x_grad);
+    Accumulate(s.E, sol.state_multipliers[i], &x_grad);
+    residual = std::max(residual, MaxAbsVector(x_grad));
+
+    Vector u_grad = Transpose(s.M) * sol.states[i] + s.R * sol.controls[i] + s.r -
+                    Transpose(s.B) * sol.dynamics_multipliers[i];
+    Accumulate(s.D, sol.mixed_multipliers[i], &u_grad);
+    residual = std::max(residual, MaxAbsVector(u_grad));
+  }
+  Vector terminal_grad =
+      p.terminal_Q * sol.states[N] + p.terminal_q + sol.dynamics_multipliers[N - 1];
+  Accumulate(p.terminal_E, sol.terminal_state_multiplier, &terminal_grad);
+  residual = std::max(residual, MaxAbsVector(terminal_grad));
+  return residual;
 }
 
 std::vector<std::size_t> StateOffsets(const Problem& p) {
@@ -236,6 +283,7 @@ void CheckAgainstKkt(const Problem& p, const std::string& name) {
   for (std::size_t i = 0; i < sol.controls.size(); ++i) {
     ExpectVectorNear(sol.controls[i], kkt.u[i], kTol, name + " u" + std::to_string(i));
   }
+  ExpectNear(MaxKktStationarityResidual(p, sol), 0.0, kTol, name + " multiplier KKT residual");
 }
 
 void UnconstrainedMatchesKkt() { CheckAgainstKkt(BaseProblem(), "unconstrained"); }

@@ -45,6 +45,11 @@ def test_python_solve():
     np.testing.assert_allclose(result["states"][0], np.array([1.0]), atol=1e-9)
     np.testing.assert_allclose(result["controls"][0], np.array([-1.0]), atol=1e-9)
     np.testing.assert_allclose(result["states"][1], np.array([0.0]), atol=1e-9)
+    np.testing.assert_allclose(result["initial_multiplier"], np.array([-3.0]), atol=1e-9)
+    np.testing.assert_allclose(result["dynamics_multipliers"][0], np.array([0.0]), atol=1e-9)
+    np.testing.assert_allclose(result["mixed_multipliers"][0], np.array([2.0]), atol=1e-9)
+    assert result["state_multipliers"][0].shape == (0,)
+    assert result["terminal_state_multiplier"].shape == (0,)
 
 
 if __name__ == "__main__":

@@ -47,4 +47,6 @@ result = _clqr.solve({
 ```
 
 Arrays are NumPy-compatible `float64` arrays. The result dict contains `status`, `message`,
-`objective`, `states`, and `controls`.
+`objective`, `states`, `controls`, `initial_multiplier`, `dynamics_multipliers`,
+`mixed_multipliers`, `state_multipliers`, and `terminal_state_multiplier`. The multiplier
+signs correspond to the constraints exactly as written above.

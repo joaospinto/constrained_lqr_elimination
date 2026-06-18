@@ -53,6 +53,11 @@ struct Solution {
   std::string message;
   std::vector<Vector> states;
   std::vector<Vector> controls;
+  Vector initial_multiplier;
+  std::vector<Vector> dynamics_multipliers;
+  std::vector<Vector> mixed_multipliers;
+  std::vector<Vector> state_multipliers;
+  Vector terminal_state_multiplier;
   double objective = 0.0;
 };
 
