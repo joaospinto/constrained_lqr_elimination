@@ -217,67 +217,20 @@ bool IsPositiveDefiniteByCholesky(const Matrix& a, double tolerance) {
   return true;
 }
 
-void AddInto(Matrix* target, const Matrix& term) {
-  Check(target->rows() == term.rows() && target->cols() == term.cols(),
-        "matrix accumulation shape mismatch");
-  for (std::size_t row = 0; row < target->rows(); ++row) {
-    for (std::size_t col = 0; col < target->cols(); ++col) {
-      (*target)(row, col) += term(row, col);
-    }
-  }
-}
-
-std::vector<std::size_t> ControlVariableOffsets(const WorkingProblem& problem) {
-  std::vector<std::size_t> offsets(problem.stages.size());
-  std::size_t offset = 0;
-  for (std::size_t i = 0; i < problem.stages.size(); ++i) {
-    offsets[i] = offset;
-    offset += problem.stages[i].B.cols();
-  }
-  return offsets;
-}
-
-void AnalyzeReducedHessian(const WorkingProblem& problem, double tolerance,
-                           NewtonKktDiagnostics* diagnostics) {
-  const std::size_t N = problem.stages.size();
-  std::vector<std::size_t> control_offsets = ControlVariableOffsets(problem);
-  std::size_t controls = 0;
-  for (const Stage& stage : problem.stages) controls += stage.B.cols();
-  if (controls == 0) return;
-
-  Matrix hessian(controls, controls);
-  Matrix state_sensitivity(problem.stages.empty() ? problem.terminal_Q.rows()
-                                                  : problem.stages.front().A.cols(),
-                           controls);
-  for (std::size_t i = 0; i < N; ++i) {
-    const Stage& s = problem.stages[i];
-    Matrix control_sensitivity(s.B.cols(), controls);
-    for (std::size_t col = 0; col < s.B.cols(); ++col) {
-      control_sensitivity(col, control_offsets[i] + col) = 1.0;
-    }
-
-    AddInto(&hessian, Transpose(state_sensitivity) * s.Q * state_sensitivity);
-    AddInto(&hessian, Transpose(control_sensitivity) * s.R * control_sensitivity);
-    AddInto(&hessian, Transpose(state_sensitivity) * s.M * control_sensitivity);
-    AddInto(&hessian,
-            Transpose(control_sensitivity) * Transpose(s.M) * state_sensitivity);
-
-    state_sensitivity =
-        s.A * state_sensitivity + s.B * control_sensitivity;
-  }
-  AddInto(&hessian, Transpose(state_sensitivity) * problem.terminal_Q * state_sensitivity);
-  hessian = Symmetrize(hessian);
-
-  RrefResult rank = Rref(hessian, controls, tolerance);
-  if (rank.pivot_columns.size() < controls) {
+void AnalyzeReducedControlHessian(const Matrix& Huu, std::size_t stage,
+                                  double tolerance,
+                                  NewtonKktDiagnostics* diagnostics) {
+  RrefResult rank = Rref(Huu, Huu.cols(), tolerance);
+  if (rank.pivot_columns.size() < Huu.cols()) {
     diagnostics->singular = true;
-    AddDiagnostic(diagnostics, "singular reduced Hessian on feasible directions");
+    AddDiagnostic(diagnostics, "singular reduced control Hessian at stage " +
+                                   std::to_string(stage));
     return;
   }
-  if (!IsPositiveDefiniteByCholesky(hessian, tolerance)) {
+  if (!IsPositiveDefiniteByCholesky(Huu, tolerance)) {
     diagnostics->wrong_inertia = true;
-    AddDiagnostic(diagnostics,
-                  "reduced Hessian is nonsingular but not positive definite");
+    AddDiagnostic(diagnostics, "reduced control Hessian has wrong inertia at stage " +
+                                   std::to_string(stage));
   }
 }
 
@@ -704,7 +657,8 @@ struct ReducedSolution {
   std::vector<Vector> u;
 };
 
-ReducedSolution SolveUnconstrained(const WorkingProblem& problem, double tolerance) {
+ReducedSolution SolveUnconstrained(const WorkingProblem& problem, double tolerance,
+                                   NewtonKktDiagnostics* diagnostics) {
   const std::size_t N = problem.stages.size();
   std::vector<Matrix> P(N + 1);
   std::vector<Vector> p(N + 1);
@@ -721,6 +675,7 @@ ReducedSolution SolveUnconstrained(const WorkingProblem& problem, double toleran
     const Matrix Hxu = s.M + Transpose(s.A) * P[i + 1] * s.B;
     const Vector hx = s.q + Transpose(s.A) * pc;
     const Vector hu = s.r + Transpose(s.B) * pc;
+    AnalyzeReducedControlHessian(Huu, i, tolerance, diagnostics);
     Matrix solve_hxu = SolveLinearSystem(Huu, Transpose(Hxu), tolerance);
     Vector solve_hu = SolveLinearSystem(Huu, hu, tolerance);
     K[i] = Scale(solve_hxu, -1.0);
@@ -918,9 +873,9 @@ Solution Solve(const Problem& problem, const SolveOptions& options) {
         return out;
       }
     }
-    AnalyzeReducedHessian(state.problem, options.tolerance, &diagnostics);
     try {
-      ReducedSolution reduced = SolveUnconstrained(state.problem, options.tolerance);
+      ReducedSolution reduced =
+          SolveUnconstrained(state.problem, options.tolerance, &diagnostics);
       return Recover(problem, state, reduced, options.tolerance, diagnostics);
     } catch (const std::runtime_error& e) {
       out.status = SolveStatus::kNumericalFailure;
