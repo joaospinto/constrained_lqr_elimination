@@ -34,6 +34,28 @@ Pass an integer scale factor to increase the per-case iteration counts:
 bazel run -c opt //:clqr_benchmark -- 10
 ```
 
+Sample results from `bazel run -c opt //:clqr_benchmark` on arm64 macOS with clang 22.1.1:
+
+| Case | Iterations | Mean | Min | Max |
+|---|---:|---:|---:|---:|
+| `N=16 n=4 m=2 p=0` | 200 | `127 us` | `96.9 us` | `583 us` |
+| `N=16 n=4 m=2 p=1` | 200 | `119 us` | `110 us` | `366 us` |
+| `N=16 n=4 m=2 p=2` | 200 | `119 us` | `105 us` | `1.19 ms` |
+| `N=16 n=6 m=3 p=0` | 100 | `142 us` | `133 us` | `252 us` |
+| `N=16 n=6 m=3 p=1` | 100 | `168 us` | `153 us` | `484 us` |
+| `N=16 n=6 m=3 p=2` | 100 | `157 us` | `149 us` | `237 us` |
+| `N=32 n=6 m=3 p=0` | 50 | `290 us` | `262 us` | `744 us` |
+| `N=32 n=6 m=3 p=1` | 50 | `340 us` | `305 us` | `977 us` |
+| `N=32 n=6 m=3 p=2` | 50 | `315 us` | `303 us` | `417 us` |
+| `N=64 n=6 m=3 p=0` | 20 | `575 us` | `537 us` | `1.15 ms` |
+| `N=64 n=6 m=3 p=1` | 20 | `628 us` | `599 us` | `778 us` |
+| `N=64 n=6 m=3 p=2` | 20 | `641 us` | `602 us` | `884 us` |
+| `N=128 n=8 m=4 p=0` | 10 | `1.48 ms` | `1.20 ms` | `3.83 ms` |
+| `N=128 n=8 m=4 p=1` | 10 | `1.60 ms` | `1.41 ms` | `2.34 ms` |
+| `N=128 n=8 m=4 p=2` | 10 | `1.45 ms` | `1.33 ms` | `2.07 ms` |
+
+All sample cases reported `singular_count=0` and `wrong_inertia_count=0`.
+
 C++ users include `clqr/clqr.h` and call `clqr::Solve`.
 
 The Python extension target is `//:_clqr.so`. It exposes:
