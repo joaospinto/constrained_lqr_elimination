@@ -50,14 +50,6 @@ void Matrix::resize(std::size_t rows, std::size_t cols) {
   data_.assign(rows * cols, 0.0);
 }
 
-double& Matrix::operator()(std::size_t row, std::size_t col) {
-  return data_[row * cols_ + col];
-}
-
-double Matrix::operator()(std::size_t row, std::size_t col) const {
-  return data_[row * cols_ + col];
-}
-
 Matrix Identity(std::size_t size) {
   Matrix out(size, size);
   for (std::size_t i = 0; i < size; ++i) out(i, i) = 1.0;

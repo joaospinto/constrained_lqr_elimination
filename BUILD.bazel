@@ -14,7 +14,6 @@ cc_library(
         "include/clqr/linalg.h",
     ],
     includes = ["include"],
-    copts = ["-std=c++17", "-Wall", "-Wextra", "-Wpedantic"],
     visibility = ["//visibility:public"],
 )
 
@@ -22,14 +21,12 @@ cc_test(
     name = "clqr_test",
     srcs = ["tests/clqr_test.cc"],
     deps = [":clqr"],
-    copts = ["-std=c++17", "-Wall", "-Wextra", "-Wpedantic"],
 )
 
 cc_test(
     name = "workspace_allocation_test",
     srcs = ["tests/workspace_allocation_test.cc"],
     deps = [":clqr"],
-    copts = ["-std=c++17", "-Wall", "-Wextra", "-Wpedantic"],
 )
 
 nanobind_extension(
@@ -47,12 +44,11 @@ cc_test(
         ":_clqr",
         "tests/python_binding_test.py",
     ],
-    copts = ["-std=c++17", "-Wall", "-Wextra", "-Wpedantic"],
 )
 
 cc_binary(
     name = "clqr_benchmark",
     srcs = ["benchmarks/clqr_benchmark.cc"],
-    copts = ["-std=c++17", "-O3", "-DNDEBUG", "-Wall", "-Wextra", "-Wpedantic"],
+    copts = ["-DNDEBUG"],
     deps = [":clqr"],
 )

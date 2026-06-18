@@ -202,6 +202,17 @@ Matrix Symmetrize(const Matrix& a) {
   return out;
 }
 
+void SymmetrizeInPlace(Matrix& a) {
+  Check(a.rows() == a.cols(), "cannot symmetrize a rectangular matrix");
+  for (std::size_t row = 0; row < a.rows(); ++row) {
+    for (std::size_t col = row + 1; col < a.cols(); ++col) {
+      const double value = 0.5 * (a(row, col) + a(col, row));
+      a(row, col) = value;
+      a(col, row) = value;
+    }
+  }
+}
+
 bool IsIdentity(const Matrix& a, double tolerance) {
   if (a.rows() != a.cols()) return false;
   for (std::size_t row = 0; row < a.rows(); ++row) {
@@ -541,30 +552,142 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
   const Matrix old_Q = s.Q;
   const Matrix old_R = s.R;
   const Matrix old_M = s.M;
+  const Matrix old_A = s.A;
   const Matrix old_B = s.B;
   const Vector old_q = s.q;
   const Vector old_r = s.r;
   const Vector old_c = s.c;
-  const Vector Ry = old_R * basis.y;
 
-  s.Q = Symmetrize(old_Q + Transpose(basis.Y) * old_R * basis.Y +
-                   old_M * basis.Y + Transpose(old_M * basis.Y));
-  s.R = Symmetrize(Transpose(basis.Z) * old_R * basis.Z);
-  s.M = old_M * basis.Z + Transpose(basis.Y) * old_R * basis.Z;
-  s.q = old_q + Transpose(basis.Y) * (Ry + old_r) + old_M * basis.y;
-  s.r = Transpose(basis.Z) * (Ry + old_r);
-  s.A = s.A + old_B * basis.Y;
-  s.B = old_B * basis.Z;
-  s.c = old_c + old_B * basis.y;
+  const std::size_t n = old_Q.rows();
+  const std::size_t m = old_R.rows();
+  const std::size_t next_n = old_B.rows();
+  const std::size_t reduced_m = basis.Z.cols();
+  Vector affine_control_gradient(m);
+  for (std::size_t row = 0; row < m; ++row) {
+    double value = 0.0;
+    for (std::size_t col = 0; col < m; ++col) value += old_R(row, col) * basis.y[col];
+    affine_control_gradient[row] = value + old_r[row];
+  }
+
+  s.Q = Matrix(n, n);
+  for (std::size_t row = 0; row < n; ++row) {
+    for (std::size_t col = 0; col < n; ++col) {
+      double value = old_Q(row, col);
+      for (std::size_t u = 0; u < m; ++u) {
+        value += old_M(row, u) * basis.Y(u, col);
+        value += old_M(col, u) * basis.Y(u, row);
+        for (std::size_t v = 0; v < m; ++v) {
+          value += basis.Y(u, row) * old_R(u, v) * basis.Y(v, col);
+        }
+      }
+      s.Q(row, col) = value;
+    }
+  }
+  SymmetrizeInPlace(s.Q);
+
+  s.R = Matrix(reduced_m, reduced_m);
+  for (std::size_t row = 0; row < reduced_m; ++row) {
+    for (std::size_t col = 0; col < reduced_m; ++col) {
+      double value = 0.0;
+      for (std::size_t u = 0; u < m; ++u) {
+        for (std::size_t v = 0; v < m; ++v) {
+          value += basis.Z(u, row) * old_R(u, v) * basis.Z(v, col);
+        }
+      }
+      s.R(row, col) = value;
+    }
+  }
+  SymmetrizeInPlace(s.R);
+
+  s.M = Matrix(n, reduced_m);
+  for (std::size_t row = 0; row < n; ++row) {
+    for (std::size_t col = 0; col < reduced_m; ++col) {
+      double value = 0.0;
+      for (std::size_t u = 0; u < m; ++u) {
+        value += old_M(row, u) * basis.Z(u, col);
+        for (std::size_t v = 0; v < m; ++v) {
+          value += basis.Y(u, row) * old_R(u, v) * basis.Z(v, col);
+        }
+      }
+      s.M(row, col) = value;
+    }
+  }
+
+  s.q = Vector(n);
+  for (std::size_t row = 0; row < n; ++row) {
+    double value = old_q[row];
+    for (std::size_t u = 0; u < m; ++u) {
+      value += basis.Y(u, row) * affine_control_gradient[u];
+      value += old_M(row, u) * basis.y[u];
+    }
+    s.q[row] = value;
+  }
+
+  s.r = Vector(reduced_m);
+  for (std::size_t row = 0; row < reduced_m; ++row) {
+    double value = 0.0;
+    for (std::size_t u = 0; u < m; ++u) value += basis.Z(u, row) * affine_control_gradient[u];
+    s.r[row] = value;
+  }
+
+  s.A = Matrix(next_n, n);
+  for (std::size_t row = 0; row < next_n; ++row) {
+    for (std::size_t col = 0; col < n; ++col) {
+      double value = old_A(row, col);
+      for (std::size_t u = 0; u < m; ++u) value += old_B(row, u) * basis.Y(u, col);
+      s.A(row, col) = value;
+    }
+  }
+  s.B = Matrix(next_n, reduced_m);
+  for (std::size_t row = 0; row < next_n; ++row) {
+    for (std::size_t col = 0; col < reduced_m; ++col) {
+      double value = 0.0;
+      for (std::size_t u = 0; u < m; ++u) value += old_B(row, u) * basis.Z(u, col);
+      s.B(row, col) = value;
+    }
+  }
+  s.c = Vector(next_n);
+  for (std::size_t row = 0; row < next_n; ++row) {
+    double value = old_c[row];
+    for (std::size_t u = 0; u < m; ++u) value += old_B(row, u) * basis.y[u];
+    s.c[row] = value;
+  }
   s.C = Matrix(0, s.A.cols());
   s.D = Matrix(0, s.B.cols());
   s.d = Vector(0);
   AppendStateConstraints(s, basis.state_C, basis.state_d);
 
   ControlMap old_map = state.control_maps[i];
-  state.control_maps[i].state_linear = old_map.state_linear + old_map.control_linear * basis.Y;
-  state.control_maps[i].control_linear = old_map.control_linear * basis.Z;
-  state.control_maps[i].offset = old_map.offset + old_map.control_linear * basis.y;
+  state.control_maps[i].state_linear =
+      Matrix(old_map.state_linear.rows(), basis.Y.cols());
+  for (std::size_t row = 0; row < old_map.state_linear.rows(); ++row) {
+    for (std::size_t col = 0; col < basis.Y.cols(); ++col) {
+      double value = old_map.state_linear(row, col);
+      for (std::size_t u = 0; u < old_map.control_linear.cols(); ++u) {
+        value += old_map.control_linear(row, u) * basis.Y(u, col);
+      }
+      state.control_maps[i].state_linear(row, col) = value;
+    }
+  }
+  state.control_maps[i].control_linear =
+      Matrix(old_map.control_linear.rows(), basis.Z.cols());
+  for (std::size_t row = 0; row < old_map.control_linear.rows(); ++row) {
+    for (std::size_t col = 0; col < basis.Z.cols(); ++col) {
+      double value = 0.0;
+      for (std::size_t u = 0; u < old_map.control_linear.cols(); ++u) {
+        value += old_map.control_linear(row, u) * basis.Z(u, col);
+      }
+      state.control_maps[i].control_linear(row, col) = value;
+    }
+  }
+  state.control_maps[i].offset = Vector(old_map.offset.size());
+  for (std::size_t row = 0; row < old_map.offset.size(); ++row) {
+    double value = old_map.offset[row];
+    for (std::size_t u = 0; u < old_map.control_linear.cols(); ++u) {
+      value += old_map.control_linear(row, u) * basis.y[u];
+    }
+    state.control_maps[i].offset[row] = value;
+  }
   return true;
 }
 

@@ -136,8 +136,12 @@ class Matrix {
   void reserve(std::size_t rows, std::size_t cols);
   void resize(std::size_t rows, std::size_t cols);
 
-  double& operator()(std::size_t row, std::size_t col);
-  double operator()(std::size_t row, std::size_t col) const;
+  double& operator()(std::size_t row, std::size_t col) {
+    return data_[row * cols_ + col];
+  }
+  double operator()(std::size_t row, std::size_t col) const {
+    return data_[row * cols_ + col];
+  }
 
   const Storage& data() const { return data_; }
   Storage& data() { return data_; }
