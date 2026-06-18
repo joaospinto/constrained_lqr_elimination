@@ -1,0 +1,3 @@
+startup --output_base=/private/tmp/constrained_lqr_elimination_bazel
+startup --install_base=/private/tmp/constrained_lqr_elimination_bazel_install
+build --macos_minimum_os=10.13

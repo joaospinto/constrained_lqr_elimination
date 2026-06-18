@@ -1,0 +1,44 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
+
+cc_library(
+    name = "clqr",
+    srcs = [
+        "src/clqr.cc",
+        "src/linalg.cc",
+    ],
+    hdrs = [
+        "include/clqr/clqr.h",
+        "include/clqr/linalg.h",
+    ],
+    includes = ["include"],
+    copts = ["-std=c++17", "-Wall", "-Wextra", "-Wpedantic"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "clqr_test",
+    srcs = ["tests/clqr_test.cc"],
+    deps = [":clqr"],
+    copts = ["-std=c++17", "-Wall", "-Wextra", "-Wpedantic"],
+)
+
+nanobind_extension(
+    name = "_clqr",
+    srcs = ["python/clqr_module.cc"],
+    deps = [":clqr"],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "python_binding_test",
+    srcs = ["tests/python_binding_test_runner.cc"],
+    data = [
+        ":_clqr",
+        "tests/python_binding_test.py",
+    ],
+    copts = ["-std=c++17", "-Wall", "-Wextra", "-Wpedantic"],
+)
