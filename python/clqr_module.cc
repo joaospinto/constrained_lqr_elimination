@@ -108,8 +108,7 @@ nb::list VectorViewListToPython(const clqr::VectorView* vectors, std::size_t cou
   return out;
 }
 
-nb::dict Solve(nb::object problem_object, double tolerance = 1e-9,
-               int max_elimination_passes = 100) {
+nb::dict Solve(nb::object problem_object, double tolerance = 1e-9) {
   std::string step = "start";
   try {
     step = "cast problem";
@@ -137,7 +136,6 @@ nb::dict Solve(nb::object problem_object, double tolerance = 1e-9,
     step = "solve";
     clqr::SolveOptions options;
     options.tolerance = tolerance;
-    options.max_elimination_passes = max_elimination_passes;
     clqr::Workspace workspace;
     workspace.Reserve(cproblem, options);
     clqr::SolutionView solution = clqr::Solve(cproblem, workspace, options);
@@ -182,6 +180,5 @@ nb::dict Solve(nb::object problem_object, double tolerance = 1e-9,
 
 NB_MODULE(_clqr, module) {
   module.doc() = "Sequential constrained LQR solver.";
-  module.def("solve", &Solve, nb::arg("problem"), nb::arg("tolerance") = 1e-9,
-             nb::arg("max_elimination_passes") = 100);
+  module.def("solve", &Solve, nb::arg("problem"), nb::arg("tolerance") = 1e-9);
 }

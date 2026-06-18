@@ -46,7 +46,6 @@ enum class SolveStatus {
 
 struct SolveOptions {
   double tolerance = 1e-9;
-  int max_elimination_passes = 100;
 };
 
 struct VectorView {
@@ -147,8 +146,7 @@ class Workspace {
       std::size_t stages, std::size_t state_dim, std::size_t control_dim,
       std::size_t mixed_constraints_per_stage,
       std::size_t state_constraints_per_stage = 0,
-      std::size_t terminal_constraints = 0,
-      std::size_t max_elimination_passes = 100) {
+      std::size_t terminal_constraints = 0) {
     const std::size_t total_state_scalars = (stages + 1) * state_dim;
     const std::size_t total_control_scalars = stages * control_dim;
     const std::size_t total_dynamics_scalars = stages * state_dim;
@@ -159,18 +157,7 @@ class Workspace {
     const std::size_t state_rows_bound =
         Max(terminal_constraints, state_constraints_per_stage + mixed_rows_bound);
     const std::size_t state_pivot_bound = Min(state_dim, state_rows_bound);
-    const bool has_stage_constraints =
-        stages > 0 && (mixed_constraints_per_stage > 0 || state_constraints_per_stage > 0);
-    const std::size_t rightmost_constrained_node =
-        terminal_constraints > 0 ? stages : (has_stage_constraints ? stages - 1 : 0);
-    const std::size_t pass_bound =
-        Max(std::size_t{1}, Min(max_elimination_passes, rightmost_constrained_node + 1));
-    const std::size_t generated_mixed_stage_ops =
-        rightmost_constrained_node * (rightmost_constrained_node + 1) / 2;
-    const std::size_t original_mixed_stage_ops =
-        mixed_constraints_per_stage > 0 ? stages : std::size_t{0};
-    const std::size_t mixed_stage_ops =
-        original_mixed_stage_ops + generated_mixed_stage_ops;
+    const std::size_t mixed_stage_ops = stages;
     const std::size_t mixed_stage_doubles =
         2 * mixed_rows_bound * (control_dim + state_dim + 1) +
         control_dim * state_dim + control_dim * control_dim + control_dim +
@@ -226,20 +213,20 @@ class Workspace {
                                       control_dim * control_dim + control_dim)));
     bytes = AddAligned(bytes, alignof(double),
                        sizeof(double) *
-                           (pass_bound * (stages + 1) *
+                           ((stages + 1) *
                                 (2 * state_rows_bound * (state_dim + 1) +
                                  state_dim * state_dim + state_dim) +
-                            pass_bound * stages * state_stage_doubles +
+                            stages * state_stage_doubles +
                             mixed_stage_ops * mixed_stage_doubles));
     bytes = AddAligned(bytes, alignof(std::size_t),
                        sizeof(std::size_t) *
-                           (pass_bound * (stages + 1) * 3 * state_dim +
+                           ((stages + 1) * 3 * state_dim +
                             mixed_stage_ops *
                                 (3 * control_dim + mixed_rows_bound + 3 * state_dim)));
     bytes = AddAligned(bytes, alignof(Matrix),
-                       sizeof(Matrix) * pass_bound * (4 * stages + 2));
+                       sizeof(Matrix) * (4 * stages + 2));
     bytes = AddAligned(bytes, alignof(Vector),
-                       sizeof(Vector) * pass_bound * (4 * stages + 2));
+                       sizeof(Vector) * (4 * stages + 2));
     bytes += RequiredBytesUniform(stages, state_dim, control_dim);
     bytes = AddAligned(bytes, alignof(VectorView),
                        sizeof(VectorView) * (stages + 1));

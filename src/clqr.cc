@@ -524,65 +524,202 @@ MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
   return out;
 }
 
-bool EliminateMixedWithMaps(WorkingState& state, double tolerance, std::string* error,
-                            NewtonKktDiagnostics* diagnostics) {
-  bool changed = false;
-  for (std::size_t i = 0; i < state.problem.stages.size(); ++i) {
+bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
+                                 double tolerance, std::string* error,
+                                 NewtonKktDiagnostics* diagnostics) {
+  Stage& s = state.problem.stages[i];
+  if (s.C.rows() == 0) return false;
+  MixedElimination basis = ControlBasis(s.C, s.D, s.d, tolerance);
+  if (basis.infeasible) {
+    *error = basis.message;
+    throw std::runtime_error(*error);
+  }
+  if (basis.redundant) {
+    diagnostics->singular = true;
+    AddIndexedDiagnostic(diagnostics, "redundant mixed equality constraints at stage ", i);
+  }
+  const Matrix old_Q = s.Q;
+  const Matrix old_R = s.R;
+  const Matrix old_M = s.M;
+  const Matrix old_B = s.B;
+  const Vector old_q = s.q;
+  const Vector old_r = s.r;
+  const Vector old_c = s.c;
+  const Vector Ry = old_R * basis.y;
+
+  s.Q = Symmetrize(old_Q + Transpose(basis.Y) * old_R * basis.Y +
+                   old_M * basis.Y + Transpose(old_M * basis.Y));
+  s.R = Symmetrize(Transpose(basis.Z) * old_R * basis.Z);
+  s.M = old_M * basis.Z + Transpose(basis.Y) * old_R * basis.Z;
+  s.q = old_q + Transpose(basis.Y) * (Ry + old_r) + old_M * basis.y;
+  s.r = Transpose(basis.Z) * (Ry + old_r);
+  s.A = s.A + old_B * basis.Y;
+  s.B = old_B * basis.Z;
+  s.c = old_c + old_B * basis.y;
+  s.C = Matrix(0, s.A.cols());
+  s.D = Matrix(0, s.B.cols());
+  s.d = Vector(0);
+  AppendStateConstraints(s, basis.state_C, basis.state_d);
+
+  ControlMap old_map = state.control_maps[i];
+  state.control_maps[i].state_linear = old_map.state_linear + old_map.control_linear * basis.Y;
+  state.control_maps[i].control_linear = old_map.control_linear * basis.Z;
+  state.control_maps[i].offset = old_map.offset + old_map.control_linear * basis.y;
+  return true;
+}
+
+bool StateBasisIsIdentity(const AffineStateBasis& basis, double tolerance) {
+  return basis.pivot_rows.empty() && IsIdentity(basis.T, tolerance) &&
+         MaxAbs(basis.offset) <= tolerance;
+}
+
+void ApplyTerminalStateBasis(WorkingState& state, const AffineStateBasis& basis,
+                             double tolerance) {
+  if (StateBasisIsIdentity(basis, tolerance)) {
+    state.problem.terminal_E = Matrix(0, state.problem.terminal_Q.rows());
+    state.problem.terminal_e = Vector(0);
+    return;
+  }
+  const Matrix old_terminal_Q = state.problem.terminal_Q;
+  const Vector old_terminal_q = state.problem.terminal_q;
+  state.problem.terminal_Q =
+      Symmetrize(Transpose(basis.T) * old_terminal_Q * basis.T);
+  state.problem.terminal_q =
+      Transpose(basis.T) * (old_terminal_q + old_terminal_Q * basis.offset);
+  state.problem.terminal_E = Matrix(0, basis.T.cols());
+  state.problem.terminal_e = Vector(0);
+
+  StateMap old_terminal_map = state.state_maps.back();
+  state.state_maps.back().linear = old_terminal_map.linear * basis.T;
+  state.state_maps.back().offset =
+      old_terminal_map.offset + old_terminal_map.linear * basis.offset;
+}
+
+void ApplyNextStateBasisToStage(WorkingState& state, std::size_t i,
+                                const AffineStateBasis& next,
+                                double tolerance) {
+  if (StateBasisIsIdentity(next, tolerance)) return;
+  Stage& s = state.problem.stages[i];
+  const Matrix old_A = s.A;
+  const Matrix old_B = s.B;
+  const Vector old_c = s.c;
+
+  Matrix new_A = Rows(old_A, next.free_rows);
+  Matrix new_B = Rows(old_B, next.free_rows);
+  Vector new_c = Entries(old_c, next.free_rows);
+
+  Matrix C_extra(next.pivot_rows.size(), old_A.cols());
+  Matrix D_extra(next.pivot_rows.size(), old_B.cols());
+  Vector d_extra(next.pivot_rows.size());
+  for (std::size_t row = 0; row < next.pivot_rows.size(); ++row) {
+    const std::size_t pivot = next.pivot_rows[row];
+    for (std::size_t col = 0; col < old_A.cols(); ++col) {
+      double value = old_A(pivot, col);
+      for (std::size_t f = 0; f < next.free_rows.size(); ++f) {
+        value -= next.T(pivot, f) * old_A(next.free_rows[f], col);
+      }
+      C_extra(row, col) = value;
+    }
+    for (std::size_t col = 0; col < old_B.cols(); ++col) {
+      double value = old_B(pivot, col);
+      for (std::size_t f = 0; f < next.free_rows.size(); ++f) {
+        value -= next.T(pivot, f) * old_B(next.free_rows[f], col);
+      }
+      D_extra(row, col) = value;
+    }
+    double value = old_c[pivot] - next.offset[pivot];
+    for (std::size_t f = 0; f < next.free_rows.size(); ++f) {
+      value -= next.T(pivot, f) * old_c[next.free_rows[f]];
+    }
+    d_extra[row] = value;
+  }
+
+  s.A = new_A;
+  s.B = new_B;
+  s.c = new_c;
+  AppendMixedConstraints(s, C_extra, D_extra, d_extra);
+}
+
+void ApplyCurrentStateBasisToStage(WorkingState& state, std::size_t i,
+                                   const AffineStateBasis& cur,
+                                   double tolerance) {
+  Stage& s = state.problem.stages[i];
+  if (StateBasisIsIdentity(cur, tolerance)) {
+    s.E = Matrix(0, s.A.cols());
+    s.e = Vector(0);
+    return;
+  }
+  const Matrix old_A = s.A;
+  const Matrix old_Q = s.Q;
+  const Matrix old_M = s.M;
+  const Vector old_q = s.q;
+
+  s.Q = Symmetrize(Transpose(cur.T) * old_Q * cur.T);
+  s.M = Transpose(cur.T) * old_M;
+  s.q = Transpose(cur.T) * (old_q + old_Q * cur.offset);
+  s.r = s.r + Transpose(old_M) * cur.offset;
+  s.A = old_A * cur.T;
+  s.c = old_A * cur.offset + s.c;
+  s.C = Matrix(0, cur.T.cols());
+  s.D = Matrix(0, s.B.cols());
+  s.d = Vector(0);
+  s.E = Matrix(0, cur.T.cols());
+  s.e = Vector(0);
+
+  StateMap old_state_map = state.state_maps[i];
+  state.state_maps[i].linear = old_state_map.linear * cur.T;
+  state.state_maps[i].offset =
+      old_state_map.offset + old_state_map.linear * cur.offset;
+
+  ControlMap old_control_map = state.control_maps[i];
+  state.control_maps[i].state_linear = old_control_map.state_linear * cur.T;
+  state.control_maps[i].offset =
+      old_control_map.offset + old_control_map.state_linear * cur.offset;
+}
+
+void CheckStateBasis(const AffineStateBasis& basis, std::size_t node,
+                     std::string* error, NewtonKktDiagnostics* diagnostics) {
+  if (basis.infeasible) {
+    *error = basis.message;
+    throw std::runtime_error(*error);
+  }
+  if (basis.redundant) {
+    diagnostics->singular = true;
+    AddIndexedDiagnostic(diagnostics, "redundant state equality constraints at node ", node);
+  }
+}
+
+void EliminateConstraintsRightToLeft(WorkingState& state, double tolerance,
+                                     std::string* error,
+                                     NewtonKktDiagnostics* diagnostics) {
+  const std::size_t N = state.problem.stages.size();
+  AffineStateBasis next;
+  bool next_is_identity = true;
+  if (state.problem.terminal_E.rows() > 0) {
+    next = StateBasis(state.problem.terminal_E, state.problem.terminal_e,
+                      state.problem.terminal_Q.rows(), tolerance);
+    CheckStateBasis(next, N, error, diagnostics);
+    ApplyTerminalStateBasis(state, next, tolerance);
+    next_is_identity = StateBasisIsIdentity(next, tolerance);
+  }
+
+  for (std::size_t rev = 0; rev < N; ++rev) {
+    const std::size_t i = N - 1 - rev;
+    if (!next_is_identity) ApplyNextStateBasisToStage(state, i, next, tolerance);
+    EliminateMixedStageWithMaps(state, i, tolerance, error, diagnostics);
+
     Stage& s = state.problem.stages[i];
-    if (s.C.rows() == 0) continue;
-    MixedElimination basis = ControlBasis(s.C, s.D, s.d, tolerance);
-    if (basis.infeasible) {
-      *error = basis.message;
-      throw std::runtime_error(*error);
+    if (s.E.rows() == 0) {
+      next = AffineStateBasis{};
+      next_is_identity = true;
+      continue;
     }
-    if (basis.redundant) {
-      diagnostics->singular = true;
-      AddIndexedDiagnostic(diagnostics, "redundant mixed equality constraints at stage ", i);
-    }
-    const Matrix old_Q = s.Q;
-    const Matrix old_R = s.R;
-    const Matrix old_M = s.M;
-    const Matrix old_B = s.B;
-    const Vector old_q = s.q;
-    const Vector old_r = s.r;
-    const Vector old_c = s.c;
-    const Vector Ry = old_R * basis.y;
-
-    s.Q = Symmetrize(old_Q + Transpose(basis.Y) * old_R * basis.Y +
-                     old_M * basis.Y + Transpose(old_M * basis.Y));
-    s.R = Symmetrize(Transpose(basis.Z) * old_R * basis.Z);
-    s.M = old_M * basis.Z + Transpose(basis.Y) * old_R * basis.Z;
-    s.q = old_q + Transpose(basis.Y) * (Ry + old_r) + old_M * basis.y;
-    s.r = Transpose(basis.Z) * (Ry + old_r);
-    s.A = s.A + old_B * basis.Y;
-    s.B = old_B * basis.Z;
-    s.c = old_c + old_B * basis.y;
-    s.C = Matrix(0, s.A.cols());
-    s.D = Matrix(0, s.B.cols());
-    s.d = Vector(0);
-    AppendStateConstraints(s, basis.state_C, basis.state_d);
-
-    ControlMap old_map = state.control_maps[i];
-    state.control_maps[i].state_linear = old_map.state_linear + old_map.control_linear * basis.Y;
-    state.control_maps[i].control_linear = old_map.control_linear * basis.Z;
-    state.control_maps[i].offset = old_map.offset + old_map.control_linear * basis.y;
-    changed = true;
+    AffineStateBasis cur = StateBasis(s.E, s.e, s.A.cols(), tolerance);
+    CheckStateBasis(cur, i, error, diagnostics);
+    ApplyCurrentStateBasisToStage(state, i, cur, tolerance);
+    next_is_identity = StateBasisIsIdentity(cur, tolerance);
+    next = std::move(cur);
   }
-  return changed;
-}
-
-bool AnyStateConstraints(const WorkingProblem& problem) {
-  for (const Stage& s : problem.stages) {
-    if (s.E.rows() > 0) return true;
-  }
-  return problem.terminal_E.rows() > 0;
-}
-
-bool AnyMixedConstraints(const WorkingProblem& problem) {
-  for (const Stage& s : problem.stages) {
-    if (s.C.rows() > 0) return true;
-  }
-  return false;
 }
 
 bool AnyOriginalConstraints(const Problem& problem) {
@@ -605,107 +742,6 @@ bool StateMapsAreIdentity(const WorkingState& state, double tolerance) {
   for (const StateMap& map : state.state_maps) {
     if (!IsIdentity(map.linear, tolerance) || MaxAbs(map.offset) > tolerance) return false;
   }
-  return true;
-}
-
-bool EliminateState(WorkingState& state, double tolerance, std::string* error,
-                    NewtonKktDiagnostics* diagnostics) {
-  if (!AnyStateConstraints(state.problem)) return false;
-  const std::size_t N = state.problem.stages.size();
-  WorkspaceVector<AffineStateBasis> bases(N + 1);
-  for (std::size_t i = 0; i <= N; ++i) {
-    const Matrix& E = (i == N) ? state.problem.terminal_E : state.problem.stages[i].E;
-    const Vector& e = (i == N) ? state.problem.terminal_e : state.problem.stages[i].e;
-    const std::size_t n = (i == N) ? state.problem.terminal_Q.rows()
-                                   : state.problem.stages[i].A.cols();
-    bases[i] = StateBasis(E, e, n, tolerance);
-    if (bases[i].infeasible) {
-      *error = bases[i].message;
-      throw std::runtime_error(*error);
-    }
-    if (bases[i].redundant) {
-      diagnostics->singular = true;
-      AddIndexedDiagnostic(diagnostics, "redundant state equality constraints at node ", i);
-    }
-  }
-
-  for (std::size_t i = 0; i < N; ++i) {
-    Stage& s = state.problem.stages[i];
-    const AffineStateBasis& cur = bases[i];
-    const AffineStateBasis& next = bases[i + 1];
-    const Matrix old_A = s.A;
-    const Matrix old_B = s.B;
-    const Matrix old_Q = s.Q;
-    const Matrix old_M = s.M;
-    const Vector old_q = s.q;
-    const Vector old_c = s.c;
-    const Matrix full_A = old_A * cur.T;
-    const Vector full_g = old_A * cur.offset + old_c;
-
-    Matrix new_A = Rows(full_A, next.free_rows);
-    Matrix new_B = Rows(old_B, next.free_rows);
-    Vector new_c = Entries(full_g, next.free_rows);
-
-    Matrix C_extra(next.pivot_rows.size(), cur.T.cols());
-    Matrix D_extra(next.pivot_rows.size(), old_B.cols());
-    Vector d_extra(next.pivot_rows.size());
-    for (std::size_t row = 0; row < next.pivot_rows.size(); ++row) {
-      const std::size_t pivot = next.pivot_rows[row];
-      for (std::size_t col = 0; col < cur.T.cols(); ++col) {
-        double value = full_A(pivot, col);
-        for (std::size_t f = 0; f < next.free_rows.size(); ++f) {
-          value -= next.T(pivot, f) * full_A(next.free_rows[f], col);
-        }
-        C_extra(row, col) = value;
-      }
-      for (std::size_t col = 0; col < old_B.cols(); ++col) {
-        double value = old_B(pivot, col);
-        for (std::size_t f = 0; f < next.free_rows.size(); ++f) {
-          value -= next.T(pivot, f) * old_B(next.free_rows[f], col);
-        }
-        D_extra(row, col) = value;
-      }
-      double value = full_g[pivot] - next.offset[pivot];
-      for (std::size_t f = 0; f < next.free_rows.size(); ++f) {
-        value -= next.T(pivot, f) * full_g[next.free_rows[f]];
-      }
-      d_extra[row] = value;
-    }
-
-    s.Q = Symmetrize(Transpose(cur.T) * old_Q * cur.T);
-    s.M = Transpose(cur.T) * old_M;
-    s.q = Transpose(cur.T) * (old_q + old_Q * cur.offset);
-    s.r = s.r + Transpose(old_M) * cur.offset;
-    s.A = new_A;
-    s.B = new_B;
-    s.c = new_c;
-    s.C = Matrix(0, cur.T.cols());
-    s.D = Matrix(0, old_B.cols());
-    s.d = Vector(0);
-    s.E = Matrix(0, cur.T.cols());
-    s.e = Vector(0);
-    AppendMixedConstraints(s, C_extra, D_extra, d_extra);
-
-    StateMap old_state_map = state.state_maps[i];
-    state.state_maps[i].linear = old_state_map.linear * cur.T;
-    state.state_maps[i].offset = old_state_map.offset + old_state_map.linear * cur.offset;
-
-    ControlMap old_control_map = state.control_maps[i];
-    state.control_maps[i].state_linear = old_control_map.state_linear * cur.T;
-    state.control_maps[i].offset =
-        old_control_map.offset + old_control_map.state_linear * cur.offset;
-  }
-
-  const AffineStateBasis& terminal = bases[N];
-  const Matrix old_terminal_Q = state.problem.terminal_Q;
-  const Vector old_terminal_q = state.problem.terminal_q;
-  state.problem.terminal_Q = Symmetrize(Transpose(terminal.T) * old_terminal_Q * terminal.T);
-  state.problem.terminal_q = Transpose(terminal.T) * (old_terminal_q + old_terminal_Q * terminal.offset);
-  state.problem.terminal_E = Matrix(0, terminal.T.cols());
-  state.problem.terminal_e = Vector(0);
-  StateMap old_terminal_map = state.state_maps[N];
-  state.state_maps[N].linear = old_terminal_map.linear * terminal.T;
-  state.state_maps[N].offset = old_terminal_map.offset + old_terminal_map.linear * terminal.offset;
   return true;
 }
 
@@ -1079,44 +1115,6 @@ WorkspaceDimensionSummary SummarizeWorkspaceDimensions(const Problem& problem) {
   return dims;
 }
 
-std::size_t RightmostConstrainedNode(const Problem& problem, bool* has_constraints) {
-  *has_constraints = false;
-  std::size_t rightmost_constrained_node = 0;
-  for (std::size_t i = 0; i < problem.stages.size(); ++i) {
-    const Stage& stage = problem.stages[i];
-    if (stage.C.rows() > 0 || stage.E.rows() > 0) {
-      *has_constraints = true;
-      rightmost_constrained_node = i;
-    }
-  }
-  if (problem.terminal_E.rows() > 0) {
-    *has_constraints = true;
-    rightmost_constrained_node = problem.stages.size();
-  }
-  return rightmost_constrained_node;
-}
-
-std::size_t BoundedEliminationPasses(const Problem& problem,
-                                     const SolveOptions& options,
-                                     const WorkspaceDimensionSummary& dims) {
-  (void)dims;
-  bool has_constraints = false;
-  const std::size_t rightmost_constrained_node =
-      RightmostConstrainedNode(problem, &has_constraints);
-  const std::size_t structural_bound =
-      has_constraints ? rightmost_constrained_node + 1 : std::size_t{1};
-  return std::max<std::size_t>(
-      1, std::min<std::size_t>(options.max_elimination_passes, structural_bound));
-}
-
-std::size_t OriginalMixedStageCount(const Problem& problem) {
-  std::size_t count = 0;
-  for (const Stage& stage : problem.stages) {
-    if (stage.C.rows() > 0) ++count;
-  }
-  return count;
-}
-
 void AddSolutionStorageBound(const Problem& problem, std::size_t* offset) {
   const std::size_t N = problem.stages.size();
   AddObjects<Vector>(offset, N + 1);
@@ -1203,29 +1201,24 @@ std::size_t StateEliminationStageDoubles(const WorkspaceDimensionSummary& dims,
 void AddEliminationStorageBound(const Problem& problem, const SolveOptions& options,
                                 const WorkspaceDimensionSummary& dims,
                                 std::size_t* offset) {
+  (void)problem;
+  (void)options;
   const std::size_t mixed_rows_bound = dims.max_mixed_rows + dims.max_next_state;
   const std::size_t state_rows_bound =
       std::max(dims.max_terminal_rows, dims.max_state_rows + mixed_rows_bound);
   const std::size_t state_pivot_bound = std::min(dims.max_state, state_rows_bound);
-  const std::size_t passes = BoundedEliminationPasses(problem, options, dims);
-  bool has_constraints = false;
-  const std::size_t rightmost_node = RightmostConstrainedNode(problem, &has_constraints);
-  const std::size_t generated_mixed_stage_ops =
-      has_constraints ? rightmost_node * (rightmost_node + 1) / 2 : std::size_t{0};
-  const std::size_t mixed_stage_ops =
-      OriginalMixedStageCount(problem) + generated_mixed_stage_ops;
   const std::size_t mixed_stage_doubles =
       MixedEliminationStageDoubles(dims, mixed_rows_bound, state_rows_bound);
   const std::size_t state_stage_doubles =
       StateEliminationStageDoubles(dims, state_rows_bound, state_pivot_bound);
-  AddObjects<AffineStateBasis>(offset, passes * (dims.stages + 1));
-  AddDoubles(offset, passes * (dims.stages + 1) *
+  AddObjects<AffineStateBasis>(offset, dims.stages + 1);
+  AddDoubles(offset, (dims.stages + 1) *
                          (2 * state_rows_bound * (dims.max_state + 1) +
                           dims.max_state * dims.max_state + dims.max_state));
-  AddIndices(offset, passes * (dims.stages + 1) * 3 * dims.max_state);
-  AddDoubles(offset, passes * dims.stages * state_stage_doubles);
-  AddDoubles(offset, mixed_stage_ops * mixed_stage_doubles);
-  AddIndices(offset, mixed_stage_ops *
+  AddIndices(offset, (dims.stages + 1) * 3 * dims.max_state);
+  AddDoubles(offset, dims.stages * state_stage_doubles);
+  AddDoubles(offset, dims.stages * mixed_stage_doubles);
+  AddIndices(offset, dims.stages *
                          (3 * dims.max_control + mixed_rows_bound +
                           3 * dims.max_state));
 }
@@ -2310,25 +2303,7 @@ static Solution SolveInternalResult(const Problem& problem, const SolveOptions& 
     }
     WorkingState state = Initialize(problem);
     std::string error;
-    for (int pass = 0; pass < options.max_elimination_passes; ++pass) {
-      const bool mixed =
-          EliminateMixedWithMaps(state, options.tolerance, &error, &diagnostics);
-      const bool state_changed =
-          EliminateState(state, options.tolerance, &error, &diagnostics);
-      if (!AnyMixedConstraints(state.problem) && !AnyStateConstraints(state.problem)) break;
-      if (!mixed && !state_changed) {
-        out.status = SolveStatus::kNumericalFailure;
-        out.message = "constraint elimination made no progress";
-        ApplyDiagnostics(diagnostics, &out);
-        return out;
-      }
-      if (pass + 1 == options.max_elimination_passes) {
-        out.status = SolveStatus::kNumericalFailure;
-        out.message = "constraint elimination pass limit exceeded";
-        ApplyDiagnostics(diagnostics, &out);
-        return out;
-      }
-    }
+    EliminateConstraintsRightToLeft(state, options.tolerance, &error, &diagnostics);
     LinearParametrization initial =
         ReducedInitialState(problem, state.state_maps.front(), options.tolerance);
     if (initial.inconsistent) {

@@ -16,6 +16,26 @@ s.t. x_0 = initial_state
      E_N x_N + e_N = 0
 ```
 
+The constrained solver performs a single right-to-left elimination sweep. It first
+parameterizes any terminal state equality as `x_N = T_N z_N + t_N`, then visits stages
+from `N - 1` down to `0`. At each stage it:
+
+1. applies the already-carried parameterization of `x_{i+1}` to the dynamics, turning
+   the eliminated next-state rows into additional mixed constraints on `(x_i, u_i)`;
+2. eliminates the stage mixed constraints by parameterizing the control as
+   `u_i = Y_i x_i + Z_i v_i + y_i`, appending any residual state-only constraints to
+   node `i`;
+3. parameterizes the resulting node-`i` state equality as `x_i = T_i z_i + t_i` and
+   carries that basis left to stage `i - 1`.
+
+After the sweep, all explicit equality constraints have been folded into affine state and
+control maps, so the reduced problem is an unconstrained LQR solved by a standard Riccati
+backward/forward pass. The final state and control trajectories are mapped back through the
+stored affine maps, and the original multipliers are recovered by a backward pass over the
+original KKT stationarity equations. Redundant equality rows mark the Newton-KKT system as
+singular; a reduced control Hessian with the wrong inertia is reported separately when the
+candidate solve can still proceed.
+
 Build and test:
 
 ```sh
@@ -42,21 +62,21 @@ better summary statistics.
 
 | Case | Iterations | Mean | Median | P90 | Min | Max |
 |---|---:|---:|---:|---:|---:|---:|
-| `N=16 n=4 m=2 p=0` | 1000 | `16.1 us` | `18.0 us` | `18.6 us` | `11.4 us` | `42.2 us` |
-| `N=16 n=4 m=2 p=1` | 1000 | `33.9 us` | `32.8 us` | `42.5 us` | `27.9 us` | `132 us` |
-| `N=16 n=4 m=2 p=2` | 1000 | `26.5 us` | `25.9 us` | `27.0 us` | `24.6 us` | `82.7 us` |
-| `N=16 n=6 m=3 p=0` | 500 | `25.5 us` | `25.2 us` | `25.9 us` | `25.0 us` | `37.9 us` |
-| `N=16 n=6 m=3 p=1` | 500 | `48.3 us` | `47.4 us` | `49.7 us` | `46.3 us` | `99.4 us` |
-| `N=16 n=6 m=3 p=2` | 500 | `46.1 us` | `45.4 us` | `47.5 us` | `44.7 us` | `77.4 us` |
-| `N=32 n=6 m=3 p=0` | 250 | `49.6 us` | `48.2 us` | `51.6 us` | `47.9 us` | `82.1 us` |
-| `N=32 n=6 m=3 p=1` | 250 | `93.4 us` | `92.1 us` | `96.7 us` | `91.2 us` | `118 us` |
-| `N=32 n=6 m=3 p=2` | 250 | `93.2 us` | `92.8 us` | `95.9 us` | `90.9 us` | `111 us` |
-| `N=64 n=6 m=3 p=0` | 100 | `97.1 us` | `95.8 us` | `101 us` | `94.7 us` | `109 us` |
-| `N=64 n=6 m=3 p=1` | 100 | `186 us` | `183 us` | `195 us` | `180 us` | `284 us` |
-| `N=64 n=6 m=3 p=2` | 100 | `184 us` | `180 us` | `194 us` | `179 us` | `260 us` |
-| `N=128 n=8 m=4 p=0` | 50 | `375 us` | `374 us` | `385 us` | `366 us` | `394 us` |
-| `N=128 n=8 m=4 p=1` | 50 | `595 us` | `589 us` | `612 us` | `577 us` | `702 us` |
-| `N=128 n=8 m=4 p=2` | 50 | `574 us` | `568 us` | `591 us` | `562 us` | `638 us` |
+| `N=16 n=4 m=2 p=0` | 1000 | `13.8 us` | `14.2 us` | `16.5 us` | `8.88 us` | `104 us` |
+| `N=16 n=4 m=2 p=1` | 1000 | `22.6 us` | `20.3 us` | `23.6 us` | `18.6 us` | `160 us` |
+| `N=16 n=4 m=2 p=2` | 1000 | `18.7 us` | `18.1 us` | `19.7 us` | `16.7 us` | `91.1 us` |
+| `N=16 n=6 m=3 p=0` | 500 | `24.0 us` | `23.1 us` | `24.3 us` | `22.3 us` | `93.9 us` |
+| `N=16 n=6 m=3 p=1` | 500 | `37.5 us` | `35.7 us` | `38.3 us` | `35.1 us` | `112 us` |
+| `N=16 n=6 m=3 p=2` | 500 | `37.6 us` | `35.9 us` | `38.1 us` | `34.9 us` | `124 us` |
+| `N=32 n=6 m=3 p=0` | 250 | `47.6 us` | `46.2 us` | `50.0 us` | `44.5 us` | `86.6 us` |
+| `N=32 n=6 m=3 p=1` | 250 | `77.7 us` | `74.8 us` | `78.6 us` | `71.9 us` | `227 us` |
+| `N=32 n=6 m=3 p=2` | 250 | `78.3 us` | `73.9 us` | `88.7 us` | `71.1 us` | `180 us` |
+| `N=64 n=6 m=3 p=0` | 100 | `91.5 us` | `90.0 us` | `94.6 us` | `88.9 us` | `116 us` |
+| `N=64 n=6 m=3 p=1` | 100 | `159 us` | `151 us` | `178 us` | `143 us` | `295 us` |
+| `N=64 n=6 m=3 p=2` | 100 | `151 us` | `144 us` | `158 us` | `140 us` | `406 us` |
+| `N=128 n=8 m=4 p=0` | 50 | `400 us` | `382 us` | `482 us` | `363 us` | `585 us` |
+| `N=128 n=8 m=4 p=1` | 50 | `521 us` | `513 us` | `566 us` | `497 us` | `643 us` |
+| `N=128 n=8 m=4 p=2` | 50 | `524 us` | `511 us` | `574 us` | `481 us` | `752 us` |
 
 All sample cases reported `singular_count=0` and `wrong_inertia_count=0`.
 
