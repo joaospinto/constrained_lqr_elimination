@@ -231,6 +231,7 @@ bool IsPositiveDefiniteByCholesky(const Matrix& a, double tolerance) {
 void AnalyzeReducedControlHessian(const Matrix& Huu, std::size_t stage,
                                   double tolerance,
                                   NewtonKktDiagnostics* diagnostics) {
+  if (IsPositiveDefiniteByCholesky(Huu, tolerance)) return;
   RrefResult rank = Rref(Huu, Huu.cols(), tolerance);
   if (rank.pivot_columns.size() < Huu.cols()) {
     diagnostics->singular = true;
@@ -238,11 +239,9 @@ void AnalyzeReducedControlHessian(const Matrix& Huu, std::size_t stage,
                                    std::to_string(stage));
     return;
   }
-  if (!IsPositiveDefiniteByCholesky(Huu, tolerance)) {
-    diagnostics->wrong_inertia = true;
-    AddDiagnostic(diagnostics, "reduced control Hessian has wrong inertia at stage " +
-                                   std::to_string(stage));
-  }
+  diagnostics->wrong_inertia = true;
+  AddDiagnostic(diagnostics, "reduced control Hessian has wrong inertia at stage " +
+                                 std::to_string(stage));
 }
 
 void AppendStateConstraints(Stage& stage, const Matrix& E_extra, const Vector& e_extra) {
