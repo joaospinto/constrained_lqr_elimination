@@ -48,6 +48,13 @@ double MaxAbsVector(const Vector& x) {
   return out;
 }
 
+double MaxAbsDifference(const Vector& a, const Vector& b) {
+  Expect(a.size() == b.size(), "difference size mismatch");
+  double out = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) out = std::max(out, std::abs(a[i] - b[i]));
+  return out;
+}
+
 void Accumulate(Matrix matrix, Vector multiplier, Vector* into) {
   Expect(matrix.rows() == multiplier.size(), "accumulate multiplier size mismatch");
   Expect(matrix.cols() == into->size(), "accumulate target size mismatch");
@@ -86,6 +93,32 @@ double MaxKktStationarityResidual(const Problem& p, const Solution& sol) {
   Accumulate(p.terminal_E, sol.terminal_state_multiplier, &terminal_grad);
   residual = std::max(residual, MaxAbsVector(terminal_grad));
   return residual;
+}
+
+double MaxKktPrimalResidual(const Problem& p, const Solution& sol) {
+  const std::size_t N = p.stages.size();
+  double residual = MaxAbsDifference(sol.states[0], p.initial_state);
+  for (std::size_t i = 0; i < N; ++i) {
+    const Stage& s = p.stages[i];
+    residual = std::max(
+        residual,
+        MaxAbsVector(sol.states[i + 1] - s.A * sol.states[i] - s.B * sol.controls[i] - s.c));
+    if (s.C.rows() > 0) {
+      residual =
+          std::max(residual, MaxAbsVector(s.C * sol.states[i] + s.D * sol.controls[i] + s.d));
+    }
+    if (s.E.rows() > 0) {
+      residual = std::max(residual, MaxAbsVector(s.E * sol.states[i] + s.e));
+    }
+  }
+  if (p.terminal_E.rows() > 0) {
+    residual = std::max(residual, MaxAbsVector(p.terminal_E * sol.states[N] + p.terminal_e));
+  }
+  return residual;
+}
+
+double MaxKktResidual(const Problem& p, const Solution& sol) {
+  return std::max(MaxKktStationarityResidual(p, sol), MaxKktPrimalResidual(p, sol));
 }
 
 std::vector<std::size_t> StateOffsets(const Problem& p) {
@@ -391,7 +424,7 @@ void CheckAgainstKkt(const Problem& p, const std::string& name) {
   for (std::size_t i = 0; i < sol.controls.size(); ++i) {
     ExpectVectorNear(sol.controls[i], kkt.u[i], kTol, name + " u" + std::to_string(i));
   }
-  ExpectNear(MaxKktStationarityResidual(p, sol), 0.0, kTol, name + " multiplier KKT residual");
+  ExpectNear(MaxKktResidual(p, sol), 0.0, kTol, name + " full KKT residual");
 }
 
 void UnconstrainedMatchesKkt() { CheckAgainstKkt(BaseProblem(), "unconstrained"); }
