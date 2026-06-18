@@ -118,9 +118,8 @@ void RunCase(const std::string& name, const clqr::Problem& problem, int iteratio
   }
 
   double checksum = 0.0;
-  double min_us = 0.0;
-  double max_us = 0.0;
-  double total_us = 0.0;
+  std::vector<double> times_us;
+  times_us.reserve(iterations);
   int singular_count = 0;
   int wrong_inertia_count = 0;
   for (int i = 0; i < iterations; ++i) {
@@ -132,15 +131,24 @@ void RunCase(const std::string& name, const clqr::Problem& problem, int iteratio
       return;
     }
     const double elapsed_us = std::chrono::duration<double, std::micro>(end - start).count();
-    if (i == 0 || elapsed_us < min_us) min_us = elapsed_us;
-    if (i == 0 || elapsed_us > max_us) max_us = elapsed_us;
-    total_us += elapsed_us;
+    times_us.push_back(elapsed_us);
     checksum += solution.objective;
     singular_count += solution.newton_kkt_singular ? 1 : 0;
     wrong_inertia_count += solution.newton_kkt_wrong_inertia ? 1 : 0;
   }
 
+  std::vector<double> sorted_times = times_us;
+  std::sort(sorted_times.begin(), sorted_times.end());
+  double total_us = 0.0;
+  for (double time_us : times_us) total_us += time_us;
+  const double min_us = sorted_times.front();
+  const double max_us = sorted_times.back();
+  const double median_us = sorted_times[sorted_times.size() / 2];
+  const double p90_us = sorted_times[static_cast<std::size_t>(
+      std::floor(0.9 * static_cast<double>(sorted_times.size() - 1)))];
+
   std::cout << name << ",iterations=" << iterations << ",mean_us=" << total_us / iterations
+            << ",median_us=" << median_us << ",p90_us=" << p90_us
             << ",min_us=" << min_us << ",max_us=" << max_us
             << ",objective_checksum=" << checksum << ",singular_count=" << singular_count
             << ",wrong_inertia_count=" << wrong_inertia_count << "\n";
@@ -158,8 +166,8 @@ int main(int argc, char** argv) {
       {128, 8, 4, 10},
   };
 
-  std::cout << "case,iterations,mean_us,min_us,max_us,objective_checksum,singular_count,"
-               "wrong_inertia_count\n";
+  std::cout << "case,iterations,mean_us,median_us,p90_us,min_us,max_us,"
+               "objective_checksum,singular_count,wrong_inertia_count\n";
   int seed = 1;
   for (const Dimensions& dim : dimensions) {
     for (std::size_t constraints = 0; constraints <= 2; ++constraints) {

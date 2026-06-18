@@ -11,7 +11,7 @@
 namespace clqr {
 namespace {
 
-void Check(bool condition, const std::string& message) {
+void Check(bool condition, const char* message) {
   if (!condition) {
     throw std::invalid_argument(message);
   }

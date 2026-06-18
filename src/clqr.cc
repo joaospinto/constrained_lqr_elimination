@@ -77,14 +77,18 @@ struct AffineStateBasis {
   std::string message;
 };
 
-void Check(bool condition, const std::string& message) {
-  if (!condition) throw std::invalid_argument(message);
-}
+struct CholeskyFactorization {
+  Matrix lower;
+  bool positive_definite = false;
+};
 
-Matrix VectorAsColumn(const Vector& v) {
-  Matrix out(v.size(), 1);
-  for (std::size_t i = 0; i < v.size(); ++i) out(i, 0) = v[i];
-  return out;
+struct RiccatiSolve {
+  Matrix solve_hxu;
+  Vector solve_hu;
+};
+
+void Check(bool condition, const char* message) {
+  if (!condition) throw std::invalid_argument(message);
 }
 
 RectangularSolve SolveRectangularRref(const Matrix& a, const Vector& b, double tolerance) {
@@ -210,28 +214,71 @@ std::string JoinMessages(const std::vector<std::string>& messages) {
   return out.str();
 }
 
-bool IsPositiveDefiniteByCholesky(const Matrix& a, double tolerance) {
+CholeskyFactorization CholeskyFactorize(const Matrix& a, double tolerance) {
   Check(a.rows() == a.cols(), "positive-definite check requires a square matrix");
+  CholeskyFactorization out;
   const std::size_t n = a.rows();
-  Matrix factor(n, n);
+  out.lower = Matrix(n, n);
   for (std::size_t j = 0; j < n; ++j) {
     double diagonal = a(j, j);
-    for (std::size_t k = 0; k < j; ++k) diagonal -= factor(j, k) * factor(j, k);
-    if (diagonal <= tolerance) return false;
-    factor(j, j) = std::sqrt(diagonal);
+    for (std::size_t k = 0; k < j; ++k) diagonal -= out.lower(j, k) * out.lower(j, k);
+    if (diagonal <= tolerance) return out;
+    out.lower(j, j) = std::sqrt(diagonal);
     for (std::size_t i = j + 1; i < n; ++i) {
       double value = a(i, j);
-      for (std::size_t k = 0; k < j; ++k) value -= factor(i, k) * factor(j, k);
-      factor(i, j) = value / factor(j, j);
+      for (std::size_t k = 0; k < j; ++k) value -= out.lower(i, k) * out.lower(j, k);
+      out.lower(i, j) = value / out.lower(j, j);
     }
   }
-  return true;
+  out.positive_definite = true;
+  return out;
 }
 
-void AnalyzeReducedControlHessian(const Matrix& Huu, std::size_t stage,
-                                  double tolerance,
+RiccatiSolve SolveWithCholesky(const Matrix& lower, const Matrix& Hxu,
+                               const Vector& hu) {
+  const std::size_t controls = lower.rows();
+  const std::size_t states = Hxu.rows();
+  Matrix rhs(controls, states + 1);
+  for (std::size_t control = 0; control < controls; ++control) {
+    for (std::size_t state = 0; state < states; ++state) {
+      rhs(control, state) = Hxu(state, control);
+    }
+    rhs(control, states) = hu[control];
+  }
+
+  for (std::size_t row = 0; row < controls; ++row) {
+    for (std::size_t col = 0; col < states + 1; ++col) {
+      double value = rhs(row, col);
+      for (std::size_t k = 0; k < row; ++k) value -= lower(row, k) * rhs(k, col);
+      rhs(row, col) = value / lower(row, row);
+    }
+  }
+  for (std::size_t rev = 0; rev < controls; ++rev) {
+    const std::size_t row = controls - 1 - rev;
+    for (std::size_t col = 0; col < states + 1; ++col) {
+      double value = rhs(row, col);
+      for (std::size_t k = row + 1; k < controls; ++k) value -= lower(k, row) * rhs(k, col);
+      rhs(row, col) = value / lower(row, row);
+    }
+  }
+
+  RiccatiSolve out;
+  out.solve_hxu = Matrix(controls, states);
+  out.solve_hu = Vector(controls);
+  for (std::size_t control = 0; control < controls; ++control) {
+    for (std::size_t state = 0; state < states; ++state) {
+      out.solve_hxu(control, state) = rhs(control, state);
+    }
+    out.solve_hu[control] = rhs(control, states);
+  }
+  return out;
+}
+
+void AnalyzeReducedControlHessian(const Matrix& Huu,
+                                  const CholeskyFactorization& factorization,
+                                  std::size_t stage, double tolerance,
                                   NewtonKktDiagnostics* diagnostics) {
-  if (IsPositiveDefiniteByCholesky(Huu, tolerance)) return;
+  if (factorization.positive_definite) return;
   RrefResult rank = Rref(Huu, Huu.cols(), tolerance);
   if (rank.pivot_columns.size() < Huu.cols()) {
     diagnostics->singular = true;
@@ -311,13 +358,29 @@ double Objective(const Problem& original, const std::vector<Vector>& xs,
   double value = 0.0;
   for (std::size_t i = 0; i < original.stages.size(); ++i) {
     const Stage& s = original.stages[i];
-    value += 0.5 * Dot(xs[i], s.Q * xs[i]);
-    value += 0.5 * Dot(us[i], s.R * us[i]);
-    value += Dot(xs[i], s.M * us[i]);
+    for (std::size_t row = 0; row < s.Q.rows(); ++row) {
+      for (std::size_t col = 0; col < s.Q.cols(); ++col) {
+        value += 0.5 * xs[i][row] * s.Q(row, col) * xs[i][col];
+      }
+    }
+    for (std::size_t row = 0; row < s.R.rows(); ++row) {
+      for (std::size_t col = 0; col < s.R.cols(); ++col) {
+        value += 0.5 * us[i][row] * s.R(row, col) * us[i][col];
+      }
+    }
+    for (std::size_t row = 0; row < s.M.rows(); ++row) {
+      for (std::size_t col = 0; col < s.M.cols(); ++col) {
+        value += xs[i][row] * s.M(row, col) * us[i][col];
+      }
+    }
     value += Dot(s.q, xs[i]);
     value += Dot(s.r, us[i]);
   }
-  value += 0.5 * Dot(xs.back(), original.terminal_Q * xs.back());
+  for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
+    for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
+      value += 0.5 * xs.back()[row] * original.terminal_Q(row, col) * xs.back()[col];
+    }
+  }
   value += Dot(original.terminal_q, xs.back());
   return value;
 }
@@ -370,7 +433,11 @@ AffineStateBasis StateBasis(const Matrix& E, const Vector& e, std::size_t n,
     for (std::size_t i = 0; i < n; ++i) out.free_rows[i] = i;
     return out;
   }
-  Matrix augmented = HorizontalConcat(E, VectorAsColumn(e));
+  Matrix augmented(E.rows(), n + 1);
+  for (std::size_t row = 0; row < E.rows(); ++row) {
+    for (std::size_t col = 0; col < n; ++col) augmented(row, col) = E(row, col);
+    augmented(row, n) = e[row];
+  }
   RrefResult rref = Rref(augmented, n, tolerance);
   std::unordered_set<std::size_t> pivot_set(rref.pivot_columns.begin(), rref.pivot_columns.end());
   for (std::size_t row = 0; row < rref.matrix.rows(); ++row) {
@@ -432,7 +499,12 @@ MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
     out.state_d = Vector(0);
     return out;
   }
-  Matrix augmented = HorizontalConcat(HorizontalConcat(D, C), VectorAsColumn(d));
+  Matrix augmented(constraints, m + n + 1);
+  for (std::size_t row = 0; row < constraints; ++row) {
+    for (std::size_t col = 0; col < m; ++col) augmented(row, col) = D(row, col);
+    for (std::size_t col = 0; col < n; ++col) augmented(row, m + col) = C(row, col);
+    augmented(row, m + n) = d[row];
+  }
   RrefResult rref = Rref(augmented, m, tolerance);
   std::unordered_set<std::size_t> pivot_set(rref.pivot_columns.begin(), rref.pivot_columns.end());
   std::vector<std::size_t> free_cols;
@@ -563,6 +635,21 @@ bool AnyOriginalConstraints(const Problem& problem) {
   return false;
 }
 
+bool AnyOriginalStateConstraints(const Problem& problem) {
+  if (problem.terminal_E.rows() > 0) return true;
+  for (const Stage& stage : problem.stages) {
+    if (stage.E.rows() > 0) return true;
+  }
+  return false;
+}
+
+bool StateMapsAreIdentity(const WorkingState& state, double tolerance) {
+  for (const StateMap& map : state.state_maps) {
+    if (!IsIdentity(map.linear, tolerance) || MaxAbs(map.offset) > tolerance) return false;
+  }
+  return true;
+}
+
 bool EliminateState(WorkingState& state, double tolerance, std::string* error,
                     NewtonKktDiagnostics* diagnostics) {
   if (!AnyStateConstraints(state.problem)) return false;
@@ -691,9 +778,15 @@ ReducedSolution SolveUnconstrained(const std::vector<Stage>& stages,
     const Matrix Hxu = s.M + Transpose(s.A) * P[i + 1] * s.B;
     const Vector hx = s.q + Transpose(s.A) * pc;
     const Vector hu = s.r + Transpose(s.B) * pc;
-    AnalyzeReducedControlHessian(Huu, i, tolerance, diagnostics);
-    Matrix solve_hxu = SolveLinearSystem(Huu, Transpose(Hxu), tolerance);
-    Vector solve_hu = SolveLinearSystem(Huu, hu, tolerance);
+    CholeskyFactorization hessian_factor = CholeskyFactorize(Huu, tolerance);
+    AnalyzeReducedControlHessian(Huu, hessian_factor, i, tolerance, diagnostics);
+    RiccatiSolve solve =
+        hessian_factor.positive_definite
+            ? SolveWithCholesky(hessian_factor.lower, Hxu, hu)
+            : RiccatiSolve{SolveLinearSystem(Huu, Transpose(Hxu), tolerance),
+                           SolveLinearSystem(Huu, hu, tolerance)};
+    Matrix& solve_hxu = solve.solve_hxu;
+    Vector& solve_hu = solve.solve_hu;
     K[i] = Scale(solve_hxu, -1.0);
     k[i] = Scale(solve_hu, -1.0);
     P[i] = Symmetrize(Hxx - Hxu * solve_hxu);
@@ -813,6 +906,155 @@ bool RecoverMultipliers(const Problem& original, Solution* out, double tolerance
   return true;
 }
 
+void RecoverUnconstrainedMultipliers(const Problem& original, Solution* out) {
+  const std::size_t N = original.stages.size();
+  out->mixed_multipliers.assign(N, Vector(0));
+  out->state_multipliers.assign(N, Vector(0));
+  out->terminal_state_multiplier = Vector(0);
+  if (N == 0) {
+    out->dynamics_multipliers.clear();
+    out->initial_multiplier = Vector(original.terminal_Q.rows());
+    for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
+      double value = original.terminal_q[row];
+      for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
+        value += original.terminal_Q(row, col) * out->states[0][col];
+      }
+      out->initial_multiplier[row] = -value;
+    }
+    return;
+  }
+
+  out->dynamics_multipliers.assign(N, Vector());
+  out->dynamics_multipliers[N - 1] = Vector(original.terminal_Q.rows());
+  for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
+    double value = original.terminal_q[row];
+    for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
+      value += original.terminal_Q(row, col) * out->states[N][col];
+    }
+    out->dynamics_multipliers[N - 1][row] = -value;
+  }
+  for (std::size_t rev = 1; rev < N; ++rev) {
+    const std::size_t i = N - 1 - rev;
+    const Stage& s = original.stages[i + 1];
+    out->dynamics_multipliers[i] = Vector(s.A.cols());
+    for (std::size_t col = 0; col < s.A.cols(); ++col) {
+      double value = -s.q[col];
+      for (std::size_t row = 0; row < s.A.rows(); ++row) {
+        value += s.A(row, col) * out->dynamics_multipliers[i + 1][row];
+      }
+      for (std::size_t q_col = 0; q_col < s.Q.cols(); ++q_col) {
+        value -= s.Q(col, q_col) * out->states[i + 1][q_col];
+      }
+      for (std::size_t u_col = 0; u_col < s.M.cols(); ++u_col) {
+        value -= s.M(col, u_col) * out->controls[i + 1][u_col];
+      }
+      out->dynamics_multipliers[i][col] = value;
+    }
+  }
+  const Stage& first = original.stages[0];
+  out->initial_multiplier = Vector(first.A.cols());
+  for (std::size_t col = 0; col < first.A.cols(); ++col) {
+    double value = -first.q[col];
+    for (std::size_t row = 0; row < first.A.rows(); ++row) {
+      value += first.A(row, col) * out->dynamics_multipliers[0][row];
+    }
+    for (std::size_t q_col = 0; q_col < first.Q.cols(); ++q_col) {
+      value -= first.Q(col, q_col) * out->states[0][q_col];
+    }
+    for (std::size_t u_col = 0; u_col < first.M.cols(); ++u_col) {
+      value -= first.M(col, u_col) * out->controls[0][u_col];
+    }
+    out->initial_multiplier[col] = value;
+  }
+}
+
+bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out, double tolerance,
+                                 std::string* error) {
+  const std::size_t N = original.stages.size();
+  out->dynamics_multipliers.assign(N, Vector());
+  out->mixed_multipliers.assign(N, Vector());
+  out->state_multipliers.assign(N, Vector(0));
+  out->terminal_state_multiplier = Vector(0);
+
+  if (N == 0) {
+    out->initial_multiplier = Vector(original.terminal_Q.rows());
+    for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
+      double value = original.terminal_q[row];
+      for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
+        value += original.terminal_Q(row, col) * out->states[0][col];
+      }
+      out->initial_multiplier[row] = -value;
+    }
+    return true;
+  }
+
+  out->dynamics_multipliers[N - 1] = Vector(original.terminal_Q.rows());
+  for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
+    double value = original.terminal_q[row];
+    for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
+      value += original.terminal_Q(row, col) * out->states[N][col];
+    }
+    out->dynamics_multipliers[N - 1][row] = -value;
+  }
+
+  for (std::size_t rev = 0; rev < N; ++rev) {
+    const std::size_t i = N - 1 - rev;
+    const Stage& stage = original.stages[i];
+    const Vector& y = out->dynamics_multipliers[i];
+    out->mixed_multipliers[i] = Vector(stage.C.rows());
+    if (stage.C.rows() > 0) {
+      Matrix system(stage.B.cols(), stage.C.rows());
+      Vector rhs(stage.B.cols());
+      for (std::size_t control = 0; control < stage.B.cols(); ++control) {
+        double value = -stage.r[control];
+        for (std::size_t row = 0; row < stage.B.rows(); ++row) {
+          value += stage.B(row, control) * y[row];
+        }
+        for (std::size_t row = 0; row < stage.M.rows(); ++row) {
+          value -= stage.M(row, control) * out->states[i][row];
+        }
+        for (std::size_t col = 0; col < stage.R.cols(); ++col) {
+          value -= stage.R(control, col) * out->controls[i][col];
+        }
+        rhs[control] = value;
+        for (std::size_t constraint = 0; constraint < stage.C.rows(); ++constraint) {
+          system(control, constraint) = stage.D(constraint, control);
+        }
+      }
+      RectangularSolve solve = SolveRectangularRref(system, rhs, tolerance);
+      if (solve.inconsistent) {
+        *error = "inconsistent mixed-only multiplier recovery at stage " + std::to_string(i);
+        return false;
+      }
+      out->mixed_multipliers[i] = solve.x;
+    }
+
+    Vector previous(stage.A.cols());
+    for (std::size_t state = 0; state < stage.A.cols(); ++state) {
+      double value = -stage.q[state];
+      for (std::size_t row = 0; row < stage.A.rows(); ++row) {
+        value += stage.A(row, state) * y[row];
+      }
+      for (std::size_t col = 0; col < stage.Q.cols(); ++col) {
+        value -= stage.Q(state, col) * out->states[i][col];
+      }
+      for (std::size_t control = 0; control < stage.M.cols(); ++control) {
+        value -= stage.M(state, control) * out->controls[i][control];
+      }
+      for (std::size_t constraint = 0; constraint < stage.C.rows(); ++constraint) {
+        value -= stage.C(constraint, state) * out->mixed_multipliers[i][constraint];
+      }
+      previous[state] = value;
+    }
+    if (i == 0) {
+      out->initial_multiplier = previous;
+    } else {
+      out->dynamics_multipliers[i - 1] = previous;
+    }
+  }
+  return true;
+}
+
 void ApplyDiagnostics(const NewtonKktDiagnostics& diagnostics, Solution* out) {
   out->newton_kkt_singular = diagnostics.singular;
   out->newton_kkt_wrong_inertia = diagnostics.wrong_inertia;
@@ -826,19 +1068,35 @@ Solution Recover(const Problem& original, const WorkingState& state,
   out.status = SolveStatus::kOptimal;
   out.message = "optimal";
   ApplyDiagnostics(diagnostics, &out);
-  out.states.resize(reduced.x.size());
+  const bool has_original_state_constraints = AnyOriginalStateConstraints(original);
+  const bool identity_state_maps =
+      !has_original_state_constraints && StateMapsAreIdentity(state, tolerance);
+  if (identity_state_maps) {
+    out.states = reduced.x;
+  } else {
+    out.states.resize(reduced.x.size());
+  }
   out.controls.resize(reduced.u.size());
-  for (std::size_t i = 0; i < reduced.x.size(); ++i) {
-    out.states[i] = state.state_maps[i].linear * reduced.x[i] + state.state_maps[i].offset;
+  if (!identity_state_maps) {
+    for (std::size_t i = 0; i < reduced.x.size(); ++i) {
+      out.states[i] = state.state_maps[i].linear * reduced.x[i] + state.state_maps[i].offset;
+    }
   }
   for (std::size_t i = 0; i < reduced.u.size(); ++i) {
-    out.controls[i] = state.control_maps[i].state_linear * reduced.x[i] +
-                      state.control_maps[i].control_linear * reduced.u[i] +
-                      state.control_maps[i].offset;
+    if (identity_state_maps && original.stages[i].C.rows() == 0) {
+      out.controls[i] = reduced.u[i];
+    } else {
+      out.controls[i] = state.control_maps[i].state_linear * reduced.x[i] +
+                        state.control_maps[i].control_linear * reduced.u[i] +
+                        state.control_maps[i].offset;
+    }
   }
   out.objective = Objective(original, out.states, out.controls);
   std::string error;
-  if (!RecoverMultipliers(original, &out, tolerance, &error)) {
+  const bool recovered =
+      has_original_state_constraints ? RecoverMultipliers(original, &out, tolerance, &error)
+                                     : RecoverMixedOnlyMultipliers(original, &out, tolerance, &error);
+  if (!recovered) {
     out.status = SolveStatus::kNumericalFailure;
     out.message = error;
   }
@@ -854,11 +1112,8 @@ Solution RecoverUnmapped(const Problem& original, const ReducedSolution& reduced
   out.states = reduced.x;
   out.controls = reduced.u;
   out.objective = Objective(original, out.states, out.controls);
-  std::string error;
-  if (!RecoverMultipliers(original, &out, tolerance, &error)) {
-    out.status = SolveStatus::kNumericalFailure;
-    out.message = error;
-  }
+  (void)tolerance;
+  RecoverUnconstrainedMultipliers(original, &out);
   return out;
 }
 
