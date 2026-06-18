@@ -42,3 +42,10 @@ cc_test(
     ],
     copts = ["-std=c++17", "-Wall", "-Wextra", "-Wpedantic"],
 )
+
+cc_binary(
+    name = "clqr_benchmark",
+    srcs = ["benchmarks/clqr_benchmark.cc"],
+    copts = ["-std=c++17", "-O3", "-DNDEBUG", "-Wall", "-Wextra", "-Wpedantic"],
+    deps = [":clqr"],
+)

@@ -22,6 +22,18 @@ Build and test:
 bazel test //...
 ```
 
+Run the C++ timing benchmark:
+
+```sh
+bazel run -c opt //:clqr_benchmark
+```
+
+Pass an integer scale factor to increase the per-case iteration counts:
+
+```sh
+bazel run -c opt //:clqr_benchmark -- 10
+```
+
 C++ users include `clqr/clqr.h` and call `clqr::Solve`.
 
 The Python extension target is `//:_clqr.so`. It exposes:
