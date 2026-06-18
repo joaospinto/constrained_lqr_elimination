@@ -114,6 +114,15 @@ struct DenseKktSolution {
   std::vector<Vector> u;
 };
 
+enum class ConstraintMode {
+  kUnconstrained,
+  kStateOnly,
+  kFullMixed,
+  kMixed,
+  kRankDeficientMixed,
+  kTerminalState,
+};
+
 void AddConstraintRow(std::vector<Vector>* rows, std::vector<double>* rhs, Vector row,
                       double constant) {
   rows->push_back(row);
@@ -233,6 +242,105 @@ DenseKktSolution SolveKkt(const Problem& p) {
   return out;
 }
 
+double DeterministicValue(int seed, std::size_t i, std::size_t j = 0) {
+  const double x = static_cast<double>(seed + 17 * static_cast<int>(i) +
+                                      31 * static_cast<int>(j));
+  return 0.5 * std::sin(0.37 * x) + 0.25 * std::cos(0.19 * x);
+}
+
+Vector GeneratedVector(std::size_t size, int seed, double scale = 1.0) {
+  Vector out(size);
+  for (std::size_t i = 0; i < size; ++i) out[i] = scale * DeterministicValue(seed, i);
+  return out;
+}
+
+Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed, double scale = 1.0) {
+  Matrix out(rows, cols);
+  for (std::size_t i = 0; i < rows; ++i) {
+    for (std::size_t j = 0; j < cols; ++j) out(i, j) = scale * DeterministicValue(seed, i, j);
+  }
+  return out;
+}
+
+Matrix PositiveDefinite(std::size_t size, int seed, double diagonal) {
+  Matrix g = GeneratedMatrix(size, size, seed, 0.25);
+  Matrix out = Transpose(g) * g;
+  for (std::size_t i = 0; i < size; ++i) out(i, i) += diagonal;
+  return out;
+}
+
+double RowDot(const Matrix& a, std::size_t row, const Vector& x) {
+  double out = 0.0;
+  for (std::size_t col = 0; col < x.size(); ++col) out += a(row, col) * x[col];
+  return out;
+}
+
+void SetMixedConstraintFromNominal(Stage* stage, const Vector& x, const Vector& u) {
+  stage->d = Vector(stage->C.rows());
+  for (std::size_t row = 0; row < stage->C.rows(); ++row) {
+    stage->d[row] = -(RowDot(stage->C, row, x) + RowDot(stage->D, row, u));
+  }
+}
+
+void SetStateConstraintFromNominal(Matrix* E, Vector* e, const Vector& x) {
+  *e = Vector(E->rows());
+  for (std::size_t row = 0; row < E->rows(); ++row) (*e)[row] = -RowDot(*E, row, x);
+}
+
+Problem GeneratedFeasibleProblem(int seed, std::size_t N, std::size_t n, std::size_t m,
+                                 std::size_t p, ConstraintMode mode) {
+  Problem problem;
+  std::vector<Vector> x(N + 1);
+  std::vector<Vector> u(N);
+  for (std::size_t i = 0; i <= N; ++i) x[i] = GeneratedVector(n, seed + 100 + static_cast<int>(i), 0.8);
+  for (std::size_t i = 0; i < N; ++i) u[i] = GeneratedVector(m, seed + 200 + static_cast<int>(i), 0.7);
+  problem.initial_state = x[0];
+  problem.stages.resize(N);
+  for (std::size_t i = 0; i < N; ++i) {
+    Stage& stage = problem.stages[i];
+    stage.A = GeneratedMatrix(n, n, seed + 10 * static_cast<int>(i), 0.2);
+    for (std::size_t row = 0; row < n; ++row) stage.A(row, row) += 0.8;
+    stage.B = GeneratedMatrix(n, m, seed + 300 + 10 * static_cast<int>(i), 0.3);
+    stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
+    stage.Q = PositiveDefinite(n, seed + 400 + static_cast<int>(i), 1.0);
+    stage.R = PositiveDefinite(m, seed + 500 + static_cast<int>(i), 1.5);
+    stage.M = GeneratedMatrix(n, m, seed + 600 + static_cast<int>(i), 0.05);
+    stage.q = GeneratedVector(n, seed + 700 + static_cast<int>(i), 0.3);
+    stage.r = GeneratedVector(m, seed + 800 + static_cast<int>(i), 0.3);
+    stage.C = Matrix(0, n);
+    stage.D = Matrix(0, m);
+    stage.d = Vector(0);
+    stage.E = Matrix(0, n);
+    stage.e = Vector(0);
+
+    if (p > 0 && (mode == ConstraintMode::kFullMixed ||
+                  mode == ConstraintMode::kRankDeficientMixed ||
+                  (mode == ConstraintMode::kMixed && i % 2 == 0))) {
+      stage.C = GeneratedMatrix(p, n, seed + 900 + static_cast<int>(i), 0.5);
+      stage.D = GeneratedMatrix(p, m, seed + 1000 + static_cast<int>(i), 0.5);
+      if (mode == ConstraintMode::kRankDeficientMixed && p >= 2) {
+        for (std::size_t col = 0; col < n; ++col) stage.C(1, col) = 2.0 * stage.C(0, col);
+        for (std::size_t col = 0; col < m; ++col) stage.D(1, col) = 2.0 * stage.D(0, col);
+      }
+      SetMixedConstraintFromNominal(&stage, x[i], u[i]);
+      if (mode == ConstraintMode::kRankDeficientMixed && p >= 2) stage.d[1] = 2.0 * stage.d[0];
+    } else if (p > 0 && (mode == ConstraintMode::kStateOnly ||
+                         (mode == ConstraintMode::kMixed && i % 2 == 1))) {
+      stage.E = GeneratedMatrix(p, n, seed + 1100 + static_cast<int>(i), 0.5);
+      SetStateConstraintFromNominal(&stage.E, &stage.e, x[i]);
+    }
+  }
+  problem.terminal_Q = PositiveDefinite(n, seed + 1200, 1.5);
+  problem.terminal_q = GeneratedVector(n, seed + 1300, 0.3);
+  problem.terminal_E = Matrix(0, n);
+  problem.terminal_e = Vector(0);
+  if (p > 0 && mode == ConstraintMode::kTerminalState) {
+    problem.terminal_E = GeneratedMatrix(p, n, seed + 1400, 0.5);
+    SetStateConstraintFromNominal(&problem.terminal_E, &problem.terminal_e, x[N]);
+  }
+  return problem;
+}
+
 Problem BaseProblem() {
   Problem p;
   p.initial_state = Vector{1.0, -0.5};
@@ -311,6 +419,34 @@ void StateConstraintMatchesKkt() {
   CheckAgainstKkt(p, "terminal state");
 }
 
+void GeneratedCasesMatchKkt() {
+  struct Case {
+    const char* name;
+    std::size_t N;
+    std::size_t n;
+    std::size_t m;
+    std::size_t p;
+    ConstraintMode mode;
+  };
+  const std::vector<Case> cases = {
+      {"generated unconstrained", 4, 3, 2, 0, ConstraintMode::kUnconstrained},
+      {"generated state-only", 4, 3, 2, 1, ConstraintMode::kStateOnly},
+      {"generated state-only narrow-control", 6, 3, 1, 1, ConstraintMode::kStateOnly},
+      {"generated full mixed", 4, 3, 2, 2, ConstraintMode::kFullMixed},
+      {"generated mixed alternating", 6, 4, 2, 2, ConstraintMode::kMixed},
+      {"generated p greater than m", 4, 3, 1, 2, ConstraintMode::kFullMixed},
+      {"generated rank-deficient mixed", 4, 3, 2, 2, ConstraintMode::kRankDeficientMixed},
+      {"generated terminal state", 5, 3, 2, 1, ConstraintMode::kTerminalState},
+      {"generated single stage", 1, 2, 2, 1, ConstraintMode::kFullMixed},
+  };
+  for (std::size_t i = 0; i < cases.size(); ++i) {
+    const Case& c = cases[i];
+    CheckAgainstKkt(GeneratedFeasibleProblem(100 + static_cast<int>(i), c.N, c.n, c.m, c.p,
+                                             c.mode),
+                    c.name);
+  }
+}
+
 void InfeasibleConstraintDetected() {
   Problem p = BaseProblem();
   p.stages[0].E = Matrix(2, 2, {1.0, 0.0, 1.0, 0.0});
@@ -326,6 +462,7 @@ int main() {
   MixedConstraintMatchesKkt();
   RankDeficientMixedConstraintMatchesKkt();
   StateConstraintMatchesKkt();
+  GeneratedCasesMatchKkt();
   InfeasibleConstraintDetected();
   std::cout << "all C++ tests passed\n";
   return 0;
