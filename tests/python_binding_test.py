@@ -42,6 +42,9 @@ def test_python_solve():
     }
     result = clqr.solve(problem)
     assert result["status"] == "optimal", result
+    assert result["newton_kkt_singular"] is False
+    assert result["newton_kkt_wrong_inertia"] is False
+    assert result["newton_kkt_diagnostic"] == ""
     np.testing.assert_allclose(result["states"][0], np.array([1.0]), atol=1e-9)
     np.testing.assert_allclose(result["controls"][0], np.array([-1.0]), atol=1e-9)
     np.testing.assert_allclose(result["states"][1], np.array([0.0]), atol=1e-9)
@@ -107,6 +110,8 @@ def test_python_multiplier_shapes_multistage():
     }
     result = clqr.solve(problem)
     assert result["status"] == "optimal", result
+    assert result["newton_kkt_singular"] is True
+    assert result["newton_kkt_wrong_inertia"] is False
     assert len(result["states"]) == 3
     assert len(result["controls"]) == 2
     assert result["initial_multiplier"].shape == (2,)

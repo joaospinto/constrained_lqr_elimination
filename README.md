@@ -47,6 +47,8 @@ result = _clqr.solve({
 ```
 
 Arrays are NumPy-compatible `float64` arrays. The result dict contains `status`, `message`,
-`objective`, `states`, `controls`, `initial_multiplier`, `dynamics_multipliers`,
-`mixed_multipliers`, `state_multipliers`, and `terminal_state_multiplier`. The multiplier
-signs correspond to the constraints exactly as written above.
+`newton_kkt_singular`, `newton_kkt_wrong_inertia`, `newton_kkt_diagnostic`, `objective`,
+`states`, `controls`, `initial_multiplier`, `dynamics_multipliers`, `mixed_multipliers`,
+`state_multipliers`, and `terminal_state_multiplier`. The multiplier signs correspond to the
+constraints exactly as written above. The Newton-KKT diagnostic fields are reported separately
+from `status`; when the reduced solve can proceed, a candidate solution is still returned.

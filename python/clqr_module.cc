@@ -144,6 +144,7 @@ nb::dict Solve(nb::object problem_object, double tolerance = 1e-9,
     nb::dict result;
     nb::str status(clqr::StatusName(solution.status));
     nb::str message(solution.message.c_str());
+    nb::str newton_kkt_diagnostic(solution.newton_kkt_diagnostic.c_str());
     nb::float_ objective(solution.objective);
     nb::list states = VectorListToPython(solution.states);
     nb::list controls = VectorListToPython(solution.controls);
@@ -152,6 +153,10 @@ nb::dict Solve(nb::object problem_object, double tolerance = 1e-9,
     nb::list state_multipliers = VectorListToPython(solution.state_multipliers);
     Set(result, "status", status);
     Set(result, "message", message);
+    result[nb::str("newton_kkt_singular")] = nb::bool_(solution.newton_kkt_singular);
+    result[nb::str("newton_kkt_wrong_inertia")] =
+        nb::bool_(solution.newton_kkt_wrong_inertia);
+    Set(result, "newton_kkt_diagnostic", newton_kkt_diagnostic);
     Set(result, "objective", objective);
     Set(result, "states", states);
     Set(result, "controls", controls);

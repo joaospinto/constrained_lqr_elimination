@@ -1,6 +1,7 @@
 #include "clqr/clqr.h"
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <sstream>
 #include <stdexcept>
@@ -32,6 +33,12 @@ struct WorkingState {
   WorkingProblem problem;
   std::vector<StateMap> state_maps;
   std::vector<ControlMap> control_maps;
+};
+
+struct NewtonKktDiagnostics {
+  bool singular = false;
+  bool wrong_inertia = false;
+  std::vector<std::string> messages;
 };
 
 struct RectangularSolve {
@@ -66,6 +73,7 @@ struct AffineStateBasis {
   std::vector<std::size_t> free_rows;
   std::vector<std::size_t> pivot_rows;
   bool infeasible = false;
+  bool redundant = false;
   std::string message;
 };
 
@@ -175,6 +183,102 @@ Matrix Symmetrize(const Matrix& a) {
     for (std::size_t j = 0; j < a.cols(); ++j) out(i, j) = 0.5 * (a(i, j) + a(j, i));
   }
   return out;
+}
+
+void AddDiagnostic(NewtonKktDiagnostics* diagnostics, const std::string& message) {
+  if (diagnostics == nullptr) return;
+  diagnostics->messages.push_back(message);
+}
+
+std::string JoinMessages(const std::vector<std::string>& messages) {
+  std::ostringstream out;
+  for (std::size_t i = 0; i < messages.size(); ++i) {
+    if (i > 0) out << "; ";
+    out << messages[i];
+  }
+  return out.str();
+}
+
+bool IsPositiveDefiniteByCholesky(const Matrix& a, double tolerance) {
+  Check(a.rows() == a.cols(), "positive-definite check requires a square matrix");
+  const std::size_t n = a.rows();
+  Matrix factor(n, n);
+  for (std::size_t j = 0; j < n; ++j) {
+    double diagonal = a(j, j);
+    for (std::size_t k = 0; k < j; ++k) diagonal -= factor(j, k) * factor(j, k);
+    if (diagonal <= tolerance) return false;
+    factor(j, j) = std::sqrt(diagonal);
+    for (std::size_t i = j + 1; i < n; ++i) {
+      double value = a(i, j);
+      for (std::size_t k = 0; k < j; ++k) value -= factor(i, k) * factor(j, k);
+      factor(i, j) = value / factor(j, j);
+    }
+  }
+  return true;
+}
+
+void AddInto(Matrix* target, const Matrix& term) {
+  Check(target->rows() == term.rows() && target->cols() == term.cols(),
+        "matrix accumulation shape mismatch");
+  for (std::size_t row = 0; row < target->rows(); ++row) {
+    for (std::size_t col = 0; col < target->cols(); ++col) {
+      (*target)(row, col) += term(row, col);
+    }
+  }
+}
+
+std::vector<std::size_t> ControlVariableOffsets(const WorkingProblem& problem) {
+  std::vector<std::size_t> offsets(problem.stages.size());
+  std::size_t offset = 0;
+  for (std::size_t i = 0; i < problem.stages.size(); ++i) {
+    offsets[i] = offset;
+    offset += problem.stages[i].B.cols();
+  }
+  return offsets;
+}
+
+void AnalyzeReducedHessian(const WorkingProblem& problem, double tolerance,
+                           NewtonKktDiagnostics* diagnostics) {
+  const std::size_t N = problem.stages.size();
+  std::vector<std::size_t> control_offsets = ControlVariableOffsets(problem);
+  std::size_t controls = 0;
+  for (const Stage& stage : problem.stages) controls += stage.B.cols();
+  if (controls == 0) return;
+
+  Matrix hessian(controls, controls);
+  Matrix state_sensitivity(problem.stages.empty() ? problem.terminal_Q.rows()
+                                                  : problem.stages.front().A.cols(),
+                           controls);
+  for (std::size_t i = 0; i < N; ++i) {
+    const Stage& s = problem.stages[i];
+    Matrix control_sensitivity(s.B.cols(), controls);
+    for (std::size_t col = 0; col < s.B.cols(); ++col) {
+      control_sensitivity(col, control_offsets[i] + col) = 1.0;
+    }
+
+    AddInto(&hessian, Transpose(state_sensitivity) * s.Q * state_sensitivity);
+    AddInto(&hessian, Transpose(control_sensitivity) * s.R * control_sensitivity);
+    AddInto(&hessian, Transpose(state_sensitivity) * s.M * control_sensitivity);
+    AddInto(&hessian,
+            Transpose(control_sensitivity) * Transpose(s.M) * state_sensitivity);
+
+    state_sensitivity =
+        s.A * state_sensitivity + s.B * control_sensitivity;
+  }
+  AddInto(&hessian, Transpose(state_sensitivity) * problem.terminal_Q * state_sensitivity);
+  hessian = Symmetrize(hessian);
+
+  RrefResult rank = Rref(hessian, controls, tolerance);
+  if (rank.pivot_columns.size() < controls) {
+    diagnostics->singular = true;
+    AddDiagnostic(diagnostics, "singular reduced Hessian on feasible directions");
+    return;
+  }
+  if (!IsPositiveDefiniteByCholesky(hessian, tolerance)) {
+    diagnostics->wrong_inertia = true;
+    AddDiagnostic(diagnostics,
+                  "reduced Hessian is nonsingular but not positive definite");
+  }
 }
 
 void AppendStateConstraints(Stage& stage, const Matrix& E_extra, const Vector& e_extra) {
@@ -325,6 +429,7 @@ AffineStateBasis StateBasis(const Matrix& E, const Vector& e, std::size_t n,
       return out;
     }
   }
+  out.redundant = rref.pivot_columns.size() < E.rows();
 
   for (std::size_t col = 0; col < n; ++col) {
     if (pivot_set.find(col) == pivot_set.end()) out.free_rows.push_back(col);
@@ -351,6 +456,7 @@ struct MixedElimination {
   Matrix state_C;
   Vector state_d;
   bool infeasible = false;
+  bool redundant = false;
   std::string message;
 };
 
@@ -416,6 +522,7 @@ MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
       out.message = "inconsistent mixed equality constraints";
       return out;
     }
+    if (!any_state && !any_const) out.redundant = true;
     if (any_state || any_const) residual_rows.push_back(row);
   }
   out.state_C = Matrix(residual_rows.size(), n);
@@ -428,7 +535,8 @@ MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
   return out;
 }
 
-bool EliminateMixedWithMaps(WorkingState& state, double tolerance, std::string* error) {
+bool EliminateMixedWithMaps(WorkingState& state, double tolerance, std::string* error,
+                            NewtonKktDiagnostics* diagnostics) {
   bool changed = false;
   for (std::size_t i = 0; i < state.problem.stages.size(); ++i) {
     Stage& s = state.problem.stages[i];
@@ -437,6 +545,11 @@ bool EliminateMixedWithMaps(WorkingState& state, double tolerance, std::string* 
     if (basis.infeasible) {
       *error = basis.message;
       throw std::runtime_error(*error);
+    }
+    if (basis.redundant) {
+      diagnostics->singular = true;
+      AddDiagnostic(diagnostics, "redundant mixed equality constraints at stage " +
+                                     std::to_string(i));
     }
     const Matrix old_Q = s.Q;
     const Matrix old_R = s.R;
@@ -484,7 +597,8 @@ bool AnyMixedConstraints(const WorkingProblem& problem) {
   return false;
 }
 
-bool EliminateState(WorkingState& state, double tolerance, std::string* error) {
+bool EliminateState(WorkingState& state, double tolerance, std::string* error,
+                    NewtonKktDiagnostics* diagnostics) {
   if (!AnyStateConstraints(state.problem)) return false;
   const std::size_t N = state.problem.stages.size();
   std::vector<AffineStateBasis> bases(N + 1);
@@ -497,6 +611,11 @@ bool EliminateState(WorkingState& state, double tolerance, std::string* error) {
     if (bases[i].infeasible) {
       *error = bases[i].message;
       throw std::runtime_error(*error);
+    }
+    if (bases[i].redundant) {
+      diagnostics->singular = true;
+      AddDiagnostic(diagnostics, "redundant state equality constraints at node " +
+                                     std::to_string(i));
     }
   }
 
@@ -725,11 +844,19 @@ bool RecoverMultipliers(const Problem& original, Solution* out, double tolerance
   return true;
 }
 
+void ApplyDiagnostics(const NewtonKktDiagnostics& diagnostics, Solution* out) {
+  out->newton_kkt_singular = diagnostics.singular;
+  out->newton_kkt_wrong_inertia = diagnostics.wrong_inertia;
+  out->newton_kkt_diagnostic = JoinMessages(diagnostics.messages);
+}
+
 Solution Recover(const Problem& original, const WorkingState& state,
-                 const ReducedSolution& reduced, double tolerance) {
+                 const ReducedSolution& reduced, double tolerance,
+                 const NewtonKktDiagnostics& diagnostics) {
   Solution out;
   out.status = SolveStatus::kOptimal;
   out.message = "optimal";
+  ApplyDiagnostics(diagnostics, &out);
   out.states.resize(reduced.x.size());
   out.controls.resize(reduced.u.size());
   for (std::size_t i = 0; i < reduced.x.size(); ++i) {
@@ -767,38 +894,54 @@ const char* StatusName(SolveStatus status) {
 
 Solution Solve(const Problem& problem, const SolveOptions& options) {
   Solution out;
+  NewtonKktDiagnostics diagnostics;
   try {
     ValidateProblem(problem);
     WorkingState state = Initialize(problem);
     std::string error;
     for (int pass = 0; pass < options.max_elimination_passes; ++pass) {
-      const bool mixed = EliminateMixedWithMaps(state, options.tolerance, &error);
-      const bool state_changed = EliminateState(state, options.tolerance, &error);
+      const bool mixed =
+          EliminateMixedWithMaps(state, options.tolerance, &error, &diagnostics);
+      const bool state_changed =
+          EliminateState(state, options.tolerance, &error, &diagnostics);
       if (!AnyMixedConstraints(state.problem) && !AnyStateConstraints(state.problem)) break;
       if (!mixed && !state_changed) {
         out.status = SolveStatus::kNumericalFailure;
         out.message = "constraint elimination made no progress";
+        ApplyDiagnostics(diagnostics, &out);
         return out;
       }
       if (pass + 1 == options.max_elimination_passes) {
         out.status = SolveStatus::kNumericalFailure;
         out.message = "constraint elimination pass limit exceeded";
+        ApplyDiagnostics(diagnostics, &out);
         return out;
       }
     }
-    ReducedSolution reduced = SolveUnconstrained(state.problem, options.tolerance);
-    return Recover(problem, state, reduced, options.tolerance);
+    AnalyzeReducedHessian(state.problem, options.tolerance, &diagnostics);
+    try {
+      ReducedSolution reduced = SolveUnconstrained(state.problem, options.tolerance);
+      return Recover(problem, state, reduced, options.tolerance, diagnostics);
+    } catch (const std::runtime_error& e) {
+      out.status = SolveStatus::kNumericalFailure;
+      out.message = e.what();
+      ApplyDiagnostics(diagnostics, &out);
+      return out;
+    }
   } catch (const std::invalid_argument& e) {
     out.status = SolveStatus::kInvalidInput;
     out.message = e.what();
+    ApplyDiagnostics(diagnostics, &out);
     return out;
   } catch (const std::runtime_error& e) {
     out.status = SolveStatus::kInfeasible;
     out.message = e.what();
+    ApplyDiagnostics(diagnostics, &out);
     return out;
   } catch (const std::exception& e) {
     out.status = SolveStatus::kNumericalFailure;
     out.message = e.what();
+    ApplyDiagnostics(diagnostics, &out);
     return out;
   }
 }

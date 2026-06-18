@@ -42,6 +42,12 @@ void ExpectVectorNear(const Vector& actual, const Vector& expected, double tol,
   }
 }
 
+void ExpectDiagnostics(const Solution& sol, bool singular, bool wrong_inertia,
+                       const std::string& message) {
+  Expect(sol.newton_kkt_singular == singular, message + " singular diagnostic");
+  Expect(sol.newton_kkt_wrong_inertia == wrong_inertia, message + " inertia diagnostic");
+}
+
 double MaxAbsVector(const Vector& x) {
   double out = 0.0;
   for (std::size_t i = 0; i < x.size(); ++i) out = std::max(out, std::abs(x[i]));
@@ -414,9 +420,11 @@ Problem BaseProblem() {
   return p;
 }
 
-void CheckAgainstKkt(const Problem& p, const std::string& name) {
+void CheckAgainstKkt(const Problem& p, const std::string& name,
+                     bool expect_singular = false, bool expect_wrong_inertia = false) {
   Solution sol = Solve(p);
   Expect(sol.status == SolveStatus::kOptimal, name + " solver status: " + sol.message);
+  ExpectDiagnostics(sol, expect_singular, expect_wrong_inertia, name);
   DenseKktSolution kkt = SolveKkt(p);
   for (std::size_t i = 0; i < sol.states.size(); ++i) {
     ExpectVectorNear(sol.states[i], kkt.x[i], kTol, name + " x" + std::to_string(i));
@@ -442,7 +450,7 @@ void RankDeficientMixedConstraintMatchesKkt() {
   p.stages[0].C = Matrix(2, 2, {1.0, 0.0, 2.0, 0.0});
   p.stages[0].D = Matrix(2, 2, {1.0, 0.0, 2.0, 0.0});
   p.stages[0].d = Vector{-0.2, -0.4};
-  CheckAgainstKkt(p, "rank-deficient mixed");
+  CheckAgainstKkt(p, "rank-deficient mixed", true);
 }
 
 void StateConstraintMatchesKkt() {
@@ -474,10 +482,66 @@ void GeneratedCasesMatchKkt() {
   };
   for (std::size_t i = 0; i < cases.size(); ++i) {
     const Case& c = cases[i];
-    CheckAgainstKkt(GeneratedFeasibleProblem(100 + static_cast<int>(i), c.N, c.n, c.m, c.p,
-                                             c.mode),
-                    c.name);
+    const bool expect_singular = c.mode == ConstraintMode::kStateOnly ||
+                                 c.mode == ConstraintMode::kMixed ||
+                                 c.mode == ConstraintMode::kRankDeficientMixed ||
+                                 (c.mode == ConstraintMode::kFullMixed && c.p > c.m);
+    CheckAgainstKkt(
+        GeneratedFeasibleProblem(100 + static_cast<int>(i), c.N, c.n, c.m, c.p, c.mode),
+        c.name, expect_singular);
   }
+}
+
+void WrongInertiaReportedWithCandidate() {
+  Problem p;
+  p.initial_state = Vector{0.0};
+  p.stages.resize(1);
+  p.stages[0].A = Matrix(1, 1, {1.0});
+  p.stages[0].B = Matrix(1, 1, {1.0});
+  p.stages[0].c = Vector{0.0};
+  p.stages[0].Q = Matrix(1, 1, {0.0});
+  p.stages[0].R = Matrix(1, 1, {-1.0});
+  p.stages[0].M = Matrix(1, 1, {0.0});
+  p.stages[0].q = Vector{0.0};
+  p.stages[0].r = Vector{-2.0};
+  p.stages[0].C = Matrix(0, 1);
+  p.stages[0].D = Matrix(0, 1);
+  p.stages[0].d = Vector(0);
+  p.stages[0].E = Matrix(0, 1);
+  p.stages[0].e = Vector(0);
+  p.terminal_Q = Matrix(1, 1, {0.0});
+  p.terminal_q = Vector{0.0};
+  p.terminal_E = Matrix(0, 1);
+  p.terminal_e = Vector(0);
+
+  CheckAgainstKkt(p, "wrong inertia", false, true);
+}
+
+void SingularReducedHessianReported() {
+  Problem p;
+  p.initial_state = Vector{0.0};
+  p.stages.resize(1);
+  p.stages[0].A = Matrix(1, 1, {1.0});
+  p.stages[0].B = Matrix(1, 1, {1.0});
+  p.stages[0].c = Vector{0.0};
+  p.stages[0].Q = Matrix(1, 1, {0.0});
+  p.stages[0].R = Matrix(1, 1, {0.0});
+  p.stages[0].M = Matrix(1, 1, {0.0});
+  p.stages[0].q = Vector{0.0};
+  p.stages[0].r = Vector{0.0};
+  p.stages[0].C = Matrix(0, 1);
+  p.stages[0].D = Matrix(0, 1);
+  p.stages[0].d = Vector(0);
+  p.stages[0].E = Matrix(0, 1);
+  p.stages[0].e = Vector(0);
+  p.terminal_Q = Matrix(1, 1, {0.0});
+  p.terminal_q = Vector{0.0};
+  p.terminal_E = Matrix(0, 1);
+  p.terminal_e = Vector(0);
+
+  Solution sol = Solve(p);
+  Expect(sol.status == SolveStatus::kNumericalFailure, "singular reduced Hessian status");
+  ExpectDiagnostics(sol, true, false, "singular reduced Hessian");
 }
 
 void InfeasibleConstraintDetected() {
@@ -496,6 +560,8 @@ int main() {
   RankDeficientMixedConstraintMatchesKkt();
   StateConstraintMatchesKkt();
   GeneratedCasesMatchKkt();
+  WrongInertiaReportedWithCandidate();
+  SingularReducedHessianReported();
   InfeasibleConstraintDetected();
   std::cout << "all C++ tests passed\n";
   return 0;

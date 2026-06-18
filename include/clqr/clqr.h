@@ -58,6 +58,9 @@ struct Solution {
   std::vector<Vector> mixed_multipliers;
   std::vector<Vector> state_multipliers;
   Vector terminal_state_multiplier;
+  bool newton_kkt_singular = false;
+  bool newton_kkt_wrong_inertia = false;
+  std::string newton_kkt_diagnostic;
   double objective = 0.0;
 };
 
