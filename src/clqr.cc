@@ -111,6 +111,20 @@ void Check(bool condition, const char* message) {
   if (!condition) throw std::invalid_argument(message);
 }
 
+std::size_t ControlLinearCols(const ControlMap& map, std::size_t identity_size) {
+  return (map.control_linear.rows() == 0 && map.control_linear.cols() == 0)
+             ? identity_size
+             : map.control_linear.cols();
+}
+
+bool LazyIdentityStateMap(const StateMap& map) {
+  return map.linear.rows() == 0 && map.linear.cols() == 0 && map.offset.size() == 0;
+}
+
+bool LazyIdentityControlLinear(const ControlMap& map) {
+  return map.control_linear.rows() == 0 && map.control_linear.cols() == 0;
+}
+
 RectangularSolve SolveRectangularRref(const Matrix& a, const Vector& b, double tolerance) {
   Check(a.rows() == b.size(), "rectangular solve rhs shape mismatch");
   RectangularSolve out;
@@ -138,6 +152,57 @@ RectangularSolve SolveRectangularRref(const Matrix& a, const Vector& b, double t
       }
     }
     if (zero_lhs && !IsNearlyZero(rref.matrix(row, a.cols()), tolerance)) {
+      out.inconsistent = true;
+      break;
+    }
+  }
+  return out;
+}
+
+RectangularSolve SolveMixedMultiplierRref(const Stage& stage, const Vector& x,
+                                          const Vector& u, const Vector& y,
+                                          double tolerance) {
+  const std::size_t constraints = stage.C.rows();
+  const std::size_t controls = stage.B.cols();
+  RectangularSolve out;
+  out.x = Vector(constraints);
+  if (constraints == 0) return out;
+
+  Matrix augmented(controls, constraints + 1);
+  for (std::size_t control = 0; control < controls; ++control) {
+    double value = -stage.r[control];
+    CLQR_UNROLL
+    for (std::size_t row = 0; row < stage.B.rows(); ++row) {
+      value += stage.B(row, control) * y[row];
+    }
+    CLQR_UNROLL
+    for (std::size_t row = 0; row < stage.M.rows(); ++row) {
+      value -= stage.M(row, control) * x[row];
+    }
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < stage.R.cols(); ++col) {
+      value -= stage.R(control, col) * u[col];
+    }
+    augmented(control, constraints) = value;
+    for (std::size_t constraint = 0; constraint < constraints; ++constraint) {
+      augmented(control, constraint) = stage.D(constraint, control);
+    }
+  }
+
+  RrefResult rref = Rref(std::move(augmented), constraints, tolerance);
+  out.rank = rref.pivot_columns.size();
+  for (std::size_t i = 0; i < rref.pivot_columns.size(); ++i) {
+    out.x[rref.pivot_columns[i]] = rref.matrix(rref.pivot_rows[i], constraints);
+  }
+  for (std::size_t row = 0; row < rref.matrix.rows(); ++row) {
+    bool zero_lhs = true;
+    for (std::size_t col = 0; col < constraints; ++col) {
+      if (!IsNearlyZero(rref.matrix(row, col), tolerance)) {
+        zero_lhs = false;
+        break;
+      }
+    }
+    if (zero_lhs && !IsNearlyZero(rref.matrix(row, constraints), tolerance)) {
       out.inconsistent = true;
       break;
     }
@@ -378,18 +443,11 @@ WorkingState Initialize(const Problem& problem) {
 
   const std::size_t num_states = problem.stages.size() + 1;
   state.state_maps.resize(num_states);
-  for (std::size_t i = 0; i < num_states; ++i) {
-    const std::size_t n = (i == problem.stages.size()) ? problem.terminal_Q.rows()
-                                                       : problem.stages[i].A.cols();
-    state.state_maps[i].linear = Identity(n);
-    state.state_maps[i].offset = Vector(n);
-  }
   state.control_maps.resize(problem.stages.size());
   for (std::size_t i = 0; i < problem.stages.size(); ++i) {
     const std::size_t n = problem.stages[i].A.cols();
     const std::size_t m = problem.stages[i].B.cols();
     state.control_maps[i].state_linear = Matrix(m, n);
-    state.control_maps[i].control_linear = Identity(m);
     state.control_maps[i].offset = Vector(m);
   }
   return state;
@@ -397,6 +455,12 @@ WorkingState Initialize(const Problem& problem) {
 
 LinearParametrization ReducedInitialState(const Problem& original, const StateMap& map,
                                           double tolerance) {
+  if (LazyIdentityStateMap(map)) {
+    LinearParametrization out;
+    out.offset = original.initial_state;
+    out.basis = Matrix(original.initial_state.size(), 0);
+    return out;
+  }
   if (IsIdentity(map.linear, tolerance) && MaxAbs(map.offset) <= tolerance) {
     LinearParametrization out;
     out.offset = original.initial_state;
@@ -671,33 +735,58 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
   AppendStateConstraints(s, basis.state_C, basis.state_d);
 
   const ControlMap& old_map = state.control_maps[i];
+  const std::size_t old_control_cols = ControlLinearCols(old_map, m);
   Matrix new_state_linear(old_map.state_linear.rows(), basis.Y.cols());
-  for (std::size_t row = 0; row < old_map.state_linear.rows(); ++row) {
-    for (std::size_t col = 0; col < basis.Y.cols(); ++col) {
-      double value = old_map.state_linear(row, col);
-      for (std::size_t u = 0; u < old_map.control_linear.cols(); ++u) {
-        value += old_map.control_linear(row, u) * basis.Y(u, col);
+  if (LazyIdentityControlLinear(old_map)) {
+    for (std::size_t row = 0; row < old_map.state_linear.rows(); ++row) {
+      for (std::size_t col = 0; col < basis.Y.cols(); ++col) {
+        new_state_linear(row, col) = old_map.state_linear(row, col) + basis.Y(row, col);
       }
-      new_state_linear(row, col) = value;
+    }
+  } else {
+    for (std::size_t row = 0; row < old_map.state_linear.rows(); ++row) {
+      for (std::size_t col = 0; col < basis.Y.cols(); ++col) {
+        double value = old_map.state_linear(row, col);
+        for (std::size_t u = 0; u < old_control_cols; ++u) {
+          value += old_map.control_linear(row, u) * basis.Y(u, col);
+        }
+        new_state_linear(row, col) = value;
+      }
     }
   }
-  Matrix new_control_linear(old_map.control_linear.rows(), basis.Z.cols());
-  for (std::size_t row = 0; row < old_map.control_linear.rows(); ++row) {
-    for (std::size_t col = 0; col < basis.Z.cols(); ++col) {
-      double value = 0.0;
-      for (std::size_t u = 0; u < old_map.control_linear.cols(); ++u) {
-        value += old_map.control_linear(row, u) * basis.Z(u, col);
+
+  Matrix new_control_linear(old_map.offset.size(), basis.Z.cols());
+  if (LazyIdentityControlLinear(old_map)) {
+    for (std::size_t row = 0; row < old_map.offset.size(); ++row) {
+      for (std::size_t col = 0; col < basis.Z.cols(); ++col) {
+        new_control_linear(row, col) = basis.Z(row, col);
       }
-      new_control_linear(row, col) = value;
+    }
+  } else {
+    for (std::size_t row = 0; row < old_map.offset.size(); ++row) {
+      for (std::size_t col = 0; col < basis.Z.cols(); ++col) {
+        double value = 0.0;
+        for (std::size_t u = 0; u < old_control_cols; ++u) {
+          value += old_map.control_linear(row, u) * basis.Z(u, col);
+        }
+        new_control_linear(row, col) = value;
+      }
     }
   }
+
   Vector new_offset(old_map.offset.size());
-  for (std::size_t row = 0; row < old_map.offset.size(); ++row) {
-    double value = old_map.offset[row];
-    for (std::size_t u = 0; u < old_map.control_linear.cols(); ++u) {
-      value += old_map.control_linear(row, u) * basis.y[u];
+  if (LazyIdentityControlLinear(old_map)) {
+    for (std::size_t row = 0; row < old_map.offset.size(); ++row) {
+      new_offset[row] = old_map.offset[row] + basis.y[row];
     }
-    new_offset[row] = value;
+  } else {
+    for (std::size_t row = 0; row < old_map.offset.size(); ++row) {
+      double value = old_map.offset[row];
+      for (std::size_t u = 0; u < old_control_cols; ++u) {
+        value += old_map.control_linear(row, u) * basis.y[u];
+      }
+      new_offset[row] = value;
+    }
   }
   state.control_maps[i].state_linear = std::move(new_state_linear);
   state.control_maps[i].control_linear = std::move(new_control_linear);
@@ -727,9 +816,14 @@ void ApplyTerminalStateBasis(WorkingState& state, const AffineStateBasis& basis,
   state.problem.terminal_e = Vector(0);
 
   StateMap old_terminal_map = state.state_maps.back();
-  state.state_maps.back().linear = old_terminal_map.linear * basis.T;
-  state.state_maps.back().offset =
-      old_terminal_map.offset + old_terminal_map.linear * basis.offset;
+  if (LazyIdentityStateMap(old_terminal_map)) {
+    state.state_maps.back().linear = basis.T;
+    state.state_maps.back().offset = basis.offset;
+  } else {
+    state.state_maps.back().linear = old_terminal_map.linear * basis.T;
+    state.state_maps.back().offset =
+        old_terminal_map.offset + old_terminal_map.linear * basis.offset;
+  }
 }
 
 void ApplyNextStateBasisToStage(WorkingState& state, std::size_t i,
@@ -804,9 +898,14 @@ void ApplyCurrentStateBasisToStage(WorkingState& state, std::size_t i,
   s.e = Vector(0);
 
   StateMap old_state_map = state.state_maps[i];
-  state.state_maps[i].linear = old_state_map.linear * cur.T;
-  state.state_maps[i].offset =
-      old_state_map.offset + old_state_map.linear * cur.offset;
+  if (LazyIdentityStateMap(old_state_map)) {
+    state.state_maps[i].linear = cur.T;
+    state.state_maps[i].offset = cur.offset;
+  } else {
+    state.state_maps[i].linear = old_state_map.linear * cur.T;
+    state.state_maps[i].offset =
+        old_state_map.offset + old_state_map.linear * cur.offset;
+  }
 
   ControlMap old_control_map = state.control_maps[i];
   state.control_maps[i].state_linear = old_control_map.state_linear * cur.T;
@@ -877,6 +976,7 @@ bool AnyOriginalStateConstraints(const Problem& problem) {
 
 bool StateMapsAreIdentity(const WorkingState& state, double tolerance) {
   for (const StateMap& map : state.state_maps) {
+    if (LazyIdentityStateMap(map)) continue;
     if (!IsIdentity(map.linear, tolerance) || MaxAbs(map.offset) > tolerance) return false;
   }
   return true;
@@ -2096,7 +2196,7 @@ bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out, double 
     return true;
   }
 
-  out->dynamics_multipliers[N - 1] = Vector(original.terminal_Q.rows());
+  out->dynamics_multipliers[N - 1].resize(original.terminal_Q.rows());
   for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
     double value = original.terminal_q[row];
     for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
@@ -2109,35 +2209,18 @@ bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out, double 
     const std::size_t i = N - 1 - rev;
     const Stage& stage = original.stages[i];
     const Vector& y = out->dynamics_multipliers[i];
-    out->mixed_multipliers[i] = Vector(stage.C.rows());
     if (stage.C.rows() > 0) {
-      Matrix system(stage.B.cols(), stage.C.rows());
-      Vector rhs(stage.B.cols());
-      for (std::size_t control = 0; control < stage.B.cols(); ++control) {
-        double value = -stage.r[control];
-        for (std::size_t row = 0; row < stage.B.rows(); ++row) {
-          value += stage.B(row, control) * y[row];
-        }
-        for (std::size_t row = 0; row < stage.M.rows(); ++row) {
-          value -= stage.M(row, control) * out->states[i][row];
-        }
-        for (std::size_t col = 0; col < stage.R.cols(); ++col) {
-          value -= stage.R(control, col) * out->controls[i][col];
-        }
-        rhs[control] = value;
-        for (std::size_t constraint = 0; constraint < stage.C.rows(); ++constraint) {
-          system(control, constraint) = stage.D(constraint, control);
-        }
-      }
-      RectangularSolve solve = SolveRectangularRref(system, rhs, tolerance);
+      RectangularSolve solve =
+          SolveMixedMultiplierRref(stage, out->states[i], out->controls[i], y, tolerance);
       if (solve.inconsistent) {
         *error = "inconsistent mixed-only multiplier recovery at stage " + std::to_string(i);
         return false;
       }
-      out->mixed_multipliers[i] = solve.x;
+      out->mixed_multipliers[i] = std::move(solve.x);
     }
 
-    Vector previous(stage.A.cols());
+    Vector& previous = i == 0 ? out->initial_multiplier : out->dynamics_multipliers[i - 1];
+    previous.resize(stage.A.cols());
     for (std::size_t state = 0; state < stage.A.cols(); ++state) {
       double value = -stage.q[state];
       for (std::size_t row = 0; row < stage.A.rows(); ++row) {
@@ -2154,11 +2237,6 @@ bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out, double 
       }
       previous[state] = value;
     }
-    if (i == 0) {
-      out->initial_multiplier = previous;
-    } else {
-      out->dynamics_multipliers[i - 1] = previous;
-    }
   }
   return true;
 }
@@ -2166,11 +2244,187 @@ bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out, double 
 void ApplyDiagnostics(const NewtonKktDiagnostics& diagnostics, Solution* out) {
   out->newton_kkt_singular = diagnostics.singular;
   out->newton_kkt_wrong_inertia = diagnostics.wrong_inertia;
-  out->newton_kkt_diagnostic = JoinMessages(diagnostics.messages);
+  out->newton_kkt_diagnostic =
+      diagnostics.messages.empty() ? std::string() : JoinMessages(diagnostics.messages);
+}
+
+void ApplyControlMap(const ControlMap& map, const Vector& reduced_state,
+                     const Vector& reduced_control, Vector* out) {
+  out->resize(map.offset.size());
+  if (LazyIdentityControlLinear(map)) {
+    for (std::size_t row = 0; row < map.offset.size(); ++row) {
+      double value = map.offset[row] + reduced_control[row];
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < reduced_state.size(); ++col) {
+        value += map.state_linear(row, col) * reduced_state[col];
+      }
+      (*out)[row] = value;
+    }
+  } else {
+    for (std::size_t row = 0; row < map.offset.size(); ++row) {
+      double value = map.offset[row];
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < reduced_state.size(); ++col) {
+        value += map.state_linear(row, col) * reduced_state[col];
+      }
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < reduced_control.size(); ++col) {
+        value += map.control_linear(row, col) * reduced_control[col];
+      }
+      (*out)[row] = value;
+    }
+  }
+}
+
+void ApplyControlMapRaw(const ControlMap& map, const Vector& reduced_state,
+                        const double* CLQR_RESTRICT reduced_control,
+                        std::size_t reduced_control_size, Vector* out) {
+  out->resize(map.offset.size());
+  if (LazyIdentityControlLinear(map)) {
+    for (std::size_t row = 0; row < map.offset.size(); ++row) {
+      double value = map.offset[row] + reduced_control[row];
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < reduced_state.size(); ++col) {
+        value += map.state_linear(row, col) * reduced_state[col];
+      }
+      (*out)[row] = value;
+    }
+  } else {
+    for (std::size_t row = 0; row < map.offset.size(); ++row) {
+      double value = map.offset[row];
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < reduced_state.size(); ++col) {
+        value += map.state_linear(row, col) * reduced_state[col];
+      }
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < reduced_control_size; ++col) {
+        value += map.control_linear(row, col) * reduced_control[col];
+      }
+      (*out)[row] = value;
+    }
+  }
+}
+
+Solution SolveMixedOnlyIdentityState(const Problem& original, const WorkingState& state,
+                                     const Vector& initial_state, double tolerance,
+                                     NewtonKktDiagnostics* diagnostics) {
+  const WorkspaceVector<Stage>& stages = state.problem.stages;
+  const std::size_t N = stages.size();
+  RiccatiWorkspace workspace;
+  if (WorkspaceArena* arena = ActiveWorkspaceArena(); arena != nullptr) {
+    const std::size_t bytes = RiccatiWorkspace::RequiredBytes(stages);
+    auto* data = static_cast<unsigned char*>(arena->Allocate(bytes, alignof(double)));
+    workspace.Assign(stages, data, bytes);
+  } else {
+    workspace.Reserve(stages);
+  }
+  if (!ComputeUnconstrainedRiccatiInto(stages, state.problem.terminal_Q,
+                                       state.problem.terminal_q, tolerance, &workspace,
+                                       diagnostics)) {
+    throw std::runtime_error("reduced control Hessian is not positive definite");
+  }
+
+  Solution out;
+  out.status = SolveStatus::kOptimal;
+  out.message = "optimal";
+  if (diagnostics != nullptr) ApplyDiagnostics(*diagnostics, &out);
+  out.states.resize(N + 1);
+  out.controls.resize(N);
+  out.states[0] = initial_state;
+  double objective = 0.0;
+  for (std::size_t i = 0; i < N; ++i) {
+    const Stage& reduced_stage = stages[i];
+    const Stage& original_stage = original.stages[i];
+    const std::size_t n = workspace.state_dim[i];
+    const std::size_t reduced_m = workspace.control_dim[i];
+    const double* K = workspace.KPtr(i);
+    const double* k = workspace.kPtr(i);
+    for (std::size_t row = 0; row < reduced_m; ++row) {
+      double value = k[row];
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < n; ++col) value += K[row * n + col] * out.states[i][col];
+      workspace.hu[row] = value;
+    }
+
+    if (original.stages[i].C.rows() == 0) {
+      out.controls[i].resize(reduced_m);
+      for (std::size_t row = 0; row < reduced_m; ++row) out.controls[i][row] = workspace.hu[row];
+    } else {
+      ApplyControlMapRaw(state.control_maps[i], out.states[i], workspace.hu, reduced_m,
+                         &out.controls[i]);
+    }
+
+    out.states[i + 1].resize(reduced_stage.A.rows());
+    for (std::size_t row = 0; row < reduced_stage.A.rows(); ++row) {
+      double value = reduced_stage.c[row];
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < reduced_stage.A.cols(); ++col) {
+        value += reduced_stage.A(row, col) * out.states[i][col];
+      }
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < reduced_stage.B.cols(); ++col) {
+        value += reduced_stage.B(row, col) * workspace.hu[col];
+      }
+      out.states[i + 1][row] = value;
+    }
+
+    const Vector& x = out.states[i];
+    const Vector& u = out.controls[i];
+    for (std::size_t row = 0; row < original_stage.Q.rows(); ++row) {
+      double value = 0.0;
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < original_stage.Q.cols(); ++col) {
+        value += original_stage.Q(row, col) * x[col];
+      }
+      objective += 0.5 * x[row] * value;
+    }
+    for (std::size_t row = 0; row < original_stage.R.rows(); ++row) {
+      double value = 0.0;
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < original_stage.R.cols(); ++col) {
+        value += original_stage.R(row, col) * u[col];
+      }
+      objective += 0.5 * u[row] * value;
+    }
+    for (std::size_t row = 0; row < original_stage.M.rows(); ++row) {
+      double value = 0.0;
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < original_stage.M.cols(); ++col) {
+        value += original_stage.M(row, col) * u[col];
+      }
+      objective += x[row] * value;
+    }
+    for (std::size_t row = 0; row < original_stage.q.size(); ++row) {
+      objective += original_stage.q[row] * x[row];
+    }
+    for (std::size_t row = 0; row < original_stage.r.size(); ++row) {
+      objective += original_stage.r[row] * u[row];
+    }
+  }
+
+  const Vector& terminal = out.states[N];
+  for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
+    double value = 0.0;
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
+      value += original.terminal_Q(row, col) * terminal[col];
+    }
+    objective += 0.5 * terminal[row] * value;
+  }
+  for (std::size_t row = 0; row < original.terminal_q.size(); ++row) {
+    objective += original.terminal_q[row] * terminal[row];
+  }
+  out.objective = objective;
+  std::string error;
+  if (!RecoverMixedOnlyMultipliers(original, &out, tolerance, &error)) {
+    out.status = SolveStatus::kNumericalFailure;
+    out.message = error;
+  }
+  return out;
 }
 
 Solution Recover(const Problem& original, const WorkingState& state,
-                 const ReducedSolution& reduced, double tolerance,
+                 ReducedSolution&& reduced, double tolerance,
                  const NewtonKktDiagnostics& diagnostics) {
   Solution out;
   out.status = SolveStatus::kOptimal;
@@ -2180,23 +2434,27 @@ Solution Recover(const Problem& original, const WorkingState& state,
   const bool identity_state_maps =
       !has_original_state_constraints && StateMapsAreIdentity(state, tolerance);
   if (identity_state_maps) {
-    out.states = reduced.x;
+    out.states = std::move(reduced.x);
   } else {
     out.states.resize(reduced.x.size());
   }
   out.controls.resize(reduced.u.size());
   if (!identity_state_maps) {
     for (std::size_t i = 0; i < reduced.x.size(); ++i) {
-      out.states[i] = state.state_maps[i].linear * reduced.x[i] + state.state_maps[i].offset;
+      const StateMap& map = state.state_maps[i];
+      if (LazyIdentityStateMap(map)) {
+        out.states[i] = reduced.x[i];
+      } else {
+        out.states[i] = map.linear * reduced.x[i] + map.offset;
+      }
     }
   }
   for (std::size_t i = 0; i < reduced.u.size(); ++i) {
     if (identity_state_maps && original.stages[i].C.rows() == 0) {
-      out.controls[i] = reduced.u[i];
+      out.controls[i] = std::move(reduced.u[i]);
     } else {
-      out.controls[i] = state.control_maps[i].state_linear * reduced.x[i] +
-                        state.control_maps[i].control_linear * reduced.u[i] +
-                        state.control_maps[i].offset;
+      const Vector& reduced_state = identity_state_maps ? out.states[i] : reduced.x[i];
+      ApplyControlMap(state.control_maps[i], reduced_state, reduced.u[i], &out.controls[i]);
     }
   }
   out.objective = Objective(original, out.states, out.controls);
@@ -2211,14 +2469,14 @@ Solution Recover(const Problem& original, const WorkingState& state,
   return out;
 }
 
-Solution RecoverUnmapped(const Problem& original, const ReducedSolution& reduced,
+Solution RecoverUnmapped(const Problem& original, ReducedSolution&& reduced,
                          double tolerance, const NewtonKktDiagnostics& diagnostics) {
   Solution out;
   out.status = SolveStatus::kOptimal;
   out.message = "optimal";
   ApplyDiagnostics(diagnostics, &out);
-  out.states = reduced.x;
-  out.controls = reduced.u;
+  out.states = std::move(reduced.x);
+  out.controls = std::move(reduced.u);
   out.objective = Objective(original, out.states, out.controls);
   (void)tolerance;
   RecoverUnconstrainedMultipliers(original, &out);
@@ -2314,7 +2572,7 @@ static Solution SolveInternalResult(const Problem& problem, const SolveOptions& 
         ReducedSolution reduced =
             SolveUnconstrained(problem.stages, problem.terminal_Q, problem.terminal_q,
                                problem.initial_state, options.tolerance, &diagnostics);
-        return RecoverUnmapped(problem, reduced, options.tolerance, diagnostics);
+        return RecoverUnmapped(problem, std::move(reduced), options.tolerance, diagnostics);
       } catch (const std::runtime_error& e) {
         out.status = SolveStatus::kNumericalFailure;
         out.message = e.what();
@@ -2333,16 +2591,24 @@ static Solution SolveInternalResult(const Problem& problem, const SolveOptions& 
       ApplyDiagnostics(diagnostics, &out);
       return out;
     }
-    if (state.state_maps.front().linear.cols() < state.state_maps.front().linear.rows()) {
+    if (!LazyIdentityStateMap(state.state_maps.front()) &&
+        state.state_maps.front().linear.cols() < state.state_maps.front().linear.rows()) {
       diagnostics.singular = true;
       AddDiagnostic(&diagnostics, "initial state makes node 0 state constraints redundant");
     }
     try {
+      const bool has_original_state_constraints = AnyOriginalStateConstraints(problem);
+      const bool identity_state_maps =
+          !has_original_state_constraints && StateMapsAreIdentity(state, options.tolerance);
+      if (identity_state_maps) {
+        return SolveMixedOnlyIdentityState(problem, state, initial.offset, options.tolerance,
+                                           &diagnostics);
+      }
       ReducedSolution reduced =
           SolveUnconstrained(state.problem.stages, state.problem.terminal_Q,
                              state.problem.terminal_q, initial.offset, options.tolerance,
                              &diagnostics);
-      return Recover(problem, state, reduced, options.tolerance, diagnostics);
+      return Recover(problem, state, std::move(reduced), options.tolerance, diagnostics);
     } catch (const std::runtime_error& e) {
       out.status = SolveStatus::kNumericalFailure;
       out.message = e.what();

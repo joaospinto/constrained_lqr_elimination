@@ -9,6 +9,7 @@
 #include <new>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace clqr {
@@ -67,22 +68,21 @@ template <typename T>
 class WorkspaceAllocator {
  public:
   using value_type = T;
+  using propagate_on_container_move_assignment = std::true_type;
 
-  WorkspaceAllocator() = default;
+  WorkspaceAllocator() : arena_(ActiveWorkspaceArena()) {}
   template <typename U>
-  WorkspaceAllocator(const WorkspaceAllocator<U>&) {}
+  WorkspaceAllocator(const WorkspaceAllocator<U>& other) : arena_(other.arena()) {}
 
   T* allocate(std::size_t n) {
     if (n > std::numeric_limits<std::size_t>::max() / sizeof(T)) throw std::bad_alloc();
     const std::size_t bytes = n * sizeof(T);
-    WorkspaceArena* arena = ActiveWorkspaceArena();
-    if (arena != nullptr) return static_cast<T*>(arena->Allocate(bytes, alignof(T)));
+    if (arena_ != nullptr) return static_cast<T*>(arena_->Allocate(bytes, alignof(T)));
     return static_cast<T*>(::operator new(bytes));
   }
 
   void deallocate(T* ptr, std::size_t) noexcept {
-    WorkspaceArena* arena = ActiveWorkspaceArena();
-    if (arena != nullptr && arena->Owns(ptr)) return;
+    if (arena_ != nullptr && arena_->Owns(ptr)) return;
     ::operator delete(ptr);
   }
 
@@ -94,6 +94,17 @@ class WorkspaceAllocator {
   bool operator!=(const WorkspaceAllocator<U>&) const noexcept {
     return false;
   }
+
+  WorkspaceArena* arena() const { return arena_; }
+  WorkspaceAllocator select_on_container_copy_construction() const {
+    return WorkspaceAllocator();
+  }
+
+ private:
+  template <typename U>
+  friend class WorkspaceAllocator;
+
+  WorkspaceArena* arena_ = nullptr;
 };
 
 template <typename T>
