@@ -125,8 +125,6 @@ class Workspace {
     bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_state);
     bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_control);
     bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_control * max_control);
-    bytes = AddAligned(bytes, alignof(double),
-                       sizeof(double) * max_control * (max_state + 1));
     bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_control * max_state);
     bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_control);
 

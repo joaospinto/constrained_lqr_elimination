@@ -10,6 +10,20 @@
 namespace clqr {
 namespace {
 
+#if defined(__GNUC__) || defined(__clang__)
+#define CLQR_RESTRICT __restrict__
+#else
+#define CLQR_RESTRICT
+#endif
+
+#if defined(__clang__)
+#define CLQR_UNROLL _Pragma("clang loop unroll_count(2)")
+#elif defined(__GNUC__)
+#define CLQR_UNROLL _Pragma("GCC unroll 2")
+#else
+#define CLQR_UNROLL
+#endif
+
 struct StateMap {
   Matrix linear;
   Vector offset;
@@ -897,7 +911,6 @@ struct RiccatiWorkspace {
   double* hx = nullptr;
   double* hu = nullptr;
   double* lower = nullptr;
-  double* rhs = nullptr;
   double* solve_hxu = nullptr;
   double* solve_hu = nullptr;
   Matrix fallback_Huu;
@@ -1018,7 +1031,6 @@ struct RiccatiWorkspace {
     double* hx = Slice<double>(base, offset, max_state);
     double* hu = Slice<double>(base, offset, max_control);
     double* lower = Slice<double>(base, offset, max_control * max_control);
-    double* rhs = Slice<double>(base, offset, max_control * (max_state + 1));
     double* solve_hxu = Slice<double>(base, offset, max_control * max_state);
     double* solve_hu = Slice<double>(base, offset, max_control);
     if (workspace == nullptr) return;
@@ -1041,7 +1053,6 @@ struct RiccatiWorkspace {
     workspace->hx = hx;
     workspace->hu = hu;
     workspace->lower = lower;
-    workspace->rhs = rhs;
     workspace->solve_hxu = solve_hxu;
     workspace->solve_hu = solve_hu;
   }
@@ -1056,15 +1067,17 @@ struct RiccatiWorkspace {
   const double* kPtr(std::size_t i) const { return k + k_offset[i]; }
 };
 
-bool CholeskyFactorizeRaw(const double* a, std::size_t n, double tolerance,
-                          double* lower) {
+bool CholeskyFactorizeRaw(const double* CLQR_RESTRICT a, std::size_t n,
+                          double tolerance, double* CLQR_RESTRICT lower) {
   for (std::size_t j = 0; j < n; ++j) {
     double diagonal = a[j * n + j];
+    CLQR_UNROLL
     for (std::size_t k = 0; k < j; ++k) diagonal -= lower[j * n + k] * lower[j * n + k];
     if (diagonal <= tolerance) return false;
     lower[j * n + j] = std::sqrt(diagonal);
     for (std::size_t i = j + 1; i < n; ++i) {
       double value = a[i * n + j];
+      CLQR_UNROLL
       for (std::size_t k = 0; k < j; ++k) value -= lower[i * n + k] * lower[j * n + k];
       lower[i * n + j] = value / lower[j * n + j];
     }
@@ -1072,7 +1085,7 @@ bool CholeskyFactorizeRaw(const double* a, std::size_t n, double tolerance,
   return true;
 }
 
-void MirrorLowerTriangleRaw(double* a, std::size_t n) {
+void MirrorLowerTriangleRaw(double* CLQR_RESTRICT a, std::size_t n) {
   for (std::size_t row = 0; row < n; ++row) {
     for (std::size_t col = 0; col < row; ++col) {
       a[col * n + row] = a[row * n + col];
@@ -1080,39 +1093,52 @@ void MirrorLowerTriangleRaw(double* a, std::size_t n) {
   }
 }
 
-void SolveWithCholeskyRaw(const double* lower, const double* Hxu, const double* hu,
-                          std::size_t n, std::size_t m, double* rhs,
-                          double* solve_hxu, double* solve_hu) {
+void SolveWithCholeskyRaw(const double* CLQR_RESTRICT lower,
+                          const double* CLQR_RESTRICT Hxu,
+                          const double* CLQR_RESTRICT hu, std::size_t n,
+                          std::size_t m, double* CLQR_RESTRICT solve_hxu,
+                          double* CLQR_RESTRICT solve_hu) {
   for (std::size_t control = 0; control < m; ++control) {
+    CLQR_UNROLL
     for (std::size_t state = 0; state < n; ++state) {
-      rhs[control * (n + 1) + state] = Hxu[state * m + control];
+      solve_hxu[control * n + state] = Hxu[state * m + control];
     }
-    rhs[control * (n + 1) + n] = hu[control];
+    solve_hu[control] = hu[control];
   }
   for (std::size_t row = 0; row < m; ++row) {
-    for (std::size_t col = 0; col < n + 1; ++col) {
-      double value = rhs[row * (n + 1) + col];
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < n; ++col) {
+      double value = solve_hxu[row * n + col];
+      CLQR_UNROLL
       for (std::size_t k = 0; k < row; ++k) {
-        value -= lower[row * m + k] * rhs[k * (n + 1) + col];
+        value -= lower[row * m + k] * solve_hxu[k * n + col];
       }
-      rhs[row * (n + 1) + col] = value / lower[row * m + row];
+      solve_hxu[row * n + col] = value / lower[row * m + row];
     }
+    double value = solve_hu[row];
+    CLQR_UNROLL
+    for (std::size_t k = 0; k < row; ++k) {
+      value -= lower[row * m + k] * solve_hu[k];
+    }
+    solve_hu[row] = value / lower[row * m + row];
   }
   for (std::size_t rev = 0; rev < m; ++rev) {
     const std::size_t row = m - 1 - rev;
-    for (std::size_t col = 0; col < n + 1; ++col) {
-      double value = rhs[row * (n + 1) + col];
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < n; ++col) {
+      double value = solve_hxu[row * n + col];
+      CLQR_UNROLL
       for (std::size_t k = row + 1; k < m; ++k) {
-        value -= lower[k * m + row] * rhs[k * (n + 1) + col];
+        value -= lower[k * m + row] * solve_hxu[k * n + col];
       }
-      rhs[row * (n + 1) + col] = value / lower[row * m + row];
+      solve_hxu[row * n + col] = value / lower[row * m + row];
     }
-  }
-  for (std::size_t control = 0; control < m; ++control) {
-    for (std::size_t state = 0; state < n; ++state) {
-      solve_hxu[control * n + state] = rhs[control * (n + 1) + state];
+    double value = solve_hu[row];
+    CLQR_UNROLL
+    for (std::size_t k = row + 1; k < m; ++k) {
+      value -= lower[k * m + row] * solve_hu[k];
     }
-    solve_hu[control] = rhs[control * (n + 1) + n];
+    solve_hu[row] = value / lower[row * m + row];
   }
 }
 
@@ -1502,19 +1528,20 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
     const std::size_t n = workspace->state_dim[i];
     const std::size_t next_n = workspace->state_dim[i + 1];
     const std::size_t m = workspace->control_dim[i];
-    const double* P_next = workspace->PPtr(i + 1);
-    const double* p_next = workspace->pPtr(i + 1);
-    const double* A_data = s.A.data().data();
-    const double* B_data = s.B.data().data();
-    const double* Q_data = s.Q.data().data();
-    const double* R_data = s.R.data().data();
-    const double* M_data = s.M.data().data();
-    const double* c_data = s.c.data().data();
-    const double* q_data = s.q.data().data();
-    const double* r_data = s.r.data().data();
+    const double* CLQR_RESTRICT P_next = workspace->PPtr(i + 1);
+    const double* CLQR_RESTRICT p_next = workspace->pPtr(i + 1);
+    const double* CLQR_RESTRICT A_data = s.A.data().data();
+    const double* CLQR_RESTRICT B_data = s.B.data().data();
+    const double* CLQR_RESTRICT Q_data = s.Q.data().data();
+    const double* CLQR_RESTRICT R_data = s.R.data().data();
+    const double* CLQR_RESTRICT M_data = s.M.data().data();
+    const double* CLQR_RESTRICT c_data = s.c.data().data();
+    const double* CLQR_RESTRICT q_data = s.q.data().data();
+    const double* CLQR_RESTRICT r_data = s.r.data().data();
 
     for (std::size_t row = 0; row < next_n; ++row) {
       double value = p_next[row];
+      CLQR_UNROLL
       for (std::size_t col = 0; col < next_n; ++col) {
         value += P_next[row * next_n + col] * c_data[col];
       }
@@ -1522,10 +1549,11 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
     }
 
     for (std::size_t row = 0; row < n; ++row) {
-      double* out = workspace->A_T_P + row * next_n;
+      double* CLQR_RESTRICT out = workspace->A_T_P + row * next_n;
       for (std::size_t p_row = 0; p_row < next_n; ++p_row) {
         double value = 0.0;
-        const double* p_data = P_next + p_row * next_n;
+        const double* CLQR_RESTRICT p_data = P_next + p_row * next_n;
+        CLQR_UNROLL
         for (std::size_t p_col = 0; p_col < next_n; ++p_col) {
           value += p_data[p_col] * A_data[p_col * n + row];
         }
@@ -1535,6 +1563,7 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
     for (std::size_t row = 0; row < n; ++row) {
       for (std::size_t col = 0; col <= row; ++col) {
         double value = Q_data[row * n + col];
+        CLQR_UNROLL
         for (std::size_t shared = 0; shared < next_n; ++shared) {
           value += workspace->A_T_P[row * next_n + shared] *
                    A_data[shared * n + col];
@@ -1544,10 +1573,11 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
     }
 
     for (std::size_t row = 0; row < m; ++row) {
-      double* out = workspace->B_T_P + row * next_n;
+      double* CLQR_RESTRICT out = workspace->B_T_P + row * next_n;
       for (std::size_t p_row = 0; p_row < next_n; ++p_row) {
         double value = 0.0;
-        const double* p_data = P_next + p_row * next_n;
+        const double* CLQR_RESTRICT p_data = P_next + p_row * next_n;
+        CLQR_UNROLL
         for (std::size_t p_col = 0; p_col < next_n; ++p_col) {
           value += p_data[p_col] * B_data[p_col * m + row];
         }
@@ -1557,6 +1587,7 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
     for (std::size_t row = 0; row < m; ++row) {
       for (std::size_t col = 0; col <= row; ++col) {
         double value = R_data[row * m + col];
+        CLQR_UNROLL
         for (std::size_t shared = 0; shared < next_n; ++shared) {
           value += workspace->B_T_P[row * next_n + shared] *
                    B_data[shared * m + col];
@@ -1568,6 +1599,7 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
     for (std::size_t row = 0; row < n; ++row) {
       for (std::size_t col = 0; col < m; ++col) {
         double value = M_data[row * m + col];
+        CLQR_UNROLL
         for (std::size_t shared = 0; shared < next_n; ++shared) {
           value += workspace->A_T_P[row * next_n + shared] *
                    B_data[shared * m + col];
@@ -1584,11 +1616,13 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
     }
     for (std::size_t shared = 0; shared < next_n; ++shared) {
       const double pc = workspace->pc[shared];
-      const double* A_row = A_data + shared * n;
+      const double* CLQR_RESTRICT A_row = A_data + shared * n;
+      CLQR_UNROLL
       for (std::size_t col = 0; col < n; ++col) {
         workspace->hx[col] += A_row[col] * pc;
       }
-      const double* B_row = B_data + shared * m;
+      const double* CLQR_RESTRICT B_row = B_data + shared * m;
+      CLQR_UNROLL
       for (std::size_t col = 0; col < m; ++col) {
         workspace->hu[col] += B_row[col] * pc;
       }
@@ -1615,22 +1649,24 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
       }
     } else {
       SolveWithCholeskyRaw(workspace->lower, workspace->Hxu, workspace->hu, n, m,
-                           workspace->rhs, workspace->solve_hxu, workspace->solve_hu);
+                           workspace->solve_hxu, workspace->solve_hu);
     }
 
-    double* K = workspace->KPtr(i);
-    double* k = workspace->kPtr(i);
+    double* CLQR_RESTRICT K = workspace->KPtr(i);
+    double* CLQR_RESTRICT k = workspace->kPtr(i);
     for (std::size_t row = 0; row < m; ++row) {
+      CLQR_UNROLL
       for (std::size_t col = 0; col < n; ++col) {
         K[row * n + col] = -workspace->solve_hxu[row * n + col];
       }
       k[row] = -workspace->solve_hu[row];
     }
 
-    double* P = workspace->PPtr(i);
+    double* CLQR_RESTRICT P = workspace->PPtr(i);
     for (std::size_t row = 0; row < n; ++row) {
       for (std::size_t col = 0; col <= row; ++col) {
         double value = workspace->Hxx[row * n + col];
+        CLQR_UNROLL
         for (std::size_t control = 0; control < m; ++control) {
           value -= workspace->Hxu[row * m + control] *
                    workspace->solve_hxu[control * n + col];
@@ -1640,9 +1676,10 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
       }
     }
 
-    double* p = workspace->pPtr(i);
+    double* CLQR_RESTRICT p = workspace->pPtr(i);
     for (std::size_t row = 0; row < n; ++row) {
       double value = workspace->hx[row];
+      CLQR_UNROLL
       for (std::size_t control = 0; control < m; ++control) {
         value -= workspace->Hxu[row * m + control] * workspace->solve_hu[control];
       }
@@ -1675,6 +1712,7 @@ void RecoverUnconstrainedMultipliersInto(const Problem& original,
         node == 0 ? out->initial_multiplier : out->dynamics_multipliers[node - 1];
     for (std::size_t row = 0; row < n; ++row) {
       double value = p[row];
+      CLQR_UNROLL
       for (std::size_t col = 0; col < n; ++col) {
         value += P[row * n + col] * x[col];
       }
@@ -1709,14 +1747,17 @@ bool SolveUnconstrainedIntoView(const Problem& problem, double tolerance,
     const double* k = layout->riccati.kPtr(i);
     for (std::size_t row = 0; row < m; ++row) {
       double value = k[row];
+      CLQR_UNROLL
       for (std::size_t col = 0; col < n; ++col) value += K[row * n + col] * out->states[i][col];
       out->controls[i][row] = value;
     }
     for (std::size_t row = 0; row < s.A.rows(); ++row) {
       double value = s.c[row];
+      CLQR_UNROLL
       for (std::size_t col = 0; col < s.A.cols(); ++col) {
         value += s.A(row, col) * out->states[i][col];
       }
+      CLQR_UNROLL
       for (std::size_t col = 0; col < s.B.cols(); ++col) {
         value += s.B(row, col) * out->controls[i][col];
       }
@@ -1726,6 +1767,7 @@ bool SolveUnconstrainedIntoView(const Problem& problem, double tolerance,
     const VectorView& u = out->controls[i];
     for (std::size_t row = 0; row < s.Q.rows(); ++row) {
       double value = 0.0;
+      CLQR_UNROLL
       for (std::size_t col = 0; col < s.Q.cols(); ++col) {
         value += s.Q(row, col) * x[col];
       }
@@ -1733,6 +1775,7 @@ bool SolveUnconstrainedIntoView(const Problem& problem, double tolerance,
     }
     for (std::size_t row = 0; row < s.R.rows(); ++row) {
       double value = 0.0;
+      CLQR_UNROLL
       for (std::size_t col = 0; col < s.R.cols(); ++col) {
         value += s.R(row, col) * u[col];
       }
@@ -1740,6 +1783,7 @@ bool SolveUnconstrainedIntoView(const Problem& problem, double tolerance,
     }
     for (std::size_t row = 0; row < s.M.rows(); ++row) {
       double value = 0.0;
+      CLQR_UNROLL
       for (std::size_t col = 0; col < s.M.cols(); ++col) {
         value += s.M(row, col) * u[col];
       }
@@ -1752,6 +1796,7 @@ bool SolveUnconstrainedIntoView(const Problem& problem, double tolerance,
   const VectorView& terminal = out->states[problem.stages.size()];
   for (std::size_t row = 0; row < problem.terminal_Q.rows(); ++row) {
     double value = 0.0;
+    CLQR_UNROLL
     for (std::size_t col = 0; col < problem.terminal_Q.cols(); ++col) {
       value += problem.terminal_Q(row, col) * terminal[col];
     }
