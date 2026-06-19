@@ -1072,6 +1072,14 @@ bool CholeskyFactorizeRaw(const double* a, std::size_t n, double tolerance,
   return true;
 }
 
+void MirrorLowerTriangleRaw(double* a, std::size_t n) {
+  for (std::size_t row = 0; row < n; ++row) {
+    for (std::size_t col = 0; col < row; ++col) {
+      a[col * n + row] = a[row * n + col];
+    }
+  }
+}
+
 void SolveWithCholeskyRaw(const double* lower, const double* Hxu, const double* hu,
                           std::size_t n, std::size_t m, double* rhs,
                           double* solve_hxu, double* solve_hu) {
@@ -1496,48 +1504,62 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
     const std::size_t m = workspace->control_dim[i];
     const double* P_next = workspace->PPtr(i + 1);
     const double* p_next = workspace->pPtr(i + 1);
+    const double* A_data = s.A.data().data();
+    const double* B_data = s.B.data().data();
+    const double* Q_data = s.Q.data().data();
+    const double* R_data = s.R.data().data();
+    const double* M_data = s.M.data().data();
+    const double* c_data = s.c.data().data();
+    const double* q_data = s.q.data().data();
+    const double* r_data = s.r.data().data();
 
     for (std::size_t row = 0; row < next_n; ++row) {
       double value = p_next[row];
       for (std::size_t col = 0; col < next_n; ++col) {
-        value += P_next[row * next_n + col] * s.c[col];
+        value += P_next[row * next_n + col] * c_data[col];
       }
       workspace->pc[row] = value;
     }
 
     for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col < next_n; ++col) {
+      double* out = workspace->A_T_P + row * next_n;
+      for (std::size_t p_row = 0; p_row < next_n; ++p_row) {
         double value = 0.0;
-        for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += s.A(shared, row) * P_next[shared * next_n + col];
+        const double* p_data = P_next + p_row * next_n;
+        for (std::size_t p_col = 0; p_col < next_n; ++p_col) {
+          value += p_data[p_col] * A_data[p_col * n + row];
         }
-        workspace->A_T_P[row * next_n + col] = value;
+        out[p_row] = value;
       }
     }
     for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col < n; ++col) {
-        double value = s.Q(row, col);
+      for (std::size_t col = 0; col <= row; ++col) {
+        double value = Q_data[row * n + col];
         for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += workspace->A_T_P[row * next_n + shared] * s.A(shared, col);
+          value += workspace->A_T_P[row * next_n + shared] *
+                   A_data[shared * n + col];
         }
         workspace->Hxx[row * n + col] = value;
       }
     }
 
     for (std::size_t row = 0; row < m; ++row) {
-      for (std::size_t col = 0; col < next_n; ++col) {
+      double* out = workspace->B_T_P + row * next_n;
+      for (std::size_t p_row = 0; p_row < next_n; ++p_row) {
         double value = 0.0;
-        for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += s.B(shared, row) * P_next[shared * next_n + col];
+        const double* p_data = P_next + p_row * next_n;
+        for (std::size_t p_col = 0; p_col < next_n; ++p_col) {
+          value += p_data[p_col] * B_data[p_col * m + row];
         }
-        workspace->B_T_P[row * next_n + col] = value;
+        out[p_row] = value;
       }
     }
     for (std::size_t row = 0; row < m; ++row) {
-      for (std::size_t col = 0; col < m; ++col) {
-        double value = s.R(row, col);
+      for (std::size_t col = 0; col <= row; ++col) {
+        double value = R_data[row * m + col];
         for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += workspace->B_T_P[row * next_n + shared] * s.B(shared, col);
+          value += workspace->B_T_P[row * next_n + shared] *
+                   B_data[shared * m + col];
         }
         workspace->Huu[row * m + col] = value;
       }
@@ -1545,30 +1567,35 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
 
     for (std::size_t row = 0; row < n; ++row) {
       for (std::size_t col = 0; col < m; ++col) {
-        double value = s.M(row, col);
+        double value = M_data[row * m + col];
         for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += workspace->A_T_P[row * next_n + shared] * s.B(shared, col);
+          value += workspace->A_T_P[row * next_n + shared] *
+                   B_data[shared * m + col];
         }
         workspace->Hxu[row * m + col] = value;
       }
     }
 
     for (std::size_t row = 0; row < n; ++row) {
-      double value = s.q[row];
-      for (std::size_t shared = 0; shared < next_n; ++shared) {
-        value += s.A(shared, row) * workspace->pc[shared];
-      }
-      workspace->hx[row] = value;
+      workspace->hx[row] = q_data[row];
     }
     for (std::size_t row = 0; row < m; ++row) {
-      double value = s.r[row];
-      for (std::size_t shared = 0; shared < next_n; ++shared) {
-        value += s.B(shared, row) * workspace->pc[shared];
+      workspace->hu[row] = r_data[row];
+    }
+    for (std::size_t shared = 0; shared < next_n; ++shared) {
+      const double pc = workspace->pc[shared];
+      const double* A_row = A_data + shared * n;
+      for (std::size_t col = 0; col < n; ++col) {
+        workspace->hx[col] += A_row[col] * pc;
       }
-      workspace->hu[row] = value;
+      const double* B_row = B_data + shared * m;
+      for (std::size_t col = 0; col < m; ++col) {
+        workspace->hu[col] += B_row[col] * pc;
+      }
     }
 
     if (!CholeskyFactorizeRaw(workspace->Huu, m, tolerance, workspace->lower)) {
+      MirrorLowerTriangleRaw(workspace->Huu, m);
       CopyRawToMatrix(workspace->Huu, m, m, &workspace->fallback_Huu);
       CopyRawToMatrix(workspace->Hxu, n, m, &workspace->fallback_Hxu);
       CopyRawToVector(workspace->hu, m, &workspace->fallback_hu);
@@ -1602,20 +1629,14 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
 
     double* P = workspace->PPtr(i);
     for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col < n; ++col) {
+      for (std::size_t col = 0; col <= row; ++col) {
         double value = workspace->Hxx[row * n + col];
         for (std::size_t control = 0; control < m; ++control) {
           value -= workspace->Hxu[row * m + control] *
                    workspace->solve_hxu[control * n + col];
         }
         P[row * n + col] = value;
-      }
-    }
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = row + 1; col < n; ++col) {
-        const double value = 0.5 * (P[row * n + col] + P[col * n + row]);
-        P[row * n + col] = value;
-        P[col * n + row] = value;
+        if (row != col) P[col * n + row] = value;
       }
     }
 
