@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
-#include <cstring>
 #include <exception>
 #include <sstream>
 #include <stdexcept>
@@ -549,14 +548,14 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
     diagnostics->singular = true;
     AddIndexedDiagnostic(diagnostics, "redundant mixed equality constraints at stage ", i);
   }
-  const Matrix old_Q = s.Q;
-  const Matrix old_R = s.R;
-  const Matrix old_M = s.M;
-  const Matrix old_A = s.A;
-  const Matrix old_B = s.B;
-  const Vector old_q = s.q;
-  const Vector old_r = s.r;
-  const Vector old_c = s.c;
+  const Matrix& old_Q = s.Q;
+  const Matrix& old_R = s.R;
+  const Matrix& old_M = s.M;
+  const Matrix& old_A = s.A;
+  const Matrix& old_B = s.B;
+  const Vector& old_q = s.q;
+  const Vector& old_r = s.r;
+  const Vector& old_c = s.c;
 
   const std::size_t n = old_Q.rows();
   const std::size_t m = old_R.rows();
@@ -569,7 +568,6 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
     affine_control_gradient[row] = value + old_r[row];
   }
 
-  s.Q = Matrix(n, n);
   for (std::size_t row = 0; row < n; ++row) {
     for (std::size_t col = 0; col < n; ++col) {
       double value = old_Q(row, col);
@@ -585,7 +583,7 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
   }
   SymmetrizeInPlace(s.Q);
 
-  s.R = Matrix(reduced_m, reduced_m);
+  Matrix new_R(reduced_m, reduced_m);
   for (std::size_t row = 0; row < reduced_m; ++row) {
     for (std::size_t col = 0; col < reduced_m; ++col) {
       double value = 0.0;
@@ -594,12 +592,12 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
           value += basis.Z(u, row) * old_R(u, v) * basis.Z(v, col);
         }
       }
-      s.R(row, col) = value;
+      new_R(row, col) = value;
     }
   }
-  SymmetrizeInPlace(s.R);
+  SymmetrizeInPlace(new_R);
 
-  s.M = Matrix(n, reduced_m);
+  Matrix new_M(n, reduced_m);
   for (std::size_t row = 0; row < n; ++row) {
     for (std::size_t col = 0; col < reduced_m; ++col) {
       double value = 0.0;
@@ -609,11 +607,10 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
           value += basis.Y(u, row) * old_R(u, v) * basis.Z(v, col);
         }
       }
-      s.M(row, col) = value;
+      new_M(row, col) = value;
     }
   }
 
-  s.q = Vector(n);
   for (std::size_t row = 0; row < n; ++row) {
     double value = old_q[row];
     for (std::size_t u = 0; u < m; ++u) {
@@ -623,14 +620,13 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
     s.q[row] = value;
   }
 
-  s.r = Vector(reduced_m);
+  Vector new_r(reduced_m);
   for (std::size_t row = 0; row < reduced_m; ++row) {
     double value = 0.0;
     for (std::size_t u = 0; u < m; ++u) value += basis.Z(u, row) * affine_control_gradient[u];
-    s.r[row] = value;
+    new_r[row] = value;
   }
 
-  s.A = Matrix(next_n, n);
   for (std::size_t row = 0; row < next_n; ++row) {
     for (std::size_t col = 0; col < n; ++col) {
       double value = old_A(row, col);
@@ -638,56 +634,60 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
       s.A(row, col) = value;
     }
   }
-  s.B = Matrix(next_n, reduced_m);
+  Matrix new_B(next_n, reduced_m);
   for (std::size_t row = 0; row < next_n; ++row) {
     for (std::size_t col = 0; col < reduced_m; ++col) {
       double value = 0.0;
       for (std::size_t u = 0; u < m; ++u) value += old_B(row, u) * basis.Z(u, col);
-      s.B(row, col) = value;
+      new_B(row, col) = value;
     }
   }
-  s.c = Vector(next_n);
   for (std::size_t row = 0; row < next_n; ++row) {
     double value = old_c[row];
     for (std::size_t u = 0; u < m; ++u) value += old_B(row, u) * basis.y[u];
     s.c[row] = value;
   }
+  s.R = std::move(new_R);
+  s.M = std::move(new_M);
+  s.r = std::move(new_r);
+  s.B = std::move(new_B);
   s.C = Matrix(0, s.A.cols());
   s.D = Matrix(0, s.B.cols());
   s.d = Vector(0);
   AppendStateConstraints(s, basis.state_C, basis.state_d);
 
-  ControlMap old_map = state.control_maps[i];
-  state.control_maps[i].state_linear =
-      Matrix(old_map.state_linear.rows(), basis.Y.cols());
+  const ControlMap& old_map = state.control_maps[i];
+  Matrix new_state_linear(old_map.state_linear.rows(), basis.Y.cols());
   for (std::size_t row = 0; row < old_map.state_linear.rows(); ++row) {
     for (std::size_t col = 0; col < basis.Y.cols(); ++col) {
       double value = old_map.state_linear(row, col);
       for (std::size_t u = 0; u < old_map.control_linear.cols(); ++u) {
         value += old_map.control_linear(row, u) * basis.Y(u, col);
       }
-      state.control_maps[i].state_linear(row, col) = value;
+      new_state_linear(row, col) = value;
     }
   }
-  state.control_maps[i].control_linear =
-      Matrix(old_map.control_linear.rows(), basis.Z.cols());
+  Matrix new_control_linear(old_map.control_linear.rows(), basis.Z.cols());
   for (std::size_t row = 0; row < old_map.control_linear.rows(); ++row) {
     for (std::size_t col = 0; col < basis.Z.cols(); ++col) {
       double value = 0.0;
       for (std::size_t u = 0; u < old_map.control_linear.cols(); ++u) {
         value += old_map.control_linear(row, u) * basis.Z(u, col);
       }
-      state.control_maps[i].control_linear(row, col) = value;
+      new_control_linear(row, col) = value;
     }
   }
-  state.control_maps[i].offset = Vector(old_map.offset.size());
+  Vector new_offset(old_map.offset.size());
   for (std::size_t row = 0; row < old_map.offset.size(); ++row) {
     double value = old_map.offset[row];
     for (std::size_t u = 0; u < old_map.control_linear.cols(); ++u) {
       value += old_map.control_linear(row, u) * basis.y[u];
     }
-    state.control_maps[i].offset[row] = value;
+    new_offset[row] = value;
   }
+  state.control_maps[i].state_linear = std::move(new_state_linear);
+  state.control_maps[i].control_linear = std::move(new_control_linear);
+  state.control_maps[i].offset = std::move(new_offset);
   return true;
 }
 
@@ -968,7 +968,6 @@ struct RiccatiWorkspace {
     if (bytes < sizes.bytes) {
       throw std::invalid_argument("workspace is too small for Riccati solve");
     }
-    std::memset(data, 0, sizes.bytes);
     std::size_t offset = 0;
     Layout(this, stages, sizes.total_P, sizes.total_p, sizes.total_K, sizes.total_k,
            sizes.max_state, sizes.max_control, data, &offset);
@@ -1059,7 +1058,6 @@ struct RiccatiWorkspace {
 
 bool CholeskyFactorizeRaw(const double* a, std::size_t n, double tolerance,
                           double* lower) {
-  std::fill(lower, lower + n * n, 0.0);
   for (std::size_t j = 0; j < n; ++j) {
     double diagonal = a[j * n + j];
     for (std::size_t k = 0; k < j; ++k) diagonal -= lower[j * n + k] * lower[j * n + k];
@@ -1412,13 +1410,9 @@ SolutionWorkspaceLayout BindSolutionWorkspace(const Problem& problem, Workspace&
   if (workspace.size() < required) {
     throw std::invalid_argument("workspace is too small");
   }
-  const bool constrained = AnyOriginalConstraints(problem);
-  const std::size_t riccati_bytes =
-      constrained ? 0 : RiccatiWorkspace::RequiredBytes(problem.stages);
+  const std::size_t riccati_bytes = RiccatiWorkspace::RequiredBytes(problem.stages);
   SolutionWorkspaceLayout layout;
-  if (!constrained) {
-    layout.riccati.Assign(problem.stages, workspace.data(), riccati_bytes);
-  }
+  layout.riccati.Assign(problem.stages, workspace.data(), riccati_bytes);
 
   std::size_t offset = riccati_bytes;
   const std::size_t N = problem.stages.size();
@@ -1637,43 +1631,9 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
   return true;
 }
 
-double ObjectiveView(const Problem& original, const SolutionView& sol) {
-  double value = 0.0;
-  for (std::size_t i = 0; i < original.stages.size(); ++i) {
-    const Stage& s = original.stages[i];
-    const VectorView& x = sol.states[i];
-    const VectorView& u = sol.controls[i];
-    for (std::size_t row = 0; row < s.Q.rows(); ++row) {
-      for (std::size_t col = 0; col < s.Q.cols(); ++col) {
-        value += 0.5 * x[row] * s.Q(row, col) * x[col];
-      }
-    }
-    for (std::size_t row = 0; row < s.R.rows(); ++row) {
-      for (std::size_t col = 0; col < s.R.cols(); ++col) {
-        value += 0.5 * u[row] * s.R(row, col) * u[col];
-      }
-    }
-    for (std::size_t row = 0; row < s.M.rows(); ++row) {
-      for (std::size_t col = 0; col < s.M.cols(); ++col) {
-        value += x[row] * s.M(row, col) * u[col];
-      }
-    }
-    for (std::size_t row = 0; row < s.q.size(); ++row) value += s.q[row] * x[row];
-    for (std::size_t row = 0; row < s.r.size(); ++row) value += s.r[row] * u[row];
-  }
-  const VectorView& terminal = sol.states[original.stages.size()];
-  for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
-    for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
-      value += 0.5 * terminal[row] * original.terminal_Q(row, col) * terminal[col];
-    }
-  }
-  for (std::size_t row = 0; row < original.terminal_q.size(); ++row) {
-    value += original.terminal_q[row] * terminal[row];
-  }
-  return value;
-}
-
-void RecoverUnconstrainedMultipliersInto(const Problem& original, SolutionView* out) {
+void RecoverUnconstrainedMultipliersInto(const Problem& original,
+                                         const RiccatiWorkspace& riccati,
+                                         SolutionView* out) {
   const std::size_t N = original.stages.size();
   if (N == 0) {
     for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
@@ -1685,49 +1645,20 @@ void RecoverUnconstrainedMultipliersInto(const Problem& original, SolutionView* 
     }
     return;
   }
-
-  VectorView terminal_y = out->dynamics_multipliers[N - 1];
-  for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
-    double value = original.terminal_q[row];
-    for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
-      value += original.terminal_Q(row, col) * out->states[N][col];
-    }
-    terminal_y[row] = -value;
-  }
-
-  for (std::size_t rev = 1; rev < N; ++rev) {
-    const std::size_t i = N - 1 - rev;
-    const Stage& s = original.stages[i + 1];
-    VectorView previous = out->dynamics_multipliers[i];
-    VectorView y = out->dynamics_multipliers[i + 1];
-    for (std::size_t col = 0; col < s.A.cols(); ++col) {
-      double value = -s.q[col];
-      for (std::size_t row = 0; row < s.A.rows(); ++row) {
-        value += s.A(row, col) * y[row];
+  for (std::size_t node = 0; node <= N; ++node) {
+    const std::size_t n = riccati.state_dim[node];
+    const double* P = riccati.PPtr(node);
+    const double* p = riccati.pPtr(node);
+    const VectorView x = out->states[node];
+    VectorView multiplier =
+        node == 0 ? out->initial_multiplier : out->dynamics_multipliers[node - 1];
+    for (std::size_t row = 0; row < n; ++row) {
+      double value = p[row];
+      for (std::size_t col = 0; col < n; ++col) {
+        value += P[row * n + col] * x[col];
       }
-      for (std::size_t q_col = 0; q_col < s.Q.cols(); ++q_col) {
-        value -= s.Q(col, q_col) * out->states[i + 1][q_col];
-      }
-      for (std::size_t u_col = 0; u_col < s.M.cols(); ++u_col) {
-        value -= s.M(col, u_col) * out->controls[i + 1][u_col];
-      }
-      previous[col] = value;
+      multiplier[row] = -value;
     }
-  }
-  const Stage& first = original.stages[0];
-  VectorView first_y = out->dynamics_multipliers[0];
-  for (std::size_t col = 0; col < first.A.cols(); ++col) {
-    double value = -first.q[col];
-    for (std::size_t row = 0; row < first.A.rows(); ++row) {
-      value += first.A(row, col) * first_y[row];
-    }
-    for (std::size_t q_col = 0; q_col < first.Q.cols(); ++q_col) {
-      value -= first.Q(col, q_col) * out->states[0][q_col];
-    }
-    for (std::size_t u_col = 0; u_col < first.M.cols(); ++u_col) {
-      value -= first.M(col, u_col) * out->controls[0][u_col];
-    }
-    out->initial_multiplier[col] = value;
   }
 }
 
@@ -1748,6 +1679,7 @@ bool SolveUnconstrainedIntoView(const Problem& problem, double tolerance,
     return false;
   }
 
+  double objective = 0.0;
   for (std::size_t i = 0; i < problem.stages.size(); ++i) {
     const Stage& s = problem.stages[i];
     const std::size_t n = layout->riccati.state_dim[i];
@@ -1769,9 +1701,45 @@ bool SolveUnconstrainedIntoView(const Problem& problem, double tolerance,
       }
       out->states[i + 1][row] = value;
     }
+    const VectorView& x = out->states[i];
+    const VectorView& u = out->controls[i];
+    for (std::size_t row = 0; row < s.Q.rows(); ++row) {
+      double value = 0.0;
+      for (std::size_t col = 0; col < s.Q.cols(); ++col) {
+        value += s.Q(row, col) * x[col];
+      }
+      objective += 0.5 * x[row] * value;
+    }
+    for (std::size_t row = 0; row < s.R.rows(); ++row) {
+      double value = 0.0;
+      for (std::size_t col = 0; col < s.R.cols(); ++col) {
+        value += s.R(row, col) * u[col];
+      }
+      objective += 0.5 * u[row] * value;
+    }
+    for (std::size_t row = 0; row < s.M.rows(); ++row) {
+      double value = 0.0;
+      for (std::size_t col = 0; col < s.M.cols(); ++col) {
+        value += s.M(row, col) * u[col];
+      }
+      objective += x[row] * value;
+    }
+    for (std::size_t row = 0; row < s.q.size(); ++row) objective += s.q[row] * x[row];
+    for (std::size_t row = 0; row < s.r.size(); ++row) objective += s.r[row] * u[row];
   }
-  RecoverUnconstrainedMultipliersInto(problem, out);
-  out->objective = ObjectiveView(problem, *out);
+  RecoverUnconstrainedMultipliersInto(problem, layout->riccati, out);
+  const VectorView& terminal = out->states[problem.stages.size()];
+  for (std::size_t row = 0; row < problem.terminal_Q.rows(); ++row) {
+    double value = 0.0;
+    for (std::size_t col = 0; col < problem.terminal_Q.cols(); ++col) {
+      value += problem.terminal_Q(row, col) * terminal[col];
+    }
+    objective += 0.5 * terminal[row] * value;
+  }
+  for (std::size_t row = 0; row < problem.terminal_q.size(); ++row) {
+    objective += problem.terminal_q[row] * terminal[row];
+  }
+  out->objective = objective;
   out->status = SolveStatus::kOptimal;
   out->message = "optimal";
   return true;
@@ -1828,157 +1796,21 @@ ReducedSolution SolveUnconstrained(const WorkspaceVector<Stage>& stages,
                                    NewtonKktDiagnostics* diagnostics) {
   const std::size_t N = stages.size();
   RiccatiWorkspace workspace;
-  workspace.Reserve(stages);
+  if (WorkspaceArena* arena = ActiveWorkspaceArena(); arena != nullptr) {
+    const std::size_t bytes = RiccatiWorkspace::RequiredBytes(stages);
+    auto* data = static_cast<unsigned char*>(arena->Allocate(bytes, alignof(double)));
+    workspace.Assign(stages, data, bytes);
+  } else {
+    workspace.Reserve(stages);
+  }
   if (N == 0) {
     ReducedSolution sol;
     sol.x.push_back(initial_state);
     return sol;
   }
-  {
-    double* terminal_P = workspace.PPtr(N);
-    for (std::size_t i = 0; i < terminal_Q.data().size(); ++i) {
-      terminal_P[i] = terminal_Q.data()[i];
-    }
-    double* terminal_p = workspace.pPtr(N);
-    for (std::size_t i = 0; i < terminal_q.size(); ++i) terminal_p[i] = terminal_q[i];
-  }
-  for (std::size_t rev = 0; rev < N; ++rev) {
-    const std::size_t i = N - 1 - rev;
-    const Stage& s = stages[i];
-    const std::size_t n = workspace.state_dim[i];
-    const std::size_t next_n = workspace.state_dim[i + 1];
-    const std::size_t m = workspace.control_dim[i];
-    const double* P_next = workspace.PPtr(i + 1);
-    const double* p_next = workspace.pPtr(i + 1);
-
-    for (std::size_t row = 0; row < next_n; ++row) {
-      double value = p_next[row];
-      for (std::size_t col = 0; col < next_n; ++col) {
-        value += P_next[row * next_n + col] * s.c[col];
-      }
-      workspace.pc[row] = value;
-    }
-
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col < next_n; ++col) {
-        double value = 0.0;
-        for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += s.A(shared, row) * P_next[shared * next_n + col];
-        }
-        workspace.A_T_P[row * next_n + col] = value;
-      }
-    }
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col < n; ++col) {
-        double value = s.Q(row, col);
-        for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += workspace.A_T_P[row * next_n + shared] * s.A(shared, col);
-        }
-        workspace.Hxx[row * n + col] = value;
-      }
-    }
-
-    for (std::size_t row = 0; row < m; ++row) {
-      for (std::size_t col = 0; col < next_n; ++col) {
-        double value = 0.0;
-        for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += s.B(shared, row) * P_next[shared * next_n + col];
-        }
-        workspace.B_T_P[row * next_n + col] = value;
-      }
-    }
-    for (std::size_t row = 0; row < m; ++row) {
-      for (std::size_t col = 0; col < m; ++col) {
-        double value = s.R(row, col);
-        for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += workspace.B_T_P[row * next_n + shared] * s.B(shared, col);
-        }
-        workspace.Huu[row * m + col] = value;
-      }
-    }
-
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col < m; ++col) {
-        double value = s.M(row, col);
-        for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += workspace.A_T_P[row * next_n + shared] * s.B(shared, col);
-        }
-        workspace.Hxu[row * m + col] = value;
-      }
-    }
-
-    for (std::size_t row = 0; row < n; ++row) {
-      double value = s.q[row];
-      for (std::size_t shared = 0; shared < next_n; ++shared) {
-        value += s.A(shared, row) * workspace.pc[shared];
-      }
-      workspace.hx[row] = value;
-    }
-    for (std::size_t row = 0; row < m; ++row) {
-      double value = s.r[row];
-      for (std::size_t shared = 0; shared < next_n; ++shared) {
-        value += s.B(shared, row) * workspace.pc[shared];
-      }
-      workspace.hu[row] = value;
-    }
-
-    const bool positive_definite =
-        CholeskyFactorizeRaw(workspace.Huu, m, tolerance, workspace.lower);
-    if (positive_definite) {
-      SolveWithCholeskyRaw(workspace.lower, workspace.Hxu, workspace.hu, n, m,
-                           workspace.rhs, workspace.solve_hxu, workspace.solve_hu);
-    } else {
-      CopyRawToMatrix(workspace.Huu, m, m, &workspace.fallback_Huu);
-      CopyRawToMatrix(workspace.Hxu, n, m, &workspace.fallback_Hxu);
-      CopyRawToVector(workspace.hu, m, &workspace.fallback_hu);
-      AnalyzeReducedControlHessian(workspace.fallback_Huu, false, i, tolerance, diagnostics);
-      Matrix solve_hxu =
-          SolveLinearSystem(workspace.fallback_Huu, Transpose(workspace.fallback_Hxu), tolerance);
-      Vector solve_hu = SolveLinearSystem(workspace.fallback_Huu, workspace.fallback_hu, tolerance);
-      for (std::size_t row = 0; row < m; ++row) {
-        for (std::size_t col = 0; col < n; ++col) {
-          workspace.solve_hxu[row * n + col] = solve_hxu(row, col);
-        }
-        workspace.solve_hu[row] = solve_hu[row];
-      }
-    }
-
-    double* K = workspace.KPtr(i);
-    double* k = workspace.kPtr(i);
-    for (std::size_t row = 0; row < m; ++row) {
-      for (std::size_t col = 0; col < n; ++col) {
-        K[row * n + col] = -workspace.solve_hxu[row * n + col];
-      }
-      k[row] = -workspace.solve_hu[row];
-    }
-
-    double* P = workspace.PPtr(i);
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col < n; ++col) {
-        double value = workspace.Hxx[row * n + col];
-        for (std::size_t control = 0; control < m; ++control) {
-          value -= workspace.Hxu[row * m + control] *
-                   workspace.solve_hxu[control * n + col];
-        }
-        P[row * n + col] = value;
-      }
-    }
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = row + 1; col < n; ++col) {
-        const double value = 0.5 * (P[row * n + col] + P[col * n + row]);
-        P[row * n + col] = value;
-        P[col * n + row] = value;
-      }
-    }
-
-    double* p = workspace.pPtr(i);
-    for (std::size_t row = 0; row < n; ++row) {
-      double value = workspace.hx[row];
-      for (std::size_t control = 0; control < m; ++control) {
-        value -= workspace.Hxu[row * m + control] * workspace.solve_hu[control];
-      }
-      p[row] = value;
-    }
+  if (!ComputeUnconstrainedRiccatiInto(stages, terminal_Q, terminal_q, tolerance,
+                                       &workspace, diagnostics)) {
+    throw std::runtime_error("reduced control Hessian is not positive definite");
   }
 
   ReducedSolution sol;

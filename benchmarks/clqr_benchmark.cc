@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -107,6 +108,13 @@ int IterationScale(int argc, char** argv) {
   return std::max(scale, 1);
 }
 
+std::optional<std::size_t> ConstraintFilter(int argc, char** argv) {
+  if (argc <= 2) return std::nullopt;
+  const int constraints = std::atoi(argv[2]);
+  if (constraints < 0) return std::nullopt;
+  return static_cast<std::size_t>(constraints);
+}
+
 void RunCase(const std::string& name, const clqr::Problem& problem, int iterations) {
   clqr::SolveOptions options;
   options.tolerance = 1e-9;
@@ -160,6 +168,7 @@ void RunCase(const std::string& name, const clqr::Problem& problem, int iteratio
 
 int main(int argc, char** argv) {
   const int scale = IterationScale(argc, argv);
+  const std::optional<std::size_t> constraint_filter = ConstraintFilter(argc, argv);
   const std::vector<Dimensions> dimensions = {
       {16, 4, 2, 200},
       {16, 6, 3, 100},
@@ -173,6 +182,10 @@ int main(int argc, char** argv) {
   int seed = 1;
   for (const Dimensions& dim : dimensions) {
     for (std::size_t constraints = 0; constraints <= 2; ++constraints) {
+      if (constraint_filter.has_value() && constraints != *constraint_filter) {
+        ++seed;
+        continue;
+      }
       clqr::Problem problem =
           MakeFeasibleMixedProblem(seed, dim.horizon, dim.states, dim.controls, constraints);
       const std::string base_name = "N=" + std::to_string(dim.horizon) +
