@@ -163,6 +163,21 @@ Problem ZeroHorizonProblem() {
   return problem;
 }
 
+Problem ZeroControlStateConstraintProblem() {
+  constexpr int seed = 1900;
+  constexpr std::size_t horizon = 4;
+  constexpr std::size_t n = 3;
+  Problem problem = UniformProblem(seed, horizon, n, 0);
+  for (std::size_t i = 0; i < horizon; ++i) {
+    Stage& stage = problem.stages[i];
+    const Vector nominal_x =
+        GeneratedVector(n, seed + 100 + static_cast<int>(i), 0.5);
+    stage.E = GeneratedMatrix(1, n, seed + 1200 + static_cast<int>(i), 0.3);
+    stage.e = Vector{-RowDot(stage.E, 0, nominal_x)};
+  }
+  return problem;
+}
+
 Problem MaximumConstraintProblem() {
   constexpr int seed = 1700;
   constexpr std::size_t dimension = kMaxStateDimension;
@@ -406,7 +421,10 @@ void RunEmulation(const Problem& problem, const std::string& name,
     InitialReducedStateKernel(state_params.data(), initial.data(),
                               reduced_initial.data(), kTolerance, &status);
   });
-  Expect(status.code == kDeviceOk, "emulated independent reduction");
+  Expect(status.code == kDeviceOk,
+         name + " emulated independent reduction (stage=" +
+             std::to_string(status.stage) +
+             ", detail=" + std::to_string(status.detail) + ")");
   bool reduced_a_state = false;
   bool reduced_a_control = false;
   for (const StateParam& param : state_params)
@@ -609,7 +627,8 @@ int main() {
   RunEmulation(
       UniformProblem(1800, 3, kMaxStateDimension, kMaxControlDimension),
       "maximum-active-dimension", false, false);
-  RunEmulation(UniformProblem(1900, 4, 3, 0), "zero-control", false, false);
+  RunEmulation(ZeroControlStateConstraintProblem(), "zero-control", true,
+               false);
   RunEmulation(MaximumConstraintProblem(), "maximum-constraint", true, true);
   RunEmulation(MoreMixedRowsThanControlsProblem(), "more-mixed-than-controls",
                true, true);

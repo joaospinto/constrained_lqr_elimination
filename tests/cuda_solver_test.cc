@@ -243,13 +243,12 @@ double MaxKktResidual(const Problem& problem,
     residual = std::max(residual,
                         TestMaxAbs(problem.terminal_E * solution.states.back() +
                                    problem.terminal_e));
-  Vector terminal_gradient = problem.terminal_Q * solution.states.back() +
-                             problem.terminal_q + solution.initial_multiplier;
-  if (horizon > 0) {
-    terminal_gradient = problem.terminal_Q * solution.states.back() +
-                        problem.terminal_q +
-                        solution.dynamics_multipliers.back();
-  }
+  Vector terminal_gradient =
+      problem.terminal_Q * solution.states.back() + problem.terminal_q;
+  terminal_gradient =
+      terminal_gradient +
+      (horizon == 0 ? solution.initial_multiplier
+                    : solution.dynamics_multipliers.back());
   AddTransposeProduct(problem.terminal_E, solution.terminal_state_multiplier,
                       &terminal_gradient);
   return std::max(residual, TestMaxAbs(terminal_gradient));
@@ -257,6 +256,7 @@ double MaxKktResidual(const Problem& problem,
 
 void CompareWithCpu(const Problem& problem, const std::string& name,
                     bool expect_parallel = true) {
+  std::cout << "case: " << name << std::endl;
   clqr::Workspace workspace;
   workspace.Reserve(problem);
   const clqr::SolutionView cpu = clqr::Solve(problem, workspace);

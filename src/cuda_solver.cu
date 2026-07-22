@@ -2604,6 +2604,51 @@ __global__ void ReduceStagesKernel(
   }
   __syncthreads();
 
+  // Normalize raw mixed equations by their original scale, while treating a
+  // successor equation produced entirely at the roundoff level as zero.  A
+  // second relative row test removes constraints that vanish after applying
+  // the current feasible-state parameterization.  This must happen before the
+  // generic RREF equilibration, which would otherwise magnify cancellation
+  // noise into a unit pivot.
+  for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+    double scale = 0.0;
+    if (row < s.mixed) {
+      for (int x = 0; x < s.n; ++x)
+        scale = fmax(scale, DeviceAbs(s.C[row * kMaxStateDimension + x]));
+      for (int u = 0; u < s.m; ++u)
+        scale = fmax(scale, DeviceAbs(s.D[row * kMaxControlDimension + u]));
+      scale = fmax(scale, DeviceAbs(s.d[row]));
+    } else {
+      for (int col = 0; col < columns; ++col)
+        scale = fmax(scale, DeviceAbs(matrix[row * columns + col]));
+    }
+    factors[row] = scale;
+  }
+  __syncthreads();
+  for (int linear = threadIdx.x; linear < rows * columns;
+       linear += blockDim.x) {
+    const int row = linear / columns;
+    const double scale = factors[row];
+    if (row >= s.mixed && scale <= tolerance) {
+      matrix[linear] = 0.0;
+    } else if (scale > 0.0) {
+      matrix[linear] /= scale;
+    }
+  }
+  __syncthreads();
+  for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+    double scale = 0.0;
+    for (int col = 0; col < columns; ++col)
+      scale = fmax(scale, DeviceAbs(matrix[row * columns + col]));
+    factors[row] = scale;
+  }
+  __syncthreads();
+  for (int linear = threadIdx.x; linear < rows * columns;
+       linear += blockDim.x) {
+    if (factors[linear / columns] <= tolerance) matrix[linear] = 0.0;
+  }
+  __syncthreads();
+
   RrefBlock(matrix, rows, columns, columns - 1, tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
