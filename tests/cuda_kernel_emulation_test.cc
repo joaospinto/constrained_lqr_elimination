@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../src/cuda_solver.cu"
+#include "cuda_jax_problem.h"
 
 namespace {
 
@@ -19,6 +20,7 @@ using namespace clqr::cuda;
 using namespace clqr::cuda::detail;
 
 constexpr double kTolerance = 1e-9;
+constexpr double kMultiplierTolerance = kMinimumMultiplierTolerance;
 
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -556,27 +558,28 @@ void RunEmulation(const Problem& problem, const std::string& name,
   std::vector<NodeValue> dual_values(total);
   Launch(padded, [&] {
     BuildDualLeavesKernel(stages.data(), &terminal, horizon, padded,
-                          states.data(), controls.data(), kTolerance,
+                          states.data(), controls.data(), kMultiplierTolerance,
                           dual_tree.data(), &status);
   });
   for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
     Launch(level_counts[level + 1], [&] {
-      ReduceDualTreeLevelKernel(
-          dual_tree.data(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], kTolerance, dual_tree.data(), &status);
+      ReduceDualTreeLevelKernel(dual_tree.data(), level_offsets[level],
+                                level_offsets[level + 1],
+                                level_counts[level + 1], kMultiplierTolerance,
+                                dual_tree.data(), &status);
     });
   }
   const int root = level_offsets.back();
   Launch(1, [&] {
     SolveDualRootKernel(dual_tree.data() + root, dual_values.data() + root,
-                        &status, kTolerance);
+                        &status, kMultiplierTolerance);
   });
   for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
        --level) {
     Launch(level_counts[level + 1], [&] {
       ExpandDualTreeLevelKernel(
           dual_tree.data(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], kTolerance, dual_values.data(),
+          level_counts[level + 1], kMultiplierTolerance, dual_values.data(),
           dual_values.data(), &status);
     });
   }
@@ -588,7 +591,7 @@ void RunEmulation(const Problem& problem, const std::string& name,
   Launch(nodes, [&] {
     RecoverLocalMultipliersKernel(
         stages.data(), &terminal, horizon, states.data(), controls.data(),
-        dual_values.data(), kTolerance, initial_multiplier.data(),
+        dual_values.data(), kMultiplierTolerance, initial_multiplier.data(),
         dynamics.data(), mixed.data(), state_multipliers.data(),
         terminal_multiplier.data(), &status);
   });
@@ -632,5 +635,7 @@ int main() {
   RunEmulation(MaximumConstraintProblem(), "maximum-constraint", true, true);
   RunEmulation(MoreMixedRowsThanControlsProblem(), "more-mixed-than-controls",
                true, true);
+  RunEmulation(clqr::test::MakeJaxCrossValidationProblem(), "exact-JAX-fixture",
+               true, false);
   return 0;
 }

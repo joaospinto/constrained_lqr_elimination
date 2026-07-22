@@ -23,6 +23,7 @@ namespace detail {
 namespace {
 
 constexpr int kThreads = 128;
+constexpr double kMinimumMultiplierTolerance = 1e-7;
 constexpr int kMaxRrefRows = 2 * kMaxRelationRows;
 constexpr int kMaxRrefColumns = kMaxDualColumns;
 constexpr int kMaxRrefEntries = kMaxRrefRows * kMaxRrefColumns;
@@ -1068,7 +1069,11 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
 
   // Multiplier recovery uses a balanced relation tree. It chooses zero for
   // genuinely free multiplier components, which is sufficient even when the
-  // original equality rows are redundant.
+  // original equality rows are redundant. Its right-hand side is formed from
+  // the reconstructed primal solution, so use a separate numerical floor for
+  // rank/consistency decisions after primal roundoff has accumulated.
+  const double multiplier_tolerance =
+      std::max(options.tolerance, kMinimumMultiplierTolerance);
   int padded = 1;
   while (padded < node_count) padded *= 2;
   std::vector<int> level_offsets{0};
@@ -1116,28 +1121,28 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
               "clear terminal multipliers");
     BuildDualLeavesKernel<<<padded, kThreads>>>(
         device_stages.get(), device_terminal.get(), stage_count, padded,
-        states.get(), controls.get(), options.tolerance, dual_tree.get(),
+        states.get(), controls.get(), multiplier_tolerance, dual_tree.get(),
         device_status.get());
     for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
       ReduceDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
           dual_tree.get(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], options.tolerance, dual_tree.get(),
+          level_counts[level + 1], multiplier_tolerance, dual_tree.get(),
           device_status.get());
     }
     const int root_offset = level_offsets.back();
     SolveDualRootKernel<<<1, 1>>>(dual_tree.get() + root_offset,
                                   dual_values.get() + root_offset,
-                                  device_status.get(), options.tolerance);
+                                  device_status.get(), multiplier_tolerance);
     for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
          --level) {
       ExpandDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
           dual_tree.get(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], options.tolerance, dual_values.get(),
+          level_counts[level + 1], multiplier_tolerance, dual_values.get(),
           dual_values.get(), device_status.get());
     }
     RecoverLocalMultipliersKernel<<<node_count, kThreads>>>(
         device_stages.get(), device_terminal.get(), stage_count, states.get(),
-        controls.get(), dual_values.get(), options.tolerance,
+        controls.get(), dual_values.get(), multiplier_tolerance,
         initial_multiplier.get(), dynamics_multipliers.get(),
         mixed_multipliers.get(), state_multipliers.get(),
         terminal_multiplier.get(), device_status.get());

@@ -1,95 +1,16 @@
-#include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <string>
-#include <vector>
 
 #include "clqr/cuda.h"
+#include "cuda_jax_problem.h"
 
 namespace {
 
 using clqr::Matrix;
 using clqr::Problem;
-using clqr::Stage;
 using clqr::Vector;
-
-double Value(int seed, std::size_t row, std::size_t col = 0) {
-  const double x = static_cast<double>(seed * 97 + row * 31 + col * 47);
-  return std::sin(0.017 * x) + 0.3 * std::cos(0.029 * x);
-}
-
-Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed,
-                       double scale) {
-  Matrix out(rows, cols);
-  for (std::size_t row = 0; row < rows; ++row)
-    for (std::size_t col = 0; col < cols; ++col)
-      out(row, col) = scale * Value(seed, row, col);
-  return out;
-}
-
-Vector GeneratedVector(std::size_t size, int seed, double scale) {
-  Vector out(size);
-  for (std::size_t row = 0; row < size; ++row)
-    out[row] = scale * Value(seed, row);
-  return out;
-}
-
-Matrix PositiveDefinite(std::size_t size, int seed, double diagonal) {
-  Matrix g = GeneratedMatrix(size, size, seed, 0.15);
-  Matrix out = clqr::Transpose(g) * g;
-  for (std::size_t row = 0; row < size; ++row) out(row, row) += diagonal;
-  return out;
-}
-
-double RowDot(const Matrix& matrix, std::size_t row, const Vector& vector) {
-  double value = 0.0;
-  for (std::size_t col = 0; col < vector.size(); ++col)
-    value += matrix(row, col) * vector[col];
-  return value;
-}
-
-Problem MakeProblem() {
-  constexpr std::size_t horizon = 7;
-  constexpr std::size_t n = 4;
-  constexpr std::size_t m = 3;
-  constexpr std::size_t p = 2;
-  Problem problem;
-  std::vector<Vector> x(horizon + 1);
-  std::vector<Vector> u(horizon);
-  for (std::size_t i = 0; i <= horizon; ++i)
-    x[i] = GeneratedVector(n, 101 + static_cast<int>(i), 0.5);
-  for (std::size_t i = 0; i < horizon; ++i)
-    u[i] = GeneratedVector(m, 201 + static_cast<int>(i), 0.4);
-  problem.initial_state = x[0];
-  problem.stages.resize(horizon);
-  for (std::size_t i = 0; i < horizon; ++i) {
-    Stage& stage = problem.stages[i];
-    stage.A = GeneratedMatrix(n, n, 301 + static_cast<int>(i), 0.1);
-    for (std::size_t row = 0; row < n; ++row) stage.A(row, row) += 0.85;
-    stage.B = GeneratedMatrix(n, m, 401 + static_cast<int>(i), 0.2);
-    stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
-    stage.Q = PositiveDefinite(n, 501 + static_cast<int>(i), 1.0);
-    stage.R = PositiveDefinite(m, 601 + static_cast<int>(i), 1.3);
-    stage.M = GeneratedMatrix(n, m, 701 + static_cast<int>(i), 0.025);
-    stage.q = GeneratedVector(n, 801 + static_cast<int>(i), 0.15);
-    stage.r = GeneratedVector(m, 901 + static_cast<int>(i), 0.15);
-    stage.C = Matrix(0, n);
-    stage.D = Matrix(0, m);
-    stage.d = Vector(0);
-    stage.E = GeneratedMatrix(p, n, 1001 + static_cast<int>(i), 0.3);
-    for (std::size_t col = 0; col < n; ++col)
-      stage.E(1, col) = 2.0 * stage.E(0, col);
-    stage.e = Vector(p);
-    stage.e[0] = -RowDot(stage.E, 0, x[i]);
-    stage.e[1] = 2.0 * stage.e[0];
-  }
-  problem.terminal_Q = PositiveDefinite(n, 1101, 1.4);
-  problem.terminal_q = GeneratedVector(n, 1201, 0.15);
-  problem.terminal_E = Matrix(0, n);
-  problem.terminal_e = Vector(0);
-  return problem;
-}
 
 void PrintVector(const Vector& vector) {
   std::cout << '[';
@@ -127,7 +48,7 @@ void PrintSequence(std::size_t count, Function function) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const Problem problem = MakeProblem();
+  const Problem problem = clqr::test::MakeJaxCrossValidationProblem();
   clqr::cuda::Solution solution;
   if (argc == 2 && std::string(argv[1]) == "--cpu") {
     clqr::Workspace workspace;

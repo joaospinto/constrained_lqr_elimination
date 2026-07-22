@@ -29,9 +29,13 @@ def main() -> None:
     command = [args.fixture]
     if args.cpu_fixture:
         command.append("--cpu")
-    raw = subprocess.run(
-        command, check=True, text=True, capture_output=True
-    ).stdout
+    completed = subprocess.run(command, text=True, capture_output=True)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"fixture exited with status {completed.returncode}: "
+            f"{completed.stderr.strip()}"
+        )
+    raw = completed.stdout
     data = json.loads(raw)
     print(
         "JAX backend:",
