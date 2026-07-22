@@ -21,12 +21,41 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   exit 2
 fi
 
-echo "=== CUDA compiler ==="
+echo "=== Host platform ==="
+uname -a
+if [[ -r /etc/os-release ]]; then
+  cat /etc/os-release
+fi
+
+echo "=== CPU topology and identification ==="
+lscpu
+echo "effective logical CPUs: $(nproc)"
+echo "all visible logical CPUs: $(nproc --all)"
+if [[ -r /proc/self/status ]]; then
+  sed -n "/^Cpus_allowed_list:/p;/^Mems_allowed_list:/p" /proc/self/status
+fi
+
+echo "=== System memory ==="
+if [[ -r /proc/meminfo ]]; then
+  sed -n "/^MemTotal:/p;/^SwapTotal:/p" /proc/meminfo
+fi
+free -h
+
+echo "=== Build toolchain ==="
+cmake --version
+c++ --version
 nvcc --version
-echo "=== GPU ==="
-nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
-echo "=== CPU allocation ==="
-lscpu | sed -n "/^Architecture:/p;/^CPU(s):/p;/^Model name:/p;/^Thread(s) per core:/p;/^Core(s) per socket:/p;/^Socket(s):/p"
+
+echo "=== NVIDIA runtime summary ==="
+nvidia-smi
+echo "=== GPU identification and fixed specifications ==="
+gpu_query="index,name,compute_cap,driver_version,vbios_version,pci.bus_id,memory.total,clocks.max.graphics,clocks.max.sm,clocks.max.memory"
+if ! nvidia-smi --query-gpu="${gpu_query}" --format=csv; then
+  echo "Extended GPU query unsupported; reporting portable fields instead."
+  nvidia-smi \
+    --query-gpu=index,name,driver_version,pci.bus_id,memory.total \
+    --format=csv
+fi
 
 if [[ "${CLQR_SKIP_JAX:-0}" != "1" ]]; then
   if [[ ! -d "${jax_dir}/.git" ]]; then
