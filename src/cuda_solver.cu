@@ -1930,7 +1930,12 @@ __global__ void RecoverLocalMultipliersKernel(
   if (!BlockEnabled(status, &block_enabled)) return;
   __shared__ Scalar
       matrix[kMaxRrefRows * (kMaxMixedConstraints + kMaxStateConstraints + 1)];
+  __shared__ Scalar original_matrix[
+      (kMaxStateDimension + kMaxControlDimension) *
+      (kMaxMixedConstraints + kMaxStateConstraints + 1)];
   __shared__ Scalar factors[kMaxRrefRows];
+  __shared__ Scalar
+      local_solution[kMaxMixedConstraints + kMaxStateConstraints];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
@@ -1938,7 +1943,6 @@ __global__ void RecoverLocalMultipliersKernel(
   __shared__ int rows;
   __shared__ int variables;
   __shared__ int local_ok;
-  __shared__ Scalar conditioned_rhs_scale;
   __shared__ Scalar
       constraint_scales[kMaxMixedConstraints + kMaxStateConstraints];
   const PackedTerminal& terminal = *terminal_ptr;
@@ -2061,30 +2065,46 @@ __global__ void RecoverLocalMultipliersKernel(
     }
   }
   __syncthreads();
-  if (threadIdx.x == 0) {
-    conditioned_rhs_scale = ConditionedRhsScale(
-        matrix, rows, columns, variables, rank_tolerance);
-  }
+  for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
+    original_matrix[i] = matrix[i];
   __syncthreads();
   RrefBlock(matrix, rows, columns, variables, rank_tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(
-        matrix, rows, columns, variables, consistency_tolerance,
-        consistency_tolerance * conditioned_rhs_scale);
+    for (int variable = 0; variable < variables; ++variable)
+      local_solution[variable] = Scalar{0};
+    for (int p = 0; p < rank; ++p) {
+      if (pivot_columns[p] < variables) {
+        local_solution[pivot_columns[p]] = matrix[p * columns + variables];
+      }
+    }
+    local_ok = 1;
+    for (int row = 0; row < rows; ++row) {
+      Scalar value = Scalar{0};
+      Scalar scale = DeviceAbs(original_matrix[row * columns + variables]);
+      for (int variable = 0; variable < variables; ++variable) {
+        const Scalar term = original_matrix[row * columns + variable] *
+                            local_solution[variable];
+        value += term;
+        scale += DeviceAbs(term);
+      }
+      if (scale < Scalar{1}) scale = Scalar{1};
+      const Scalar residual = DeviceAbs(
+          value - original_matrix[row * columns + variables]);
+      if (residual > consistency_tolerance * scale) {
+        local_ok = 0;
+        break;
+      }
+    }
     if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 17);
   }
   __syncthreads();
   if (!local_ok) return;
   if (threadIdx.x == 0) {
-    Scalar solution[kMaxMixedConstraints + kMaxStateConstraints]{};
-    for (int p = 0; p < rank; ++p) {
-      if (pivot_columns[p] < variables)
-        solution[pivot_columns[p]] = matrix[p * columns + variables];
-    }
     if (index == stage_count) {
       for (int row = 0; row < terminal.state; ++row)
-        terminal_multiplier[row] = solution[row] / constraint_scales[row];
+        terminal_multiplier[row] =
+            local_solution[row] / constraint_scales[row];
       if (stage_count == 0) {
         for (int row = 0; row < terminal.n; ++row)
           initial_multiplier[row] = endpoints.left[row];
@@ -2093,10 +2113,11 @@ __global__ void RecoverLocalMultipliersKernel(
       const PackedStage& s = stages[index];
       for (int row = 0; row < s.mixed; ++row)
         mixed_multipliers[index * kMaxMixedConstraints + row] =
-            solution[row] / constraint_scales[row];
+            local_solution[row] / constraint_scales[row];
       for (int row = 0; row < s.state; ++row)
         state_multipliers[index * kMaxStateConstraints + row] =
-            solution[s.mixed + row] / constraint_scales[s.mixed + row];
+            local_solution[s.mixed + row] /
+            constraint_scales[s.mixed + row];
       if (index == 0) {
         for (int row = 0; row < s.n; ++row)
           initial_multiplier[row] = endpoints.left[row];
