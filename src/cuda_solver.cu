@@ -43,6 +43,40 @@ __device__ inline bool DeviceFinite(Scalar x) {
   return x >= -kScalarMax && x <= kScalarMax;
 }
 
+#ifdef CLQR_CUDA_EMULATION
+constexpr int kActiveWarpWidth = 1;
+#else
+constexpr int kActiveWarpWidth = 32;
+#endif
+
+__device__ Scalar WarpSum(Scalar value) {
+#ifdef CLQR_CUDA_EMULATION
+  return value;
+#else
+  constexpr unsigned kFullWarp = 0xffffffffu;
+  for (int offset = 16; offset > 0; offset /= 2)
+    value += __shfl_down_sync(kFullWarp, value, offset);
+  return __shfl_sync(kFullWarp, value, 0);
+#endif
+}
+
+__device__ Scalar WarpMaximum(Scalar value) {
+#ifdef CLQR_CUDA_EMULATION
+  return value;
+#else
+  constexpr unsigned kFullWarp = 0xffffffffu;
+  for (int offset = 16; offset > 0; offset /= 2)
+    value = fmax(value, __shfl_down_sync(kFullWarp, value, offset));
+  return __shfl_sync(kFullWarp, value, 0);
+#endif
+}
+
+__device__ void WarpSynchronize() {
+#ifndef CLQR_CUDA_EMULATION
+  __syncwarp();
+#endif
+}
+
 __device__ void SetFailure(DeviceStatus* status, int code, int stage,
                            int detail) {
   if (atomicCAS(&status->code, kDeviceOk, code) == kDeviceOk) {
@@ -241,12 +275,14 @@ __device__ void EliminateRelationOrthogonally(
     Scalar* matrix, int rows, int columns, int eliminated_columns, int left_dim,
     int right_dim, Scalar rank_tolerance, Scalar consistency_tolerance,
     Relation* relation, int* local_ok) {
-  if (threadIdx.x == 0) {
+  if (threadIdx.x < kActiveWarpWidth) {
+    const int lane = threadIdx.x;
     const Scalar rank_threshold_squared = rank_tolerance * rank_tolerance;
     Scalar rhs_scale = Scalar{1};
-    for (int row = 0; row < rows; ++row)
+    for (int row = lane; row < rows; row += kActiveWarpWidth)
       rhs_scale =
           fmax(rhs_scale, DeviceAbs(matrix[row * columns + columns - 1]));
+    rhs_scale = WarpMaximum(rhs_scale);
 
     int eliminated_rank = 0;
     for (int basis = 0; basis < eliminated_columns; ++basis) {
@@ -254,10 +290,11 @@ __device__ void EliminateRelationOrthogonally(
       Scalar best_norm_squared = Scalar{-1};
       for (int candidate = basis; candidate < eliminated_columns; ++candidate) {
         Scalar norm_squared = Scalar{0};
-        for (int row = 0; row < rows; ++row) {
+        for (int row = lane; row < rows; row += kActiveWarpWidth) {
           const Scalar value = matrix[row * columns + candidate];
           norm_squared += value * value;
         }
+        norm_squared = WarpSum(norm_squared);
         if (norm_squared > best_norm_squared) {
           best_norm_squared = norm_squared;
           best_column = candidate;
@@ -265,44 +302,51 @@ __device__ void EliminateRelationOrthogonally(
       }
       if (!(best_norm_squared > rank_threshold_squared)) break;
       if (best_column != basis) {
-        for (int row = 0; row < rows; ++row) {
+        for (int row = lane; row < rows; row += kActiveWarpWidth) {
           const Scalar value = matrix[row * columns + basis];
           matrix[row * columns + basis] = matrix[row * columns + best_column];
           matrix[row * columns + best_column] = value;
         }
+        WarpSynchronize();
       }
       for (int pass = 0; pass < 2; ++pass) {
         for (int previous = 0; previous < basis; ++previous) {
           Scalar projection = Scalar{0};
-          for (int row = 0; row < rows; ++row) {
+          for (int row = lane; row < rows; row += kActiveWarpWidth) {
             projection += matrix[row * columns + basis] *
                           matrix[row * columns + previous];
           }
-          for (int row = 0; row < rows; ++row) {
+          projection = WarpSum(projection);
+          for (int row = lane; row < rows; row += kActiveWarpWidth) {
             matrix[row * columns + basis] -=
                 projection * matrix[row * columns + previous];
           }
+          WarpSynchronize();
         }
       }
       Scalar norm_squared = Scalar{0};
-      for (int row = 0; row < rows; ++row) {
+      for (int row = lane; row < rows; row += kActiveWarpWidth) {
         const Scalar value = matrix[row * columns + basis];
         norm_squared += value * value;
       }
+      norm_squared = WarpSum(norm_squared);
       if (!(norm_squared > rank_threshold_squared)) break;
       const Scalar inverse_norm = Scalar{1} / sqrt(norm_squared);
-      for (int row = 0; row < rows; ++row)
+      for (int row = lane; row < rows; row += kActiveWarpWidth)
         matrix[row * columns + basis] *= inverse_norm;
+      WarpSynchronize();
       for (int candidate = basis + 1; candidate < eliminated_columns;
            ++candidate) {
         for (int pass = 0; pass < 2; ++pass) {
           Scalar projection = Scalar{0};
-          for (int row = 0; row < rows; ++row)
+          for (int row = lane; row < rows; row += kActiveWarpWidth)
             projection += matrix[row * columns + candidate] *
                           matrix[row * columns + basis];
-          for (int row = 0; row < rows; ++row)
+          projection = WarpSum(projection);
+          for (int row = lane; row < rows; row += kActiveWarpWidth)
             matrix[row * columns + candidate] -=
                 projection * matrix[row * columns + basis];
+          WarpSynchronize();
         }
       }
       ++eliminated_rank;
@@ -315,12 +359,14 @@ __device__ void EliminateRelationOrthogonally(
       for (int basis = 0; basis < eliminated_rank; ++basis) {
         for (int pass = 0; pass < 2; ++pass) {
           Scalar projection = Scalar{0};
-          for (int row = 0; row < rows; ++row)
+          for (int row = lane; row < rows; row += kActiveWarpWidth)
             projection +=
                 matrix[row * columns + col] * matrix[row * columns + basis];
-          for (int row = 0; row < rows; ++row)
+          projection = WarpSum(projection);
+          for (int row = lane; row < rows; row += kActiveWarpWidth)
             matrix[row * columns + col] -=
                 projection * matrix[row * columns + basis];
+          WarpSynchronize();
         }
       }
     }
@@ -332,11 +378,12 @@ __device__ void EliminateRelationOrthogonally(
       Scalar best_norm_squared = Scalar{-1};
       for (int candidate = relation_rank; candidate < rows; ++candidate) {
         Scalar norm_squared = Scalar{0};
-        for (int col = 0; col < outer_columns; ++col) {
+        for (int col = lane; col < outer_columns; col += kActiveWarpWidth) {
           const Scalar value =
               matrix[candidate * columns + eliminated_columns + col];
           norm_squared += value * value;
         }
+        norm_squared = WarpSum(norm_squared);
         if (norm_squared > best_norm_squared) {
           best_norm_squared = norm_squared;
           best_row = candidate;
@@ -344,80 +391,92 @@ __device__ void EliminateRelationOrthogonally(
       }
       if (!(best_norm_squared > rank_threshold_squared)) break;
       if (best_row != relation_rank) {
-        for (int col = eliminated_columns; col < columns; ++col) {
+        for (int outer = lane; outer <= outer_columns;
+             outer += kActiveWarpWidth) {
+          const int col = eliminated_columns + outer;
           const Scalar value = matrix[relation_rank * columns + col];
           matrix[relation_rank * columns + col] =
               matrix[best_row * columns + col];
           matrix[best_row * columns + col] = value;
         }
+        WarpSynchronize();
       }
       for (int pass = 0; pass < 2; ++pass) {
         for (int previous = 0; previous < relation_rank; ++previous) {
           Scalar projection = Scalar{0};
-          for (int col = 0; col < outer_columns; ++col) {
+          for (int col = lane; col < outer_columns; col += kActiveWarpWidth) {
             projection +=
                 matrix[relation_rank * columns + eliminated_columns + col] *
                 matrix[previous * columns + eliminated_columns + col];
           }
-          for (int col = 0; col <= outer_columns; ++col) {
+          projection = WarpSum(projection);
+          for (int col = lane; col <= outer_columns; col += kActiveWarpWidth) {
             matrix[relation_rank * columns + eliminated_columns + col] -=
                 projection *
                 matrix[previous * columns + eliminated_columns + col];
           }
+          WarpSynchronize();
         }
       }
       Scalar norm_squared = Scalar{0};
-      for (int col = 0; col < outer_columns; ++col) {
+      for (int col = lane; col < outer_columns; col += kActiveWarpWidth) {
         const Scalar value =
             matrix[relation_rank * columns + eliminated_columns + col];
         norm_squared += value * value;
       }
+      norm_squared = WarpSum(norm_squared);
       if (!(norm_squared > rank_threshold_squared)) break;
       const Scalar inverse_norm = Scalar{1} / sqrt(norm_squared);
-      for (int col = 0; col <= outer_columns; ++col)
+      for (int col = lane; col <= outer_columns; col += kActiveWarpWidth)
         matrix[relation_rank * columns + eliminated_columns + col] *=
             inverse_norm;
+      WarpSynchronize();
       for (int row = relation_rank + 1; row < rows; ++row) {
         for (int pass = 0; pass < 2; ++pass) {
           Scalar projection = Scalar{0};
-          for (int col = 0; col < outer_columns; ++col) {
+          for (int col = lane; col < outer_columns; col += kActiveWarpWidth) {
             projection +=
                 matrix[row * columns + eliminated_columns + col] *
                 matrix[relation_rank * columns + eliminated_columns + col];
           }
-          for (int col = 0; col <= outer_columns; ++col) {
+          projection = WarpSum(projection);
+          for (int col = lane; col <= outer_columns; col += kActiveWarpWidth) {
             matrix[row * columns + eliminated_columns + col] -=
                 projection *
                 matrix[relation_rank * columns + eliminated_columns + col];
           }
+          WarpSynchronize();
         }
       }
       ++relation_rank;
     }
 
-    *local_ok = 1;
-    for (int row = relation_rank; row < rows; ++row) {
-      if (DeviceAbs(matrix[row * columns + columns - 1]) >
-          consistency_tolerance * rhs_scale) {
-        *local_ok = 0;
-        break;
-      }
+    Scalar maximum_residual = Scalar{0};
+    for (int row = relation_rank + lane; row < rows; row += kActiveWarpWidth)
+      maximum_residual = fmax(maximum_residual,
+                              DeviceAbs(matrix[row * columns + columns - 1]));
+    maximum_residual = WarpMaximum(maximum_residual);
+    const bool okay = maximum_residual <= consistency_tolerance * rhs_scale;
+    if (lane == 0) {
+      *local_ok = okay;
+      relation->left_dim = left_dim;
+      relation->right_dim = right_dim;
+      relation->rows = relation_rank;
     }
-    relation->left_dim = left_dim;
-    relation->right_dim = right_dim;
-    relation->rows = relation_rank;
-    if (*local_ok) {
-      for (int row = 0; row < relation_rank; ++row) {
-        for (int col = 0; col < left_dim; ++col) {
-          relation->left[row * kMaxStateDimension + col] =
-              matrix[row * columns + eliminated_columns + col];
+    if (okay) {
+      const int outer_entries = relation_rank * outer_columns;
+      for (int entry = lane; entry < outer_entries; entry += kActiveWarpWidth) {
+        const int row = entry / outer_columns;
+        const int col = entry % outer_columns;
+        const Scalar value = matrix[row * columns + eliminated_columns + col];
+        if (col < left_dim) {
+          relation->left[row * kMaxStateDimension + col] = value;
+        } else {
+          relation->right[row * kMaxStateDimension + col - left_dim] = value;
         }
-        for (int col = 0; col < right_dim; ++col) {
-          relation->right[row * kMaxStateDimension + col] =
-              matrix[row * columns + eliminated_columns + left_dim + col];
-        }
-        relation->rhs[row] = matrix[row * columns + columns - 1];
       }
+      for (int row = lane; row < relation_rank; row += kActiveWarpWidth)
+        relation->rhs[row] = matrix[row * columns + columns - 1];
     }
   }
   __syncthreads();
@@ -433,28 +492,33 @@ __device__ void SolveSystemOrthogonally(Scalar* matrix, int rows, int columns,
                                         Scalar* upper, Scalar* rhs_projection,
                                         Scalar* solution, int* permutation,
                                         int* rank, int* local_ok) {
-  if (threadIdx.x == 0) {
-    for (int index = 0; index < variables * variables; ++index)
+  if (threadIdx.x < kActiveWarpWidth) {
+    const int lane = threadIdx.x;
+    for (int index = lane; index < variables * variables;
+         index += kActiveWarpWidth)
       upper[index] = Scalar{0};
-    for (int variable = 0; variable < variables; ++variable) {
+    for (int variable = lane; variable < variables;
+         variable += kActiveWarpWidth) {
       permutation[variable] = variable;
       rhs_projection[variable] = Scalar{0};
       solution[variable] = Scalar{0};
     }
-    for (int row = 0; row < rows; ++row)
+    for (int row = lane; row < rows; row += kActiveWarpWidth)
       residual_rhs[row] = matrix[row * columns + variables];
+    WarpSynchronize();
 
-    *rank = 0;
+    int computed_rank = 0;
     const Scalar rank_threshold_squared = rank_tolerance * rank_tolerance;
     for (int basis = 0; basis < variables; ++basis) {
       int best_column = basis;
       Scalar best_norm_squared = Scalar{-1};
       for (int candidate = basis; candidate < variables; ++candidate) {
         Scalar norm_squared = Scalar{0};
-        for (int row = 0; row < rows; ++row) {
+        for (int row = lane; row < rows; row += kActiveWarpWidth) {
           const Scalar value = matrix[row * columns + candidate];
           norm_squared += value * value;
         }
+        norm_squared = WarpSum(norm_squared);
         if (norm_squared > best_norm_squared) {
           best_norm_squared = norm_squared;
           best_column = candidate;
@@ -462,72 +526,88 @@ __device__ void SolveSystemOrthogonally(Scalar* matrix, int rows, int columns,
       }
       if (!(best_norm_squared > rank_threshold_squared)) break;
       if (best_column != basis) {
-        for (int row = 0; row < rows; ++row) {
+        for (int row = lane; row < rows; row += kActiveWarpWidth) {
           const Scalar value = matrix[row * columns + basis];
           matrix[row * columns + basis] = matrix[row * columns + best_column];
           matrix[row * columns + best_column] = value;
         }
-        for (int previous = 0; previous < basis; ++previous) {
+        for (int previous = lane; previous < basis;
+             previous += kActiveWarpWidth) {
           const Scalar value = upper[previous * variables + basis];
           upper[previous * variables + basis] =
               upper[previous * variables + best_column];
           upper[previous * variables + best_column] = value;
         }
-        const int variable = permutation[basis];
-        permutation[basis] = permutation[best_column];
-        permutation[best_column] = variable;
+        if (lane == 0) {
+          const int variable = permutation[basis];
+          permutation[basis] = permutation[best_column];
+          permutation[best_column] = variable;
+        }
+        WarpSynchronize();
       }
 
       Scalar norm_squared = Scalar{0};
-      for (int row = 0; row < rows; ++row) {
+      for (int row = lane; row < rows; row += kActiveWarpWidth) {
         const Scalar value = matrix[row * columns + basis];
         norm_squared += value * value;
       }
+      norm_squared = WarpSum(norm_squared);
       if (!(norm_squared > rank_threshold_squared)) break;
       const Scalar norm = sqrt(norm_squared);
-      upper[basis * variables + basis] = norm;
-      for (int row = 0; row < rows; ++row)
+      if (lane == 0) upper[basis * variables + basis] = norm;
+      for (int row = lane; row < rows; row += kActiveWarpWidth)
         matrix[row * columns + basis] /= norm;
+      WarpSynchronize();
 
       for (int pass = 0; pass < 2; ++pass) {
         Scalar projection = Scalar{0};
-        for (int row = 0; row < rows; ++row)
+        for (int row = lane; row < rows; row += kActiveWarpWidth)
           projection += matrix[row * columns + basis] * residual_rhs[row];
-        rhs_projection[basis] += projection;
-        for (int row = 0; row < rows; ++row)
+        projection = WarpSum(projection);
+        if (lane == 0) rhs_projection[basis] += projection;
+        for (int row = lane; row < rows; row += kActiveWarpWidth)
           residual_rhs[row] -= projection * matrix[row * columns + basis];
+        WarpSynchronize();
       }
       for (int candidate = basis + 1; candidate < variables; ++candidate) {
         for (int pass = 0; pass < 2; ++pass) {
           Scalar projection = Scalar{0};
-          for (int row = 0; row < rows; ++row) {
+          for (int row = lane; row < rows; row += kActiveWarpWidth) {
             projection += matrix[row * columns + basis] *
                           matrix[row * columns + candidate];
           }
-          upper[basis * variables + candidate] += projection;
-          for (int row = 0; row < rows; ++row) {
+          projection = WarpSum(projection);
+          if (lane == 0) upper[basis * variables + candidate] += projection;
+          for (int row = lane; row < rows; row += kActiveWarpWidth) {
             matrix[row * columns + candidate] -=
                 projection * matrix[row * columns + basis];
           }
+          WarpSynchronize();
         }
       }
-      ++(*rank);
+      ++computed_rank;
     }
 
     Scalar maximum_residual = Scalar{0};
-    for (int row = 0; row < rows; ++row)
+    for (int row = lane; row < rows; row += kActiveWarpWidth)
       maximum_residual = fmax(maximum_residual, DeviceAbs(residual_rhs[row]));
-    *local_ok = maximum_residual <= consistency_tolerance * rhs_scale;
-    if (*local_ok) {
+    maximum_residual = WarpMaximum(maximum_residual);
+    const bool okay = maximum_residual <= consistency_tolerance * rhs_scale;
+    WarpSynchronize();
+    if (lane == 0) {
+      *rank = computed_rank;
+      *local_ok = okay;
+    }
+    if (okay && lane == 0) {
       Scalar pivoted_solution[kMaxStateDimension]{};
-      for (int reverse = 0; reverse < *rank; ++reverse) {
-        const int row = *rank - 1 - reverse;
+      for (int reverse = 0; reverse < computed_rank; ++reverse) {
+        const int row = computed_rank - 1 - reverse;
         Scalar value = rhs_projection[row];
-        for (int col = row + 1; col < *rank; ++col)
+        for (int col = row + 1; col < computed_rank; ++col)
           value -= upper[row * variables + col] * pivoted_solution[col];
         pivoted_solution[row] = value / upper[row * variables + row];
       }
-      for (int variable = 0; variable < *rank; ++variable)
+      for (int variable = 0; variable < computed_rank; ++variable)
         solution[permutation[variable]] = pivoted_solution[variable];
     }
   }
