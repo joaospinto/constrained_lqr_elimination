@@ -172,6 +172,15 @@ int main() {
   Expect(constrained_external_solution.status == SolveStatus::kOptimal,
          "constrained external workspace solve status");
 
+  const std::size_t constrained_32 =
+      Workspace::RequiredBytes(MakeConstrainedProblem(32, 4, 2));
+  const std::size_t constrained_64 =
+      Workspace::RequiredBytes(MakeConstrainedProblem(64, 4, 2));
+  Expect(constrained_64 > constrained_32,
+         "constrained workspace should grow with the horizon");
+  Expect(constrained_64 <= 3 * constrained_32,
+         "constrained workspace should scale linearly with the horizon");
+
   Problem terminal_constrained = MakeProblem(8, 3, 2);
   terminal_constrained.terminal_E = Matrix(1, 3);
   terminal_constrained.terminal_E(0, 0) = 1.0;

@@ -43,10 +43,51 @@ struct WorkingProblem {
   Vector terminal_e;
 };
 
+struct RrefOperations {
+  WorkspaceVector<std::size_t> pivot_rows;
+  WorkspaceVector<std::size_t> best_rows;
+  Vector pivot_values;
+  Matrix factors;
+  std::size_t count = 0;
+};
+
+struct AffineStateBasis {
+  Matrix T;
+  Vector offset;
+  RrefOperations rhs_operations;
+  WorkspaceVector<std::size_t> free_rows;
+  WorkspaceVector<std::size_t> pivot_rows;
+  bool active = false;
+  bool infeasible = false;
+  bool redundant = false;
+  std::string message;
+};
+
+struct MixedElimination {
+  Matrix Y;
+  Matrix Z;
+  Vector y;
+  Matrix state_C;
+  Vector state_d;
+  RrefOperations rhs_operations;
+  WorkspaceVector<std::size_t> pivot_columns;
+  WorkspaceVector<std::size_t> state_rref_rows;
+  bool active = false;
+  bool infeasible = false;
+  bool redundant = false;
+  std::string message;
+};
+
+struct EliminationStageTrace {
+  MixedElimination mixed;
+};
+
 struct WorkingState {
   WorkingProblem problem;
   WorkspaceVector<StateMap> state_maps;
   WorkspaceVector<ControlMap> control_maps;
+  WorkspaceVector<AffineStateBasis> state_bases;
+  WorkspaceVector<EliminationStageTrace> elimination_traces;
 };
 
 struct NewtonKktDiagnostics {
@@ -81,30 +122,6 @@ struct LinearParametrization {
   Matrix basis;
   Vector offset;
   bool inconsistent = false;
-};
-
-struct AffineSet {
-  Matrix basis;
-  Vector offset;
-};
-
-struct StageMultiplierMap {
-  AffineSet future_y;
-  Matrix local_basis;
-  Vector local_offset;
-  std::size_t future_parameter_size = 0;
-  std::size_t mixed_size = 0;
-  std::size_t state_size = 0;
-};
-
-struct AffineStateBasis {
-  Matrix T;
-  Vector offset;
-  WorkspaceVector<std::size_t> free_rows;
-  WorkspaceVector<std::size_t> pivot_rows;
-  bool infeasible = false;
-  bool redundant = false;
-  std::string message;
 };
 
 void Check(bool condition, const char* message) {
@@ -221,6 +238,92 @@ bool Contains(const WorkspaceVector<std::size_t>& values, std::size_t needle) {
     if (value == needle) return true;
   }
   return false;
+}
+
+struct TracedRref {
+  RrefResult rref;
+  RrefOperations operations;
+};
+
+TracedRref RrefWithOperations(Matrix matrix,
+                              std::size_t pivot_column_limit,
+                              double tolerance) {
+  TracedRref result;
+  const std::size_t maximum_operations =
+      std::min(matrix.rows(), pivot_column_limit);
+  result.rref.pivot_columns.reserve(maximum_operations);
+  result.rref.pivot_rows.reserve(maximum_operations);
+  result.operations.pivot_rows.reserve(maximum_operations);
+  result.operations.best_rows.reserve(maximum_operations);
+  result.operations.pivot_values = Vector(maximum_operations);
+  result.operations.factors = Matrix(maximum_operations, matrix.rows());
+  std::size_t pivot_row = 0;
+  const std::size_t limit = std::min(pivot_column_limit, matrix.cols());
+  for (std::size_t col = 0; col < limit && pivot_row < matrix.rows(); ++col) {
+    std::size_t best_row = pivot_row;
+    double best = std::abs(matrix(best_row, col));
+    for (std::size_t row = pivot_row + 1; row < matrix.rows(); ++row) {
+      const double candidate = std::abs(matrix(row, col));
+      if (candidate > best) {
+        best = candidate;
+        best_row = row;
+      }
+    }
+    if (best <= tolerance) continue;
+    const std::size_t operation = result.operations.count++;
+    result.operations.pivot_rows.push_back(pivot_row);
+    result.operations.best_rows.push_back(best_row);
+    if (best_row != pivot_row) {
+      for (std::size_t j = 0; j < matrix.cols(); ++j) {
+        std::swap(matrix(pivot_row, j), matrix(best_row, j));
+      }
+    }
+    const double pivot_value = matrix(pivot_row, col);
+    result.operations.pivot_values[operation] = pivot_value;
+    for (std::size_t j = col; j < matrix.cols(); ++j) {
+      matrix(pivot_row, j) /= pivot_value;
+    }
+    for (std::size_t row = 0; row < matrix.rows(); ++row) {
+      if (row == pivot_row) continue;
+      const double factor = matrix(row, col);
+      if (IsNearlyZero(factor, tolerance)) continue;
+      result.operations.factors(operation, row) = factor;
+      for (std::size_t j = col; j < matrix.cols(); ++j) {
+        matrix(row, j) -= factor * matrix(pivot_row, j);
+      }
+    }
+    result.rref.pivot_columns.push_back(col);
+    result.rref.pivot_rows.push_back(pivot_row);
+    ++pivot_row;
+  }
+  for (double& value : matrix.data()) {
+    if (IsNearlyZero(value, tolerance)) value = 0.0;
+  }
+  result.rref.matrix = std::move(matrix);
+  return result;
+}
+
+Vector ApplyRrefTranspose(const RrefOperations& operations,
+                          Vector cotangent) {
+  Check(cotangent.size() == operations.factors.cols(),
+        "RREF transpose shape mismatch");
+  for (std::size_t reverse = 0; reverse < operations.count; ++reverse) {
+    const std::size_t operation = operations.count - 1 - reverse;
+    const std::size_t pivot_row = operations.pivot_rows[operation];
+    const std::size_t best_row = operations.best_rows[operation];
+    double off_pivot = 0.0;
+    for (std::size_t row = 0; row < cotangent.size(); ++row) {
+      if (row == pivot_row) continue;
+      off_pivot += operations.factors(operation, row) * cotangent[row];
+    }
+    cotangent[pivot_row] =
+        (cotangent[pivot_row] - off_pivot) /
+        operations.pivot_values[operation];
+    if (best_row != pivot_row) {
+      std::swap(cotangent[pivot_row], cotangent[best_row]);
+    }
+  }
+  return cotangent;
 }
 
 LinearParametrization ParametrizeLinearSystem(const Matrix& a, const Vector& b,
@@ -444,6 +547,8 @@ WorkingState Initialize(const Problem& problem) {
   const std::size_t num_states = problem.stages.size() + 1;
   state.state_maps.resize(num_states);
   state.control_maps.resize(problem.stages.size());
+  state.state_bases.resize(num_states);
+  state.elimination_traces.resize(problem.stages.size());
   for (std::size_t i = 0; i < problem.stages.size(); ++i) {
     const std::size_t n = problem.stages[i].A.cols();
     const std::size_t m = problem.stages[i].B.cols();
@@ -473,6 +578,7 @@ LinearParametrization ReducedInitialState(const Problem& original, const StateMa
 AffineStateBasis StateBasis(const Matrix& E, const Vector& e, std::size_t n,
                             double tolerance) {
   AffineStateBasis out;
+  out.active = E.rows() > 0;
   if (E.rows() == 0) {
     out.T = Identity(n);
     out.offset = Vector(n);
@@ -485,7 +591,8 @@ AffineStateBasis StateBasis(const Matrix& E, const Vector& e, std::size_t n,
     for (std::size_t col = 0; col < n; ++col) augmented(row, col) = E(row, col);
     augmented(row, n) = e[row];
   }
-  RrefResult rref = Rref(augmented, n, tolerance);
+  TracedRref traced = RrefWithOperations(std::move(augmented), n, tolerance);
+  const RrefResult& rref = traced.rref;
   for (std::size_t row = 0; row < rref.matrix.rows(); ++row) {
     bool zero_e = true;
     for (std::size_t col = 0; col < n; ++col) {
@@ -518,19 +625,9 @@ AffineStateBasis StateBasis(const Matrix& E, const Vector& e, std::size_t n,
       out.T(pivot_col, free_index) = -rref.matrix(row, out.free_rows[free_index]);
     }
   }
+  out.rhs_operations = std::move(traced.operations);
   return out;
 }
-
-struct MixedElimination {
-  Matrix Y;
-  Matrix Z;
-  Vector y;
-  Matrix state_C;
-  Vector state_d;
-  bool infeasible = false;
-  bool redundant = false;
-  std::string message;
-};
 
 MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
                               double tolerance) {
@@ -538,6 +635,7 @@ MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
   const std::size_t constraints = D.rows();
   const std::size_t m = D.cols();
   const std::size_t n = C.cols();
+  out.active = constraints > 0;
   if (constraints == 0) {
     out.Y = Matrix(m, n);
     out.Z = Identity(m);
@@ -552,7 +650,8 @@ MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
     for (std::size_t col = 0; col < n; ++col) augmented(row, m + col) = C(row, col);
     augmented(row, m + n) = d[row];
   }
-  RrefResult rref = Rref(augmented, m, tolerance);
+  TracedRref traced = RrefWithOperations(std::move(augmented), m, tolerance);
+  const RrefResult& rref = traced.rref;
   WorkspaceVector<std::size_t> free_cols;
   free_cols.reserve(m);
   for (std::size_t col = 0; col < m; ++col) {
@@ -561,6 +660,7 @@ MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
   out.Y = Matrix(m, n);
   out.Z = Matrix(m, free_cols.size());
   out.y = Vector(m);
+  out.pivot_columns = rref.pivot_columns;
   for (std::size_t j = 0; j < free_cols.size(); ++j) out.Z(free_cols[j], j) = 1.0;
   for (std::size_t pivot_index = 0; pivot_index < rref.pivot_columns.size(); ++pivot_index) {
     const std::size_t pivot_col = rref.pivot_columns[pivot_index];
@@ -604,11 +704,13 @@ MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
   }
   out.state_C = Matrix(residual_rows.size(), n);
   out.state_d = Vector(residual_rows.size());
+  out.state_rref_rows = residual_rows;
   for (std::size_t i = 0; i < residual_rows.size(); ++i) {
     const std::size_t row = residual_rows[i];
     for (std::size_t col = 0; col < n; ++col) out.state_C(i, col) = rref.matrix(row, m + col);
     out.state_d[i] = rref.matrix(row, m + n);
   }
+  out.rhs_operations = std::move(traced.operations);
   return out;
 }
 
@@ -791,6 +893,7 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
   state.control_maps[i].state_linear = std::move(new_state_linear);
   state.control_maps[i].control_linear = std::move(new_control_linear);
   state.control_maps[i].offset = std::move(new_offset);
+  state.elimination_traces[i].mixed = std::move(basis);
   return true;
 }
 
@@ -929,32 +1032,29 @@ void EliminateConstraintsRightToLeft(WorkingState& state, double tolerance,
                                      std::string* error,
                                      NewtonKktDiagnostics* diagnostics) {
   const std::size_t N = state.problem.stages.size();
-  AffineStateBasis next;
-  bool next_is_identity = true;
   if (state.problem.terminal_E.rows() > 0) {
-    next = StateBasis(state.problem.terminal_E, state.problem.terminal_e,
-                      state.problem.terminal_Q.rows(), tolerance);
-    CheckStateBasis(next, N, error, diagnostics);
-    ApplyTerminalStateBasis(state, next, tolerance);
-    next_is_identity = StateBasisIsIdentity(next, tolerance);
+    state.state_bases[N] =
+        StateBasis(state.problem.terminal_E, state.problem.terminal_e,
+                   state.problem.terminal_Q.rows(), tolerance);
+    CheckStateBasis(state.state_bases[N], N, error, diagnostics);
+    ApplyTerminalStateBasis(state, state.state_bases[N], tolerance);
   }
 
   for (std::size_t rev = 0; rev < N; ++rev) {
     const std::size_t i = N - 1 - rev;
-    if (!next_is_identity) ApplyNextStateBasisToStage(state, i, next, tolerance);
+    const AffineStateBasis& next = state.state_bases[i + 1];
+    if (next.active && !StateBasisIsIdentity(next, tolerance)) {
+      ApplyNextStateBasisToStage(state, i, next, tolerance);
+    }
     EliminateMixedStageWithMaps(state, i, tolerance, error, diagnostics);
 
     Stage& s = state.problem.stages[i];
     if (s.E.rows() == 0) {
-      next = AffineStateBasis{};
-      next_is_identity = true;
       continue;
     }
-    AffineStateBasis cur = StateBasis(s.E, s.e, s.A.cols(), tolerance);
-    CheckStateBasis(cur, i, error, diagnostics);
-    ApplyCurrentStateBasisToStage(state, i, cur, tolerance);
-    next_is_identity = StateBasisIsIdentity(cur, tolerance);
-    next = std::move(cur);
+    state.state_bases[i] = StateBasis(s.E, s.e, s.A.cols(), tolerance);
+    CheckStateBasis(state.state_bases[i], i, error, diagnostics);
+    ApplyCurrentStateBasisToStage(state, i, state.state_bases[i], tolerance);
   }
 }
 
@@ -1425,9 +1525,9 @@ std::size_t MixedEliminationStageDoubles(const WorkspaceDimensionSummary& dims,
   const std::size_t p = std::max<std::size_t>(1, mixed_rows_bound);
   const std::size_t f = m;
   std::size_t scalars = 0;
-  scalars += 2 * p * (m + n + 1);       // augmented RREF input and by-value RREF copy
+  scalars += 2 * p * (m + n + 1 + p);   // augmented RREF input and by-value copy
   scalars += m * n + m * f + m;         // Y, Z, y
-  scalars += p * n + p;                 // residual state constraints
+  scalars += m * p + p * n + p + p * p; // RHS pullback and residual relation
   scalars += n * n + m * m + n * m + next_n * m + n + m + next_n;  // old copies
   scalars += 8 * n * n + 4 * m * m + 6 * n * m + 2 * next_n * n +
              2 * next_n * m + 3 * next_n + 4 * n + 4 * m;          // temporaries
@@ -1445,7 +1545,7 @@ std::size_t StateEliminationStageDoubles(const WorkspaceDimensionSummary& dims,
   const std::size_t p = std::max<std::size_t>(1, state_rows_bound);
   const std::size_t pivots = std::max<std::size_t>(1, state_pivot_bound);
   std::size_t scalars = 0;
-  scalars += 2 * p * (n + 1) + n * n + n;                          // basis RREF, T, offset
+  scalars += 2 * p * (n + 1 + p) + n * n + n + n * p;              // basis and RHS pullback
   scalars += 3 * next_n * n + 3 * next_n * m + 4 * next_n;          // dynamics and extras
   scalars += 8 * n * n + 4 * n * m + 2 * m * n + 4 * n + 2 * m;     // cost temporaries
   scalars += (pivots + dims.max_mixed_rows) * (n + m + 1);          // appended C/D/d
@@ -1467,6 +1567,7 @@ void AddEliminationStorageBound(const Problem& problem, const SolveOptions& opti
   const std::size_t state_stage_doubles =
       StateEliminationStageDoubles(dims, state_rows_bound, state_pivot_bound);
   AddObjects<AffineStateBasis>(offset, dims.stages + 1);
+  AddObjects<EliminationStageTrace>(offset, dims.stages);
   AddDoubles(offset, (dims.stages + 1) *
                          (2 * state_rows_bound * (dims.max_state + 1) +
                           dims.max_state * dims.max_state + dims.max_state));
@@ -1481,25 +1582,16 @@ void AddEliminationStorageBound(const Problem& problem, const SolveOptions& opti
 void AddRecoveryStorageBound(const Problem& problem, const WorkspaceDimensionSummary& dims,
                              std::size_t* offset) {
   const std::size_t N = problem.stages.size();
-  const std::size_t total_constraints =
-      TotalMixedMultiplierScalars(problem) + TotalStateMultiplierScalars(problem) +
-      problem.terminal_E.rows();
-  const std::size_t parameter_bound =
-      std::max<std::size_t>(1, total_constraints + dims.max_mixed_rows +
-                                   dims.max_state_rows + dims.max_terminal_rows);
-  AddObjects<StageMultiplierMap>(offset, N);
-  AddDoubles(offset, dims.max_state * parameter_bound + dims.max_state);
-  for (const Stage& stage : problem.stages) {
-    const std::size_t n = stage.A.cols();
-    const std::size_t m = stage.B.cols();
-    const std::size_t cols = parameter_bound + stage.C.rows() + stage.E.rows();
-    AddDoubles(offset, m * cols + m);                    // local system and rhs
-    AddDoubles(offset, 2 * m * (cols + 1));              // RREF input/copy
-    AddIndices(offset, 3 * std::max(m, cols));
-    AddDoubles(offset, cols * cols + cols);              // local parametrization
-    AddDoubles(offset, n * cols + n + cols);             // previous/local parameters
-    AddDoubles(offset, stage.A.rows() + stage.C.rows() + stage.E.rows());
-  }
+  AddObjects<Vector>(offset, 2 * N + 1);
+  AddDoubles(offset, dims.total_dynamics + dims.total_state);
+  const std::size_t local_vector_bound =
+      40 * (dims.max_state + dims.max_next_state + dims.max_control +
+            dims.max_mixed_rows + dims.max_state_rows +
+            dims.max_terminal_rows + 1);
+  AddDoubles(offset, N * local_vector_bound);
+  AddDoubles(offset,
+             4 * dims.terminal_state *
+                 (dims.terminal_state + dims.max_terminal_rows + 1));
   AddSolutionStorageBound(problem, offset);
 }
 
@@ -2012,105 +2104,26 @@ ReducedSolution SolveUnconstrained(const WorkspaceVector<Stage>& stages,
   return sol;
 }
 
-bool RecoverMultipliers(const Problem& original, Solution* out, double tolerance,
-                        std::string* error) {
-  const std::size_t N = original.stages.size();
-  out->dynamics_multipliers.assign(N, Vector());
-  out->mixed_multipliers.assign(N, Vector());
-  out->state_multipliers.assign(N, Vector());
-
-  if (N == 0) {
-    const std::size_t n = original.terminal_Q.rows();
-    const std::size_t pt = original.terminal_E.rows();
-    Matrix k(n, n + pt);
-    for (std::size_t row = 0; row < n; ++row) k(row, row) = 1.0;
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col < pt; ++col) k(row, n + col) = original.terminal_E(col, row);
+bool RecoverZeroHorizonMultipliers(const Problem& original, Solution* out,
+                                   double tolerance, std::string* error) {
+  const std::size_t n = original.terminal_Q.rows();
+  const std::size_t pt = original.terminal_E.rows();
+  Matrix system(n, n + pt);
+  for (std::size_t row = 0; row < n; ++row) system(row, row) = 1.0;
+  for (std::size_t row = 0; row < n; ++row) {
+    for (std::size_t col = 0; col < pt; ++col) {
+      system(row, n + col) = original.terminal_E(col, row);
     }
-    Vector rhs = Scale(original.terminal_Q * out->states[0] + original.terminal_q, -1.0);
-    RectangularSolve solve = SolveRectangularRref(k, rhs, tolerance);
-    if (solve.inconsistent) {
-      *error = "inconsistent terminal multiplier recovery";
-      return false;
-    }
-    out->initial_multiplier = Slice(solve.x, 0, n);
-    out->terminal_state_multiplier = Slice(solve.x, n, pt);
-    return true;
   }
-
-  AffineSet future_y;
-  future_y.basis = Scale(Transpose(original.terminal_E), -1.0);
-  future_y.offset = Scale(original.terminal_Q * out->states[N] + original.terminal_q, -1.0);
-  WorkspaceVector<StageMultiplierMap> maps(N);
-  for (std::size_t rev = 0; rev < N; ++rev) {
-    const std::size_t i = N - 1 - rev;
-    const Stage& s = original.stages[i];
-    const std::size_t n = s.A.cols();
-    const std::size_t m = s.B.cols();
-    const std::size_t mixed = s.C.rows();
-    const std::size_t state = s.E.rows();
-    const std::size_t future_params = future_y.basis.cols();
-
-    Matrix u_system(m, future_params + mixed + state);
-    for (std::size_t row = 0; row < m; ++row) {
-      for (std::size_t col = 0; col < future_params; ++col) {
-        double value = 0.0;
-        for (std::size_t r = 0; r < s.B.rows(); ++r) value -= s.B(r, row) * future_y.basis(r, col);
-        u_system(row, col) = value;
-      }
-    }
-    for (std::size_t row = 0; row < m; ++row) {
-      for (std::size_t col = 0; col < mixed; ++col) u_system(row, future_params + col) = s.D(col, row);
-    }
-    Vector u_rhs = Scale(Transpose(s.M) * out->states[i] + s.R * out->controls[i] + s.r,
-                         -1.0) +
-                   Transpose(s.B) * future_y.offset;
-    LinearParametrization local = ParametrizeLinearSystem(u_system, u_rhs, tolerance);
-    if (local.inconsistent) {
-      *error = "inconsistent stage multiplier recovery at stage " + std::to_string(i);
-      return false;
-    }
-
-    Matrix prev_from_local(n, future_params + mixed + state);
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col < future_params; ++col) {
-        double value = 0.0;
-        for (std::size_t r = 0; r < s.A.rows(); ++r) value += s.A(r, row) * future_y.basis(r, col);
-        prev_from_local(row, col) = value;
-      }
-      for (std::size_t col = 0; col < mixed; ++col) prev_from_local(row, future_params + col) = -s.C(col, row);
-      for (std::size_t col = 0; col < state; ++col) {
-        prev_from_local(row, future_params + mixed + col) = -s.E(col, row);
-      }
-    }
-    Vector prev_offset = Scale(s.Q * out->states[i] + s.M * out->controls[i] + s.q,
-                               -1.0) +
-                         Transpose(s.A) * future_y.offset;
-
-    maps[i].future_y = future_y;
-    maps[i].local_basis = local.basis;
-    maps[i].local_offset = local.offset;
-    maps[i].future_parameter_size = future_params;
-    maps[i].mixed_size = mixed;
-    maps[i].state_size = state;
-
-    future_y.basis = prev_from_local * local.basis;
-    future_y.offset = prev_offset + prev_from_local * local.offset;
+  Vector rhs =
+      Scale(original.terminal_Q * out->states[0] + original.terminal_q, -1.0);
+  RectangularSolve solve = SolveRectangularRref(system, rhs, tolerance);
+  if (solve.inconsistent) {
+    *error = "inconsistent terminal multiplier recovery";
+    return false;
   }
-
-  Vector parameter(future_y.basis.cols());
-  out->initial_multiplier = future_y.offset;
-  for (std::size_t i = 0; i < N; ++i) {
-    const StageMultiplierMap& map = maps[i];
-    Vector local = map.local_offset + map.local_basis * parameter;
-    Vector future_parameter = Slice(local, 0, map.future_parameter_size);
-    out->dynamics_multipliers[i] = map.future_y.offset + map.future_y.basis * future_parameter;
-    out->mixed_multipliers[i] = Slice(local, map.future_parameter_size, map.mixed_size);
-    out->state_multipliers[i] =
-        Slice(local, map.future_parameter_size + map.mixed_size, map.state_size);
-    parameter = future_parameter;
-  }
-  out->terminal_state_multiplier = parameter;
+  out->initial_multiplier = Slice(solve.x, 0, n);
+  out->terminal_state_multiplier = Slice(solve.x, n, pt);
   return true;
 }
 
@@ -2237,6 +2250,227 @@ bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out, double 
       }
       previous[state] = value;
     }
+  }
+  return true;
+}
+
+void AddInPlace(Vector* destination, const Vector& increment) {
+  Check(destination->size() == increment.size(),
+        "multiplier pullback vector shape mismatch");
+  for (std::size_t i = 0; i < destination->size(); ++i) {
+    (*destination)[i] += increment[i];
+  }
+}
+
+Vector TransposeMultiply(const Matrix& matrix, const Vector& vector) {
+  Check(matrix.rows() == vector.size(),
+        "transpose multiply vector shape mismatch");
+  Vector result(matrix.cols());
+  for (std::size_t row = 0; row < matrix.rows(); ++row) {
+    const double value = vector[row];
+    for (std::size_t col = 0; col < matrix.cols(); ++col) {
+      result[col] += matrix(row, col) * value;
+    }
+  }
+  return result;
+}
+
+Vector TransposeSelectedRowsMultiply(const Matrix& matrix,
+                                     const AffineStateBasis& row_basis,
+                                     const Vector& vector) {
+  Vector result(matrix.cols());
+  const bool all_rows = vector.size() == matrix.rows();
+  Check(all_rows || vector.size() == row_basis.free_rows.size(),
+        "selected transpose multiply shape mismatch");
+  for (std::size_t row = 0; row < vector.size(); ++row) {
+    const std::size_t source_row = all_rows ? row : row_basis.free_rows[row];
+    for (std::size_t col = 0; col < matrix.cols(); ++col) {
+      result[col] += matrix(source_row, col) * vector[row];
+    }
+  }
+  return result;
+}
+
+WorkspaceVector<Vector> ReducedDynamicsMultipliers(
+    const WorkingProblem& problem, const ReducedSolution& reduced) {
+  const std::size_t N = problem.stages.size();
+  WorkspaceVector<Vector> dynamics(N);
+  if (N == 0) return dynamics;
+
+  dynamics[N - 1] =
+      Scale(problem.terminal_Q * reduced.x[N] + problem.terminal_q, -1.0);
+  for (std::size_t rev = 1; rev < N; ++rev) {
+    const std::size_t i = N - 1 - rev;
+    const Stage& stage = problem.stages[i + 1];
+    dynamics[i] =
+        Scale(stage.Q * reduced.x[i + 1] +
+                  stage.M * reduced.u[i + 1] + stage.q,
+              -1.0) +
+        TransposeMultiply(stage.A, dynamics[i + 1]);
+  }
+  return dynamics;
+}
+
+bool RecoverEliminatedMultipliers(const Problem& original,
+                                  const WorkingState& working,
+                                  const ReducedSolution& reduced,
+                                  Solution* out, double tolerance,
+                                  std::string* error) {
+  const std::size_t N = original.stages.size();
+  if (N == 0)
+    return RecoverZeroHorizonMultipliers(original, out, tolerance, error);
+
+  out->dynamics_multipliers.assign(N, Vector());
+  out->mixed_multipliers.assign(N, Vector());
+  out->state_multipliers.assign(N, Vector());
+  WorkspaceVector<Vector> offset_cotangent(N + 1);
+  for (std::size_t node = 0; node <= N; ++node) {
+    const std::size_t n = node == N ? original.terminal_Q.rows()
+                                    : original.stages[node].A.cols();
+    offset_cotangent[node] = Vector(n);
+  }
+
+  const WorkspaceVector<Vector> reduced_dynamics =
+      ReducedDynamicsMultipliers(working.problem, reduced);
+
+  // Constraint elimination runs right to left. Its transpose therefore runs
+  // left to right, carrying each suffix-state offset cotangent to the node at
+  // which that offset was formed.
+  for (std::size_t i = 0; i < N; ++i) {
+    const Stage& original_stage = original.stages[i];
+    const EliminationStageTrace& trace = working.elimination_traces[i];
+    const AffineStateBasis& current = working.state_bases[i];
+    const AffineStateBasis& next = working.state_bases[i + 1];
+
+    Vector bar_c = Scale(reduced_dynamics[i], -1.0);
+    Vector bar_e;
+    Vector bar_y;
+
+    if (trace.mixed.active) {
+      bar_y = TransposeMultiply(original_stage.M, out->states[i]) +
+              original_stage.R * out->controls[i] + original_stage.r;
+      AddInPlace(&bar_y, TransposeSelectedRowsMultiply(
+                                 original_stage.B, next, bar_c));
+    }
+
+    if (current.active) {
+      Vector bar_offset = original_stage.Q * out->states[i] +
+                          original_stage.M * out->controls[i] +
+                          original_stage.q;
+      AddInPlace(&bar_offset, TransposeSelectedRowsMultiply(
+                                  original_stage.A, next, bar_c));
+      if (trace.mixed.active) {
+        AddInPlace(&bar_offset,
+                   TransposeMultiply(trace.mixed.Y, bar_y));
+      }
+      AddInPlace(&offset_cotangent[i], bar_offset);
+      Vector reduced_rhs_cotangent(
+          current.rhs_operations.factors.cols());
+      for (std::size_t pivot = 0; pivot < current.pivot_rows.size(); ++pivot) {
+        reduced_rhs_cotangent[current.rhs_operations.pivot_rows[pivot]] -=
+            offset_cotangent[i][current.pivot_rows[pivot]];
+      }
+      bar_e = ApplyRrefTranspose(current.rhs_operations,
+                                 std::move(reduced_rhs_cotangent));
+    } else {
+      bar_e = Vector(0);
+    }
+
+    Vector bar_d;
+    if (trace.mixed.active) {
+      const MixedElimination& mixed = trace.mixed;
+      Vector reduced_rhs_cotangent(mixed.rhs_operations.factors.cols());
+      for (std::size_t pivot = 0; pivot < mixed.pivot_columns.size(); ++pivot) {
+        reduced_rhs_cotangent[mixed.rhs_operations.pivot_rows[pivot]] -=
+            bar_y[mixed.pivot_columns[pivot]];
+      }
+      const std::size_t original_state_rows = original_stage.E.rows();
+      const std::size_t residual_rows = mixed.state_rref_rows.size();
+      if (residual_rows > 0) {
+        const Vector residual_cotangent =
+            Slice(bar_e, original_state_rows, residual_rows);
+        for (std::size_t row = 0; row < residual_rows; ++row) {
+          reduced_rhs_cotangent[mixed.state_rref_rows[row]] +=
+              residual_cotangent[row];
+        }
+      }
+      bar_d = ApplyRrefTranspose(mixed.rhs_operations,
+                                 std::move(reduced_rhs_cotangent));
+      out->state_multipliers[i] =
+          Slice(bar_e, 0, original_state_rows);
+      out->mixed_multipliers[i] =
+          Slice(bar_d, 0, original_stage.C.rows());
+    } else {
+      out->state_multipliers[i] = bar_e;
+      out->mixed_multipliers[i] = Vector(0);
+      bar_d = Vector(0);
+    }
+
+    const std::size_t original_mixed_rows = original_stage.C.rows();
+    const std::size_t extra_rows =
+        bar_d.size() >= original_mixed_rows
+            ? bar_d.size() - original_mixed_rows
+            : std::size_t{0};
+    Vector original_c(original_stage.A.rows());
+    if (extra_rows > 0) {
+      Check(next.active && extra_rows == next.pivot_rows.size(),
+            "invalid propagated multiplier pullback trace");
+      Check(bar_c.size() == next.free_rows.size(),
+            "propagated multiplier state shape mismatch");
+      for (std::size_t free_index = 0;
+           free_index < next.free_rows.size(); ++free_index) {
+        original_c[next.free_rows[free_index]] += bar_c[free_index];
+      }
+      for (std::size_t row = 0; row < extra_rows; ++row) {
+        const double value = bar_d[original_mixed_rows + row];
+        const std::size_t pivot = next.pivot_rows[row];
+        original_c[pivot] += value;
+        for (std::size_t free_index = 0;
+             free_index < next.free_rows.size(); ++free_index) {
+          original_c[next.free_rows[free_index]] -=
+              next.T(pivot, free_index) * value;
+        }
+        offset_cotangent[i + 1][pivot] -= value;
+      }
+    } else {
+      Check(bar_c.size() == original_c.size(),
+            "multiplier dynamics shape mismatch");
+      original_c = std::move(bar_c);
+    }
+    out->dynamics_multipliers[i] = Scale(original_c, -1.0);
+  }
+
+  const AffineStateBasis& terminal = working.state_bases[N];
+  if (terminal.active) {
+    Vector bar_offset =
+        original.terminal_Q * out->states[N] + original.terminal_q;
+    AddInPlace(&offset_cotangent[N], bar_offset);
+    Vector reduced_rhs_cotangent(
+        terminal.rhs_operations.factors.cols());
+    for (std::size_t pivot = 0; pivot < terminal.pivot_rows.size(); ++pivot) {
+      reduced_rhs_cotangent[terminal.rhs_operations.pivot_rows[pivot]] -=
+          offset_cotangent[N][terminal.pivot_rows[pivot]];
+    }
+    out->terminal_state_multiplier = ApplyRrefTranspose(
+        terminal.rhs_operations, std::move(reduced_rhs_cotangent));
+  } else {
+    out->terminal_state_multiplier = Vector(0);
+  }
+
+  const Stage& first = original.stages.front();
+  out->initial_multiplier =
+      Scale(first.Q * out->states[0] + first.M * out->controls[0] + first.q,
+            -1.0) +
+      TransposeMultiply(first.A, out->dynamics_multipliers[0]);
+  if (first.C.rows() > 0) {
+    AddInPlace(&out->initial_multiplier,
+               Scale(TransposeMultiply(first.C, out->mixed_multipliers[0]),
+                     -1.0));
+  }
+  if (first.E.rows() > 0) {
+    AddInPlace(&out->initial_multiplier,
+               Scale(TransposeMultiply(first.E, out->state_multipliers[0]),
+                     -1.0));
   }
   return true;
 }
@@ -2460,7 +2694,9 @@ Solution Recover(const Problem& original, const WorkingState& state,
   out.objective = Objective(original, out.states, out.controls);
   std::string error;
   const bool recovered =
-      has_original_state_constraints ? RecoverMultipliers(original, &out, tolerance, &error)
+      has_original_state_constraints
+          ? RecoverEliminatedMultipliers(original, state, reduced, &out,
+                                         tolerance, &error)
                                      : RecoverMixedOnlyMultipliers(original, &out, tolerance, &error);
   if (!recovered) {
     out.status = SolveStatus::kNumericalFailure;
