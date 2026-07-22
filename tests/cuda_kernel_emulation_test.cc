@@ -551,6 +551,18 @@ void RunEmulation(const Problem &problem, const std::string &name,
 
   std::vector<ValueElement> value_a(nodes),
       value_b(std::max(node_tree_size - nodes, 1));
+  std::vector<Scalar> value_a_storage(static_cast<std::size_t>(nodes) *
+                                      kMaxValueElementEntries);
+  std::vector<Scalar> value_b_storage(value_b.size() * kMaxValueElementEntries);
+  for (int node = 0; node < nodes; ++node) {
+    BindValueElementScratch(&value_a[node], value_a_storage.data() +
+                                                static_cast<std::size_t>(node) *
+                                                    kMaxValueElementEntries);
+  }
+  for (std::size_t node = 0; node < value_b.size(); ++node) {
+    BindValueElementScratch(&value_b[node], value_b_storage.data() +
+                                                node * kMaxValueElementEntries);
+  }
   std::vector<Feedback> feedback(horizon);
   int parallel_ok = 1;
   Launch(nodes, [&] {
@@ -600,6 +612,14 @@ void RunEmulation(const Problem &problem, const std::string &name,
   Expect(status.code == kDeviceOk, "emulated feedback solve");
 
   std::vector<ValueElement> sequential_values(nodes);
+  std::vector<Scalar> sequential_value_storage(static_cast<std::size_t>(nodes) *
+                                               kMaxValueElementEntries);
+  for (int node = 0; node < nodes; ++node) {
+    BindValueElementScratch(&sequential_values[node],
+                            sequential_value_storage.data() +
+                                static_cast<std::size_t>(node) *
+                                    kMaxValueElementEntries);
+  }
   std::vector<Feedback> sequential_feedback(horizon);
   int sequential_base_ok = 1;
   Launch(nodes, [&] {
@@ -647,6 +667,18 @@ void RunEmulation(const Problem &problem, const std::string &name,
   }
   std::vector<AffineMap> map_a(horizon),
       map_b(std::max(stage_tree_size - std::max(horizon, 1), 1));
+  std::vector<Scalar> map_a_storage(static_cast<std::size_t>(horizon) *
+                                    kMaxAffineMapEntries);
+  std::vector<Scalar> map_b_storage(map_b.size() * kMaxAffineMapEntries);
+  for (int stage = 0; stage < horizon; ++stage) {
+    BindAffineMapScratch(&map_a[stage], map_a_storage.data() +
+                                            static_cast<std::size_t>(stage) *
+                                                kMaxAffineMapEntries);
+  }
+  for (std::size_t node = 0; node < map_b.size(); ++node) {
+    BindAffineMapScratch(&map_b[node],
+                         map_b_storage.data() + node * kMaxAffineMapEntries);
+  }
   Launch(horizon, [&] {
     InitializeAffineMapsKernel(feedback.data(), horizon, map_a.data());
   });

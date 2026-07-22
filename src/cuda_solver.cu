@@ -41,6 +41,10 @@ constexpr int kMaxRrefRows = ConstexprMax(
                               kMaxStateDimension + kMaxControlDimension)));
 constexpr int kMaxRrefColumns = kMaxDualColumns;
 constexpr int kMaxRrefEntries = kMaxRrefRows * kMaxRrefColumns;
+constexpr int kMaxValueElementEntries =
+    3 * kMaxStateDimension * kMaxStateDimension + 2 * kMaxStateDimension;
+constexpr int kMaxAffineMapEntries =
+    kMaxStateDimension * kMaxStateDimension + kMaxStateDimension;
 constexpr std::size_t kConservativeSharedMemoryLimit = 48 * 1024;
 constexpr std::size_t kMaximumRrefSharedBytes =
     static_cast<std::size_t>(kMaxRrefEntries + 2 * kMaxRrefRows) *
@@ -93,6 +97,20 @@ __device__ void WarpSynchronize() {
 #ifndef CLQR_CUDA_EMULATION
   __syncwarp();
 #endif
+}
+
+__device__ void BindValueElementScratch(ValueElement *element,
+                                        Scalar *storage) {
+  element->A = storage;
+  element->b = element->A + kMaxStateDimension * kMaxStateDimension;
+  element->C = element->b + kMaxStateDimension;
+  element->eta = element->C + kMaxStateDimension * kMaxStateDimension;
+  element->J = element->eta + kMaxStateDimension;
+}
+
+__device__ void BindAffineMapScratch(AffineMap *map, Scalar *storage) {
+  map->linear = storage;
+  map->offset = map->linear + kMaxStateDimension * kMaxStateDimension;
 }
 
 __device__ void SetFailure(DeviceStatus *status, int code, int stage,
@@ -1333,10 +1351,12 @@ struct WorkspaceStorage {
   DeviceBuffer<Scalar> reduced_initial;
   DeviceBuffer<ValueElement> value_leaves;
   DeviceBuffer<ValueElement> value_scan;
+  DeviceBuffer<Scalar> value_data;
   DeviceBuffer<Feedback> feedback;
   DeviceBuffer<int> parallel_ok;
   DeviceBuffer<AffineMap> map_leaves;
   DeviceBuffer<AffineMap> map_scan;
+  DeviceBuffer<Scalar> map_data;
   DeviceBuffer<Scalar> reduced_states;
   DeviceBuffer<Scalar> states;
   DeviceBuffer<Scalar> controls;
@@ -1378,6 +1398,10 @@ struct WorkspaceStorage {
   PinnedBuffer<int> host_state_constraint_offsets;
   PinnedBuffer<int> host_state_dimensions;
   PinnedBuffer<int> host_control_dimensions;
+  PinnedBuffer<ValueElement> host_value_leaves;
+  PinnedBuffer<ValueElement> host_value_scan;
+  PinnedBuffer<AffineMap> host_map_leaves;
+  PinnedBuffer<AffineMap> host_map_scan;
   PinnedBuffer<int> host_parallel_ok;
   PinnedBuffer<int> host_dual_scan_needed;
   PinnedBuffer<DeviceStatus> host_status;
@@ -1478,6 +1502,10 @@ struct WorkspaceStorage {
     host_state_constraint_offsets.Resize(stage_count + 1);
     host_state_dimensions.Resize(static_cast<std::size_t>(2) * node_count);
     host_control_dimensions.Resize(static_cast<std::size_t>(2) * stage_count);
+    host_value_leaves.Resize(node_count);
+    host_value_scan.Resize(total_tree_nodes - node_count);
+    host_map_leaves.Resize(stage_count);
+    host_map_scan.Resize(total_stage_tree_nodes - std::max(stage_count, 1));
     host_parallel_ok.Resize(1);
     host_dual_scan_needed.Resize(1);
     host_status.Resize(1);
@@ -1735,6 +1763,270 @@ void BuildCompactOffsets(const Problem &problem, WorkspaceStorage *workspace) {
   state[problem.stages.size() + 1] =
       state[problem.stages.size()] +
       static_cast<int>(problem.terminal_Q.rows());
+}
+
+struct ScanShape {
+  int left = -1;
+  int right = 0;
+};
+
+ScanShape ComposeScanShapes(const ScanShape &first, const ScanShape &second) {
+  if (first.left < 0)
+    return second;
+  if (second.left < 0)
+    return first;
+  Require(first.right == second.left,
+          "internal CUDA scan layout has incompatible dimensions");
+  return {first.left, second.right};
+}
+
+struct ValueCapacity {
+  std::size_t a = 0;
+  std::size_t b = 0;
+  std::size_t c = 0;
+  std::size_t eta = 0;
+  std::size_t j = 0;
+
+  void Include(const ScanShape &shape) {
+    if (shape.left < 0)
+      return;
+    const std::size_t left = static_cast<std::size_t>(shape.left);
+    const std::size_t right = static_cast<std::size_t>(shape.right);
+    a = std::max(a, right * left);
+    b = std::max(b, right);
+    c = std::max(c, right * right);
+    eta = std::max(eta, left);
+    j = std::max(j, left * left);
+  }
+
+  std::size_t Entries() const { return a + b + c + eta + j; }
+};
+
+struct MapCapacity {
+  std::size_t linear = 0;
+  std::size_t offset = 0;
+
+  void Include(const ScanShape &shape) {
+    if (shape.left < 0)
+      return;
+    linear =
+        std::max(linear, static_cast<std::size_t>(shape.left) * shape.right);
+    offset = std::max(offset, static_cast<std::size_t>(shape.right));
+  }
+
+  std::size_t Entries() const { return linear + offset; }
+};
+
+void BindValueStorage(ValueElement *element, Scalar **cursor,
+                      const ValueCapacity &capacity) {
+  element->left_dim = -1;
+  element->right_dim = 0;
+  element->A = *cursor;
+  *cursor += capacity.a;
+  element->b = *cursor;
+  *cursor += capacity.b;
+  element->C = *cursor;
+  *cursor += capacity.c;
+  element->eta = *cursor;
+  *cursor += capacity.eta;
+  element->J = *cursor;
+  *cursor += capacity.j;
+}
+
+void BindMapStorage(AffineMap *map, Scalar **cursor,
+                    const MapCapacity &capacity) {
+  map->left_dim = -1;
+  map->right_dim = 0;
+  map->linear = *cursor;
+  *cursor += capacity.linear;
+  map->offset = *cursor;
+  *cursor += capacity.offset;
+}
+
+void PrepareValueStorage(WorkspaceStorage *workspace, int stage_count) {
+  const int node_count = stage_count + 1;
+  const auto &level_offsets = workspace->node_level_offsets;
+  const auto &level_counts = workspace->node_level_counts;
+  std::vector<ScanShape> leaves(node_count);
+  std::vector<ValueCapacity> leaf_capacity(node_count);
+  for (int node = 0; node < node_count; ++node) {
+    const int left = workspace->host_state_dimensions[2 * node + 1];
+    const int right = node == stage_count
+                          ? 0
+                          : workspace->host_state_dimensions[2 * node + 3];
+    leaves[node] = {left, right};
+    leaf_capacity[node].Include(leaves[node]);
+  }
+
+  const int internal_count =
+      static_cast<int>(workspace->host_value_scan.size());
+  std::vector<ScanShape> reductions(internal_count);
+  std::vector<ScanShape> contexts(internal_count);
+  std::vector<ValueCapacity> internal_capacity(internal_count);
+  for (std::size_t level = 1; level < level_counts.size(); ++level) {
+    const int offset = level_offsets[level] - node_count;
+    const int child_count = level_counts[level - 1];
+    const int child_offset = level_offsets[level - 1] - node_count;
+    for (int parent = 0; parent < level_counts[level]; ++parent) {
+      const int child = 2 * parent;
+      const ScanShape first =
+          level == 1 ? leaves[child] : reductions[child_offset + child];
+      ScanShape result = first;
+      if (child + 1 < child_count) {
+        const ScanShape second = level == 1
+                                     ? leaves[child + 1]
+                                     : reductions[child_offset + child + 1];
+        result = ComposeScanShapes(first, second);
+      }
+      reductions[offset + parent] = result;
+      internal_capacity[offset + parent].Include(result);
+    }
+  }
+
+  if (node_count > 1) {
+    contexts[level_offsets.back() - node_count] = ScanShape{};
+    for (int level = static_cast<int>(level_counts.size()) - 2; level >= 1;
+         --level) {
+      const int child_offset = level_offsets[level] - node_count;
+      const int parent_offset = level_offsets[level + 1] - node_count;
+      for (int parent = 0; parent < level_counts[level + 1]; ++parent) {
+        const int child = 2 * parent;
+        const ScanShape parent_context = contexts[parent_offset + parent];
+        if (child + 1 >= level_counts[level]) {
+          contexts[child_offset + child] = parent_context;
+          internal_capacity[child_offset + child].Include(parent_context);
+          continue;
+        }
+        const ScanShape left_context = ComposeScanShapes(
+            reductions[child_offset + child + 1], parent_context);
+        contexts[child_offset + child] = left_context;
+        contexts[child_offset + child + 1] = parent_context;
+        internal_capacity[child_offset + child].Include(left_context);
+        internal_capacity[child_offset + child + 1].Include(parent_context);
+      }
+    }
+
+    const int parent_offset = level_offsets[1] - node_count;
+    for (int parent = 0; parent < level_counts[1]; ++parent) {
+      const int child = 2 * parent;
+      const ScanShape parent_context = contexts[parent_offset + parent];
+      if (child + 1 >= node_count) {
+        leaf_capacity[child].Include(
+            ComposeScanShapes(leaves[child], parent_context));
+        continue;
+      }
+      const ScanShape right_suffix =
+          ComposeScanShapes(leaves[child + 1], parent_context);
+      const ScanShape left_suffix =
+          ComposeScanShapes(leaves[child], right_suffix);
+      leaf_capacity[child + 1].Include(right_suffix);
+      leaf_capacity[child].Include(left_suffix);
+    }
+  }
+
+  std::size_t entries = 0;
+  for (const ValueCapacity &capacity : leaf_capacity)
+    entries += capacity.Entries();
+  for (const ValueCapacity &capacity : internal_capacity)
+    entries += capacity.Entries();
+  workspace->value_data.Reserve(entries);
+  Scalar *cursor = workspace->value_data.get();
+  for (int node = 0; node < node_count; ++node)
+    BindValueStorage(&workspace->host_value_leaves[node], &cursor,
+                     leaf_capacity[node]);
+  for (int node = 0; node < internal_count; ++node)
+    BindValueStorage(&workspace->host_value_scan[node], &cursor,
+                     internal_capacity[node]);
+  Require(cursor == workspace->value_data.get() + entries,
+          "internal CUDA value layout size mismatch");
+}
+
+void PrepareMapStorage(WorkspaceStorage *workspace, int stage_count) {
+  if (stage_count == 0)
+    return;
+  const auto &level_offsets = workspace->stage_level_offsets;
+  const auto &level_counts = workspace->stage_level_counts;
+  std::vector<ScanShape> leaves(stage_count);
+  std::vector<MapCapacity> leaf_capacity(stage_count);
+  for (int stage = 0; stage < stage_count; ++stage) {
+    leaves[stage] = {workspace->host_state_dimensions[2 * stage + 1],
+                     workspace->host_state_dimensions[2 * stage + 3]};
+    leaf_capacity[stage].Include(leaves[stage]);
+  }
+
+  const int internal_count = static_cast<int>(workspace->host_map_scan.size());
+  std::vector<ScanShape> reductions(internal_count);
+  std::vector<ScanShape> contexts(internal_count);
+  std::vector<MapCapacity> internal_capacity(internal_count);
+  for (std::size_t level = 1; level < level_counts.size(); ++level) {
+    const int offset = level_offsets[level] - stage_count;
+    const int child_count = level_counts[level - 1];
+    const int child_offset = level_offsets[level - 1] - stage_count;
+    for (int parent = 0; parent < level_counts[level]; ++parent) {
+      const int child = 2 * parent;
+      const ScanShape first =
+          level == 1 ? leaves[child] : reductions[child_offset + child];
+      ScanShape result = first;
+      if (child + 1 < child_count) {
+        const ScanShape second = level == 1
+                                     ? leaves[child + 1]
+                                     : reductions[child_offset + child + 1];
+        result = ComposeScanShapes(first, second);
+      }
+      reductions[offset + parent] = result;
+      internal_capacity[offset + parent].Include(result);
+    }
+  }
+
+  if (stage_count > 1) {
+    contexts[level_offsets.back() - stage_count] = ScanShape{};
+    for (int level = static_cast<int>(level_counts.size()) - 2; level >= 1;
+         --level) {
+      const int child_offset = level_offsets[level] - stage_count;
+      const int parent_offset = level_offsets[level + 1] - stage_count;
+      for (int parent = 0; parent < level_counts[level + 1]; ++parent) {
+        const int child = 2 * parent;
+        const ScanShape parent_context = contexts[parent_offset + parent];
+        contexts[child_offset + child] = parent_context;
+        internal_capacity[child_offset + child].Include(parent_context);
+        if (child + 1 < level_counts[level]) {
+          const ScanShape right_context = ComposeScanShapes(
+              parent_context, reductions[child_offset + child]);
+          contexts[child_offset + child + 1] = right_context;
+          internal_capacity[child_offset + child + 1].Include(right_context);
+        }
+      }
+    }
+
+    const int parent_offset = level_offsets[1] - stage_count;
+    for (int parent = 0; parent < level_counts[1]; ++parent) {
+      const int child = 2 * parent;
+      const ScanShape parent_context = contexts[parent_offset + parent];
+      const ScanShape left_prefix =
+          ComposeScanShapes(parent_context, leaves[child]);
+      leaf_capacity[child].Include(left_prefix);
+      if (child + 1 < stage_count) {
+        leaf_capacity[child + 1].Include(
+            ComposeScanShapes(left_prefix, leaves[child + 1]));
+      }
+    }
+  }
+
+  std::size_t entries = 0;
+  for (const MapCapacity &capacity : leaf_capacity)
+    entries += capacity.Entries();
+  for (const MapCapacity &capacity : internal_capacity)
+    entries += capacity.Entries();
+  workspace->map_data.Reserve(entries);
+  Scalar *cursor = workspace->map_data.get();
+  for (int stage = 0; stage < stage_count; ++stage)
+    BindMapStorage(&workspace->host_map_leaves[stage], &cursor,
+                   leaf_capacity[stage]);
+  for (int node = 0; node < internal_count; ++node)
+    BindMapStorage(&workspace->host_map_scan[node], &cursor,
+                   internal_capacity[node]);
+  Require(cursor == workspace->map_data.get() + entries,
+          "internal CUDA map layout size mismatch");
 }
 
 Scalar ObjectiveFromCompact(const Problem &problem, const int *state_offsets,
@@ -2011,6 +2303,9 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     return solution;
   }
 
+  PrepareValueStorage(&workspace, stage_count);
+  PrepareMapStorage(&workspace, stage_count);
+
   auto &value_a = workspace.value_leaves;
   auto &value_b = workspace.value_scan;
   auto &feedback = workspace.feedback;
@@ -2019,6 +2314,18 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   int &host_parallel_ok = workspace.host_parallel_ok[0];
   host_parallel_ok = 1;
   solution.timings.riccati_ms = TimeGpu(workspace, [&] {
+    CudaCheck(cudaMemcpyAsync(value_a.get(), workspace.host_value_leaves.data(),
+                              workspace.host_value_leaves.size() *
+                                  sizeof(ValueElement),
+                              cudaMemcpyHostToDevice),
+              "upload compact value leaves");
+    if (workspace.host_value_scan.size() > 0) {
+      CudaCheck(cudaMemcpyAsync(value_b.get(), workspace.host_value_scan.data(),
+                                workspace.host_value_scan.size() *
+                                    sizeof(ValueElement),
+                                cudaMemcpyHostToDevice),
+                "upload compact value tree");
+    }
     CudaCheck(cudaMemcpyAsync(parallel_ok.get(), &host_parallel_ok, sizeof(int),
                               cudaMemcpyHostToDevice),
               "initialize parallel Riccati flag");
@@ -2117,6 +2424,18 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   AffineMap *prefix = map_a.get();
   solution.timings.reconstruction_ms = TimeGpu(workspace, [&] {
     if (stage_count > 0) {
+      CudaCheck(
+          cudaMemcpyAsync(map_a.get(), workspace.host_map_leaves.data(),
+                          workspace.host_map_leaves.size() * sizeof(AffineMap),
+                          cudaMemcpyHostToDevice),
+          "upload compact affine leaves");
+      if (workspace.host_map_scan.size() > 0) {
+        CudaCheck(
+            cudaMemcpyAsync(map_b.get(), workspace.host_map_scan.data(),
+                            workspace.host_map_scan.size() * sizeof(AffineMap),
+                            cudaMemcpyHostToDevice),
+            "upload compact affine tree");
+      }
       InitializeAffineMapsKernel<<<stage_count, kThreads>>>(
           feedback.get(), stage_count, map_a.get());
       if (stage_count > 1) {
@@ -2672,6 +2991,10 @@ FinalizeAffinePrefixFromParentsKernel(AffineMap *leaves, int count,
   const int left = 2 * index;
   const AffineMap &parent = parent_contexts[index];
   __shared__ AffineMap composed;
+  __shared__ Scalar composed_storage[kMaxAffineMapEntries];
+  if (threadIdx.x == 0)
+    BindAffineMapScratch(&composed, composed_storage);
+  WarpSynchronize();
   if (left + 1 >= count) {
     if (!InvalidScanAffineMap(parent)) {
       ComposeAffineMapsBlock(parent, leaves[left], &composed, status, left);
@@ -3850,10 +4173,14 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
       augmented[kMaxStateDimension * (3 * kMaxStateDimension + 1)];
   __shared__ Scalar factors[kMaxRrefRows];
   __shared__ ValueElement composed;
+  __shared__ Scalar composed_storage[kMaxValueElementEntries];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
   __shared__ int best_row;
+  if (threadIdx.x == 0)
+    BindValueElementScratch(&composed, composed_storage);
+  WarpSynchronize();
   if (left + 1 >= count) {
     if (!InvalidScanValueElement(parent)) {
       ComposeScanValueBlock(leaves[left], parent, tolerance, &composed,

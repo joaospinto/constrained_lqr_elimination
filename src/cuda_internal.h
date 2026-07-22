@@ -131,11 +131,11 @@ struct ReducedTerminal {
 struct ValueElement {
   int left_dim;
   int right_dim;
-  Scalar A[kMaxStateDimension * kMaxStateDimension];
-  Scalar b[kMaxStateDimension];
-  Scalar C[kMaxStateDimension * kMaxStateDimension];
-  Scalar eta[kMaxStateDimension];
-  Scalar J[kMaxStateDimension * kMaxStateDimension];
+  Scalar *A;
+  Scalar *b;
+  Scalar *C;
+  Scalar *eta;
+  Scalar *J;
 };
 
 struct Feedback {
@@ -151,8 +151,8 @@ struct Feedback {
 struct AffineMap {
   int left_dim;
   int right_dim;
-  Scalar linear[kMaxStateDimension * kMaxStateDimension];
-  Scalar offset[kMaxStateDimension];
+  Scalar *linear;
+  Scalar *offset;
 };
 
 struct DualNodeValue {
