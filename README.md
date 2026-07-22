@@ -74,9 +74,9 @@ The public numeric type is `clqr::Scalar`. CMake selects it consistently for the
 CPU solver, and CUDA backend with `CLQR_PRECISION=FP64` (the default) or `FP32`; use separate
 build directories because the choice changes the library ABI. FP32 and FP64 instantiate the
 same GPU algorithm; only `Scalar` and precision-appropriate numerical thresholds differ.
-Multiplier consistency checks remain enabled by default. The CUDA benchmark may retry a
-rejected multiplier tree without enforcing those checks so it can report the resulting full
-KKT residual; this diagnostic mode is not the default solver behavior.
+Multiplier consistency checks remain enabled by default. The CUDA benchmark disables their
+hard rejection for its timed diagnostic runs and reports the resulting full KKT residual;
+this diagnostic mode is not the default solver behavior.
 
 The CUDA benchmark is precision matched: an FP32 build reports FP32 sequential C++ CPU times
 against FP32 CUDA times, while an FP64 build compares the corresponding FP64 implementations.

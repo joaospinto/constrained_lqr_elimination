@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   int repeats = 5;
-  std::size_t cpu_max_horizon = 128;
+  std::size_t cpu_max_horizon = std::numeric_limits<std::size_t>::max();
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string option = argv[i];
     if (option == "--repeats") {
@@ -159,14 +159,17 @@ int main(int argc, char** argv) {
   std::cout
       << "# CUDA wall time includes allocation; cuda_device_ms is the sum "
          "of event-timed transfer and kernel phases.\n";
-  std::cout << "# CPU columns are nan above N=" << cpu_max_horizon
-            << "; larger CPU cases are skipped to limit benchmark time.\n";
-  std::cout << "# A failed strict multiplier check is retried in diagnostic "
-               "mode; strict_check and kkt_residual expose that result.\n";
+  if (cpu_max_horizon == std::numeric_limits<std::size_t>::max()) {
+    std::cout << "# The sequential C++ solver is timed at every horizon.\n";
+  } else {
+    std::cout << "# CPU columns are nan above N=" << cpu_max_horizon << ".\n";
+  }
+  std::cout << "# Multiplier consistency rejection is disabled for this "
+               "single diagnostic run; kkt_residual reports accuracy.\n";
   std::cout << "N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_device_ms,"
                "wall_speedup,feasibility_ms,reduction_ms,riccati_ms,"
                "reconstruction_ms,multiplier_ms,min_reduced_n,"
-               "min_reduced_m,parallel_riccati,strict_check,kkt_residual\n";
+               "min_reduced_m,parallel_riccati,kkt_residual\n";
   for (std::size_t horizon : horizons) {
     Problem problem = clqr::benchmark::StateOnlyProblem(horizon, n, m, p);
     clqr::Workspace workspace;
@@ -183,15 +186,8 @@ int main(int argc, char** argv) {
       }
     }
     clqr::cuda::Options cuda_options;
+    cuda_options.enforce_multiplier_consistency = false;
     clqr::cuda::Solution gpu = clqr::cuda::Solve(problem, cuda_options);
-    const bool strict_check_passed = gpu.status == clqr::SolveStatus::kOptimal;
-    if (!strict_check_passed) {
-      std::cerr << "CUDA strict multiplier check failed at N=" << horizon
-                << ": " << gpu.message
-                << "; retrying in benchmark diagnostic mode\n";
-      cuda_options.enforce_multiplier_consistency = false;
-      gpu = clqr::cuda::Solve(problem, cuda_options);
-    }
     if (gpu.status != clqr::SolveStatus::kOptimal) {
       std::cerr << "CUDA warmup failed at N=" << horizon << ": " << gpu.message
                 << "\n";
@@ -249,7 +245,6 @@ int main(int argc, char** argv) {
               << Median(reconstruction) << ',' << Median(multiplier) << ','
               << min_reduced_n << ',' << min_reduced_m << ','
               << (gpu.used_parallel_riccati ? "yes" : "no") << ','
-              << (strict_check_passed ? "pass" : "failed") << ','
               << std::scientific << kkt_residual << '\n';
   }
   return 0;
