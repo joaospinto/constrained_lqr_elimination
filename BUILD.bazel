@@ -20,7 +20,10 @@ cc_library(
 
 cc_test(
     name = "clqr_test",
-    srcs = ["tests/clqr_test.cc"],
+    srcs = [
+        "benchmarks/cuda_benchmark_problem.h",
+        "tests/clqr_test.cc",
+    ],
     deps = [":clqr"],
 )
 

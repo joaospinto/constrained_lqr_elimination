@@ -74,7 +74,9 @@ CPU solver, and CUDA backend with `CLQR_PRECISION=FP64` (the default) or `FP32`;
 build directories because the choice changes the library ABI. FP32 uses precision-appropriate
 rank and consistency thresholds. For short FP32 problems with dependent equality rows, it
 conservatively uses the sequential CUDA Riccati path and the CPU's linear-time, linear-space
-multiplier pullback; full-rank instances retain the parallel GPU path.
+multiplier pullback; full-rank instances retain the parallel GPU path. If the parallel dual
+tree later rejects its multiplier chain because of accumulated roundoff, the solver preserves
+the parallel GPU primal solution and reruns only multiplier recovery with that same pullback.
 
 The CUDA benchmark is precision matched: an FP32 build reports FP32 sequential C++ CPU times
 against FP32 CUDA times, while an FP64 build compares the corresponding FP64 implementations.

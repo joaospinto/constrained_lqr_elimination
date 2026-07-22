@@ -895,11 +895,12 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   // dual relation tree unnecessarily ill-conditioned. Small such problems
   // use the stable linear-space pullback shared with the CPU solver. The cap
   // limits sequential fallback latency and leaves large CUDA solves parallel.
-  const bool use_host_multiplier_recovery =
+  bool use_host_multiplier_recovery =
       stage_count <= 64 && HasDependentEqualityRows(problem, options.tolerance);
 #else
-  const bool use_host_multiplier_recovery = false;
+  bool use_host_multiplier_recovery = false;
 #endif
+  int multiplier_fallback_detail = 0;
   solution.used_host_multiplier_recovery = use_host_multiplier_recovery;
   std::vector<PackedStage> host_stages;
   host_stages.reserve(problem.stages.size());
@@ -1251,7 +1252,16 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
     }
   });
   status = ReadStatus(device_status);
-  if (ApplyDeviceFailure(status, &solution)) {
+  if (!use_host_multiplier_recovery &&
+      status.code == kDeviceNumericalFailure) {
+    // The primal trajectory is already available. If finite-precision error
+    // makes the parallel dual relation tree reject its own multiplier chain,
+    // retain that trajectory and recover only the multipliers through the
+    // linear-space elimination pullback on the host.
+    use_host_multiplier_recovery = true;
+    solution.used_host_multiplier_recovery = true;
+    multiplier_fallback_detail = status.detail;
+  } else if (ApplyDeviceFailure(status, &solution)) {
     solution.timings.total_ms =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - total_start)
@@ -1391,8 +1401,15 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
       ObjectiveFromPacked(host_stages, terminal, host_states, host_controls);
   solution.status = SolveStatus::kOptimal;
   if (solution.used_host_multiplier_recovery) {
-    solution.message =
-        "optimal (CUDA sequential Riccati and host multiplier fallback)";
+    std::ostringstream message;
+    message << "optimal ("
+            << (solution.used_parallel_riccati ? "parallel" : "sequential")
+            << " CUDA Riccati and host multiplier fallback";
+    if (multiplier_fallback_detail != 0) {
+      message << " after GPU diagnostic " << multiplier_fallback_detail;
+    }
+    message << ")";
+    solution.message = message.str();
   } else {
     solution.message = solution.used_parallel_riccati
                            ? "optimal (parallel CUDA Riccati scan)"

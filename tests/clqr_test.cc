@@ -1,4 +1,5 @@
 #include "clqr/clqr.h"
+#include "../benchmarks/cuda_benchmark_problem.h"
 #include "../src/multiplier_recovery.h"
 
 #include <algorithm>
@@ -688,8 +689,7 @@ void GeneratedCasesMatchKkt() {
 }
 
 void TrajectoryMultiplierRecoveryMatchesKkt() {
-  Problem problem =
-      GeneratedFeasibleProblem(519, 64, 4, 2, 1, ConstraintMode::kStateOnly);
+  Problem problem = clqr::benchmark::StateOnlyProblem(256, 8, 4, 2);
   Solution solution = SolveWithWorkspace(problem);
   Expect(solution.status == SolveStatus::kOptimal,
          "trajectory multiplier source solve status");
