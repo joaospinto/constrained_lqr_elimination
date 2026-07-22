@@ -100,15 +100,16 @@ dimension-limit cases.
 CUDA-free test builds additionally execute every numerical kernel in a one-thread CPU-emulation
 mode, comparing both Riccati paths and the recovered KKT point with the C++ solver.
 
-On Google Colab, select a GPU runtime, clone this repository, and run the complete hardware
-report, build, C++/CUDA tests, JAX cross-validation, and benchmark with one command:
+On Google Colab or Kaggle, select a GPU runtime, clone this repository, and run the complete
+hardware report, build, C++/CUDA tests, JAX cross-validation, and benchmark with one command:
 
 ```sh
 bash scripts/colab_t4.sh
 ```
 
-The script builds, tests, cross-validates, and benchmarks FP64 and FP32 in separate directories.
-It defaults to architecture 75 and five benchmark repetitions. Override these with
+The script automatically uses `/content` on Colab and `/kaggle/working` on Kaggle. It builds,
+tests, cross-validates, and benchmarks FP64 and FP32 in separate directories. It defaults to
+architecture 75 and five benchmark repetitions. Override these with
 `CLQR_CUDA_ARCH`, `CLQR_BENCHMARK_REPEATS`, or a space-separated `CLQR_PRECISIONS` selection.
 Set `CLQR_JAX_DIR` to reuse an existing checkout of `joaospinto/constrained_lqr_jax`, or
 `CLQR_SKIP_JAX=1` to omit only that cross-check. When `compute-sanitizer` is available, the

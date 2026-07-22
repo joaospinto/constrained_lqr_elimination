@@ -2,17 +2,22 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-build_root="${CLQR_CUDA_BUILD_DIR:-/content/clqr_cuda_build}"
-jax_dir="${CLQR_JAX_DIR:-/content/constrained_lqr_jax}"
+if [[ -d /kaggle/working ]]; then
+  notebook_work_dir=/kaggle/working
+else
+  notebook_work_dir=/content
+fi
+build_root="${CLQR_CUDA_BUILD_DIR:-${notebook_work_dir}/clqr_cuda_build}"
+jax_dir="${CLQR_JAX_DIR:-${notebook_work_dir}/constrained_lqr_jax}"
 cuda_arch="${CLQR_CUDA_ARCH:-75}"
 read -r -a precisions <<< "${CLQR_PRECISIONS:-FP64 FP32}"
 
 if ! command -v nvcc >/dev/null 2>&1; then
-  echo "nvcc is unavailable; select a Colab GPU runtime first." >&2
+  echo "nvcc is unavailable; select a CUDA GPU runtime first." >&2
   exit 2
 fi
 if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "nvidia-smi is unavailable; select a Colab GPU runtime first." >&2
+  echo "nvidia-smi is unavailable; select a CUDA GPU runtime first." >&2
   exit 2
 fi
 
