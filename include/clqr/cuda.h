@@ -10,7 +10,11 @@ namespace clqr {
 namespace cuda {
 
 struct Options {
-  double tolerance = 1e-10;
+#ifdef CLQR_USE_FLOAT
+  Scalar tolerance = 1e-5f;
+#else
+  Scalar tolerance = 1e-10;
+#endif
   int device = 0;
 };
 
@@ -38,7 +42,8 @@ struct Solution {
   std::vector<int> reduced_state_dimensions;
   std::vector<int> reduced_control_dimensions;
   bool used_parallel_riccati = false;
-  double objective = 0.0;
+  bool used_host_multiplier_recovery = false;
+  Scalar objective = Scalar{0};
   Timings timings;
 };
 

@@ -59,7 +59,17 @@ Rank decisions use row equilibration and partial pivoting. Redundant equalities 
 and free multiplier components are set to zero. If a reduced stage cost `R_i` is not positive
 definite, the backend retains the same reduced coordinates but uses a GPU-side sequential
 Riccati fallback; this avoids making positive definiteness of each `R_i` a new correctness
-requirement. All CUDA calculations use `double` precision.
+requirement.
+
+The public numeric type is `clqr::Scalar`. CMake selects it consistently for the C++ API,
+CPU solver, and CUDA backend with `CLQR_PRECISION=FP64` (the default) or `FP32`; use separate
+build directories because the choice changes the library ABI. FP32 uses precision-appropriate
+rank and consistency thresholds. For short FP32 problems with dependent equality rows, it
+conservatively uses the sequential CUDA Riccati path and host multiplier recovery; full-rank
+instances retain the parallel GPU path.
+
+The CUDA benchmark is precision matched: an FP32 build reports FP32 sequential C++ CPU times
+against FP32 CUDA times, while an FP64 build compares the corresponding FP64 implementations.
 
 The default build remains CUDA-free:
 
@@ -73,11 +83,14 @@ Build for a Tesla T4 (compute capability 7.5) with:
 
 ```sh
 cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
-  -DCLQR_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+  -DCLQR_ENABLE_CUDA=ON -DCLQR_PRECISION=FP64 \
+  -DCMAKE_CUDA_ARCHITECTURES=75
 cmake --build build-cuda --parallel
 ctest --test-dir build-cuda --output-on-failure
 build-cuda/clqr_cuda_benchmark
 ```
+
+For FP32, configure a distinct directory with `-DCLQR_PRECISION=FP32`.
 
 The CUDA test compares states, controls, and objective values against the existing C++ solver,
 then checks the complete primal-dual KKT residual. It covers unconstrained, state-only, mixed,
@@ -94,11 +107,13 @@ report, build, C++/CUDA tests, JAX cross-validation, and benchmark with one comm
 bash scripts/colab_t4.sh
 ```
 
-The script defaults to architecture 75 and five benchmark repetitions. Override these with
-`CLQR_CUDA_ARCH` and `CLQR_BENCHMARK_REPEATS`. Set `CLQR_JAX_DIR` to reuse an existing checkout
-of `joaospinto/constrained_lqr_jax`, or `CLQR_SKIP_JAX=1` to omit only that cross-check. When
-`compute-sanitizer` is available, the script also runs its memory, initialization, shared-memory
-race, and synchronization checkers. Set `CLQR_SKIP_SANITIZER=1` to omit those passes, or set
+The script builds, tests, cross-validates, and benchmarks FP64 and FP32 in separate directories.
+It defaults to architecture 75 and five benchmark repetitions. Override these with
+`CLQR_CUDA_ARCH`, `CLQR_BENCHMARK_REPEATS`, or a space-separated `CLQR_PRECISIONS` selection.
+Set `CLQR_JAX_DIR` to reuse an existing checkout of `joaospinto/constrained_lqr_jax`, or
+`CLQR_SKIP_JAX=1` to omit only that cross-check. When `compute-sanitizer` is available, the
+script also runs its memory, initialization, shared-memory race, and synchronization checkers
+for each selected precision. Set `CLQR_SKIP_SANITIZER=1` to omit those passes, or set
 `CLQR_SANITIZER_TOOLS` to a space-separated subset.
 
 Build and test:

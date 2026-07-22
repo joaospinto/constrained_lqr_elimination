@@ -12,6 +12,7 @@ cc_library(
     hdrs = [
         "include/clqr/clqr.h",
         "include/clqr/linalg.h",
+        "src/multiplier_recovery.h",
     ],
     includes = ["include"],
     visibility = ["//visibility:public"],
@@ -57,7 +58,10 @@ cc_library(
 
 cc_test(
     name = "cuda_kernel_emulation_test",
-    srcs = ["tests/cuda_kernel_emulation_test.cc"],
+    srcs = [
+        "tests/cuda_jax_problem.h",
+        "tests/cuda_kernel_emulation_test.cc",
+    ],
     copts = ["-Wno-sometimes-uninitialized"],
     deps = [
         ":clqr",

@@ -15,16 +15,17 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using clqr::Matrix;
 using clqr::Problem;
+using clqr::Scalar;
 using clqr::Stage;
 using clqr::Vector;
 
-double Value(int seed, std::size_t row, std::size_t col = 0) {
-  const double x = static_cast<double>(seed * 97 + row * 31 + col * 47);
+Scalar Value(int seed, std::size_t row, std::size_t col = 0) {
+  const Scalar x = static_cast<Scalar>(seed * 97 + row * 31 + col * 47);
   return std::sin(0.017 * x) + 0.3 * std::cos(0.029 * x);
 }
 
 Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed,
-                       double scale) {
+                       Scalar scale) {
   Matrix out(rows, cols);
   for (std::size_t row = 0; row < rows; ++row) {
     for (std::size_t col = 0; col < cols; ++col)
@@ -33,22 +34,22 @@ Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed,
   return out;
 }
 
-Vector GeneratedVector(std::size_t size, int seed, double scale) {
+Vector GeneratedVector(std::size_t size, int seed, Scalar scale) {
   Vector out(size);
   for (std::size_t row = 0; row < size; ++row)
     out[row] = scale * Value(seed, row);
   return out;
 }
 
-Matrix PositiveDefinite(std::size_t size, int seed, double diagonal) {
+Matrix PositiveDefinite(std::size_t size, int seed, Scalar diagonal) {
   Matrix g = GeneratedMatrix(size, size, seed, 0.15);
   Matrix out = clqr::Transpose(g) * g;
   for (std::size_t row = 0; row < size; ++row) out(row, row) += diagonal;
   return out;
 }
 
-double RowDot(const Matrix& matrix, std::size_t row, const Vector& vector) {
-  double value = 0.0;
+Scalar RowDot(const Matrix& matrix, std::size_t row, const Vector& vector) {
+  Scalar value = 0.0;
   for (std::size_t col = 0; col < vector.size(); ++col)
     value += matrix(row, col) * vector[col];
   return value;
@@ -129,6 +130,8 @@ int main(int argc, char** argv) {
   constexpr std::size_t m = 4;
   constexpr std::size_t p = 2;
   std::cout << "# device=" << clqr::cuda::DeviceDescription() << "\n";
+  std::cout << "# precision=" << clqr::kPrecisionName << "\n";
+  std::cout << "# cpp_cpu_ms and CUDA timings use the same scalar precision.\n";
   std::cout
       << "# CUDA wall time includes allocation; cuda_device_ms is the sum "
          "of event-timed transfer and kernel phases.\n";

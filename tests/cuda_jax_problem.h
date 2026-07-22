@@ -11,13 +11,13 @@ namespace clqr {
 namespace test {
 namespace detail {
 
-inline double JaxFixtureValue(int seed, std::size_t row, std::size_t col = 0) {
-  const double x = static_cast<double>(seed * 97 + row * 31 + col * 47);
+inline Scalar JaxFixtureValue(int seed, std::size_t row, std::size_t col = 0) {
+  const Scalar x = static_cast<Scalar>(seed * 97 + row * 31 + col * 47);
   return std::sin(0.017 * x) + 0.3 * std::cos(0.029 * x);
 }
 
 inline Matrix JaxFixtureMatrix(std::size_t rows, std::size_t cols, int seed,
-                               double scale) {
+                               Scalar scale) {
   Matrix out(rows, cols);
   for (std::size_t row = 0; row < rows; ++row)
     for (std::size_t col = 0; col < cols; ++col)
@@ -25,7 +25,7 @@ inline Matrix JaxFixtureMatrix(std::size_t rows, std::size_t cols, int seed,
   return out;
 }
 
-inline Vector JaxFixtureVector(std::size_t size, int seed, double scale) {
+inline Vector JaxFixtureVector(std::size_t size, int seed, Scalar scale) {
   Vector out(size);
   for (std::size_t row = 0; row < size; ++row)
     out[row] = scale * JaxFixtureValue(seed, row);
@@ -33,16 +33,16 @@ inline Vector JaxFixtureVector(std::size_t size, int seed, double scale) {
 }
 
 inline Matrix JaxFixturePositiveDefinite(std::size_t size, int seed,
-                                         double diagonal) {
+                                         Scalar diagonal) {
   Matrix g = JaxFixtureMatrix(size, size, seed, 0.15);
   Matrix out = Transpose(g) * g;
   for (std::size_t row = 0; row < size; ++row) out(row, row) += diagonal;
   return out;
 }
 
-inline double RowDot(const Matrix& matrix, std::size_t row,
+inline Scalar RowDot(const Matrix& matrix, std::size_t row,
                      const Vector& vector) {
-  double value = 0.0;
+  Scalar value = 0.0;
   for (std::size_t col = 0; col < vector.size(); ++col)
     value += matrix(row, col) * vector[col];
   return value;

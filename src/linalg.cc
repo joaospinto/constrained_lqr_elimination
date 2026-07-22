@@ -23,36 +23,40 @@ void Check(bool condition, const char* message) {
 
 WorkspaceArena* ActiveWorkspaceArena() { return active_workspace_arena; }
 
-void SetActiveWorkspaceArena(WorkspaceArena* arena) { active_workspace_arena = arena; }
+void SetActiveWorkspaceArena(WorkspaceArena* arena) {
+  active_workspace_arena = arena;
+}
 
-Vector::Vector(std::size_t size) : data_(size, 0.0) {}
+Vector::Vector(std::size_t size) : data_(size, Scalar{0}) {}
 
-Vector::Vector(std::initializer_list<double> values) : data_(values) {}
+Vector::Vector(std::initializer_list<Scalar> values) : data_(values) {}
 
 void Vector::reserve(std::size_t size) { data_.reserve(size); }
 
-void Vector::resize(std::size_t size) { data_.assign(size, 0.0); }
+void Vector::resize(std::size_t size) { data_.assign(size, Scalar{0}); }
 
 Matrix::Matrix(std::size_t rows, std::size_t cols)
-    : rows_(rows), cols_(cols), data_(rows * cols, 0.0) {}
+    : rows_(rows), cols_(cols), data_(rows * cols, Scalar{0}) {}
 
 Matrix::Matrix(std::size_t rows, std::size_t cols,
-               std::initializer_list<double> values)
+               std::initializer_list<Scalar> values)
     : rows_(rows), cols_(cols), data_(values) {
   Check(data_.size() == rows * cols, "matrix initializer has wrong size");
 }
 
-void Matrix::reserve(std::size_t rows, std::size_t cols) { data_.reserve(rows * cols); }
+void Matrix::reserve(std::size_t rows, std::size_t cols) {
+  data_.reserve(rows * cols);
+}
 
 void Matrix::resize(std::size_t rows, std::size_t cols) {
   rows_ = rows;
   cols_ = cols;
-  data_.assign(rows * cols, 0.0);
+  data_.assign(rows * cols, Scalar{0});
 }
 
 Matrix Identity(std::size_t size) {
   Matrix out(size, size);
-  for (std::size_t i = 0; i < size; ++i) out(i, i) = 1.0;
+  for (std::size_t i = 0; i < size; ++i) out(i, i) = Scalar{1};
   return out;
 }
 
@@ -69,16 +73,20 @@ Matrix Transpose(const Matrix& a) {
 }
 
 Matrix operator+(const Matrix& a, const Matrix& b) {
-  Check(a.rows() == b.rows() && a.cols() == b.cols(), "matrix add shape mismatch");
+  Check(a.rows() == b.rows() && a.cols() == b.cols(),
+        "matrix add shape mismatch");
   Matrix out(a.rows(), a.cols());
-  for (std::size_t i = 0; i < out.data().size(); ++i) out.data()[i] = a.data()[i] + b.data()[i];
+  for (std::size_t i = 0; i < out.data().size(); ++i)
+    out.data()[i] = a.data()[i] + b.data()[i];
   return out;
 }
 
 Matrix operator-(const Matrix& a, const Matrix& b) {
-  Check(a.rows() == b.rows() && a.cols() == b.cols(), "matrix subtract shape mismatch");
+  Check(a.rows() == b.rows() && a.cols() == b.cols(),
+        "matrix subtract shape mismatch");
   Matrix out(a.rows(), a.cols());
-  for (std::size_t i = 0; i < out.data().size(); ++i) out.data()[i] = a.data()[i] - b.data()[i];
+  for (std::size_t i = 0; i < out.data().size(); ++i)
+    out.data()[i] = a.data()[i] - b.data()[i];
   return out;
 }
 
@@ -87,7 +95,7 @@ Matrix operator*(const Matrix& a, const Matrix& b) {
   Matrix out(a.rows(), b.cols());
   for (std::size_t i = 0; i < a.rows(); ++i) {
     for (std::size_t k = 0; k < a.cols(); ++k) {
-      const double aik = a(i, k);
+      const Scalar aik = a(i, k);
       for (std::size_t j = 0; j < b.cols(); ++j) out(i, j) += aik * b(k, j);
     }
   }
@@ -117,13 +125,14 @@ Vector operator*(const Matrix& a, const Vector& x) {
   return out;
 }
 
-Matrix Scale(const Matrix& a, double alpha) {
+Matrix Scale(const Matrix& a, Scalar alpha) {
   Matrix out(a.rows(), a.cols());
-  for (std::size_t i = 0; i < out.data().size(); ++i) out.data()[i] = alpha * a.data()[i];
+  for (std::size_t i = 0; i < out.data().size(); ++i)
+    out.data()[i] = alpha * a.data()[i];
   return out;
 }
 
-Vector Scale(const Vector& x, double alpha) {
+Vector Scale(const Vector& x, Scalar alpha) {
   Vector out(x.size());
   for (std::size_t i = 0; i < x.size(); ++i) out[i] = alpha * x[i];
   return out;
@@ -198,50 +207,52 @@ Matrix RemoveRows(const Matrix& a, const WorkspaceVector<std::size_t>& remove) {
   return out;
 }
 
-double Dot(const Vector& a, const Vector& b) {
+Scalar Dot(const Vector& a, const Vector& b) {
   Check(a.size() == b.size(), "dot product shape mismatch");
-  double out = 0.0;
+  Scalar out = Scalar{0};
   for (std::size_t i = 0; i < a.size(); ++i) out += a[i] * b[i];
   return out;
 }
 
-double MaxAbs(const Matrix& a) {
-  double out = 0.0;
-  for (double value : a.data()) out = std::max(out, std::abs(value));
+Scalar MaxAbs(const Matrix& a) {
+  Scalar out = Scalar{0};
+  for (Scalar value : a.data()) out = std::max(out, std::abs(value));
   return out;
 }
 
-double MaxAbs(const Vector& a) {
-  double out = 0.0;
-  for (double value : a.data()) out = std::max(out, std::abs(value));
+Scalar MaxAbs(const Vector& a) {
+  Scalar out = Scalar{0};
+  for (Scalar value : a.data()) out = std::max(out, std::abs(value));
   return out;
 }
 
-bool IsNearlyZero(double value, double tolerance) { return std::abs(value) <= tolerance; }
+bool IsNearlyZero(Scalar value, Scalar tolerance) {
+  return std::abs(value) <= tolerance;
+}
 
 bool AllFinite(const Matrix& a) {
-  for (double value : a.data()) {
+  for (Scalar value : a.data()) {
     if (!std::isfinite(value)) return false;
   }
   return true;
 }
 
 bool AllFinite(const Vector& a) {
-  for (double value : a.data()) {
+  for (Scalar value : a.data()) {
     if (!std::isfinite(value)) return false;
   }
   return true;
 }
 
-Vector SolveLinearSystem(Matrix a, Vector b, double tolerance) {
+Vector SolveLinearSystem(Matrix a, Vector b, Scalar tolerance) {
   Check(a.rows() == a.cols(), "linear solve matrix must be square");
   Check(a.rows() == b.size(), "linear solve rhs shape mismatch");
   const std::size_t n = a.rows();
   for (std::size_t col = 0; col < n; ++col) {
     std::size_t pivot = col;
-    double best = std::abs(a(col, col));
+    Scalar best = std::abs(a(col, col));
     for (std::size_t row = col + 1; row < n; ++row) {
-      const double candidate = std::abs(a(row, col));
+      const Scalar candidate = std::abs(a(row, col));
       if (candidate > best) {
         best = candidate;
         pivot = row;
@@ -252,12 +263,12 @@ Vector SolveLinearSystem(Matrix a, Vector b, double tolerance) {
       for (std::size_t j = col; j < n; ++j) std::swap(a(col, j), a(pivot, j));
       std::swap(b[col], b[pivot]);
     }
-    const double pivot_value = a(col, col);
+    const Scalar pivot_value = a(col, col);
     for (std::size_t j = col; j < n; ++j) a(col, j) /= pivot_value;
     b[col] /= pivot_value;
     for (std::size_t row = 0; row < n; ++row) {
       if (row == col) continue;
-      const double factor = a(row, col);
+      const Scalar factor = a(row, col);
       if (IsNearlyZero(factor, tolerance)) continue;
       for (std::size_t j = col; j < n; ++j) a(row, j) -= factor * a(col, j);
       b[row] -= factor * b[col];
@@ -266,15 +277,15 @@ Vector SolveLinearSystem(Matrix a, Vector b, double tolerance) {
   return b;
 }
 
-Matrix SolveLinearSystem(Matrix a, Matrix b, double tolerance) {
+Matrix SolveLinearSystem(Matrix a, Matrix b, Scalar tolerance) {
   Check(a.rows() == a.cols(), "linear solve matrix must be square");
   Check(a.rows() == b.rows(), "linear solve rhs shape mismatch");
   const std::size_t n = a.rows();
   for (std::size_t col = 0; col < n; ++col) {
     std::size_t pivot = col;
-    double best = std::abs(a(col, col));
+    Scalar best = std::abs(a(col, col));
     for (std::size_t row = col + 1; row < n; ++row) {
-      const double candidate = std::abs(a(row, col));
+      const Scalar candidate = std::abs(a(row, col));
       if (candidate > best) {
         best = candidate;
         pivot = row;
@@ -283,23 +294,25 @@ Matrix SolveLinearSystem(Matrix a, Matrix b, double tolerance) {
     if (best <= tolerance) throw std::runtime_error("singular linear system");
     if (pivot != col) {
       for (std::size_t j = col; j < n; ++j) std::swap(a(col, j), a(pivot, j));
-      for (std::size_t j = 0; j < b.cols(); ++j) std::swap(b(col, j), b(pivot, j));
+      for (std::size_t j = 0; j < b.cols(); ++j)
+        std::swap(b(col, j), b(pivot, j));
     }
-    const double pivot_value = a(col, col);
+    const Scalar pivot_value = a(col, col);
     for (std::size_t j = col; j < n; ++j) a(col, j) /= pivot_value;
     for (std::size_t j = 0; j < b.cols(); ++j) b(col, j) /= pivot_value;
     for (std::size_t row = 0; row < n; ++row) {
       if (row == col) continue;
-      const double factor = a(row, col);
+      const Scalar factor = a(row, col);
       if (IsNearlyZero(factor, tolerance)) continue;
       for (std::size_t j = col; j < n; ++j) a(row, j) -= factor * a(col, j);
-      for (std::size_t j = 0; j < b.cols(); ++j) b(row, j) -= factor * b(col, j);
+      for (std::size_t j = 0; j < b.cols(); ++j)
+        b(row, j) -= factor * b(col, j);
     }
   }
   return b;
 }
 
-RrefResult Rref(Matrix a, std::size_t pivot_column_limit, double tolerance) {
+RrefResult Rref(Matrix a, std::size_t pivot_column_limit, Scalar tolerance) {
   RrefResult result;
   result.pivot_columns.reserve(std::min(a.rows(), pivot_column_limit));
   result.pivot_rows.reserve(std::min(a.rows(), pivot_column_limit));
@@ -307,9 +320,9 @@ RrefResult Rref(Matrix a, std::size_t pivot_column_limit, double tolerance) {
   const std::size_t limit = std::min(pivot_column_limit, a.cols());
   for (std::size_t col = 0; col < limit && pivot_row < a.rows(); ++col) {
     std::size_t best_row = pivot_row;
-    double best = std::abs(a(best_row, col));
+    Scalar best = std::abs(a(best_row, col));
     for (std::size_t row = pivot_row + 1; row < a.rows(); ++row) {
-      const double candidate = std::abs(a(row, col));
+      const Scalar candidate = std::abs(a(row, col));
       if (candidate > best) {
         best = candidate;
         best_row = row;
@@ -317,22 +330,24 @@ RrefResult Rref(Matrix a, std::size_t pivot_column_limit, double tolerance) {
     }
     if (best <= tolerance) continue;
     if (best_row != pivot_row) {
-      for (std::size_t j = 0; j < a.cols(); ++j) std::swap(a(pivot_row, j), a(best_row, j));
+      for (std::size_t j = 0; j < a.cols(); ++j)
+        std::swap(a(pivot_row, j), a(best_row, j));
     }
-    const double pivot_value = a(pivot_row, col);
+    const Scalar pivot_value = a(pivot_row, col);
     for (std::size_t j = col; j < a.cols(); ++j) a(pivot_row, j) /= pivot_value;
     for (std::size_t row = 0; row < a.rows(); ++row) {
       if (row == pivot_row) continue;
-      const double factor = a(row, col);
+      const Scalar factor = a(row, col);
       if (IsNearlyZero(factor, tolerance)) continue;
-      for (std::size_t j = col; j < a.cols(); ++j) a(row, j) -= factor * a(pivot_row, j);
+      for (std::size_t j = col; j < a.cols(); ++j)
+        a(row, j) -= factor * a(pivot_row, j);
     }
     result.pivot_columns.push_back(col);
     result.pivot_rows.push_back(pivot_row);
     ++pivot_row;
   }
-  for (double& value : a.data()) {
-    if (IsNearlyZero(value, tolerance)) value = 0.0;
+  for (Scalar& value : a.data()) {
+    if (IsNearlyZero(value, tolerance)) value = Scalar{0};
   }
   result.matrix = std::move(a);
   return result;

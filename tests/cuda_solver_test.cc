@@ -11,11 +11,20 @@ namespace {
 
 using clqr::Matrix;
 using clqr::Problem;
+using clqr::Scalar;
 using clqr::SolveStatus;
 using clqr::Stage;
 using clqr::Vector;
 
-constexpr double kTolerance = 3e-6;
+#ifdef CLQR_USE_FLOAT
+constexpr Scalar kTolerance = 2e-2f;
+constexpr Scalar kKktTolerance = 1e-2f;
+constexpr bool kRedundantUsesParallelRiccati = false;
+#else
+constexpr Scalar kTolerance = 3e-6;
+constexpr Scalar kKktTolerance = 2e-5;
+constexpr bool kRedundantUsesParallelRiccati = true;
+#endif
 
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -24,13 +33,13 @@ void Expect(bool condition, const std::string& message) {
   }
 }
 
-double DeterministicValue(int seed, std::size_t i, std::size_t j = 0) {
-  const double x = static_cast<double>(
+Scalar DeterministicValue(int seed, std::size_t i, std::size_t j = 0) {
+  const Scalar x = static_cast<Scalar>(
       (seed + 17) * 131 + static_cast<int>(i) * 37 + static_cast<int>(j) * 53);
   return std::sin(0.013 * x) + 0.35 * std::cos(0.031 * x);
 }
 
-Vector GeneratedVector(std::size_t size, int seed, double scale = 1.0) {
+Vector GeneratedVector(std::size_t size, int seed, Scalar scale = 1.0) {
   Vector out(size);
   for (std::size_t i = 0; i < size; ++i)
     out[i] = scale * DeterministicValue(seed, i);
@@ -38,7 +47,7 @@ Vector GeneratedVector(std::size_t size, int seed, double scale = 1.0) {
 }
 
 Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed,
-                       double scale = 1.0) {
+                       Scalar scale = 1.0) {
   Matrix out(rows, cols);
   for (std::size_t row = 0; row < rows; ++row) {
     for (std::size_t col = 0; col < cols; ++col)
@@ -47,15 +56,15 @@ Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed,
   return out;
 }
 
-Matrix PositiveDefinite(std::size_t size, int seed, double diagonal) {
+Matrix PositiveDefinite(std::size_t size, int seed, Scalar diagonal) {
   Matrix g = GeneratedMatrix(size, size, seed, 0.2);
   Matrix out = clqr::Transpose(g) * g;
   for (std::size_t i = 0; i < size; ++i) out(i, i) += diagonal;
   return out;
 }
 
-double RowDot(const Matrix& matrix, std::size_t row, const Vector& vector) {
-  double value = 0.0;
+Scalar RowDot(const Matrix& matrix, std::size_t row, const Vector& vector) {
+  Scalar value = 0.0;
   for (std::size_t col = 0; col < vector.size(); ++col)
     value += matrix(row, col) * vector[col];
   return value;
@@ -189,11 +198,45 @@ Problem NonuniformProblem() {
   return problem;
 }
 
-double TestMaxAbs(const Vector& vector) {
-  double value = 0.0;
+Scalar TestMaxAbs(const Vector& vector) {
+  Scalar value = 0.0;
   for (std::size_t i = 0; i < vector.size(); ++i)
     value = std::max(value, std::abs(vector[i]));
   return value;
+}
+
+Scalar MaxScaledMixedResidual(const Stage& stage, const Vector& state,
+                              const Vector& control) {
+  Scalar residual = Scalar{0};
+  for (std::size_t row = 0; row < stage.C.rows(); ++row) {
+    Scalar value = stage.d[row];
+    Scalar scale = std::max(Scalar{1}, std::abs(stage.d[row]));
+    for (std::size_t col = 0; col < stage.C.cols(); ++col) {
+      value += stage.C(row, col) * state[col];
+      scale = std::max(scale, std::abs(stage.C(row, col)));
+    }
+    for (std::size_t col = 0; col < stage.D.cols(); ++col) {
+      value += stage.D(row, col) * control[col];
+      scale = std::max(scale, std::abs(stage.D(row, col)));
+    }
+    residual = std::max(residual, std::abs(value) / scale);
+  }
+  return residual;
+}
+
+Scalar MaxScaledStateResidual(const Matrix& matrix, const Vector& offset,
+                              const Vector& state) {
+  Scalar residual = Scalar{0};
+  for (std::size_t row = 0; row < matrix.rows(); ++row) {
+    Scalar value = offset[row];
+    Scalar scale = std::max(Scalar{1}, std::abs(offset[row]));
+    for (std::size_t col = 0; col < matrix.cols(); ++col) {
+      value += matrix(row, col) * state[col];
+      scale = std::max(scale, std::abs(matrix(row, col)));
+    }
+    residual = std::max(residual, std::abs(value) / scale);
+  }
+  return residual;
 }
 
 void AddTransposeProduct(const Matrix& matrix, const Vector& multiplier,
@@ -204,9 +247,9 @@ void AddTransposeProduct(const Matrix& matrix, const Vector& multiplier,
   }
 }
 
-double MaxKktResidual(const Problem& problem,
+Scalar MaxKktResidual(const Problem& problem,
                       const clqr::cuda::Solution& solution) {
-  double residual = 0.0;
+  Scalar residual = 0.0;
   const std::size_t horizon = problem.stages.size();
   for (std::size_t i = 0; i < horizon; ++i) {
     const Stage& stage = problem.stages[i];
@@ -215,12 +258,12 @@ double MaxKktResidual(const Problem& problem,
         TestMaxAbs(solution.states[i + 1] - stage.A * solution.states[i] -
                    stage.B * solution.controls[i] - stage.c));
     if (stage.C.rows() > 0)
-      residual = std::max(residual,
-                          TestMaxAbs(stage.C * solution.states[i] +
-                                     stage.D * solution.controls[i] + stage.d));
+      residual =
+          std::max(residual, MaxScaledMixedResidual(stage, solution.states[i],
+                                                    solution.controls[i]));
     if (stage.E.rows() > 0)
-      residual = std::max(residual,
-                          TestMaxAbs(stage.E * solution.states[i] + stage.e));
+      residual = std::max(residual, MaxScaledStateResidual(stage.E, stage.e,
+                                                           solution.states[i]));
 
     Vector gx = stage.Q * solution.states[i] + stage.M * solution.controls[i] +
                 stage.q -
@@ -240,15 +283,14 @@ double MaxKktResidual(const Problem& problem,
   Vector initial_error = solution.states.front() - problem.initial_state;
   residual = std::max(residual, TestMaxAbs(initial_error));
   if (problem.terminal_E.rows() > 0)
-    residual = std::max(residual,
-                        TestMaxAbs(problem.terminal_E * solution.states.back() +
-                                   problem.terminal_e));
+    residual = std::max(
+        residual, MaxScaledStateResidual(problem.terminal_E, problem.terminal_e,
+                                         solution.states.back()));
   Vector terminal_gradient =
       problem.terminal_Q * solution.states.back() + problem.terminal_q;
   terminal_gradient =
-      terminal_gradient +
-      (horizon == 0 ? solution.initial_multiplier
-                    : solution.dynamics_multipliers.back());
+      terminal_gradient + (horizon == 0 ? solution.initial_multiplier
+                                        : solution.dynamics_multipliers.back());
   AddTransposeProduct(problem.terminal_E, solution.terminal_state_multiplier,
                       &terminal_gradient);
   return std::max(residual, TestMaxAbs(terminal_gradient));
@@ -256,7 +298,8 @@ double MaxKktResidual(const Problem& problem,
 
 void CompareWithCpu(const Problem& problem, const std::string& name,
                     bool expect_parallel = true,
-                    const Problem* cpu_reference_problem = nullptr) {
+                    const Problem* cpu_reference_problem = nullptr,
+                    bool expect_host_multiplier_recovery = false) {
   std::cout << "case: " << name << std::endl;
   const Problem& cpu_problem =
       cpu_reference_problem == nullptr ? problem : *cpu_reference_problem;
@@ -269,6 +312,8 @@ void CompareWithCpu(const Problem& problem, const std::string& name,
   Expect(gpu.status == SolveStatus::kOptimal,
          name + " CUDA status: " + gpu.message);
   Expect(gpu.used_parallel_riccati == expect_parallel, name + " Riccati path");
+  Expect(gpu.used_host_multiplier_recovery == expect_host_multiplier_recovery,
+         name + " multiplier recovery path");
   Expect(gpu.states.size() == cpu.state_count, name + " state count");
   Expect(gpu.controls.size() == cpu.control_count, name + " control count");
   for (std::size_t i = 0; i < cpu.state_count; ++i) {
@@ -292,7 +337,7 @@ void CompareWithCpu(const Problem& problem, const std::string& name,
   Expect(std::abs(gpu.objective - cpu.objective) <=
              kTolerance * (1.0 + std::abs(cpu.objective)),
          name + " objective mismatch");
-  Expect(MaxKktResidual(problem, gpu) <= 2e-5,
+  Expect(MaxKktResidual(problem, gpu) <= kKktTolerance,
          name + " full primal-dual KKT residual");
   for (std::size_t i = 0; i < gpu.reduced_state_dimensions.size(); ++i) {
     Expect(gpu.reduced_state_dimensions[i] <=
@@ -367,7 +412,7 @@ Problem RescaledMixedRowsProblem(const Problem& unscaled) {
   Problem problem = unscaled;
   for (Stage& stage : problem.stages) {
     for (std::size_t row = 0; row < stage.C.rows(); ++row) {
-      const double scale = row == 0 ? 1e-7 : (row == 2 ? 1e7 : 1.0);
+      const Scalar scale = row == 0 ? 1e-7 : (row == 2 ? 1e7 : 1.0);
       for (std::size_t col = 0; col < stage.C.cols(); ++col)
         stage.C(row, col) *= scale;
       for (std::size_t col = 0; col < stage.D.cols(); ++col)
@@ -419,7 +464,8 @@ int main() {
                  "alternating");
   CompareWithCpu(
       GeneratedProblem(5, 5, 4, 2, 2, ConstraintMode::kRedundantMixed),
-      "rank-deficient redundant");
+      "rank-deficient redundant", kRedundantUsesParallelRiccati, nullptr,
+      !kRedundantUsesParallelRiccati);
   CompareWithCpu(GeneratedProblem(6, 4, 4, 2, 2, ConstraintMode::kTerminal),
                  "terminal constraints");
   CompareWithCpu(NonuniformProblem(), "nonuniform dimensions");

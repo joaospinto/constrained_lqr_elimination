@@ -34,9 +34,10 @@ extern const __device__ dim3 gridDim;
 extern "C" __device__ int atomicCAS(int*, int, int);
 extern "C" __device__ int atomicExch(int*, int);
 extern "C" __device__ void __syncthreads();
-extern "C" __device__ double fmax(double, double);
-extern "C" __device__ double sqrt(double);
-extern "C" __device__ int isfinite(double);
+__device__ double fmax(double, double);
+__device__ float fmax(float, float);
+__device__ double sqrt(double);
+__device__ float sqrt(float);
 
 using cudaError_t = int;
 using cudaEvent_t = void*;

@@ -1,7 +1,6 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -16,23 +15,68 @@
 
 #include "clqr/cuda.h"
 #include "cuda_internal.h"
+#include "multiplier_recovery.h"
 
 namespace clqr {
 namespace cuda {
 namespace detail {
 namespace {
 
+#ifdef CLQR_USE_FLOAT
+bool HasDependentRows(const Matrix& matrix, Scalar tolerance) {
+  if (matrix.rows() == 0) return false;
+  Matrix scaled = matrix;
+  for (std::size_t row = 0; row < scaled.rows(); ++row) {
+    Scalar scale = Scalar{0};
+    for (std::size_t col = 0; col < scaled.cols(); ++col)
+      scale = std::max(scale, std::abs(scaled(row, col)));
+    if (scale > Scalar{0}) {
+      for (std::size_t col = 0; col < scaled.cols(); ++col)
+        scaled(row, col) /= scale;
+    }
+  }
+  return Rref(std::move(scaled), matrix.cols(), tolerance)
+             .pivot_columns.size() < matrix.rows();
+}
+
+bool HasDependentEqualityRows(const Problem& problem, Scalar tolerance) {
+  for (const Stage& stage : problem.stages) {
+    Matrix mixed(stage.C.rows(), stage.C.cols() + stage.D.cols());
+    for (std::size_t row = 0; row < stage.C.rows(); ++row) {
+      for (std::size_t col = 0; col < stage.C.cols(); ++col)
+        mixed(row, col) = stage.C(row, col);
+      for (std::size_t col = 0; col < stage.D.cols(); ++col)
+        mixed(row, stage.C.cols() + col) = stage.D(row, col);
+    }
+    if (HasDependentRows(mixed, tolerance) ||
+        HasDependentRows(stage.E, tolerance)) {
+      return true;
+    }
+  }
+  return HasDependentRows(problem.terminal_E, tolerance);
+}
+#endif
+
 constexpr int kThreads = 128;
-constexpr double kMinimumMultiplierRankTolerance = 1e-7;
-constexpr double kMultiplierConsistencyTolerancePerTreeLevel = 1e-6;
+#ifdef CLQR_USE_FLOAT
+constexpr Scalar kMinimumFeasibilityConsistencyTolerance = 1e-4f;
+constexpr Scalar kMinimumMultiplierRankTolerance = 3e-3f;
+constexpr Scalar kMultiplierConsistencyTolerancePerTreeLevel = 2e-2f;
+#else
+constexpr Scalar kMinimumFeasibilityConsistencyTolerance = Scalar{0};
+constexpr Scalar kMinimumMultiplierRankTolerance = 1e-7;
+constexpr Scalar kMultiplierConsistencyTolerancePerTreeLevel = 1e-6;
+#endif
 constexpr int kMaxRrefRows = 2 * kMaxRelationRows;
 constexpr int kMaxRrefColumns = kMaxDualColumns;
 constexpr int kMaxRrefEntries = kMaxRrefRows * kMaxRrefColumns;
 
-__device__ inline double DeviceAbs(double x) { return x < 0.0 ? -x : x; }
+constexpr Scalar kScalarMax = std::numeric_limits<Scalar>::max();
 
-__device__ inline bool DeviceFinite(double x) {
-  return x >= -DBL_MAX && x <= DBL_MAX;
+__device__ inline Scalar DeviceAbs(Scalar x) { return x < Scalar{0} ? -x : x; }
+
+__device__ inline bool DeviceFinite(Scalar x) {
+  return x >= -kScalarMax && x <= kScalarMax;
 }
 
 __device__ void SetFailure(DeviceStatus* status, int code, int stage,
@@ -62,16 +106,16 @@ __device__ bool BlockEnabled(const int* flag, int* enabled) {
 // Scale each nonzero equation before pivoting, then use partial row pivoting.
 // This makes rank decisions invariant to independent equation rescaling while
 // retaining the deterministic free-column convention of the CPU RREF path.
-__device__ void RrefBlock(double* matrix, int rows, int columns,
-                          int pivot_limit, double tolerance, int* pivot_columns,
+__device__ void RrefBlock(Scalar* matrix, int rows, int columns,
+                          int pivot_limit, Scalar tolerance, int* pivot_columns,
                           int* pivot_rows, int* rank, int* best_row,
-                          double* factors) {
+                          Scalar* factors) {
   for (int row = threadIdx.x; row < rows; row += blockDim.x) {
-    double scale = 0.0;
+    Scalar scale = Scalar{0};
     for (int col = 0; col < pivot_limit; ++col) {
       scale = fmax(scale, DeviceAbs(matrix[row * columns + col]));
     }
-    if (scale > 0.0) {
+    if (scale > Scalar{0}) {
       for (int col = 0; col < columns; ++col)
         matrix[row * columns + col] /= scale;
     }
@@ -82,9 +126,9 @@ __device__ void RrefBlock(double* matrix, int rows, int columns,
   for (int col = 0; col < pivot_limit; ++col) {
     if (threadIdx.x == 0) {
       *best_row = -1;
-      double best = tolerance;
+      Scalar best = tolerance;
       for (int row = *rank; row < rows; ++row) {
-        const double candidate = DeviceAbs(matrix[row * columns + col]);
+        const Scalar candidate = DeviceAbs(matrix[row * columns + col]);
         if (candidate > best) {
           best = candidate;
           *best_row = row;
@@ -101,14 +145,14 @@ __device__ void RrefBlock(double* matrix, int rows, int columns,
     const int pivot_row = *rank;
     if (selected_row != pivot_row) {
       for (int j = threadIdx.x; j < columns; j += blockDim.x) {
-        const double tmp = matrix[pivot_row * columns + j];
+        const Scalar tmp = matrix[pivot_row * columns + j];
         matrix[pivot_row * columns + j] = matrix[selected_row * columns + j];
         matrix[selected_row * columns + j] = tmp;
       }
     }
     __syncthreads();
 
-    const double pivot = matrix[pivot_row * columns + col];
+    const Scalar pivot = matrix[pivot_row * columns + col];
     // All threads must load the pivot before any thread normalizes its entry.
     __syncthreads();
     for (int j = col + threadIdx.x; j < columns; j += blockDim.x) {
@@ -117,7 +161,7 @@ __device__ void RrefBlock(double* matrix, int rows, int columns,
     __syncthreads();
 
     for (int row = threadIdx.x; row < rows; row += blockDim.x) {
-      factors[row] = row == pivot_row ? 0.0 : matrix[row * columns + col];
+      factors[row] = row == pivot_row ? Scalar{0} : matrix[row * columns + col];
     }
     __syncthreads();
     for (int index = threadIdx.x; index < rows * (columns - col);
@@ -140,13 +184,13 @@ __device__ void RrefBlock(double* matrix, int rows, int columns,
   }
 
   for (int index = threadIdx.x; index < rows * columns; index += blockDim.x) {
-    if (DeviceAbs(matrix[index]) <= tolerance) matrix[index] = 0.0;
+    if (DeviceAbs(matrix[index]) <= tolerance) matrix[index] = Scalar{0};
   }
   __syncthreads();
 }
 
-__device__ bool InconsistentRref(const double* matrix, int rows, int columns,
-                                 int lhs_columns, double tolerance) {
+__device__ bool InconsistentRref(const Scalar* matrix, int rows, int columns,
+                                 int lhs_columns, Scalar tolerance) {
   for (int row = 0; row < rows; ++row) {
     bool zero = true;
     for (int col = 0; col < lhs_columns; ++col) {
@@ -161,7 +205,7 @@ __device__ bool InconsistentRref(const double* matrix, int rows, int columns,
   return false;
 }
 
-__device__ void ExtractResidualRelation(const double* matrix, int columns,
+__device__ void ExtractResidualRelation(const Scalar* matrix, int columns,
                                         int rank, const int* pivot_columns,
                                         int eliminated_columns, int left_dim,
                                         int right_dim, Relation* output) {
@@ -182,7 +226,7 @@ __device__ void ExtractResidualRelation(const double* matrix, int columns,
        index += blockDim.x) {
     const int row = index / outer_dim;
     const int col = index % outer_dim;
-    const double value =
+    const Scalar value =
         matrix[(eliminated_rank + row) * columns + eliminated_columns + col];
     if (col < left_dim) {
       output->left[row * kMaxStateDimension + col] = value;
@@ -196,17 +240,16 @@ __device__ void ExtractResidualRelation(const double* matrix, int columns,
   __syncthreads();
 }
 
-__global__ void BuildPrimalLeavesKernel(const PackedStage* stages,
-                                        int stage_count,
-                                        const PackedTerminal* terminal_ptr,
-                                        double tolerance, Relation* leaves,
-                                        DeviceStatus* status) {
+__global__ void BuildPrimalLeavesKernel(
+    const PackedStage* stages, int stage_count,
+    const PackedTerminal* terminal_ptr, Scalar rank_tolerance,
+    Scalar consistency_tolerance, Relation* leaves, DeviceStatus* status) {
   const int index = blockIdx.x;
   if (index > stage_count) return;
   __shared__ int block_enabled;
   if (!BlockEnabled(status, &block_enabled)) return;
-  __shared__ double matrix[kMaxRrefEntries];
-  __shared__ double factors[kMaxRrefRows];
+  __shared__ Scalar matrix[kMaxRrefEntries];
+  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
@@ -239,7 +282,7 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage* stages,
   __syncthreads();
 
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
-    matrix[i] = 0.0;
+    matrix[i] = Scalar{0};
   __syncthreads();
   if (index == stage_count) {
     for (int linear = threadIdx.x; linear < terminal.state * terminal.n;
@@ -294,15 +337,16 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage* stages,
           -s.A[row * kMaxStateDimension + col];
     }
     for (int row = threadIdx.x; row < s.next_n; row += blockDim.x) {
-      matrix[(dynamics_row + row) * columns + s.m + s.n + row] = 1.0;
+      matrix[(dynamics_row + row) * columns + s.m + s.n + row] = Scalar{1};
       matrix[(dynamics_row + row) * columns + columns - 1] = s.c[row];
     }
   }
   __syncthreads();
-  RrefBlock(matrix, rows, columns, columns - 1, tolerance, pivot_columns,
+  RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(matrix, rows, columns, columns - 1, tolerance);
+    local_ok = !InconsistentRref(matrix, rows, columns, columns - 1,
+                                 consistency_tolerance);
     if (!local_ok) SetFailure(status, kDeviceInfeasible, index, 1);
   }
   __syncthreads();
@@ -311,16 +355,12 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage* stages,
                           left_dim, right_dim, &leaves[index]);
 }
 
-__device__ void ComposeRelationsBlock(const Relation& first,
-                                      const Relation& second,
-                                      double rank_tolerance,
-                                      double consistency_tolerance,
-                                      Relation* output, DeviceStatus* status,
-                                      int stage, int inconsistency_code,
-                                      int inconsistency_detail, double* matrix,
-                                      double* factors, int* pivot_columns,
-                                      int* pivot_rows, int* rank, int* best_row,
-                                      int* local_ok) {
+__device__ void ComposeRelationsBlock(
+    const Relation& first, const Relation& second, Scalar rank_tolerance,
+    Scalar consistency_tolerance, Relation* output, DeviceStatus* status,
+    int stage, int inconsistency_code, int inconsistency_detail, Scalar* matrix,
+    Scalar* factors, int* pivot_columns, int* pivot_rows, int* rank,
+    int* best_row, int* local_ok) {
   if (first.right_dim != second.left_dim) {
     if (threadIdx.x == 0) SetFailure(status, kDeviceNumericalFailure, stage, 2);
     return;
@@ -329,7 +369,7 @@ __device__ void ComposeRelationsBlock(const Relation& first,
   const int rows = first.rows + second.rows;
   const int columns = shared + first.left_dim + second.right_dim + 1;
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
-    matrix[i] = 0.0;
+    matrix[i] = Scalar{0};
   __syncthreads();
   for (int linear = threadIdx.x; linear < first.rows * shared;
        linear += blockDim.x) {
@@ -369,7 +409,7 @@ __device__ void ComposeRelationsBlock(const Relation& first,
             pivot_rows, rank, best_row, factors);
   if (threadIdx.x == 0) {
     *local_ok = !InconsistentRref(matrix, rows, columns, columns - 1,
-                                 consistency_tolerance);
+                                  consistency_tolerance);
     if (!*local_ok)
       SetFailure(status, inconsistency_code, stage, inconsistency_detail);
   }
@@ -404,7 +444,8 @@ __device__ void CopyRelationBlock(const Relation& input, Relation* output) {
 }
 
 __global__ void SuffixRelationsKernel(const Relation* input, int count,
-                                      int offset, double tolerance,
+                                      int offset, Scalar rank_tolerance,
+                                      Scalar consistency_tolerance,
                                       Relation* output, DeviceStatus* status) {
   const int index = blockIdx.x;
   if (index >= count) return;
@@ -414,22 +455,22 @@ __global__ void SuffixRelationsKernel(const Relation* input, int count,
     CopyRelationBlock(input[index], &output[index]);
     return;
   }
-  __shared__ double matrix[kMaxRrefEntries];
-  __shared__ double factors[kMaxRrefRows];
+  __shared__ Scalar matrix[kMaxRrefEntries];
+  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
   __shared__ int best_row;
   __shared__ int local_ok;
-  ComposeRelationsBlock(
-      input[index], input[index + offset], tolerance, tolerance, &output[index],
-      status, index, kDeviceInfeasible, 3, matrix, factors, pivot_columns,
-      pivot_rows, &rank, &best_row, &local_ok);
+  ComposeRelationsBlock(input[index], input[index + offset], rank_tolerance,
+                        consistency_tolerance, &output[index], status, index,
+                        kDeviceInfeasible, 3, matrix, factors, pivot_columns,
+                        pivot_rows, &rank, &best_row, &local_ok);
 }
 
 __global__ void StateParamKernel(const Relation* suffix, int count,
                                  StateParam* params, DeviceStatus* status,
-                                 double tolerance) {
+                                 Scalar tolerance) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= count || status->code != kDeviceOk) return;
   const Relation& relation = suffix[index];
@@ -466,7 +507,7 @@ __global__ void StateParamKernel(const Relation* suffix, int count,
   for (int col = 0; col < relation.left_dim; ++col) {
     if (pivot[col]) {
       const int row = pivot_row[col];
-      const double diagonal = relation.left[row * kMaxStateDimension + col];
+      const Scalar diagonal = relation.left[row * kMaxStateDimension + col];
       out.t[col] = relation.rhs[row] / diagonal;
       for (int free = 0; free < reduced; ++free) {
         out.T[col * kMaxStateDimension + free] =
@@ -476,7 +517,7 @@ __global__ void StateParamKernel(const Relation* suffix, int count,
     }
   }
   for (int free = 0; free < reduced; ++free) {
-    out.T[out.free_columns[free] * kMaxStateDimension + free] = 1.0;
+    out.T[out.free_columns[free] * kMaxStateDimension + free] = Scalar{1};
   }
 }
 
@@ -492,47 +533,47 @@ namespace detail {
 namespace {
 
 __global__ void ReduceStagesKernel(const PackedStage*, const Relation*,
-                                   const StateParam*, int, double,
+                                   const StateParam*, int, Scalar, Scalar,
                                    ControlParam*, ReducedStage*, DeviceStatus*);
 __global__ void ReduceTerminalKernel(const PackedTerminal*, const StateParam*,
                                      int, ReducedTerminal*);
-__global__ void InitialReducedStateKernel(const StateParam*, const double*,
-                                          double*, double, DeviceStatus*);
+__global__ void InitialReducedStateKernel(const StateParam*, const Scalar*,
+                                          Scalar*, Scalar, DeviceStatus*);
 __global__ void BuildValueElementsKernel(const ReducedStage*,
-                                         const ReducedTerminal*, int, double,
+                                         const ReducedTerminal*, int, Scalar,
                                          ValueElement*, int*, DeviceStatus*);
-__global__ void SuffixValueElementsKernel(const ValueElement*, int, int, double,
+__global__ void SuffixValueElementsKernel(const ValueElement*, int, int, Scalar,
                                           ValueElement*, int*);
 __global__ void FeedbackKernel(const ReducedStage*, const ValueElement*, int,
-                               double, Feedback*, DeviceStatus*);
-__global__ void SequentialRiccatiKernel(const ReducedStage*, int, double,
+                               Scalar, Feedback*, DeviceStatus*);
+__global__ void SequentialRiccatiKernel(const ReducedStage*, int, Scalar,
                                         ValueElement*, Feedback*,
                                         DeviceStatus*);
 __global__ void InitializeAffineMapsKernel(const Feedback*, int, AffineMap*);
 __global__ void PrefixAffineMapsKernel(const AffineMap*, int, int, AffineMap*,
                                        DeviceStatus*);
 __global__ void EvaluateReducedStatesKernel(const AffineMap*, int,
-                                            const double*, double*);
+                                            const Scalar*, Scalar*);
 __global__ void ReconstructPrimalKernel(const StateParam*, const ControlParam*,
-                                        const Feedback*, const double*, int,
-                                        double*, double*);
+                                        const Feedback*, const Scalar*, int,
+                                        Scalar*, Scalar*);
 __global__ void BuildDualLeavesKernel(const PackedStage*, const PackedTerminal*,
-                                      int, int, const double*, const double*,
-                                      double, double, Relation*, DeviceStatus*);
+                                      int, int, const Scalar*, const Scalar*,
+                                      Scalar, Scalar, Relation*, DeviceStatus*);
 __global__ void ReduceDualTreeLevelKernel(const Relation*, int, int, int,
-                                          double, double, Relation*,
+                                          Scalar, Scalar, Relation*,
                                           DeviceStatus*);
 __global__ void SolveDualRootKernel(const Relation*, NodeValue*, DeviceStatus*,
-                                    double);
+                                    Scalar);
 __global__ void ExpandDualTreeLevelKernel(const Relation*, int, int, int,
-                                          double, double, const NodeValue*,
+                                          Scalar, Scalar, const NodeValue*,
                                           NodeValue*, DeviceStatus*);
 __global__ void RecoverLocalMultipliersKernel(const PackedStage*,
                                               const PackedTerminal*, int,
-                                              const double*, const double*,
-                                              const NodeValue*, double, double,
-                                              double*, double*, double*,
-                                              double*, double*, DeviceStatus*);
+                                              const Scalar*, const Scalar*,
+                                              const NodeValue*, Scalar, Scalar,
+                                              Scalar*, Scalar*, Scalar*,
+                                              Scalar*, Scalar*, DeviceStatus*);
 
 void CudaCheck(cudaError_t error, const char* operation) {
   if (error == cudaSuccess) return;
@@ -605,14 +646,14 @@ double TimeGpu(const std::function<void()>& function) {
 }
 
 bool Finite(const Matrix& matrix) {
-  for (double value : matrix.data()) {
+  for (Scalar value : matrix.data()) {
     if (!std::isfinite(value)) return false;
   }
   return true;
 }
 
 bool Finite(const Vector& vector) {
-  for (double value : vector.data()) {
+  for (Scalar value : vector.data()) {
     if (!std::isfinite(value)) return false;
   }
   return true;
@@ -623,7 +664,7 @@ void Require(bool condition, const std::string& message) {
 }
 
 void ValidateCudaProblem(const Problem& problem, const Options& options) {
-  Require(std::isfinite(options.tolerance) && options.tolerance > 0.0,
+  Require(std::isfinite(options.tolerance) && options.tolerance > Scalar{0},
           "CUDA tolerance must be finite and positive");
   Require(options.device >= 0, "CUDA device index must be nonnegative");
   // node_count, its next power of two, and the resulting 2*padded-1 tree size
@@ -700,7 +741,7 @@ void ValidateCudaProblem(const Problem& problem, const Options& options) {
 }
 
 template <std::size_t Size>
-void PackMatrix(const Matrix& source, double (&target)[Size],
+void PackMatrix(const Matrix& source, Scalar (&target)[Size],
                 std::size_t stride) {
   for (std::size_t row = 0; row < source.rows(); ++row) {
     for (std::size_t col = 0; col < source.cols(); ++col) {
@@ -710,7 +751,7 @@ void PackMatrix(const Matrix& source, double (&target)[Size],
 }
 
 template <std::size_t Size>
-void PackVector(const Vector& source, double (&target)[Size]) {
+void PackVector(const Vector& source, Scalar (&target)[Size]) {
   for (std::size_t i = 0; i < source.size(); ++i) target[i] = source[i];
 }
 
@@ -777,36 +818,36 @@ bool ApplyDeviceFailure(const DeviceStatus& status, Solution* solution) {
   return true;
 }
 
-double ObjectiveFromPacked(const std::vector<PackedStage>& stages,
+Scalar ObjectiveFromPacked(const std::vector<PackedStage>& stages,
                            const PackedTerminal& terminal,
-                           const std::vector<double>& states,
-                           const std::vector<double>& controls) {
-  double objective = 0.0;
+                           const std::vector<Scalar>& states,
+                           const std::vector<Scalar>& controls) {
+  Scalar objective = Scalar{0};
   for (std::size_t i = 0; i < stages.size(); ++i) {
     const PackedStage& s = stages[i];
-    const double* x = states.data() + i * kMaxStateDimension;
-    const double* u = controls.data() + i * kMaxControlDimension;
+    const Scalar* x = states.data() + i * kMaxStateDimension;
+    const Scalar* u = controls.data() + i * kMaxControlDimension;
     for (int row = 0; row < s.n; ++row) {
       objective += s.q[row] * x[row];
       for (int col = 0; col < s.n; ++col)
         objective +=
-            0.5 * x[row] * s.Q[row * kMaxStateDimension + col] * x[col];
+            Scalar{0.5} * x[row] * s.Q[row * kMaxStateDimension + col] * x[col];
       for (int col = 0; col < s.m; ++col)
         objective += x[row] * s.M[row * kMaxControlDimension + col] * u[col];
     }
     for (int row = 0; row < s.m; ++row) {
       objective += s.r[row] * u[row];
       for (int col = 0; col < s.m; ++col)
-        objective +=
-            0.5 * u[row] * s.R[row * kMaxControlDimension + col] * u[col];
+        objective += Scalar{0.5} * u[row] *
+                     s.R[row * kMaxControlDimension + col] * u[col];
     }
   }
-  const double* x = states.data() + stages.size() * kMaxStateDimension;
+  const Scalar* x = states.data() + stages.size() * kMaxStateDimension;
   for (int row = 0; row < terminal.n; ++row) {
     objective += terminal.q[row] * x[row];
     for (int col = 0; col < terminal.n; ++col)
-      objective +=
-          0.5 * x[row] * terminal.Q[row * kMaxStateDimension + col] * x[col];
+      objective += Scalar{0.5} * x[row] *
+                   terminal.Q[row * kMaxStateDimension + col] * x[col];
   }
   return objective;
 }
@@ -821,18 +862,29 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   Solution solution;
   const int stage_count = static_cast<int>(problem.stages.size());
   const int node_count = stage_count + 1;
+#ifdef CLQR_USE_FLOAT
+  // In single precision, dependent local equality rows can make the balanced
+  // dual relation tree unnecessarily ill-conditioned. Small such problems
+  // use the stable sequential recovery already shared with the CPU solver;
+  // the horizon cap avoids its worst-case cubic multiplier workspace.
+  const bool use_host_multiplier_recovery =
+      stage_count <= 64 && HasDependentEqualityRows(problem, options.tolerance);
+#else
+  const bool use_host_multiplier_recovery = false;
+#endif
+  solution.used_host_multiplier_recovery = use_host_multiplier_recovery;
   std::vector<PackedStage> host_stages;
   host_stages.reserve(problem.stages.size());
   for (const Stage& stage : problem.stages)
     host_stages.push_back(PackStage(stage));
   const PackedTerminal terminal = PackTerminal(problem);
-  std::vector<double> host_initial(kMaxStateDimension, 0.0);
+  std::vector<Scalar> host_initial(kMaxStateDimension, Scalar{0});
   for (std::size_t i = 0; i < problem.initial_state.size(); ++i)
     host_initial[i] = problem.initial_state[i];
 
   DeviceBuffer<PackedStage> device_stages(stage_count);
   DeviceBuffer<PackedTerminal> device_terminal(1);
-  DeviceBuffer<double> device_initial(kMaxStateDimension);
+  DeviceBuffer<Scalar> device_initial(kMaxStateDimension);
   DeviceBuffer<DeviceStatus> device_status(1);
   DeviceBuffer<Relation> relation_a(node_count);
   DeviceBuffer<Relation> relation_b(node_count);
@@ -840,7 +892,7 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   DeviceBuffer<ControlParam> control_params(stage_count);
   DeviceBuffer<ReducedStage> reduced_stages(stage_count);
   DeviceBuffer<ReducedTerminal> reduced_terminal(1);
-  DeviceBuffer<double> reduced_initial(kMaxStateDimension);
+  DeviceBuffer<Scalar> reduced_initial(kMaxStateDimension);
 
   solution.timings.upload_ms = TimeGpu([&] {
     if (stage_count > 0) {
@@ -854,7 +906,7 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
               "upload terminal data");
     CudaCheck(
         cudaMemcpy(device_initial.get(), host_initial.data(),
-                   kMaxStateDimension * sizeof(double), cudaMemcpyHostToDevice),
+                   kMaxStateDimension * sizeof(Scalar), cudaMemcpyHostToDevice),
         "upload initial state");
     CudaCheck(cudaMemset(device_status.get(), 0, sizeof(DeviceStatus)),
               "clear CUDA status");
@@ -876,23 +928,30 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
     CudaCheck(cudaMemset(reduced_terminal.get(), 0, sizeof(ReducedTerminal)),
               "clear reduced terminal");
     CudaCheck(cudaMemset(reduced_initial.get(), 0,
-                         kMaxStateDimension * sizeof(double)),
+                         kMaxStateDimension * sizeof(Scalar)),
               "clear reduced initial state");
   });
 
   Relation* suffix = relation_a.get();
+  Scalar feasibility_consistency_tolerance =
+      std::max(options.tolerance, kMinimumFeasibilityConsistencyTolerance);
   solution.timings.feasibility_ms = TimeGpu([&] {
     BuildPrimalLeavesKernel<<<node_count, kThreads>>>(
         device_stages.get(), stage_count, device_terminal.get(),
-        options.tolerance, relation_a.get(), device_status.get());
+        options.tolerance, feasibility_consistency_tolerance, relation_a.get(),
+        device_status.get());
     Relation* input = relation_a.get();
     Relation* output = relation_b.get();
+    int scan_level = 1;
     for (int offset = 1; offset < node_count; offset *= 2) {
       CudaCheck(cudaMemset(output, 0, node_count * sizeof(Relation)),
                 "clear suffix relation output");
-      SuffixRelationsKernel<<<node_count, kThreads>>>(input, node_count, offset,
-                                                      options.tolerance, output,
-                                                      device_status.get());
+      feasibility_consistency_tolerance =
+          std::max(options.tolerance, kMinimumFeasibilityConsistencyTolerance *
+                                          static_cast<Scalar>(++scan_level));
+      SuffixRelationsKernel<<<node_count, kThreads>>>(
+          input, node_count, offset, options.tolerance,
+          feasibility_consistency_tolerance, output, device_status.get());
       std::swap(input, output);
     }
     suffix = input;
@@ -914,8 +973,8 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
     if (stage_count > 0) {
       ReduceStagesKernel<<<stage_count, kThreads>>>(
           device_stages.get(), suffix, state_params.get(), stage_count,
-          options.tolerance, control_params.get(), reduced_stages.get(),
-          device_status.get());
+          options.tolerance, feasibility_consistency_tolerance,
+          control_params.get(), reduced_stages.get(), device_status.get());
     }
     ReduceTerminalKernel<<<1, kThreads>>>(device_terminal.get(),
                                           state_params.get(), stage_count,
@@ -938,7 +997,7 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   DeviceBuffer<Feedback> feedback(stage_count);
   DeviceBuffer<int> parallel_ok(1);
   ValueElement* value_suffix = value_a.get();
-  int host_parallel_ok = 1;
+  int host_parallel_ok = use_host_multiplier_recovery ? 0 : 1;
   solution.timings.riccati_ms = TimeGpu([&] {
     CudaCheck(cudaMemset(value_a.get(), 0, node_count * sizeof(ValueElement)),
               "clear value elements A");
@@ -1019,26 +1078,26 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
 
   DeviceBuffer<AffineMap> map_a(stage_count);
   DeviceBuffer<AffineMap> map_b(stage_count);
-  DeviceBuffer<double> reduced_states(static_cast<std::size_t>(node_count) *
+  DeviceBuffer<Scalar> reduced_states(static_cast<std::size_t>(node_count) *
                                       kMaxStateDimension);
-  DeviceBuffer<double> states(static_cast<std::size_t>(node_count) *
+  DeviceBuffer<Scalar> states(static_cast<std::size_t>(node_count) *
                               kMaxStateDimension);
-  DeviceBuffer<double> controls(
+  DeviceBuffer<Scalar> controls(
       static_cast<std::size_t>(std::max(stage_count, 1)) *
       kMaxControlDimension);
   AffineMap* prefix = map_a.get();
   solution.timings.reconstruction_ms = TimeGpu([&] {
     CudaCheck(cudaMemset(reduced_states.get(), 0,
                          static_cast<std::size_t>(node_count) *
-                             kMaxStateDimension * sizeof(double)),
+                             kMaxStateDimension * sizeof(Scalar)),
               "clear reduced states");
     CudaCheck(cudaMemset(states.get(), 0,
                          static_cast<std::size_t>(node_count) *
-                             kMaxStateDimension * sizeof(double)),
+                             kMaxStateDimension * sizeof(Scalar)),
               "clear physical states");
     CudaCheck(cudaMemset(controls.get(), 0,
                          static_cast<std::size_t>(std::max(stage_count, 1)) *
-                             kMaxControlDimension * sizeof(double)),
+                             kMaxControlDimension * sizeof(Scalar)),
               "clear physical controls");
     if (stage_count > 0) {
       CudaCheck(cudaMemset(map_a.get(), 0, stage_count * sizeof(AffineMap)),
@@ -1089,78 +1148,79 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
     level_counts.push_back(level_counts.back() / 2);
     total_nodes += level_counts.back();
   }
-  const double multiplier_rank_tolerance =
+  const Scalar multiplier_rank_tolerance =
       std::max(options.tolerance, kMinimumMultiplierRankTolerance);
-  const double multiplier_consistency_tolerance =
-      std::max(multiplier_rank_tolerance,
-               kMultiplierConsistencyTolerancePerTreeLevel *
-                   level_counts.size());
+  const Scalar multiplier_consistency_tolerance = std::max(
+      multiplier_rank_tolerance,
+      kMultiplierConsistencyTolerancePerTreeLevel * level_counts.size());
   DeviceBuffer<Relation> dual_tree(total_nodes);
   DeviceBuffer<NodeValue> dual_values(total_nodes);
-  DeviceBuffer<double> initial_multiplier(kMaxStateDimension);
-  DeviceBuffer<double> dynamics_multipliers(
+  DeviceBuffer<Scalar> initial_multiplier(kMaxStateDimension);
+  DeviceBuffer<Scalar> dynamics_multipliers(
       static_cast<std::size_t>(std::max(stage_count, 1)) * kMaxStateDimension);
-  DeviceBuffer<double> mixed_multipliers(
+  DeviceBuffer<Scalar> mixed_multipliers(
       static_cast<std::size_t>(std::max(stage_count, 1)) *
       kMaxMixedConstraints);
-  DeviceBuffer<double> state_multipliers(
+  DeviceBuffer<Scalar> state_multipliers(
       static_cast<std::size_t>(std::max(stage_count, 1)) *
       kMaxStateConstraints);
-  DeviceBuffer<double> terminal_multiplier(kMaxStateConstraints);
+  DeviceBuffer<Scalar> terminal_multiplier(kMaxStateConstraints);
   solution.timings.multiplier_ms = TimeGpu([&] {
     CudaCheck(cudaMemset(dual_tree.get(), 0, total_nodes * sizeof(Relation)),
               "clear dual relation tree");
     CudaCheck(cudaMemset(dual_values.get(), 0, total_nodes * sizeof(NodeValue)),
               "clear dual tree values");
     CudaCheck(cudaMemset(initial_multiplier.get(), 0,
-                         kMaxStateDimension * sizeof(double)),
+                         kMaxStateDimension * sizeof(Scalar)),
               "clear initial multiplier");
     CudaCheck(cudaMemset(dynamics_multipliers.get(), 0,
                          static_cast<std::size_t>(std::max(stage_count, 1)) *
-                             kMaxStateDimension * sizeof(double)),
+                             kMaxStateDimension * sizeof(Scalar)),
               "clear dynamics multipliers");
     CudaCheck(cudaMemset(mixed_multipliers.get(), 0,
                          static_cast<std::size_t>(std::max(stage_count, 1)) *
-                             kMaxMixedConstraints * sizeof(double)),
+                             kMaxMixedConstraints * sizeof(Scalar)),
               "clear mixed multipliers");
     CudaCheck(cudaMemset(state_multipliers.get(), 0,
                          static_cast<std::size_t>(std::max(stage_count, 1)) *
-                             kMaxStateConstraints * sizeof(double)),
+                             kMaxStateConstraints * sizeof(Scalar)),
               "clear state multipliers");
     CudaCheck(cudaMemset(terminal_multiplier.get(), 0,
-                         kMaxStateConstraints * sizeof(double)),
+                         kMaxStateConstraints * sizeof(Scalar)),
               "clear terminal multipliers");
-    BuildDualLeavesKernel<<<padded, kThreads>>>(
-        device_stages.get(), device_terminal.get(), stage_count, padded,
-        states.get(), controls.get(), multiplier_rank_tolerance,
-        multiplier_consistency_tolerance, dual_tree.get(), device_status.get());
-    for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
-      ReduceDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
-          dual_tree.get(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], multiplier_rank_tolerance,
+    if (!use_host_multiplier_recovery) {
+      BuildDualLeavesKernel<<<padded, kThreads>>>(
+          device_stages.get(), device_terminal.get(), stage_count, padded,
+          states.get(), controls.get(), multiplier_rank_tolerance,
           multiplier_consistency_tolerance, dual_tree.get(),
           device_status.get());
+      for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
+        ReduceDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
+            dual_tree.get(), level_offsets[level], level_offsets[level + 1],
+            level_counts[level + 1], multiplier_rank_tolerance,
+            multiplier_consistency_tolerance, dual_tree.get(),
+            device_status.get());
+      }
+      const int root_offset = level_offsets.back();
+      SolveDualRootKernel<<<1, 1>>>(
+          dual_tree.get() + root_offset, dual_values.get() + root_offset,
+          device_status.get(), multiplier_rank_tolerance);
+      for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
+           --level) {
+        ExpandDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
+            dual_tree.get(), level_offsets[level], level_offsets[level + 1],
+            level_counts[level + 1], multiplier_rank_tolerance,
+            multiplier_consistency_tolerance, dual_values.get(),
+            dual_values.get(), device_status.get());
+      }
+      RecoverLocalMultipliersKernel<<<node_count, kThreads>>>(
+          device_stages.get(), device_terminal.get(), stage_count, states.get(),
+          controls.get(), dual_values.get(), multiplier_rank_tolerance,
+          multiplier_consistency_tolerance, initial_multiplier.get(),
+          dynamics_multipliers.get(), mixed_multipliers.get(),
+          state_multipliers.get(), terminal_multiplier.get(),
+          device_status.get());
     }
-    const int root_offset = level_offsets.back();
-    SolveDualRootKernel<<<1, 1>>>(dual_tree.get() + root_offset,
-                                  dual_values.get() + root_offset,
-                                  device_status.get(),
-                                  multiplier_rank_tolerance);
-    for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
-         --level) {
-      ExpandDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
-          dual_tree.get(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], multiplier_rank_tolerance,
-          multiplier_consistency_tolerance, dual_values.get(),
-          dual_values.get(), device_status.get());
-    }
-    RecoverLocalMultipliersKernel<<<node_count, kThreads>>>(
-        device_stages.get(), device_terminal.get(), stage_count, states.get(),
-        controls.get(), dual_values.get(), multiplier_rank_tolerance,
-        multiplier_consistency_tolerance,
-        initial_multiplier.get(), dynamics_multipliers.get(),
-        mixed_multipliers.get(), state_multipliers.get(),
-        terminal_multiplier.get(), device_status.get());
   });
   status = ReadStatus(device_status);
   if (ApplyDeviceFailure(status, &solution)) {
@@ -1171,52 +1231,52 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
     return solution;
   }
 
-  std::vector<double> host_states(static_cast<std::size_t>(node_count) *
+  std::vector<Scalar> host_states(static_cast<std::size_t>(node_count) *
                                   kMaxStateDimension);
-  std::vector<double> host_controls(
+  std::vector<Scalar> host_controls(
       static_cast<std::size_t>(std::max(stage_count, 1)) *
       kMaxControlDimension);
-  std::vector<double> host_initial_multiplier(kMaxStateDimension);
-  std::vector<double> host_dynamics(
+  std::vector<Scalar> host_initial_multiplier(kMaxStateDimension);
+  std::vector<Scalar> host_dynamics(
       static_cast<std::size_t>(std::max(stage_count, 1)) * kMaxStateDimension);
-  std::vector<double> host_mixed(
+  std::vector<Scalar> host_mixed(
       static_cast<std::size_t>(std::max(stage_count, 1)) *
       kMaxMixedConstraints);
-  std::vector<double> host_state_multipliers(
+  std::vector<Scalar> host_state_multipliers(
       static_cast<std::size_t>(std::max(stage_count, 1)) *
       kMaxStateConstraints);
-  std::vector<double> host_terminal_multiplier(kMaxStateConstraints);
+  std::vector<Scalar> host_terminal_multiplier(kMaxStateConstraints);
   std::vector<StateParam> host_state_params(node_count);
   std::vector<ControlParam> host_control_params(stage_count);
   solution.timings.download_ms = TimeGpu([&] {
     CudaCheck(
         cudaMemcpy(host_states.data(), states.get(),
-                   host_states.size() * sizeof(double), cudaMemcpyDeviceToHost),
+                   host_states.size() * sizeof(Scalar), cudaMemcpyDeviceToHost),
         "download states");
     CudaCheck(cudaMemcpy(host_controls.data(), controls.get(),
-                         host_controls.size() * sizeof(double),
+                         host_controls.size() * sizeof(Scalar),
                          cudaMemcpyDeviceToHost),
               "download controls");
     CudaCheck(
         cudaMemcpy(host_initial_multiplier.data(), initial_multiplier.get(),
-                   host_initial_multiplier.size() * sizeof(double),
+                   host_initial_multiplier.size() * sizeof(Scalar),
                    cudaMemcpyDeviceToHost),
         "download initial multiplier");
     CudaCheck(cudaMemcpy(host_dynamics.data(), dynamics_multipliers.get(),
-                         host_dynamics.size() * sizeof(double),
+                         host_dynamics.size() * sizeof(Scalar),
                          cudaMemcpyDeviceToHost),
               "download dynamics multipliers");
     CudaCheck(
         cudaMemcpy(host_mixed.data(), mixed_multipliers.get(),
-                   host_mixed.size() * sizeof(double), cudaMemcpyDeviceToHost),
+                   host_mixed.size() * sizeof(Scalar), cudaMemcpyDeviceToHost),
         "download mixed multipliers");
     CudaCheck(cudaMemcpy(host_state_multipliers.data(), state_multipliers.get(),
-                         host_state_multipliers.size() * sizeof(double),
+                         host_state_multipliers.size() * sizeof(Scalar),
                          cudaMemcpyDeviceToHost),
               "download state multipliers");
     CudaCheck(
         cudaMemcpy(host_terminal_multiplier.data(), terminal_multiplier.get(),
-                   host_terminal_multiplier.size() * sizeof(double),
+                   host_terminal_multiplier.size() * sizeof(Scalar),
                    cudaMemcpyDeviceToHost),
         "download terminal multiplier");
     CudaCheck(cudaMemcpy(host_state_params.data(), state_params.get(),
@@ -1275,12 +1335,41 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   solution.terminal_state_multiplier = Vector(terminal.state);
   for (int row = 0; row < terminal.state; ++row)
     solution.terminal_state_multiplier[row] = host_terminal_multiplier[row];
+  if (use_host_multiplier_recovery) {
+    const auto recovery_start = std::chrono::steady_clock::now();
+    internal::MultiplierRecovery recovery =
+        internal::RecoverMultipliersForTrajectory(
+            problem, solution.states, solution.controls, options.tolerance);
+    solution.timings.multiplier_ms +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - recovery_start)
+            .count();
+    if (!recovery.success) {
+      solution.status = SolveStatus::kNumericalFailure;
+      solution.message = "host multiplier recovery failed: " + recovery.message;
+      solution.timings.total_ms =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - total_start)
+              .count();
+      return solution;
+    }
+    solution.initial_multiplier = std::move(recovery.initial);
+    solution.dynamics_multipliers = std::move(recovery.dynamics);
+    solution.mixed_multipliers = std::move(recovery.mixed);
+    solution.state_multipliers = std::move(recovery.state);
+    solution.terminal_state_multiplier = std::move(recovery.terminal);
+  }
   solution.objective =
       ObjectiveFromPacked(host_stages, terminal, host_states, host_controls);
   solution.status = SolveStatus::kOptimal;
-  solution.message = solution.used_parallel_riccati
-                         ? "optimal (parallel CUDA Riccati scan)"
-                         : "optimal (CUDA sequential Riccati fallback)";
+  if (solution.used_host_multiplier_recovery) {
+    solution.message =
+        "optimal (CUDA sequential Riccati and host multiplier fallback)";
+  } else {
+    solution.message = solution.used_parallel_riccati
+                           ? "optimal (parallel CUDA Riccati scan)"
+                           : "optimal (CUDA sequential Riccati fallback)";
+  }
   solution.timings.total_ms =
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - total_start)
@@ -1396,7 +1485,7 @@ __global__ void PrefixAffineMapsKernel(const AffineMap* input, int count,
        linear += blockDim.x) {
     const int row = linear / first.left_dim;
     const int col = linear % first.left_dim;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int k = 0; k < first.right_dim; ++k) {
       value += second.linear[row * kMaxStateDimension + k] *
                first.linear[k * kMaxStateDimension + col];
@@ -1404,7 +1493,7 @@ __global__ void PrefixAffineMapsKernel(const AffineMap* input, int count,
     output[index].linear[row * kMaxStateDimension + col] = value;
   }
   for (int row = threadIdx.x; row < second.right_dim; row += blockDim.x) {
-    double value = second.offset[row];
+    Scalar value = second.offset[row];
     for (int k = 0; k < first.right_dim; ++k) {
       value += second.linear[row * kMaxStateDimension + k] * first.offset[k];
     }
@@ -1414,8 +1503,8 @@ __global__ void PrefixAffineMapsKernel(const AffineMap* input, int count,
 
 __global__ void EvaluateReducedStatesKernel(const AffineMap* prefix,
                                             int stage_count,
-                                            const double* initial,
-                                            double* reduced_states) {
+                                            const Scalar* initial,
+                                            Scalar* reduced_states) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index > stage_count) return;
   if (index == 0) {
@@ -1425,7 +1514,7 @@ __global__ void EvaluateReducedStatesKernel(const AffineMap* prefix,
   }
   const AffineMap& map = prefix[index - 1];
   for (int row = 0; row < map.right_dim; ++row) {
-    double value = map.offset[row];
+    Scalar value = map.offset[row];
     for (int col = 0; col < map.left_dim; ++col) {
       value += map.linear[row * kMaxStateDimension + col] * initial[col];
     }
@@ -1436,15 +1525,15 @@ __global__ void EvaluateReducedStatesKernel(const AffineMap* prefix,
 __global__ void ReconstructPrimalKernel(const StateParam* state_params,
                                         const ControlParam* control_params,
                                         const Feedback* feedback,
-                                        const double* reduced_states,
-                                        int stage_count, double* states,
-                                        double* controls) {
+                                        const Scalar* reduced_states,
+                                        int stage_count, Scalar* states,
+                                        Scalar* controls) {
   const int index = blockIdx.x;
   if (index > stage_count) return;
   const StateParam& state = state_params[index];
-  const double* z = reduced_states + index * kMaxStateDimension;
+  const Scalar* z = reduced_states + index * kMaxStateDimension;
   for (int x = threadIdx.x; x < state.physical_dim; x += blockDim.x) {
-    double value = state.t[x];
+    Scalar value = state.t[x];
     for (int col = 0; col < state.reduced_dim; ++col) {
       value += state.T[x * kMaxStateDimension + col] * z[col];
     }
@@ -1453,9 +1542,9 @@ __global__ void ReconstructPrimalKernel(const StateParam* state_params,
   if (index == stage_count) return;
   const ControlParam& control = control_params[index];
   const Feedback& fb = feedback[index];
-  __shared__ double v[kMaxControlDimension];
+  __shared__ Scalar v[kMaxControlDimension];
   for (int row = threadIdx.x; row < control.reduced_dim; row += blockDim.x) {
-    double value = fb.k[row];
+    Scalar value = fb.k[row];
     for (int col = 0; col < fb.state_dim; ++col) {
       value += fb.K[row * kMaxStateDimension + col] * z[col];
     }
@@ -1463,7 +1552,7 @@ __global__ void ReconstructPrimalKernel(const StateParam* state_params,
   }
   __syncthreads();
   for (int u = threadIdx.x; u < control.physical_dim; u += blockDim.x) {
-    double value = control.y[u];
+    Scalar value = control.y[u];
     for (int col = 0; col < control.state_dim; ++col) {
       value += control.Y[u * kMaxStateDimension + col] * z[col];
     }
@@ -1474,14 +1563,11 @@ __global__ void ReconstructPrimalKernel(const StateParam* state_params,
   }
 }
 
-__global__ void BuildDualLeavesKernel(const PackedStage* stages,
-                                      const PackedTerminal* terminal_ptr,
-                                      int stage_count, int padded_count,
-                                      const double* states,
-                                      const double* controls,
-                                      double rank_tolerance,
-                                      double consistency_tolerance,
-                                      Relation* tree, DeviceStatus* status) {
+__global__ void BuildDualLeavesKernel(
+    const PackedStage* stages, const PackedTerminal* terminal_ptr,
+    int stage_count, int padded_count, const Scalar* states,
+    const Scalar* controls, Scalar rank_tolerance, Scalar consistency_tolerance,
+    Relation* tree, DeviceStatus* status) {
   const int index = blockIdx.x;
   if (index >= padded_count) return;
   __shared__ int block_enabled;
@@ -1494,8 +1580,8 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
     }
     return;
   }
-  __shared__ double matrix[kMaxRrefEntries];
-  __shared__ double factors[kMaxRrefRows];
+  __shared__ Scalar matrix[kMaxRrefEntries];
+  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
@@ -1506,6 +1592,8 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
   __shared__ int left_dim;
   __shared__ int right_dim;
   __shared__ int local_ok;
+  __shared__ Scalar
+      constraint_scales[kMaxMixedConstraints + kMaxStateConstraints];
   const PackedTerminal& terminal = *terminal_ptr;
   if (threadIdx.x == 0) {
     if (index == stage_count) {
@@ -1525,21 +1613,59 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
   }
   __syncthreads();
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
-    matrix[i] = 0.0;
+    matrix[i] = Scalar{0};
+  if (index == stage_count) {
+    for (int constraint = threadIdx.x; constraint < terminal.state;
+         constraint += blockDim.x) {
+      Scalar scale = Scalar{0};
+      for (int row = 0; row < terminal.n; ++row) {
+        scale =
+            fmax(scale,
+                 DeviceAbs(terminal.E[constraint * kMaxStateDimension + row]));
+      }
+      constraint_scales[constraint] = scale > Scalar{0} ? scale : Scalar{1};
+    }
+  } else {
+    const PackedStage& s = stages[index];
+    for (int constraint = threadIdx.x; constraint < s.mixed;
+         constraint += blockDim.x) {
+      Scalar scale = Scalar{0};
+      for (int row = 0; row < s.n; ++row) {
+        scale =
+            fmax(scale, DeviceAbs(s.C[constraint * kMaxStateDimension + row]));
+      }
+      for (int row = 0; row < s.m; ++row) {
+        scale = fmax(scale,
+                     DeviceAbs(s.D[constraint * kMaxControlDimension + row]));
+      }
+      constraint_scales[constraint] = scale > Scalar{0} ? scale : Scalar{1};
+    }
+    for (int constraint = threadIdx.x; constraint < s.state;
+         constraint += blockDim.x) {
+      Scalar scale = Scalar{0};
+      for (int row = 0; row < s.n; ++row) {
+        scale =
+            fmax(scale, DeviceAbs(s.E[constraint * kMaxStateDimension + row]));
+      }
+      constraint_scales[s.mixed + constraint] =
+          scale > Scalar{0} ? scale : Scalar{1};
+    }
+  }
   __syncthreads();
 
   if (index == stage_count) {
-    const double* x = states + index * kMaxStateDimension;
+    const Scalar* x = states + index * kMaxStateDimension;
     for (int linear = threadIdx.x; linear < terminal.n * terminal.state;
          linear += blockDim.x) {
       const int row = linear / terminal.state;
       const int constraint = linear % terminal.state;
       matrix[row * columns + constraint] =
-          terminal.E[constraint * kMaxStateDimension + row];
+          terminal.E[constraint * kMaxStateDimension + row] /
+          constraint_scales[constraint];
     }
     for (int row = threadIdx.x; row < terminal.n; row += blockDim.x) {
-      matrix[row * columns + eliminated + row] = 1.0;
-      double gradient = terminal.q[row];
+      matrix[row * columns + eliminated + row] = Scalar{1};
+      Scalar gradient = terminal.q[row];
       for (int col = 0; col < terminal.n; ++col) {
         gradient += terminal.Q[row * kMaxStateDimension + col] * x[col];
       }
@@ -1547,36 +1673,39 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
     }
   } else {
     const PackedStage& s = stages[index];
-    const double* x = states + index * kMaxStateDimension;
-    const double* u = controls + index * kMaxControlDimension;
+    const Scalar* x = states + index * kMaxStateDimension;
+    const Scalar* u = controls + index * kMaxControlDimension;
     for (int linear = threadIdx.x; linear < s.n * s.mixed;
          linear += blockDim.x) {
       const int row = linear / s.mixed;
       const int constraint = linear % s.mixed;
       matrix[row * columns + constraint] =
-          s.C[constraint * kMaxStateDimension + row];
+          s.C[constraint * kMaxStateDimension + row] /
+          constraint_scales[constraint];
     }
     for (int linear = threadIdx.x; linear < s.n * s.state;
          linear += blockDim.x) {
       const int row = linear / s.state;
       const int constraint = linear % s.state;
       matrix[row * columns + s.mixed + constraint] =
-          s.E[constraint * kMaxStateDimension + row];
+          s.E[constraint * kMaxStateDimension + row] /
+          constraint_scales[s.mixed + constraint];
     }
     for (int linear = threadIdx.x; linear < s.m * s.mixed;
          linear += blockDim.x) {
       const int row = linear / s.mixed;
       const int constraint = linear % s.mixed;
       matrix[(s.n + row) * columns + constraint] =
-          s.D[constraint * kMaxControlDimension + row];
+          s.D[constraint * kMaxControlDimension + row] /
+          constraint_scales[constraint];
     }
     for (int row = threadIdx.x; row < s.n; row += blockDim.x) {
-      matrix[row * columns + eliminated + row] = 1.0;
+      matrix[row * columns + eliminated + row] = Scalar{1};
       for (int next = 0; next < s.next_n; ++next) {
         matrix[row * columns + eliminated + s.n + next] =
             -s.A[next * kMaxStateDimension + row];
       }
-      double gradient = s.q[row];
+      Scalar gradient = s.q[row];
       for (int col = 0; col < s.n; ++col)
         gradient += s.Q[row * kMaxStateDimension + col] * x[col];
       for (int col = 0; col < s.m; ++col)
@@ -1588,7 +1717,7 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
         matrix[(s.n + row) * columns + eliminated + s.n + next] =
             -s.B[next * kMaxControlDimension + row];
       }
-      double gradient = s.r[row];
+      Scalar gradient = s.r[row];
       for (int col = 0; col < s.n; ++col)
         gradient += s.M[col * kMaxControlDimension + row] * x[col];
       for (int col = 0; col < s.m; ++col)
@@ -1610,34 +1739,31 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
                           left_dim, right_dim, &tree[index]);
 }
 
-__global__ void ReduceDualTreeLevelKernel(const Relation* tree,
-                                          int child_offset, int parent_offset,
-                                          int parent_count,
-                                          double rank_tolerance,
-                                          double consistency_tolerance,
-                                          Relation* mutable_tree,
-                                          DeviceStatus* status) {
+__global__ void ReduceDualTreeLevelKernel(
+    const Relation* tree, int child_offset, int parent_offset, int parent_count,
+    Scalar rank_tolerance, Scalar consistency_tolerance, Relation* mutable_tree,
+    DeviceStatus* status) {
   const int index = blockIdx.x;
   if (index >= parent_count) return;
   __shared__ int block_enabled;
   if (!BlockEnabled(status, &block_enabled)) return;
-  __shared__ double matrix[kMaxRrefEntries];
-  __shared__ double factors[kMaxRrefRows];
+  __shared__ Scalar matrix[kMaxRrefEntries];
+  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
   __shared__ int best_row;
   __shared__ int local_ok;
-  ComposeRelationsBlock(
-      tree[child_offset + 2 * index], tree[child_offset + 2 * index + 1],
-      rank_tolerance, consistency_tolerance,
-      &mutable_tree[parent_offset + index], status, index,
-      kDeviceNumericalFailure, 18, matrix, factors, pivot_columns, pivot_rows,
-      &rank, &best_row, &local_ok);
+  ComposeRelationsBlock(tree[child_offset + 2 * index],
+                        tree[child_offset + 2 * index + 1], rank_tolerance,
+                        consistency_tolerance,
+                        &mutable_tree[parent_offset + index], status, index,
+                        kDeviceNumericalFailure, 18, matrix, factors,
+                        pivot_columns, pivot_rows, &rank, &best_row, &local_ok);
 }
 
 __global__ void SolveDualRootKernel(const Relation* relation, NodeValue* value,
-                                    DeviceStatus* status, double tolerance) {
+                                    DeviceStatus* status, Scalar tolerance) {
   if (blockIdx.x != 0 || threadIdx.x != 0 || status->code != kDeviceOk) return;
   if (relation->right_dim != 0) {
     SetFailure(status, kDeviceNumericalFailure, 0, 13);
@@ -1665,14 +1791,10 @@ __global__ void SolveDualRootKernel(const Relation* relation, NodeValue* value,
   }
 }
 
-__global__ void ExpandDualTreeLevelKernel(const Relation* tree,
-                                          int child_offset, int parent_offset,
-                                          int parent_count,
-                                          double rank_tolerance,
-                                          double consistency_tolerance,
-                                          const NodeValue* parent_values,
-                                          NodeValue* values,
-                                          DeviceStatus* status) {
+__global__ void ExpandDualTreeLevelKernel(
+    const Relation* tree, int child_offset, int parent_offset, int parent_count,
+    Scalar rank_tolerance, Scalar consistency_tolerance,
+    const NodeValue* parent_values, NodeValue* values, DeviceStatus* status) {
   const int index = blockIdx.x;
   if (index >= parent_count) return;
   __shared__ int block_enabled;
@@ -1689,15 +1811,15 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
   const int shared = left.right_dim;
   const int rows = left.rows + right.rows;
   const int columns = shared + 1;
-  __shared__ double matrix[kMaxRrefRows * (kMaxStateDimension + 1)];
-  __shared__ double factors[kMaxRrefRows];
+  __shared__ Scalar matrix[kMaxRrefRows * (kMaxStateDimension + 1)];
+  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
   __shared__ int best_row;
   __shared__ int local_ok;
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
-    matrix[i] = 0.0;
+    matrix[i] = Scalar{0};
   __syncthreads();
   for (int linear = threadIdx.x; linear < left.rows * shared;
        linear += blockDim.x) {
@@ -1706,7 +1828,7 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
     matrix[row * columns + col] = left.right[row * kMaxStateDimension + col];
   }
   for (int row = threadIdx.x; row < left.rows; row += blockDim.x) {
-    double rhs = left.rhs[row];
+    Scalar rhs = left.rhs[row];
     for (int col = 0; col < left.left_dim; ++col) {
       rhs -= left.left[row * kMaxStateDimension + col] * parent.left[col];
     }
@@ -1720,7 +1842,7 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
         right.left[row * kMaxStateDimension + col];
   }
   for (int row = threadIdx.x; row < right.rows; row += blockDim.x) {
-    double rhs = right.rhs[row];
+    Scalar rhs = right.rhs[row];
     for (int col = 0; col < right.right_dim; ++col) {
       rhs -= right.right[row * kMaxStateDimension + col] * parent.right[col];
     }
@@ -1730,8 +1852,8 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
   RrefBlock(matrix, rows, columns, shared, rank_tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(matrix, rows, columns, shared,
-                                 consistency_tolerance);
+    local_ok =
+        !InconsistentRref(matrix, rows, columns, shared, consistency_tolerance);
     if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 16);
   }
   __syncthreads();
@@ -1747,7 +1869,7 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
       left_value.left[col] = parent.left[col];
     for (int col = 0; col < right.right_dim; ++col)
       right_value.right[col] = parent.right[col];
-    double shared_value[kMaxStateDimension]{};
+    Scalar shared_value[kMaxStateDimension]{};
     for (int p = 0; p < rank; ++p) {
       if (pivot_columns[p] < shared)
         shared_value[pivot_columns[p]] = matrix[p * columns + shared];
@@ -1761,19 +1883,19 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
 
 __global__ void RecoverLocalMultipliersKernel(
     const PackedStage* stages, const PackedTerminal* terminal_ptr,
-    int stage_count, const double* states, const double* controls,
-    const NodeValue* leaf_values, double rank_tolerance,
-    double consistency_tolerance, double* initial_multiplier,
-    double* dynamics_multipliers, double* mixed_multipliers,
-    double* state_multipliers, double* terminal_multiplier,
+    int stage_count, const Scalar* states, const Scalar* controls,
+    const NodeValue* leaf_values, Scalar rank_tolerance,
+    Scalar consistency_tolerance, Scalar* initial_multiplier,
+    Scalar* dynamics_multipliers, Scalar* mixed_multipliers,
+    Scalar* state_multipliers, Scalar* terminal_multiplier,
     DeviceStatus* status) {
   const int index = blockIdx.x;
   if (index > stage_count) return;
   __shared__ int block_enabled;
   if (!BlockEnabled(status, &block_enabled)) return;
-  __shared__ double
+  __shared__ Scalar
       matrix[kMaxRrefRows * (kMaxMixedConstraints + kMaxStateConstraints + 1)];
-  __shared__ double factors[kMaxRrefRows];
+  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
@@ -1781,6 +1903,8 @@ __global__ void RecoverLocalMultipliersKernel(
   __shared__ int rows;
   __shared__ int variables;
   __shared__ int local_ok;
+  __shared__ Scalar
+      constraint_scales[kMaxMixedConstraints + kMaxStateConstraints];
   const PackedTerminal& terminal = *terminal_ptr;
   if (threadIdx.x == 0) {
     if (index == stage_count) {
@@ -1794,52 +1918,93 @@ __global__ void RecoverLocalMultipliersKernel(
   __syncthreads();
   const int columns = variables + 1;
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
-    matrix[i] = 0.0;
+    matrix[i] = Scalar{0};
+  if (index == stage_count) {
+    for (int constraint = threadIdx.x; constraint < terminal.state;
+         constraint += blockDim.x) {
+      Scalar scale = Scalar{0};
+      for (int row = 0; row < terminal.n; ++row) {
+        scale =
+            fmax(scale,
+                 DeviceAbs(terminal.E[constraint * kMaxStateDimension + row]));
+      }
+      constraint_scales[constraint] = scale > Scalar{0} ? scale : Scalar{1};
+    }
+  } else {
+    const PackedStage& s = stages[index];
+    for (int constraint = threadIdx.x; constraint < s.mixed;
+         constraint += blockDim.x) {
+      Scalar scale = Scalar{0};
+      for (int row = 0; row < s.n; ++row) {
+        scale =
+            fmax(scale, DeviceAbs(s.C[constraint * kMaxStateDimension + row]));
+      }
+      for (int row = 0; row < s.m; ++row) {
+        scale = fmax(scale,
+                     DeviceAbs(s.D[constraint * kMaxControlDimension + row]));
+      }
+      constraint_scales[constraint] = scale > Scalar{0} ? scale : Scalar{1};
+    }
+    for (int constraint = threadIdx.x; constraint < s.state;
+         constraint += blockDim.x) {
+      Scalar scale = Scalar{0};
+      for (int row = 0; row < s.n; ++row) {
+        scale =
+            fmax(scale, DeviceAbs(s.E[constraint * kMaxStateDimension + row]));
+      }
+      constraint_scales[s.mixed + constraint] =
+          scale > Scalar{0} ? scale : Scalar{1};
+    }
+  }
   __syncthreads();
   const NodeValue& endpoints = leaf_values[index];
 
   if (index == stage_count) {
-    const double* x = states + index * kMaxStateDimension;
+    const Scalar* x = states + index * kMaxStateDimension;
     for (int linear = threadIdx.x; linear < terminal.n * terminal.state;
          linear += blockDim.x) {
       const int row = linear / terminal.state;
       const int constraint = linear % terminal.state;
       matrix[row * columns + constraint] =
-          terminal.E[constraint * kMaxStateDimension + row];
+          terminal.E[constraint * kMaxStateDimension + row] /
+          constraint_scales[constraint];
     }
     for (int row = threadIdx.x; row < terminal.n; row += blockDim.x) {
-      double rhs = -terminal.q[row] - endpoints.left[row];
+      Scalar rhs = -terminal.q[row] - endpoints.left[row];
       for (int col = 0; col < terminal.n; ++col)
         rhs -= terminal.Q[row * kMaxStateDimension + col] * x[col];
       matrix[row * columns + variables] = rhs;
     }
   } else {
     const PackedStage& s = stages[index];
-    const double* x = states + index * kMaxStateDimension;
-    const double* u = controls + index * kMaxControlDimension;
+    const Scalar* x = states + index * kMaxStateDimension;
+    const Scalar* u = controls + index * kMaxControlDimension;
     for (int linear = threadIdx.x; linear < s.n * s.mixed;
          linear += blockDim.x) {
       const int row = linear / s.mixed;
       const int constraint = linear % s.mixed;
       matrix[row * columns + constraint] =
-          s.C[constraint * kMaxStateDimension + row];
+          s.C[constraint * kMaxStateDimension + row] /
+          constraint_scales[constraint];
     }
     for (int linear = threadIdx.x; linear < s.n * s.state;
          linear += blockDim.x) {
       const int row = linear / s.state;
       const int constraint = linear % s.state;
       matrix[row * columns + s.mixed + constraint] =
-          s.E[constraint * kMaxStateDimension + row];
+          s.E[constraint * kMaxStateDimension + row] /
+          constraint_scales[s.mixed + constraint];
     }
     for (int linear = threadIdx.x; linear < s.m * s.mixed;
          linear += blockDim.x) {
       const int row = linear / s.mixed;
       const int constraint = linear % s.mixed;
       matrix[(s.n + row) * columns + constraint] =
-          s.D[constraint * kMaxControlDimension + row];
+          s.D[constraint * kMaxControlDimension + row] /
+          constraint_scales[constraint];
     }
     for (int row = threadIdx.x; row < s.n; row += blockDim.x) {
-      double rhs = -s.q[row] - endpoints.left[row];
+      Scalar rhs = -s.q[row] - endpoints.left[row];
       for (int col = 0; col < s.n; ++col)
         rhs -= s.Q[row * kMaxStateDimension + col] * x[col];
       for (int col = 0; col < s.m; ++col)
@@ -1849,7 +2014,7 @@ __global__ void RecoverLocalMultipliersKernel(
       matrix[row * columns + variables] = rhs;
     }
     for (int row = threadIdx.x; row < s.m; row += blockDim.x) {
-      double rhs = -s.r[row];
+      Scalar rhs = -s.r[row];
       for (int col = 0; col < s.n; ++col)
         rhs -= s.M[col * kMaxControlDimension + row] * x[col];
       for (int col = 0; col < s.m; ++col)
@@ -1870,14 +2035,14 @@ __global__ void RecoverLocalMultipliersKernel(
   __syncthreads();
   if (!local_ok) return;
   if (threadIdx.x == 0) {
-    double solution[kMaxMixedConstraints + kMaxStateConstraints]{};
+    Scalar solution[kMaxMixedConstraints + kMaxStateConstraints]{};
     for (int p = 0; p < rank; ++p) {
       if (pivot_columns[p] < variables)
         solution[pivot_columns[p]] = matrix[p * columns + variables];
     }
     if (index == stage_count) {
       for (int row = 0; row < terminal.state; ++row)
-        terminal_multiplier[row] = solution[row];
+        terminal_multiplier[row] = solution[row] / constraint_scales[row];
       if (stage_count == 0) {
         for (int row = 0; row < terminal.n; ++row)
           initial_multiplier[row] = endpoints.left[row];
@@ -1885,10 +2050,11 @@ __global__ void RecoverLocalMultipliersKernel(
     } else {
       const PackedStage& s = stages[index];
       for (int row = 0; row < s.mixed; ++row)
-        mixed_multipliers[index * kMaxMixedConstraints + row] = solution[row];
+        mixed_multipliers[index * kMaxMixedConstraints + row] =
+            solution[row] / constraint_scales[row];
       for (int row = 0; row < s.state; ++row)
         state_multipliers[index * kMaxStateConstraints + row] =
-            solution[s.mixed + row];
+            solution[s.mixed + row] / constraint_scales[s.mixed + row];
       if (index == 0) {
         for (int row = 0; row < s.n; ++row)
           initial_multiplier[row] = endpoints.left[row];
@@ -1912,7 +2078,7 @@ namespace {
 
 __global__ void BuildValueElementsKernel(const ReducedStage* stages,
                                          const ReducedTerminal* terminal_ptr,
-                                         int stage_count, double tolerance,
+                                         int stage_count, Scalar tolerance,
                                          ValueElement* elements,
                                          int* parallel_ok,
                                          DeviceStatus* status) {
@@ -1966,10 +2132,10 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
     return;
   }
 
-  __shared__ double
+  __shared__ Scalar
       augmented[kMaxControlDimension * (2 * kMaxControlDimension)];
-  __shared__ double factors[kMaxRrefRows];
-  __shared__ double cholesky[kMaxControlDimension * kMaxControlDimension];
+  __shared__ Scalar factors[kMaxRrefRows];
+  __shared__ Scalar cholesky[kMaxControlDimension * kMaxControlDimension];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
@@ -1980,22 +2146,22 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
     const int row = linear / columns;
     const int col = linear % columns;
     augmented[linear] = col < s.m ? s.R[row * kMaxControlDimension + col]
-                                  : (col - s.m == row ? 1.0 : 0.0);
+                                  : (col - s.m == row ? Scalar{1} : Scalar{0});
   }
   for (int linear = threadIdx.x; linear < s.m * s.m; linear += blockDim.x) {
     const int row = linear / s.m;
     const int col = linear % s.m;
-    cholesky[linear] = 0.5 * (s.R[row * kMaxControlDimension + col] +
-                              s.R[col * kMaxControlDimension + row]);
+    cholesky[linear] = Scalar{0.5} * (s.R[row * kMaxControlDimension + col] +
+                                      s.R[col * kMaxControlDimension + row]);
   }
   __syncthreads();
   if (threadIdx.x == 0) {
     positive_definite = 1;
-    double scale = 1.0;
+    Scalar scale = Scalar{1};
     for (int i = 0; i < s.m; ++i)
       scale = fmax(scale, DeviceAbs(cholesky[i * s.m + i]));
     for (int i = 0; i < s.m && positive_definite; ++i) {
-      double diagonal = cholesky[i * s.m + i];
+      Scalar diagonal = cholesky[i * s.m + i];
       for (int k = 0; k < i; ++k) {
         diagonal -= cholesky[i * s.m + k] * cholesky[i * s.m + k];
       }
@@ -2005,7 +2171,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
       }
       cholesky[i * s.m + i] = sqrt(diagonal);
       for (int row = i + 1; row < s.m; ++row) {
-        double value = cholesky[row * s.m + i];
+        Scalar value = cholesky[row * s.m + i];
         for (int k = 0; k < i; ++k) {
           value -= cholesky[row * s.m + k] * cholesky[i * s.m + k];
         }
@@ -2028,7 +2194,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
   for (int linear = threadIdx.x; linear < s.n * s.n; linear += blockDim.x) {
     const int a = linear / s.n;
     const int b = linear % s.n;
-    double value = s.Q[a * kMaxStateDimension + b];
+    Scalar value = s.Q[a * kMaxStateDimension + b];
     for (int u = 0; u < s.m; ++u) {
       for (int v = 0; v < s.m; ++v) {
         value -= s.M[a * kMaxControlDimension + u] *
@@ -2039,7 +2205,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
     out.J[a * kMaxStateDimension + b] = value;
   }
   for (int a = threadIdx.x; a < s.n; a += blockDim.x) {
-    double value = s.q[a];
+    Scalar value = s.q[a];
     for (int u = 0; u < s.m; ++u) {
       for (int v = 0; v < s.m; ++v) {
         value -= s.M[a * kMaxControlDimension + u] *
@@ -2052,7 +2218,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
        linear += blockDim.x) {
     const int row = linear / s.n;
     const int col = linear % s.n;
-    double value = s.A[row * kMaxStateDimension + col];
+    Scalar value = s.A[row * kMaxStateDimension + col];
     for (int u = 0; u < s.m; ++u) {
       for (int v = 0; v < s.m; ++v) {
         value -= s.B[row * kMaxControlDimension + u] *
@@ -2063,7 +2229,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
     out.A[row * kMaxStateDimension + col] = value;
   }
   for (int row = threadIdx.x; row < s.next_n; row += blockDim.x) {
-    double value = s.c[row];
+    Scalar value = s.c[row];
     for (int u = 0; u < s.m; ++u) {
       for (int v = 0; v < s.m; ++v) {
         value -= s.B[row * kMaxControlDimension + u] *
@@ -2076,7 +2242,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
        linear += blockDim.x) {
     const int a = linear / s.next_n;
     const int b = linear % s.next_n;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int u = 0; u < s.m; ++u) {
       for (int v = 0; v < s.m; ++v) {
         value += s.B[a * kMaxControlDimension + u] *
@@ -2089,8 +2255,8 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
 }
 
 __device__ void ComposeValueElementsBlock(
-    const ValueElement& first, const ValueElement& second, double tolerance,
-    ValueElement* output, int* parallel_ok, double* augmented, double* factors,
+    const ValueElement& first, const ValueElement& second, Scalar tolerance,
+    ValueElement* output, int* parallel_ok, Scalar* augmented, Scalar* factors,
     int* pivot_columns, int* pivot_rows, int* rank, int* best_row) {
   const int shared = first.right_dim;
   if (shared != second.left_dim) {
@@ -2130,9 +2296,9 @@ __device__ void ComposeValueElementsBlock(
        linear += blockDim.x) {
     const int row = linear / columns;
     const int col = linear % columns;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     if (col < shared) {
-      value = row == col ? 1.0 : 0.0;
+      value = row == col ? Scalar{1} : Scalar{0};
       for (int k = 0; k < shared; ++k) {
         value += first.C[row * kMaxStateDimension + k] *
                  second.J[k * kMaxStateDimension + col];
@@ -2161,7 +2327,7 @@ __device__ void ComposeValueElementsBlock(
   for (int linear = threadIdx.x; linear < right * left; linear += blockDim.x) {
     const int row = linear / left;
     const int col = linear % left;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int k = 0; k < shared; ++k) {
       value += second.A[row * kMaxStateDimension + k] *
                augmented[k * columns + shared + col];
@@ -2169,7 +2335,7 @@ __device__ void ComposeValueElementsBlock(
     output->A[row * kMaxStateDimension + col] = value;
   }
   for (int row = threadIdx.x; row < right; row += blockDim.x) {
-    double value = second.b[row];
+    Scalar value = second.b[row];
     for (int k = 0; k < shared; ++k) {
       value += second.A[row * kMaxStateDimension + k] *
                augmented[k * columns + shared + left];
@@ -2179,7 +2345,7 @@ __device__ void ComposeValueElementsBlock(
   for (int linear = threadIdx.x; linear < right * right; linear += blockDim.x) {
     const int row = linear / right;
     const int col = linear % right;
-    double value = second.C[row * kMaxStateDimension + col];
+    Scalar value = second.C[row * kMaxStateDimension + col];
     for (int p = 0; p < shared; ++p) {
       for (int q = 0; q < shared; ++q) {
         value += second.A[row * kMaxStateDimension + p] *
@@ -2192,7 +2358,7 @@ __device__ void ComposeValueElementsBlock(
   for (int linear = threadIdx.x; linear < left * left; linear += blockDim.x) {
     const int row = linear / left;
     const int col = linear % left;
-    double value = first.J[row * kMaxStateDimension + col];
+    Scalar value = first.J[row * kMaxStateDimension + col];
     for (int p = 0; p < shared; ++p) {
       for (int q = 0; q < shared; ++q) {
         value += first.A[p * kMaxStateDimension + row] *
@@ -2203,9 +2369,9 @@ __device__ void ComposeValueElementsBlock(
     output->J[row * kMaxStateDimension + col] = value;
   }
   for (int row = threadIdx.x; row < left; row += blockDim.x) {
-    double value = first.eta[row];
+    Scalar value = first.eta[row];
     for (int p = 0; p < shared; ++p) {
-      double dual = second.eta[p];
+      Scalar dual = second.eta[p];
       for (int q = 0; q < shared; ++q) {
         dual += second.J[p * kMaxStateDimension + q] *
                 augmented[q * columns + shared + left];
@@ -2219,8 +2385,9 @@ __device__ void ComposeValueElementsBlock(
     const int row = linear / left;
     const int col = linear % left;
     if (row < col) {
-      const double value = 0.5 * (output->J[row * kMaxStateDimension + col] +
-                                  output->J[col * kMaxStateDimension + row]);
+      const Scalar value =
+          Scalar{0.5} * (output->J[row * kMaxStateDimension + col] +
+                         output->J[col * kMaxStateDimension + row]);
       output->J[row * kMaxStateDimension + col] = value;
       output->J[col * kMaxStateDimension + row] = value;
     }
@@ -2229,8 +2396,9 @@ __device__ void ComposeValueElementsBlock(
     const int row = linear / right;
     const int col = linear % right;
     if (row < col) {
-      const double value = 0.5 * (output->C[row * kMaxStateDimension + col] +
-                                  output->C[col * kMaxStateDimension + row]);
+      const Scalar value =
+          Scalar{0.5} * (output->C[row * kMaxStateDimension + col] +
+                         output->C[col * kMaxStateDimension + row]);
       output->C[row * kMaxStateDimension + col] = value;
       output->C[col * kMaxStateDimension + row] = value;
     }
@@ -2271,7 +2439,7 @@ __device__ void CopyValueElementBlock(const ValueElement& input,
 }
 
 __global__ void SuffixValueElementsKernel(const ValueElement* input, int count,
-                                          int offset, double tolerance,
+                                          int offset, Scalar tolerance,
                                           ValueElement* output,
                                           int* parallel_ok) {
   const int index = blockIdx.x;
@@ -2282,9 +2450,9 @@ __global__ void SuffixValueElementsKernel(const ValueElement* input, int count,
     CopyValueElementBlock(input[index], &output[index]);
     return;
   }
-  __shared__ double
+  __shared__ Scalar
       augmented[kMaxStateDimension * (3 * kMaxStateDimension + 1)];
-  __shared__ double factors[kMaxRrefRows];
+  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
@@ -2295,12 +2463,12 @@ __global__ void SuffixValueElementsKernel(const ValueElement* input, int count,
 }
 
 __device__ void BuildFeedbackSystem(const ReducedStage& s,
-                                    const ValueElement& next, double* augmented,
+                                    const ValueElement& next, Scalar* augmented,
                                     int columns) {
   for (int linear = threadIdx.x; linear < s.m * columns; linear += blockDim.x) {
     const int row = linear / columns;
     const int col = linear % columns;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     if (col < s.m) {
       value = s.R[row * kMaxControlDimension + col];
       for (int a = 0; a < s.next_n; ++a) {
@@ -2323,7 +2491,7 @@ __device__ void BuildFeedbackSystem(const ReducedStage& s,
     } else {
       value = -s.r[row];
       for (int a = 0; a < s.next_n; ++a) {
-        double future = next.eta[a];
+        Scalar future = next.eta[a];
         for (int b = 0; b < s.next_n; ++b) {
           future += next.J[a * kMaxStateDimension + b] * s.c[b];
         }
@@ -2334,7 +2502,7 @@ __device__ void BuildFeedbackSystem(const ReducedStage& s,
   }
 }
 
-__device__ void ExtractFeedback(const ReducedStage& s, const double* augmented,
+__device__ void ExtractFeedback(const ReducedStage& s, const Scalar* augmented,
                                 int columns, Feedback* feedback) {
   if (threadIdx.x == 0) {
     feedback->state_dim = s.n;
@@ -2355,7 +2523,7 @@ __device__ void ExtractFeedback(const ReducedStage& s, const double* augmented,
        linear += blockDim.x) {
     const int row = linear / s.n;
     const int col = linear % s.n;
-    double value = s.A[row * kMaxStateDimension + col];
+    Scalar value = s.A[row * kMaxStateDimension + col];
     for (int u = 0; u < s.m; ++u) {
       value += s.B[row * kMaxControlDimension + u] *
                feedback->K[u * kMaxStateDimension + col];
@@ -2363,7 +2531,7 @@ __device__ void ExtractFeedback(const ReducedStage& s, const double* augmented,
     feedback->transition[row * kMaxStateDimension + col] = value;
   }
   for (int row = threadIdx.x; row < s.next_n; row += blockDim.x) {
-    double value = s.c[row];
+    Scalar value = s.c[row];
     for (int u = 0; u < s.m; ++u) {
       value += s.B[row * kMaxControlDimension + u] * feedback->k[u];
     }
@@ -2373,7 +2541,7 @@ __device__ void ExtractFeedback(const ReducedStage& s, const double* augmented,
 
 __global__ void FeedbackKernel(const ReducedStage* stages,
                                const ValueElement* suffix, int stage_count,
-                               double tolerance, Feedback* feedback,
+                               Scalar tolerance, Feedback* feedback,
                                DeviceStatus* status) {
   const int index = blockIdx.x;
   if (index >= stage_count) return;
@@ -2399,9 +2567,9 @@ __global__ void FeedbackKernel(const ReducedStage* stages,
       out.offset[row] = s.c[row];
     return;
   }
-  __shared__ double augmented[kMaxControlDimension *
+  __shared__ Scalar augmented[kMaxControlDimension *
                               (kMaxControlDimension + kMaxStateDimension + 1)];
-  __shared__ double factors[kMaxRrefRows];
+  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
@@ -2419,16 +2587,16 @@ __global__ void FeedbackKernel(const ReducedStage* stages,
 }
 
 __global__ void SequentialRiccatiKernel(const ReducedStage* stages,
-                                        int stage_count, double tolerance,
+                                        int stage_count, Scalar tolerance,
                                         ValueElement* suffix,
                                         Feedback* feedback,
                                         DeviceStatus* status) {
   if (blockIdx.x != 0) return;
   __shared__ int block_enabled;
   if (!BlockEnabled(status, &block_enabled)) return;
-  __shared__ double augmented[kMaxControlDimension *
+  __shared__ Scalar augmented[kMaxControlDimension *
                               (kMaxControlDimension + kMaxStateDimension + 1)];
-  __shared__ double factors[kMaxRrefRows];
+  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
@@ -2476,7 +2644,7 @@ __global__ void SequentialRiccatiKernel(const ReducedStage* stages,
     for (int linear = threadIdx.x; linear < s.n * s.n; linear += blockDim.x) {
       const int row = linear / s.n;
       const int col = linear % s.n;
-      double value = s.Q[row * kMaxStateDimension + col];
+      Scalar value = s.Q[row * kMaxStateDimension + col];
       for (int a = 0; a < s.next_n; ++a) {
         for (int b = 0; b < s.next_n; ++b) {
           value += s.A[a * kMaxStateDimension + row] *
@@ -2485,7 +2653,7 @@ __global__ void SequentialRiccatiKernel(const ReducedStage* stages,
         }
       }
       for (int u = 0; u < s.m; ++u) {
-        double cross = s.M[row * kMaxControlDimension + u];
+        Scalar cross = s.M[row * kMaxControlDimension + u];
         for (int a = 0; a < s.next_n; ++a) {
           for (int b = 0; b < s.next_n; ++b) {
             cross += s.A[a * kMaxStateDimension + row] *
@@ -2498,16 +2666,16 @@ __global__ void SequentialRiccatiKernel(const ReducedStage* stages,
       current.J[row * kMaxStateDimension + col] = value;
     }
     for (int row = threadIdx.x; row < s.n; row += blockDim.x) {
-      double value = s.q[row];
+      Scalar value = s.q[row];
       for (int a = 0; a < s.next_n; ++a) {
-        double future = next.eta[a];
+        Scalar future = next.eta[a];
         for (int b = 0; b < s.next_n; ++b) {
           future += next.J[a * kMaxStateDimension + b] * s.c[b];
         }
         value += s.A[a * kMaxStateDimension + row] * future;
       }
       for (int u = 0; u < s.m; ++u) {
-        double cross = s.M[row * kMaxControlDimension + u];
+        Scalar cross = s.M[row * kMaxControlDimension + u];
         for (int a = 0; a < s.next_n; ++a) {
           for (int b = 0; b < s.next_n; ++b) {
             cross += s.A[a * kMaxStateDimension + row] *
@@ -2524,8 +2692,9 @@ __global__ void SequentialRiccatiKernel(const ReducedStage* stages,
       const int row = linear / s.n;
       const int col = linear % s.n;
       if (row < col) {
-        const double value = 0.5 * (current.J[row * kMaxStateDimension + col] +
-                                    current.J[col * kMaxStateDimension + row]);
+        const Scalar value =
+            Scalar{0.5} * (current.J[row * kMaxStateDimension + col] +
+                           current.J[col * kMaxStateDimension + row]);
         current.J[row * kMaxStateDimension + col] = value;
         current.J[col * kMaxStateDimension + row] = value;
       }
@@ -2546,8 +2715,9 @@ namespace {
 
 __global__ void ReduceStagesKernel(
     const PackedStage* stages, const Relation* suffix,
-    const StateParam* state_params, int stage_count, double tolerance,
-    ControlParam* control_params, ReducedStage* reduced, DeviceStatus* status) {
+    const StateParam* state_params, int stage_count, Scalar rank_tolerance,
+    Scalar consistency_tolerance, ControlParam* control_params,
+    ReducedStage* reduced, DeviceStatus* status) {
   const int index = blockIdx.x;
   if (index >= stage_count) return;
   __shared__ int block_enabled;
@@ -2556,8 +2726,8 @@ __global__ void ReduceStagesKernel(
   const StateParam& current = state_params[index];
   const StateParam& next = state_params[index + 1];
   const Relation& next_relation = suffix[index + 1];
-  __shared__ double matrix[kMaxStageConstraintRows * kMaxStageReductionColumns];
-  __shared__ double factors[kMaxRrefRows];
+  __shared__ Scalar matrix[kMaxStageConstraintRows * kMaxStageReductionColumns];
+  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
@@ -2573,7 +2743,7 @@ __global__ void ReduceStagesKernel(
   }
   __syncthreads();
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
-    matrix[i] = 0.0;
+    matrix[i] = Scalar{0};
   __syncthreads();
 
   // Original mixed equalities after x = T*z + t.
@@ -2586,7 +2756,7 @@ __global__ void ReduceStagesKernel(
        linear += blockDim.x) {
     const int row = linear / current.reduced_dim;
     const int z = linear % current.reduced_dim;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int x = 0; x < s.n; ++x) {
       value += s.C[row * kMaxStateDimension + x] *
                current.T[x * kMaxStateDimension + z];
@@ -2594,7 +2764,7 @@ __global__ void ReduceStagesKernel(
     matrix[row * columns + s.m + z] = value;
   }
   for (int row = threadIdx.x; row < s.mixed; row += blockDim.x) {
-    double value = -s.d[row];
+    Scalar value = -s.d[row];
     for (int x = 0; x < s.n; ++x) {
       value -= s.C[row * kMaxStateDimension + x] * current.t[x];
     }
@@ -2606,7 +2776,7 @@ __global__ void ReduceStagesKernel(
        linear += blockDim.x) {
     const int row = linear / s.m;
     const int u = linear % s.m;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int xp = 0; xp < s.next_n; ++xp) {
       value += next_relation.left[row * kMaxStateDimension + xp] *
                s.B[xp * kMaxControlDimension + u];
@@ -2618,9 +2788,9 @@ __global__ void ReduceStagesKernel(
        linear += blockDim.x) {
     const int row = linear / current.reduced_dim;
     const int z = linear % current.reduced_dim;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int xp = 0; xp < s.next_n; ++xp) {
-      double at = 0.0;
+      Scalar at = Scalar{0};
       for (int x = 0; x < s.n; ++x) {
         at += s.A[xp * kMaxStateDimension + x] *
               current.T[x * kMaxStateDimension + z];
@@ -2630,9 +2800,9 @@ __global__ void ReduceStagesKernel(
     matrix[(s.mixed + row) * columns + s.m + z] = value;
   }
   for (int row = threadIdx.x; row < next_relation.rows; row += blockDim.x) {
-    double value = next_relation.rhs[row];
+    Scalar value = next_relation.rhs[row];
     for (int xp = 0; xp < s.next_n; ++xp) {
-      double affine = s.c[xp];
+      Scalar affine = s.c[xp];
       for (int x = 0; x < s.n; ++x) {
         affine += s.A[xp * kMaxStateDimension + x] * current.t[x];
       }
@@ -2649,7 +2819,7 @@ __global__ void ReduceStagesKernel(
   // generic RREF equilibration, which would otherwise magnify cancellation
   // noise into a unit pivot.
   for (int row = threadIdx.x; row < rows; row += blockDim.x) {
-    double scale = 0.0;
+    Scalar scale = Scalar{0};
     if (row < s.mixed) {
       for (int x = 0; x < s.n; ++x)
         scale = fmax(scale, DeviceAbs(s.C[row * kMaxStateDimension + x]));
@@ -2666,16 +2836,16 @@ __global__ void ReduceStagesKernel(
   for (int linear = threadIdx.x; linear < rows * columns;
        linear += blockDim.x) {
     const int row = linear / columns;
-    const double scale = factors[row];
-    if (row >= s.mixed && scale <= tolerance) {
-      matrix[linear] = 0.0;
-    } else if (scale > 0.0) {
+    const Scalar scale = factors[row];
+    if (row >= s.mixed && scale <= rank_tolerance) {
+      matrix[linear] = Scalar{0};
+    } else if (scale > Scalar{0}) {
       matrix[linear] /= scale;
     }
   }
   __syncthreads();
   for (int row = threadIdx.x; row < rows; row += blockDim.x) {
-    double scale = 0.0;
+    Scalar scale = Scalar{0};
     for (int col = 0; col < columns; ++col)
       scale = fmax(scale, DeviceAbs(matrix[row * columns + col]));
     factors[row] = scale;
@@ -2683,15 +2853,16 @@ __global__ void ReduceStagesKernel(
   __syncthreads();
   for (int linear = threadIdx.x; linear < rows * columns;
        linear += blockDim.x) {
-    if (factors[linear / columns] <= tolerance) matrix[linear] = 0.0;
+    if (factors[linear / columns] <= rank_tolerance) matrix[linear] = Scalar{0};
   }
   __syncthreads();
 
-  RrefBlock(matrix, rows, columns, columns - 1, tolerance, pivot_columns,
+  RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
     local_ok = 1;
-    if (InconsistentRref(matrix, rows, columns, columns - 1, tolerance)) {
+    if (InconsistentRref(matrix, rows, columns, columns - 1,
+                         consistency_tolerance)) {
       SetFailure(status, kDeviceInfeasible, index, 6);
       local_ok = 0;
     }
@@ -2727,7 +2898,7 @@ __global__ void ReduceStagesKernel(
         }
       }
       for (int v = 0; v < cp.reduced_dim; ++v) {
-        cp.Z[cp.free_columns[v] * kMaxControlDimension + v] = 1.0;
+        cp.Z[cp.free_columns[v] * kMaxControlDimension + v] = Scalar{1};
       }
       ReducedStage& rs = reduced[index];
       rs.n = current.reduced_dim;
@@ -2747,7 +2918,7 @@ __global__ void ReduceStagesKernel(
     const int row = linear / rs.n;
     const int z = linear % rs.n;
     const int xp = next.free_columns[row];
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int x = 0; x < s.n; ++x) {
       value += s.A[xp * kMaxStateDimension + x] *
                current.T[x * kMaxStateDimension + z];
@@ -2763,7 +2934,7 @@ __global__ void ReduceStagesKernel(
     const int row = linear / rs.m;
     const int v = linear % rs.m;
     const int xp = next.free_columns[row];
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int u = 0; u < s.m; ++u) {
       value += s.B[xp * kMaxControlDimension + u] *
                cp.Z[u * kMaxControlDimension + v];
@@ -2772,7 +2943,7 @@ __global__ void ReduceStagesKernel(
   }
   for (int row = threadIdx.x; row < rs.next_n; row += blockDim.x) {
     const int xp = next.free_columns[row];
-    double value = s.c[xp] - next.t[xp];
+    Scalar value = s.c[xp] - next.t[xp];
     for (int x = 0; x < s.n; ++x) {
       value += s.A[xp * kMaxStateDimension + x] * current.t[x];
     }
@@ -2786,7 +2957,7 @@ __global__ void ReduceStagesKernel(
   for (int linear = threadIdx.x; linear < rs.n * rs.n; linear += blockDim.x) {
     const int a = linear / rs.n;
     const int b = linear % rs.n;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int x = 0; x < s.n; ++x) {
       for (int y = 0; y < s.n; ++y) {
         value += current.T[x * kMaxStateDimension + a] *
@@ -2814,7 +2985,7 @@ __global__ void ReduceStagesKernel(
   for (int linear = threadIdx.x; linear < rs.m * rs.m; linear += blockDim.x) {
     const int a = linear / rs.m;
     const int b = linear % rs.m;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int u = 0; u < s.m; ++u) {
       for (int v = 0; v < s.m; ++v) {
         value += cp.Z[u * kMaxControlDimension + a] *
@@ -2827,7 +2998,7 @@ __global__ void ReduceStagesKernel(
   for (int linear = threadIdx.x; linear < rs.n * rs.m; linear += blockDim.x) {
     const int z = linear / rs.m;
     const int v = linear % rs.m;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int x = 0; x < s.n; ++x) {
       for (int u = 0; u < s.m; ++u) {
         value += current.T[x * kMaxStateDimension + z] *
@@ -2846,9 +3017,9 @@ __global__ void ReduceStagesKernel(
   }
 
   for (int z = threadIdx.x; z < rs.n; z += blockDim.x) {
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int x = 0; x < s.n; ++x) {
-      double gx = s.q[x];
+      Scalar gx = s.q[x];
       for (int y = 0; y < s.n; ++y)
         gx += s.Q[x * kMaxStateDimension + y] * current.t[y];
       for (int u = 0; u < s.m; ++u)
@@ -2856,7 +3027,7 @@ __global__ void ReduceStagesKernel(
       value += current.T[x * kMaxStateDimension + z] * gx;
     }
     for (int u = 0; u < s.m; ++u) {
-      double gu = s.r[u];
+      Scalar gu = s.r[u];
       for (int x = 0; x < s.n; ++x)
         gu += s.M[x * kMaxControlDimension + u] * current.t[x];
       for (int v = 0; v < s.m; ++v)
@@ -2866,9 +3037,9 @@ __global__ void ReduceStagesKernel(
     rs.q[z] = value;
   }
   for (int v = threadIdx.x; v < rs.m; v += blockDim.x) {
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int u = 0; u < s.m; ++u) {
-      double gu = s.r[u];
+      Scalar gu = s.r[u];
       for (int x = 0; x < s.n; ++x)
         gu += s.M[x * kMaxControlDimension + u] * current.t[x];
       for (int w = 0; w < s.m; ++w)
@@ -2890,7 +3061,7 @@ __global__ void ReduceTerminalKernel(const PackedTerminal* terminal_ptr,
        linear += blockDim.x) {
     const int a = linear / param.reduced_dim;
     const int b = linear % param.reduced_dim;
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int x = 0; x < terminal.n; ++x) {
       for (int y = 0; y < terminal.n; ++y) {
         value += param.T[x * kMaxStateDimension + a] *
@@ -2901,9 +3072,9 @@ __global__ void ReduceTerminalKernel(const PackedTerminal* terminal_ptr,
     reduced->Q[a * kMaxStateDimension + b] = value;
   }
   for (int a = threadIdx.x; a < param.reduced_dim; a += blockDim.x) {
-    double value = 0.0;
+    Scalar value = Scalar{0};
     for (int x = 0; x < terminal.n; ++x) {
-      double gx = terminal.q[x];
+      Scalar gx = terminal.q[x];
       for (int y = 0; y < terminal.n; ++y) {
         gx += terminal.Q[x * kMaxStateDimension + y] * param.t[y];
       }
@@ -2914,9 +3085,9 @@ __global__ void ReduceTerminalKernel(const PackedTerminal* terminal_ptr,
 }
 
 __global__ void InitialReducedStateKernel(const StateParam* state_params,
-                                          const double* initial_state,
-                                          double* reduced_initial,
-                                          double tolerance,
+                                          const Scalar* initial_state,
+                                          Scalar* reduced_initial,
+                                          Scalar tolerance,
                                           DeviceStatus* status) {
   const StateParam& param = state_params[0];
   for (int z = threadIdx.x; z < param.reduced_dim; z += blockDim.x) {
@@ -2925,17 +3096,17 @@ __global__ void InitialReducedStateKernel(const StateParam* state_params,
   }
   __syncthreads();
   if (threadIdx.x == 0) {
-    double scale = 1.0;
-    double residual = 0.0;
+    Scalar scale = Scalar{1};
+    Scalar residual = Scalar{0};
     for (int x = 0; x < param.physical_dim; ++x) {
-      double value = param.t[x];
+      Scalar value = param.t[x];
       for (int z = 0; z < param.reduced_dim; ++z) {
         value += param.T[x * kMaxStateDimension + z] * reduced_initial[z];
       }
       scale = fmax(scale, DeviceAbs(initial_state[x]));
       residual = fmax(residual, DeviceAbs(value - initial_state[x]));
     }
-    if (residual > 20.0 * tolerance * scale) {
+    if (residual > Scalar{20} * tolerance * scale) {
       SetFailure(status, kDeviceInfeasible, 0, 8);
     }
   }

@@ -14,12 +14,25 @@ namespace {
 
 using clqr::Matrix;
 using clqr::Problem;
+using clqr::Scalar;
 using clqr::Stage;
 using clqr::Vector;
 using namespace clqr::cuda;
 using namespace clqr::cuda::detail;
 
-constexpr double kTolerance = 1e-9;
+#ifdef CLQR_USE_FLOAT
+constexpr Scalar kTolerance = 1e-5f;
+constexpr Scalar kRiccatiComparisonTolerance = 3e-2f;
+constexpr Scalar kPrimalComparisonTolerance = 2e-2f;
+constexpr Scalar kKktComparisonTolerance = 5e-3f;
+constexpr Scalar kLongHorizonKktComparisonTolerance = 1e-1f;
+#else
+constexpr Scalar kTolerance = 1e-9;
+constexpr Scalar kRiccatiComparisonTolerance = 2e-8;
+constexpr Scalar kPrimalComparisonTolerance = 2e-7;
+constexpr Scalar kKktComparisonTolerance = 2e-7;
+constexpr Scalar kLongHorizonKktComparisonTolerance = 2e-5;
+#endif
 
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -28,13 +41,13 @@ void Expect(bool condition, const std::string& message) {
   }
 }
 
-double Value(int seed, std::size_t row, std::size_t col = 0) {
-  const double x = static_cast<double>(seed * 83 + row * 29 + col * 43);
+Scalar Value(int seed, std::size_t row, std::size_t col = 0) {
+  const Scalar x = static_cast<Scalar>(seed * 83 + row * 29 + col * 43);
   return std::sin(0.019 * x) + 0.25 * std::cos(0.037 * x);
 }
 
 Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed,
-                       double scale) {
+                       Scalar scale) {
   Matrix out(rows, cols);
   for (std::size_t row = 0; row < rows; ++row)
     for (std::size_t col = 0; col < cols; ++col)
@@ -42,22 +55,22 @@ Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed,
   return out;
 }
 
-Vector GeneratedVector(std::size_t size, int seed, double scale) {
+Vector GeneratedVector(std::size_t size, int seed, Scalar scale) {
   Vector out(size);
   for (std::size_t row = 0; row < size; ++row)
     out[row] = scale * Value(seed, row);
   return out;
 }
 
-Matrix PositiveDefinite(std::size_t size, int seed, double diagonal) {
+Matrix PositiveDefinite(std::size_t size, int seed, Scalar diagonal) {
   Matrix g = GeneratedMatrix(size, size, seed, 0.18);
   Matrix out = clqr::Transpose(g) * g;
   for (std::size_t row = 0; row < size; ++row) out(row, row) += diagonal;
   return out;
 }
 
-double RowDot(const Matrix& matrix, std::size_t row, const Vector& vector) {
-  double value = 0.0;
+Scalar RowDot(const Matrix& matrix, std::size_t row, const Vector& vector) {
+  Scalar value = 0.0;
   for (std::size_t col = 0; col < vector.size(); ++col)
     value += matrix(row, col) * vector[col];
   return value;
@@ -216,7 +229,7 @@ Problem MoreMixedRowsThanControlsProblem() {
     stage.D = GeneratedMatrix(rows, m, seed + 1300 + static_cast<int>(i), 0.3);
     stage.d = Vector(rows);
     for (std::size_t row = 0; row < rows; ++row) {
-      const double scale = row == 0 ? 1e-7 : (row == 2 ? 1e7 : 1.0);
+      const Scalar scale = row == 0 ? 1e-7 : (row == 2 ? 1e7 : 1.0);
       for (std::size_t col = 0; col < n; ++col) stage.C(row, col) *= scale;
       for (std::size_t col = 0; col < m; ++col) stage.D(row, col) *= scale;
       stage.d[row] =
@@ -244,7 +257,7 @@ Problem LongHorizonStateConstraintProblem() {
 }
 
 template <std::size_t Size>
-void PackMatrix(const Matrix& source, double (&target)[Size],
+void PackMatrix(const Matrix& source, Scalar (&target)[Size],
                 std::size_t stride) {
   for (std::size_t row = 0; row < source.rows(); ++row)
     for (std::size_t col = 0; col < source.cols(); ++col)
@@ -252,7 +265,7 @@ void PackMatrix(const Matrix& source, double (&target)[Size],
 }
 
 template <std::size_t Size>
-void PackVector(const Vector& source, double (&target)[Size]) {
+void PackVector(const Vector& source, Scalar (&target)[Size]) {
   for (std::size_t row = 0; row < source.size(); ++row)
     target[row] = source[row];
 }
@@ -302,26 +315,26 @@ void Launch(int blocks, Function function) {
   }
 }
 
-double MaxResidual(const Problem& problem, const std::vector<double>& states,
-                   const std::vector<double>& controls,
-                   const std::vector<double>& initial_multiplier,
-                   const std::vector<double>& dynamics,
-                   const std::vector<double>& mixed,
-                   const std::vector<double>& state_multipliers,
-                   const std::vector<double>& terminal_multiplier) {
-  double residual = 0.0;
+Scalar MaxResidual(const Problem& problem, const std::vector<Scalar>& states,
+                   const std::vector<Scalar>& controls,
+                   const std::vector<Scalar>& initial_multiplier,
+                   const std::vector<Scalar>& dynamics,
+                   const std::vector<Scalar>& mixed,
+                   const std::vector<Scalar>& state_multipliers,
+                   const std::vector<Scalar>& terminal_multiplier) {
+  Scalar residual = 0.0;
   const int horizon = static_cast<int>(problem.stages.size());
   for (int i = 0; i < horizon; ++i) {
     const Stage& s = problem.stages[i];
-    const double* x = states.data() + i * kMaxStateDimension;
-    const double* xp = states.data() + (i + 1) * kMaxStateDimension;
-    const double* u = controls.data() + i * kMaxControlDimension;
-    const double* right = dynamics.data() + i * kMaxStateDimension;
-    const double* left = i == 0
+    const Scalar* x = states.data() + i * kMaxStateDimension;
+    const Scalar* xp = states.data() + (i + 1) * kMaxStateDimension;
+    const Scalar* u = controls.data() + i * kMaxControlDimension;
+    const Scalar* right = dynamics.data() + i * kMaxStateDimension;
+    const Scalar* left = i == 0
                              ? initial_multiplier.data()
                              : dynamics.data() + (i - 1) * kMaxStateDimension;
     for (std::size_t row = 0; row < s.A.rows(); ++row) {
-      double value = xp[row] - s.c[row];
+      Scalar value = xp[row] - s.c[row];
       for (std::size_t col = 0; col < s.A.cols(); ++col)
         value -= s.A(row, col) * x[col];
       for (std::size_t col = 0; col < s.B.cols(); ++col)
@@ -329,21 +342,29 @@ double MaxResidual(const Problem& problem, const std::vector<double>& states,
       residual = std::max(residual, std::abs(value));
     }
     for (std::size_t row = 0; row < s.C.rows(); ++row) {
-      double value = s.d[row];
-      for (std::size_t col = 0; col < s.C.cols(); ++col)
+      Scalar value = s.d[row];
+      Scalar scale = std::max(Scalar{1}, std::abs(s.d[row]));
+      for (std::size_t col = 0; col < s.C.cols(); ++col) {
         value += s.C(row, col) * x[col];
-      for (std::size_t col = 0; col < s.D.cols(); ++col)
+        scale = std::max(scale, std::abs(s.C(row, col)));
+      }
+      for (std::size_t col = 0; col < s.D.cols(); ++col) {
         value += s.D(row, col) * u[col];
-      residual = std::max(residual, std::abs(value));
+        scale = std::max(scale, std::abs(s.D(row, col)));
+      }
+      residual = std::max(residual, std::abs(value) / scale);
     }
     for (std::size_t row = 0; row < s.E.rows(); ++row) {
-      double value = s.e[row];
-      for (std::size_t col = 0; col < s.E.cols(); ++col)
+      Scalar value = s.e[row];
+      Scalar scale = std::max(Scalar{1}, std::abs(s.e[row]));
+      for (std::size_t col = 0; col < s.E.cols(); ++col) {
         value += s.E(row, col) * x[col];
-      residual = std::max(residual, std::abs(value));
+        scale = std::max(scale, std::abs(s.E(row, col)));
+      }
+      residual = std::max(residual, std::abs(value) / scale);
     }
     for (std::size_t row = 0; row < s.A.cols(); ++row) {
-      double value = s.q[row] + left[row];
+      Scalar value = s.q[row] + left[row];
       for (std::size_t col = 0; col < s.Q.cols(); ++col)
         value += s.Q(row, col) * x[col];
       for (std::size_t col = 0; col < s.M.cols(); ++col)
@@ -359,7 +380,7 @@ double MaxResidual(const Problem& problem, const std::vector<double>& states,
       residual = std::max(residual, std::abs(value));
     }
     for (std::size_t row = 0; row < s.B.cols(); ++row) {
-      double value = s.r[row];
+      Scalar value = s.r[row];
       for (std::size_t col = 0; col < s.M.rows(); ++col)
         value += s.M(col, row) * x[col];
       for (std::size_t col = 0; col < s.R.cols(); ++col)
@@ -372,12 +393,12 @@ double MaxResidual(const Problem& problem, const std::vector<double>& states,
       residual = std::max(residual, std::abs(value));
     }
   }
-  const double* terminal = states.data() + horizon * kMaxStateDimension;
-  const double* left =
+  const Scalar* terminal = states.data() + horizon * kMaxStateDimension;
+  const Scalar* left =
       horizon == 0 ? initial_multiplier.data()
                    : dynamics.data() + (horizon - 1) * kMaxStateDimension;
   for (std::size_t row = 0; row < problem.terminal_Q.rows(); ++row) {
-    double value = problem.terminal_q[row] + left[row];
+    Scalar value = problem.terminal_q[row] + left[row];
     for (std::size_t col = 0; col < problem.terminal_Q.cols(); ++col)
       value += problem.terminal_Q(row, col) * terminal[col];
     for (std::size_t constraint = 0; constraint < problem.terminal_E.rows();
@@ -394,25 +415,39 @@ void RunEmulation(const Problem& problem, const std::string& name,
                   bool compare_cpu = true) {
   const int horizon = static_cast<int>(problem.stages.size());
   const int nodes = horizon + 1;
+#ifdef CLQR_USE_FLOAT
+  const bool use_host_multiplier_recovery =
+      horizon <= 64 && HasDependentEqualityRows(problem, kTolerance);
+#else
+  const bool use_host_multiplier_recovery = false;
+#endif
   std::vector<PackedStage> stages;
   for (const Stage& stage : problem.stages) stages.push_back(Pack(stage));
   const PackedTerminal terminal = Pack(problem);
-  std::vector<double> initial(kMaxStateDimension);
+  std::vector<Scalar> initial(kMaxStateDimension);
   for (std::size_t row = 0; row < problem.initial_state.size(); ++row)
     initial[row] = problem.initial_state[row];
   DeviceStatus status;
+  Scalar feasibility_consistency_tolerance =
+      std::max(kTolerance, kMinimumFeasibilityConsistencyTolerance);
 
   std::vector<Relation> relation_a(nodes), relation_b(nodes);
   Launch(nodes, [&] {
     BuildPrimalLeavesKernel(stages.data(), horizon, &terminal, kTolerance,
+                            feasibility_consistency_tolerance,
                             relation_a.data(), &status);
   });
   Relation* suffix = relation_a.data();
   Relation* relation_output = relation_b.data();
+  int scan_level = 1;
   for (int offset = 1; offset < nodes; offset *= 2) {
     std::fill(relation_output, relation_output + nodes, Relation{});
+    feasibility_consistency_tolerance =
+        std::max(kTolerance, kMinimumFeasibilityConsistencyTolerance *
+                                 static_cast<Scalar>(++scan_level));
     Launch(nodes, [&] {
-      SuffixRelationsKernel(suffix, nodes, offset, kTolerance, relation_output,
+      SuffixRelationsKernel(suffix, nodes, offset, kTolerance,
+                            feasibility_consistency_tolerance, relation_output,
                             &status);
     });
     std::swap(suffix, relation_output);
@@ -426,11 +461,11 @@ void RunEmulation(const Problem& problem, const std::string& name,
   std::vector<ControlParam> control_params(horizon);
   std::vector<ReducedStage> reduced(horizon);
   ReducedTerminal reduced_terminal;
-  std::vector<double> reduced_initial(kMaxStateDimension);
+  std::vector<Scalar> reduced_initial(kMaxStateDimension);
   Launch(horizon, [&] {
     ReduceStagesKernel(stages.data(), suffix, state_params.data(), horizon,
-                       kTolerance, control_params.data(), reduced.data(),
-                       &status);
+                       kTolerance, feasibility_consistency_tolerance,
+                       control_params.data(), reduced.data(), &status);
   });
   Launch(1, [&] {
     ReduceTerminalKernel(&terminal, state_params.data(), horizon,
@@ -497,17 +532,25 @@ void RunEmulation(const Problem& problem, const std::string& name,
   for (int i = 0; i < horizon; ++i) {
     for (int row = 0; row < feedback[i].control_dim; ++row) {
       Expect(
-          std::abs(feedback[i].k[row] - sequential_feedback[i].k[row]) < 2e-8,
-          "parallel and sequential feedforward terms agree");
+          std::abs(feedback[i].k[row] - sequential_feedback[i].k[row]) <
+              kRiccatiComparisonTolerance,
+          name + " parallel and sequential feedforward terms agree: parallel=" +
+              std::to_string(feedback[i].k[row]) +
+              ", sequential=" + std::to_string(sequential_feedback[i].k[row]));
       for (int col = 0; col < feedback[i].state_dim; ++col) {
         Expect(
             std::abs(feedback[i].K[row * kMaxStateDimension + col] -
                      sequential_feedback[i].K[row * kMaxStateDimension + col]) <
-                2e-8,
-            "parallel and sequential feedback terms agree");
+                kRiccatiComparisonTolerance,
+            name + " parallel and sequential feedback terms agree: parallel=" +
+                std::to_string(feedback[i].K[row * kMaxStateDimension + col]) +
+                ", sequential=" +
+                std::to_string(
+                    sequential_feedback[i].K[row * kMaxStateDimension + col]));
       }
     }
   }
+  if (use_host_multiplier_recovery) feedback = sequential_feedback;
 
   std::vector<AffineMap> map_a(horizon), map_b(horizon);
   Launch(horizon, [&] {
@@ -522,9 +565,9 @@ void RunEmulation(const Problem& problem, const std::string& name,
     });
     std::swap(prefix, map_output);
   }
-  std::vector<double> reduced_states(nodes * kMaxStateDimension);
-  std::vector<double> states(nodes * kMaxStateDimension);
-  std::vector<double> controls(horizon * kMaxControlDimension);
+  std::vector<Scalar> reduced_states(nodes * kMaxStateDimension);
+  std::vector<Scalar> states(nodes * kMaxStateDimension);
+  std::vector<Scalar> controls(horizon * kMaxControlDimension);
   Launch(nodes, [&] {
     EvaluateReducedStatesKernel(prefix, horizon, reduced_initial.data(),
                                 reduced_states.data());
@@ -545,7 +588,7 @@ void RunEmulation(const Problem& problem, const std::string& name,
     for (int i = 0; i < nodes; ++i) {
       for (std::size_t row = 0; row < cpu.states[i].size; ++row) {
         Expect(std::abs(states[i * kMaxStateDimension + row] -
-                        cpu.states[i][row]) < 2e-7,
+                        cpu.states[i][row]) < kPrimalComparisonTolerance,
                "emulated state matches CPU before dual recovery at " +
                    std::to_string(i) + "," + std::to_string(row) +
                    ": emulated=" +
@@ -556,7 +599,7 @@ void RunEmulation(const Problem& problem, const std::string& name,
     for (int i = 0; i < horizon; ++i) {
       for (std::size_t row = 0; row < cpu.controls[i].size; ++row) {
         Expect(std::abs(controls[i * kMaxControlDimension + row] -
-                        cpu.controls[i][row]) < 2e-7,
+                        cpu.controls[i][row]) < kPrimalComparisonTolerance,
                "emulated control matches CPU before dual recovery at " +
                    std::to_string(i) + "," + std::to_string(row) +
                    ": emulated=" +
@@ -566,6 +609,11 @@ void RunEmulation(const Problem& problem, const std::string& name,
     }
   }
 
+  std::vector<Scalar> initial_multiplier(kMaxStateDimension);
+  std::vector<Scalar> dynamics(horizon * kMaxStateDimension);
+  std::vector<Scalar> mixed(horizon * kMaxMixedConstraints);
+  std::vector<Scalar> state_multipliers(horizon * kMaxStateConstraints);
+  std::vector<Scalar> terminal_multiplier(kMaxStateConstraints);
   int padded = 1;
   while (padded < nodes) padded *= 2;
   std::vector<int> level_offsets{0};
@@ -576,81 +624,112 @@ void RunEmulation(const Problem& problem, const std::string& name,
     level_counts.push_back(level_counts.back() / 2);
     total += level_counts.back();
   }
-  const double multiplier_rank_tolerance = kMinimumMultiplierRankTolerance;
-  const double multiplier_consistency_tolerance =
+  const Scalar multiplier_rank_tolerance = kMinimumMultiplierRankTolerance;
+  const Scalar multiplier_consistency_tolerance =
       kMultiplierConsistencyTolerancePerTreeLevel * level_counts.size();
-  std::vector<Relation> dual_tree(total);
-  std::vector<NodeValue> dual_values(total);
-  Launch(padded, [&] {
-    BuildDualLeavesKernel(stages.data(), &terminal, horizon, padded,
-                          states.data(), controls.data(),
-                          multiplier_rank_tolerance,
-                          multiplier_consistency_tolerance, dual_tree.data(),
-                          &status);
-  });
-  for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
-    Launch(level_counts[level + 1], [&] {
-      ReduceDualTreeLevelKernel(dual_tree.data(), level_offsets[level],
-                                level_offsets[level + 1],
-                                level_counts[level + 1],
-                                multiplier_rank_tolerance,
-                                multiplier_consistency_tolerance,
-                                dual_tree.data(), &status);
+  if (use_host_multiplier_recovery) {
+    std::vector<Vector> trajectory_states(nodes);
+    std::vector<Vector> trajectory_controls(horizon);
+    for (int i = 0; i < nodes; ++i) {
+      trajectory_states[i] = Vector(state_params[i].physical_dim);
+      for (int row = 0; row < state_params[i].physical_dim; ++row) {
+        trajectory_states[i][row] = states[i * kMaxStateDimension + row];
+      }
+    }
+    for (int i = 0; i < horizon; ++i) {
+      trajectory_controls[i] = Vector(control_params[i].physical_dim);
+      for (int row = 0; row < control_params[i].physical_dim; ++row) {
+        trajectory_controls[i][row] = controls[i * kMaxControlDimension + row];
+      }
+    }
+    clqr::internal::MultiplierRecovery recovery =
+        clqr::internal::RecoverMultipliersForTrajectory(
+            problem, trajectory_states, trajectory_controls, kTolerance);
+    Expect(recovery.success,
+           "emulated host multiplier recovery: " + recovery.message);
+    for (std::size_t row = 0; row < recovery.initial.size(); ++row)
+      initial_multiplier[row] = recovery.initial[row];
+    for (int i = 0; i < horizon; ++i) {
+      for (std::size_t row = 0; row < recovery.dynamics[i].size(); ++row)
+        dynamics[i * kMaxStateDimension + row] = recovery.dynamics[i][row];
+      for (std::size_t row = 0; row < recovery.mixed[i].size(); ++row)
+        mixed[i * kMaxMixedConstraints + row] = recovery.mixed[i][row];
+      for (std::size_t row = 0; row < recovery.state[i].size(); ++row)
+        state_multipliers[i * kMaxStateConstraints + row] =
+            recovery.state[i][row];
+    }
+    for (std::size_t row = 0; row < recovery.terminal.size(); ++row)
+      terminal_multiplier[row] = recovery.terminal[row];
+  } else {
+    std::vector<Relation> dual_tree(total);
+    std::vector<NodeValue> dual_values(total);
+    Launch(padded, [&] {
+      BuildDualLeavesKernel(
+          stages.data(), &terminal, horizon, padded, states.data(),
+          controls.data(), multiplier_rank_tolerance,
+          multiplier_consistency_tolerance, dual_tree.data(), &status);
     });
-  }
-  const int root = level_offsets.back();
-  Launch(1, [&] {
-    SolveDualRootKernel(dual_tree.data() + root, dual_values.data() + root,
-                        &status, multiplier_rank_tolerance);
-  });
-  for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
-       --level) {
-    Launch(level_counts[level + 1], [&] {
-      ExpandDualTreeLevelKernel(
-          dual_tree.data(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], multiplier_rank_tolerance,
-          multiplier_consistency_tolerance, dual_values.data(),
-          dual_values.data(), &status);
+    for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
+      Launch(level_counts[level + 1], [&] {
+        ReduceDualTreeLevelKernel(
+            dual_tree.data(), level_offsets[level], level_offsets[level + 1],
+            level_counts[level + 1], multiplier_rank_tolerance,
+            multiplier_consistency_tolerance, dual_tree.data(), &status);
+      });
+    }
+    const int root = level_offsets.back();
+    Launch(1, [&] {
+      SolveDualRootKernel(dual_tree.data() + root, dual_values.data() + root,
+                          &status, multiplier_rank_tolerance);
     });
+    for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
+         --level) {
+      Launch(level_counts[level + 1], [&] {
+        ExpandDualTreeLevelKernel(
+            dual_tree.data(), level_offsets[level], level_offsets[level + 1],
+            level_counts[level + 1], multiplier_rank_tolerance,
+            multiplier_consistency_tolerance, dual_values.data(),
+            dual_values.data(), &status);
+      });
+    }
+    Launch(nodes, [&] {
+      RecoverLocalMultipliersKernel(
+          stages.data(), &terminal, horizon, states.data(), controls.data(),
+          dual_values.data(), multiplier_rank_tolerance,
+          multiplier_consistency_tolerance, initial_multiplier.data(),
+          dynamics.data(), mixed.data(), state_multipliers.data(),
+          terminal_multiplier.data(), &status);
+    });
+    Expect(
+        status.code == kDeviceOk,
+        "emulated multiplier recovery (stage=" + std::to_string(status.stage) +
+            ", detail=" + std::to_string(status.detail) + ")");
   }
-  std::vector<double> initial_multiplier(kMaxStateDimension);
-  std::vector<double> dynamics(horizon * kMaxStateDimension);
-  std::vector<double> mixed(horizon * kMaxMixedConstraints);
-  std::vector<double> state_multipliers(horizon * kMaxStateConstraints);
-  std::vector<double> terminal_multiplier(kMaxStateConstraints);
-  Launch(nodes, [&] {
-    RecoverLocalMultipliersKernel(
-        stages.data(), &terminal, horizon, states.data(), controls.data(),
-        dual_values.data(), multiplier_rank_tolerance,
-        multiplier_consistency_tolerance, initial_multiplier.data(),
-        dynamics.data(), mixed.data(), state_multipliers.data(),
-        terminal_multiplier.data(), &status);
-  });
-  Expect(status.code == kDeviceOk,
-         "emulated multiplier recovery (stage=" + std::to_string(status.stage) +
-             ", detail=" + std::to_string(status.detail) + ")");
 
   if (compare_cpu) {
     for (int i = 0; i < nodes; ++i) {
       for (std::size_t row = 0; row < cpu.states[i].size; ++row) {
         Expect(std::abs(states[i * kMaxStateDimension + row] -
-                        cpu.states[i][row]) < 2e-7,
+                        cpu.states[i][row]) < kPrimalComparisonTolerance,
                "emulated state matches CPU");
       }
     }
     for (int i = 0; i < horizon; ++i) {
       for (std::size_t row = 0; row < cpu.controls[i].size; ++row) {
         Expect(std::abs(controls[i * kMaxControlDimension + row] -
-                        cpu.controls[i][row]) < 2e-7,
+                        cpu.controls[i][row]) < kPrimalComparisonTolerance,
                "emulated control matches CPU");
       }
     }
   }
-  const double residual =
+  const Scalar residual =
       MaxResidual(problem, states, controls, initial_multiplier, dynamics,
                   mixed, state_multipliers, terminal_multiplier);
-  Expect(residual < std::max(2e-7, 2.0 * multiplier_consistency_tolerance),
-         "emulated full KKT residual");
+  const Scalar kkt_tolerance = horizon >= 256
+                                   ? kLongHorizonKktComparisonTolerance
+                                   : kKktComparisonTolerance;
+  Expect(residual < kkt_tolerance,
+         "emulated full KKT residual: " + std::to_string(residual));
   std::cout << name << " CUDA kernel emulation "
             << (compare_cpu ? "matched CPU" : "completed")
             << "; KKT residual=" << residual << '\n';
@@ -671,7 +750,7 @@ int main() {
                true, true);
   RunEmulation(clqr::test::MakeJaxCrossValidationProblem(), "exact-JAX-fixture",
                true, false);
-  RunEmulation(LongHorizonStateConstraintProblem(), "long-horizon-state",
-               true, false, false);
+  RunEmulation(LongHorizonStateConstraintProblem(), "long-horizon-state", true,
+               false, false);
   return 0;
 }

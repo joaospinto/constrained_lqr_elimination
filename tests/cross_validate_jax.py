@@ -37,23 +37,35 @@ def main() -> None:
         )
     raw = completed.stdout
     data = json.loads(raw)
+    precision = data["precision"]
+    comparison_tolerance = 2e-2 if precision == "FP32" else 3e-6
+    residual_tolerance = 3e-6
+    storage_dtype = np.float32 if precision == "FP32" else np.float64
+
+    def reference_array(value: object) -> jax.Array:
+        # Reconstruct the selected C++ storage values first, then promote them
+        # for a high-accuracy JAX reference solve. This also preserves exact
+        # FP32 row dependencies that decimal JSON parses can perturb in FP64.
+        return jnp.asarray(np.asarray(value, dtype=storage_dtype), dtype=jnp.float64)
     print(
         "JAX backend:",
         jax.default_backend(),
         "; devices:",
         ", ".join(str(device) for device in jax.devices()),
+        "; fixture precision:",
+        precision,
     )
-    A = jnp.asarray(data["A"], dtype=jnp.float64)
-    B = jnp.asarray(data["B"], dtype=jnp.float64)
-    Q = jnp.asarray(data["Q"], dtype=jnp.float64)
-    M = jnp.asarray(data["M"], dtype=jnp.float64)
-    R = jnp.asarray(data["R"], dtype=jnp.float64)
-    D = jnp.asarray(data["D"], dtype=jnp.float64)
-    E = jnp.asarray(data["E"], dtype=jnp.float64)
-    q = jnp.asarray(data["q"], dtype=jnp.float64)
-    r = jnp.asarray(data["r"], dtype=jnp.float64)
-    c = jnp.asarray(data["c"], dtype=jnp.float64)
-    d = jnp.asarray(data["d"], dtype=jnp.float64)
+    A = reference_array(data["A"])
+    B = reference_array(data["B"])
+    Q = reference_array(data["Q"])
+    M = reference_array(data["M"])
+    R = reference_array(data["R"])
+    D = reference_array(data["D"])
+    E = reference_array(data["E"])
+    q = reference_array(data["q"])
+    r = reference_array(data["r"])
+    c = reference_array(data["c"])
+    d = reference_array(data["d"])
     horizon, n = A.shape[:2]
     p = D.shape[1]
     factorization = FactorizationInputs(
@@ -79,14 +91,24 @@ def main() -> None:
         ("JAX parallel elimination", jax_solver.factor_and_solve_parallel_elimination),
     ):
         solution = solver(factorization, solve_inputs)
-        np.testing.assert_allclose(solution.X, cuda_x, atol=3e-6, rtol=3e-6)
-        np.testing.assert_allclose(solution.U, cuda_u, atol=3e-6, rtol=3e-6)
+        np.testing.assert_allclose(
+            solution.X,
+            cuda_x,
+            atol=comparison_tolerance,
+            rtol=comparison_tolerance,
+        )
+        np.testing.assert_allclose(
+            solution.U,
+            cuda_u,
+            atol=comparison_tolerance,
+            rtol=comparison_tolerance,
+        )
         residual = float(
             jnp.max(
                 jnp.abs(compute_residual(factorization, solve_inputs, solution))
             )
         )
-        if residual > 3e-6:
+        if residual > residual_tolerance:
             raise AssertionError(f"{name} KKT residual is {residual:.3e}")
         print(f"{name}: matched {fixture_name}; KKT residual={residual:.3e}")
 

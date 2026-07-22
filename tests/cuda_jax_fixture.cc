@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <string>
 
 #include "clqr/cuda.h"
@@ -79,8 +80,9 @@ int main(int argc, char** argv) {
   const std::size_t horizon = problem.stages.size();
   const std::size_t n = problem.initial_state.size();
   const std::size_t p = problem.stages.front().E.rows();
-  std::cout << std::setprecision(17);
-  std::cout << "{\"A\":";
+  std::cout << std::setprecision(
+      std::numeric_limits<clqr::Scalar>::max_digits10);
+  std::cout << "{\"precision\":\"" << clqr::kPrecisionName << "\",\"A\":";
   PrintSequence(horizon,
                 [&](std::size_t i) { PrintMatrix(problem.stages[i].A); });
   std::cout << ",\"B\":";
