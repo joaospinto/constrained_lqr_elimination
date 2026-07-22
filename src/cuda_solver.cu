@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -27,6 +28,10 @@ constexpr int kMaxRrefColumns = kMaxDualColumns;
 constexpr int kMaxRrefEntries = kMaxRrefRows * kMaxRrefColumns;
 
 __device__ inline double DeviceAbs(double x) { return x < 0.0 ? -x : x; }
+
+__device__ inline bool DeviceFinite(double x) {
+  return x >= -DBL_MAX && x <= DBL_MAX;
+}
 
 __device__ void SetFailure(DeviceStatus* status, int code, int stage,
                            int detail) {
@@ -1956,7 +1961,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
       for (int k = 0; k < i; ++k) {
         diagonal -= cholesky[i * s.m + k] * cholesky[i * s.m + k];
       }
-      if (!(diagonal > tolerance * scale) || !isfinite(diagonal)) {
+      if (!(diagonal > tolerance * scale) || !DeviceFinite(diagonal)) {
         positive_definite = 0;
         break;
       }
