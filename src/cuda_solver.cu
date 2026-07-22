@@ -28,10 +28,12 @@ constexpr int kThreads = 32;
 constexpr Scalar kMinimumFeasibilityConsistencyTolerance = 1e-4f;
 constexpr Scalar kMinimumMultiplierRankTolerance = 1e-4f;
 constexpr Scalar kMultiplierConsistencyTolerancePerTreeLevel = 2e-2f;
+constexpr Scalar kMinimumDualRelationRowScale = 1e-6f;
 #else
 constexpr Scalar kMinimumFeasibilityConsistencyTolerance = Scalar{0};
 constexpr Scalar kMinimumMultiplierRankTolerance = 1e-7;
 constexpr Scalar kMultiplierConsistencyTolerancePerTreeLevel = 1e-6;
+constexpr Scalar kMinimumDualRelationRowScale = 1e-12;
 #endif
 constexpr int kMaxRrefRows = ConstexprMax(
     4 * kMaxDualParameterDimension,
@@ -168,16 +170,19 @@ __device__ bool BlockEnabled(const int *flag, int *enabled) {
 // Scale each nonzero equation before pivoting, then use partial row pivoting.
 // This makes rank decisions invariant to independent equation rescaling while
 // retaining the deterministic free-column convention of the CPU RREF path.
+// Generated relations may supply a positive minimum_row_scale to prevent
+// roundoff-level cancellation noise from being normalized to order one.
 __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
                           int pivot_limit, Scalar tolerance, int *pivot_columns,
                           int *pivot_rows, int *rank, int *best_row,
-                          Scalar *factors) {
+                          Scalar *factors,
+                          Scalar minimum_row_scale = Scalar{0}) {
   for (int row = threadIdx.x; row < rows; row += blockDim.x) {
     Scalar scale = Scalar{0};
     for (int col = 0; col < pivot_limit; ++col) {
       scale = fmax(scale, DeviceAbs(matrix[row * columns + col]));
     }
-    if (scale > Scalar{0}) {
+    if (scale > minimum_row_scale) {
       for (int col = 0; col < columns; ++col)
         matrix[row * columns + col] /= scale;
     }
@@ -340,9 +345,9 @@ __device__ void ExtractResidualRelation(const Scalar *matrix, int columns,
 // Eliminate the leading variables by orthogonally projecting the equations
 // onto their left nullspace, then retain an orthonormal basis of the resulting
 // affine relation.  Pivoted, reorthogonalized modified Gram--Schmidt is used in
-// both directions.  Stage dimensions are bounded, so the serial work within a
-// block is constant with respect to the horizon while independent tree nodes
-// remain fully parallel.
+// both directions. Stage dimensions are bounded, so the local work is constant
+// with respect to the horizon while independent tree nodes remain fully
+// parallel.
 template <typename RelationType>
 __device__ void EliminateRelationOrthogonally(
     Scalar *matrix, int rows, int columns, int eliminated_columns, int left_dim,
@@ -3620,12 +3625,13 @@ __global__ void BuildDualParameterRelationsKernel(
     matrix[row * columns + columns - 1] = rhs;
   }
   WarpSynchronize();
+  // A redundant mixed-constraint multiplier is a true null direction. Its
+  // contribution to state stationarity can cancel exactly or leave only
+  // architecture-dependent roundoff, which must not become a new equation.
   RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
-            pivot_rows, &rank, &best_row, factors);
+            pivot_rows, &rank, &best_row, factors,
+            kMinimumDualRelationRowScale);
   if (threadIdx.x == 0) {
-    // Any zero-left/nonzero-rhs row is retained in the residual relation and
-    // checked by the global contraction.  Rejecting it locally is incorrect:
-    // adjacent free dual coordinates can still satisfy that relation.
     StateDualParam &out = state_params[relation_index];
     out.constraint_dim = state_constraints;
     out.left_dim = left.free_dim;

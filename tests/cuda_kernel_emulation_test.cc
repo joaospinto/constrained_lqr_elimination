@@ -42,6 +42,21 @@ void Expect(bool condition, const std::string &message) {
   }
 }
 
+void TinyCoefficientRrefCase() {
+  constexpr Scalar rank_tolerance = Scalar{1e-4};
+  Scalar matrix[]{rank_tolerance * rank_tolerance, Scalar{1}};
+  int pivot_columns[1]{};
+  int pivot_rows[1]{};
+  int rank = -1;
+  int best_row = -1;
+  Scalar factors[1]{};
+  RrefBlock(matrix, 1, 2, 1, rank_tolerance, pivot_columns, pivot_rows,
+            &rank, &best_row, factors, rank_tolerance);
+  Expect(rank == 0, "RREF does not amplify a roundoff-level coefficient");
+  Expect(matrix[0] == Scalar{0},
+         "RREF removes a coefficient below its rank tolerance");
+}
+
 Scalar Value(int seed, std::size_t row, std::size_t col = 0) {
   const Scalar x = static_cast<Scalar>(seed * 83 + row * 29 + col * 43);
   return std::sin(0.019 * x) + 0.25 * std::cos(0.037 * x);
@@ -925,6 +940,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
 } // namespace
 
 int main() {
+  TinyCoefficientRrefCase();
   RunEmulation(MakeProblem(), "rank-deficient constrained", true, true);
   RunEmulation(ZeroHorizonProblem(), "zero-horizon", false, false);
   RunEmulation(
