@@ -525,6 +525,9 @@ int main() {
   CompareWithCpu(GeneratedProblem(111, 3, 3, 1, 1, ConstraintMode::kState),
                  "reusable workspace smaller case", true, nullptr,
                  &reusable_cuda_workspace, &reusable_cuda_solution);
+  CompareWithCpu(GeneratedProblem(111, 3, 3, 1, 1, ConstraintMode::kState),
+                 "reusable workspace cached layout", true, nullptr,
+                 &reusable_cuda_workspace, &reusable_cuda_solution);
   LongHorizonCase();
   InfeasibleCase();
   InvalidDeviceCases();

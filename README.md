@@ -103,9 +103,10 @@ build-cuda/clqr_cuda_benchmark
 For FP32, configure a distinct directory with `-DCLQR_PRECISION=FP32`.
 The four `CLQR_CUDA_MAX_*` CMake settings bound the state, control, mixed-constraint,
 and state-constraint dimensions (all default to 8). These settings change the CUDA ABI and
-determine the kernels' shared-memory envelope. Problem data, trajectories, and multipliers are
-stored compactly using each stage's active dimensions; choosing a tighter envelope further
-reduces shared memory and register pressure without padding the numerical work.
+determine the kernels' shared-memory envelope. Problem data, trajectories, multipliers, and
+all horizon-scaling scan arenas are stored compactly using the active stage or endpoint
+dimensions. Choosing a tighter envelope further reduces shared memory and register pressure;
+kernel arithmetic always uses the active dimensions.
 
 The CUDA test compares states, controls, and objective values against the existing C++ solver,
 then checks the complete primal-dual KKT residual. It covers unconstrained, state-only, mixed,
@@ -122,10 +123,10 @@ hardware report, build, C++/CUDA tests, JAX cross-validation, and benchmark with
 bash scripts/colab_t4.sh
 ```
 
-The script automatically uses `/content` on Colab and `/kaggle/working` on Kaggle. It builds,
-tests, cross-validates, and benchmarks FP64 and FP32 in separate directories. It defaults to
-architecture 75 and five benchmark repetitions. Override these with
-`CLQR_CUDA_ARCH`, `CLQR_BENCHMARK_REPEATS`, or a space-separated `CLQR_PRECISIONS` selection.
+The script automatically uses `/content` on Colab and `/kaggle/working` on Kaggle. It defaults
+to an FP64 build, architecture 75, and five benchmark repetitions. Override these with
+`CLQR_CUDA_ARCH`, `CLQR_BENCHMARK_REPEATS`, or a space-separated `CLQR_PRECISIONS` selection
+(for example, `CLQR_PRECISIONS="FP64 FP32"` to run both builds).
 Set `CLQR_JAX_DIR` to reuse an existing checkout of `joaospinto/constrained_lqr_jax`, or
 `CLQR_SKIP_JAX=1` to omit only that cross-check. When `compute-sanitizer` is available, the
 script also runs its memory, initialization, shared-memory race, and synchronization checkers

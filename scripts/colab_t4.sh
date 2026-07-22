@@ -14,7 +14,7 @@ max_state_dimension="${CLQR_CUDA_MAX_STATE_DIMENSION:-8}"
 max_control_dimension="${CLQR_CUDA_MAX_CONTROL_DIMENSION:-4}"
 max_mixed_constraints="${CLQR_CUDA_MAX_MIXED_CONSTRAINTS:-2}"
 max_state_constraints="${CLQR_CUDA_MAX_STATE_CONSTRAINTS:-2}"
-read -r -a precisions <<< "${CLQR_PRECISIONS:-FP64 FP32}"
+read -r -a precisions <<< "${CLQR_PRECISIONS:-FP64}"
 
 if ! command -v nvcc >/dev/null 2>&1; then
   echo "nvcc is unavailable; select a CUDA GPU runtime first." >&2

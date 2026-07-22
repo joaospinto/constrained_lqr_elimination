@@ -170,26 +170,27 @@ int main(int argc, char **argv) {
   } else {
     std::cout << "# CPU columns are nan above N=" << cpu_max_horizon << ".\n";
   }
-  std::cout << "# Multiplier consistency rejection is disabled for this "
-               "single diagnostic run; kkt_residual reports accuracy.\n";
+  std::cout << "# Multiplier consistency rejection is disabled while timing; "
+               "kkt_residual reports the final repeated solution's "
+               "accuracy.\n";
   std::cout << "N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_device_ms,"
-               "wall_speedup,feasibility_ms,reduction_ms,riccati_ms,"
-               "reconstruction_ms,multiplier_ms,min_reduced_n,"
+               "wall_speedup,device_speedup,host_overhead_ms,upload_ms,"
+               "feasibility_ms,reduction_ms,riccati_ms,reconstruction_ms,"
+               "multiplier_ms,download_ms,min_reduced_n,"
                "min_reduced_m,parallel_riccati,kkt_residual\n";
   clqr::cuda::Workspace cuda_workspace;
+  int completed_horizons = 0;
   for (std::size_t horizon : horizons) {
     Problem problem = clqr::benchmark::StateOnlyProblem(horizon, n, m, p);
     clqr::Workspace workspace;
     const bool run_cpu = horizon <= cpu_max_horizon;
     if (run_cpu) {
       workspace.Reserve(problem);
-      for (int warmup = 0; warmup < 2; ++warmup) {
-        const clqr::SolutionView cpu = clqr::Solve(problem, workspace);
-        if (cpu.status != clqr::SolveStatus::kOptimal) {
-          std::cerr << "CPU warmup failed at N=" << horizon << ": "
-                    << cpu.message << "\n";
-          return 1;
-        }
+      const clqr::SolutionView cpu = clqr::Solve(problem, workspace);
+      if (cpu.status != clqr::SolveStatus::kOptimal) {
+        std::cerr << "CPU warmup failed at N=" << horizon << ": " << cpu.message
+                  << "\n";
+        return 1;
       }
     }
     clqr::cuda::Options cuda_options;
@@ -198,19 +199,23 @@ int main(int argc, char **argv) {
     clqr::cuda::Solution gpu;
     clqr::cuda::Solve(problem, cuda_workspace, gpu, cuda_options);
     if (gpu.status != clqr::SolveStatus::kOptimal) {
-      std::cerr << "CUDA warmup failed at N=" << horizon << ": " << gpu.message
-                << "\n";
-      return 1;
+      std::cout << "# CUDA warmup failed at N=" << horizon << ": "
+                << gpu.message << "\n";
+      continue;
     }
 
     std::vector<double> cpu_times;
     std::vector<double> gpu_wall_times;
     std::vector<double> gpu_device_times;
+    std::vector<double> host_overheads;
     std::vector<double> feasibility;
+    std::vector<double> upload;
     std::vector<double> reduction;
     std::vector<double> riccati;
     std::vector<double> reconstruction;
     std::vector<double> multiplier;
+    std::vector<double> download;
+    bool repeat_failed = false;
     for (int repeat = 0; repeat < repeats; ++repeat) {
       if (run_cpu) {
         const auto cpu_start = Clock::now();
@@ -226,21 +231,33 @@ int main(int argc, char **argv) {
       const auto gpu_start = Clock::now();
       clqr::cuda::Solve(problem, cuda_workspace, gpu, cuda_options);
       const auto gpu_stop = Clock::now();
-      if (gpu.status != clqr::SolveStatus::kOptimal)
-        return 1;
-      gpu_wall_times.push_back(
+      if (gpu.status != clqr::SolveStatus::kOptimal) {
+        std::cout << "# CUDA timed solve failed at N=" << horizon
+                  << ", repeat=" << repeat << ": " << gpu.message << "\n";
+        repeat_failed = true;
+        break;
+      }
+      const double gpu_wall_time =
           std::chrono::duration<double, std::milli>(gpu_stop - gpu_start)
-              .count());
-      gpu_device_times.push_back(DeviceTotal(gpu.timings));
+              .count();
+      const double gpu_device_time = DeviceTotal(gpu.timings);
+      gpu_wall_times.push_back(gpu_wall_time);
+      gpu_device_times.push_back(gpu_device_time);
+      host_overheads.push_back(gpu_wall_time - gpu_device_time);
+      upload.push_back(gpu.timings.upload_ms);
       feasibility.push_back(gpu.timings.feasibility_ms);
       reduction.push_back(gpu.timings.reduction_ms);
       riccati.push_back(gpu.timings.riccati_ms);
       reconstruction.push_back(gpu.timings.reconstruction_ms);
       multiplier.push_back(gpu.timings.multiplier_ms);
+      download.push_back(gpu.timings.download_ms);
     }
+    if (repeat_failed)
+      continue;
     const double cpu_ms =
         run_cpu ? Median(cpu_times) : std::numeric_limits<double>::quiet_NaN();
     const double gpu_wall_ms = Median(gpu_wall_times);
+    const double gpu_device_ms = Median(gpu_device_times);
     int min_reduced_n = std::numeric_limits<int>::max();
     int min_reduced_m = std::numeric_limits<int>::max();
     for (int value : gpu.reduced_state_dimensions)
@@ -250,13 +267,16 @@ int main(int argc, char **argv) {
     const Scalar kkt_residual = MaxKktResidual(problem, gpu);
     std::cout << horizon << ',' << n << ',' << m << ',' << p << ',' << repeats
               << ',' << std::fixed << std::setprecision(6) << cpu_ms << ','
-              << gpu_wall_ms << ',' << Median(gpu_device_times) << ','
-              << cpu_ms / gpu_wall_ms << ',' << Median(feasibility) << ','
-              << Median(reduction) << ',' << Median(riccati) << ','
-              << Median(reconstruction) << ',' << Median(multiplier) << ','
+              << gpu_wall_ms << ',' << gpu_device_ms << ','
+              << cpu_ms / gpu_wall_ms << ',' << cpu_ms / gpu_device_ms << ','
+              << Median(host_overheads) << ',' << Median(upload) << ','
+              << Median(feasibility) << ',' << Median(reduction) << ','
+              << Median(riccati) << ',' << Median(reconstruction) << ','
+              << Median(multiplier) << ',' << Median(download) << ','
               << min_reduced_n << ',' << min_reduced_m << ','
               << (gpu.used_parallel_riccati ? "yes" : "no") << ','
               << std::scientific << kkt_residual << '\n';
+    ++completed_horizons;
   }
-  return 0;
+  return completed_horizons == 0 ? 1 : 0;
 }

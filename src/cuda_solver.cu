@@ -1456,6 +1456,10 @@ struct WorkspaceStorage {
   std::vector<int> node_level_counts;
   std::vector<int> stage_level_offsets;
   std::vector<int> stage_level_counts;
+  std::vector<int> relation_layout_key;
+  std::vector<int> value_layout_key;
+  std::vector<int> map_layout_key;
+  std::vector<int> dual_layout_key;
 
   ~WorkspaceStorage() {
     if (device >= 0)
@@ -2004,16 +2008,37 @@ void BindMapStorage(AffineMap *map, Scalar **cursor,
   *cursor += capacity.offset;
 }
 
-void PrepareRelationStorage(const Problem &problem,
+bool PrepareRelationStorage(const Problem &problem,
                             WorkspaceStorage *workspace) {
   const int stage_count = static_cast<int>(problem.stages.size());
   const int node_count = stage_count + 1;
+  bool layout_matches = workspace->relation_layout_key.size() ==
+                        static_cast<std::size_t>(2 * node_count);
+  for (int stage = 0; stage < stage_count && layout_matches; ++stage) {
+    layout_matches &= workspace->relation_layout_key[2 * stage] ==
+                          static_cast<int>(problem.stages[stage].A.cols()) &&
+                      workspace->relation_layout_key[2 * stage + 1] ==
+                          static_cast<int>(problem.stages[stage].A.rows());
+  }
+  if (layout_matches) {
+    layout_matches &= workspace->relation_layout_key[2 * stage_count] ==
+                          static_cast<int>(problem.terminal_Q.rows()) &&
+                      workspace->relation_layout_key[2 * stage_count + 1] == 0;
+  }
+  if (layout_matches)
+    return false;
   std::vector<ScanShape> leaves(node_count);
+  std::vector<int> key;
+  key.reserve(static_cast<std::size_t>(2) * node_count);
   for (int stage = 0; stage < stage_count; ++stage) {
     leaves[stage] = {static_cast<int>(problem.stages[stage].A.cols()),
                      static_cast<int>(problem.stages[stage].A.rows())};
+    key.push_back(leaves[stage].left);
+    key.push_back(leaves[stage].right);
   }
   leaves[stage_count] = {static_cast<int>(problem.terminal_Q.rows()), 0};
+  key.push_back(leaves[stage_count].left);
+  key.push_back(0);
   std::vector<RelationCapacity> leaf_capacity;
   std::vector<RelationCapacity> internal_capacity;
   PlanSuffixScanStorage(leaves, workspace->node_level_offsets,
@@ -2034,19 +2059,32 @@ void PrepareRelationStorage(const Problem &problem,
                         internal_capacity[node]);
   Require(cursor == workspace->relation_data.get() + entries,
           "internal CUDA relation layout size mismatch");
+  workspace->relation_layout_key = std::move(key);
+  return true;
 }
 
-void PrepareValueStorage(WorkspaceStorage *workspace, int stage_count) {
+bool PrepareValueStorage(WorkspaceStorage *workspace, int stage_count) {
   const int node_count = stage_count + 1;
+  bool layout_matches = workspace->value_layout_key.size() ==
+                        static_cast<std::size_t>(node_count);
+  for (int node = 0; node < node_count && layout_matches; ++node) {
+    layout_matches &= workspace->value_layout_key[node] ==
+                      workspace->host_state_dimensions[2 * node + 1];
+  }
+  if (layout_matches)
+    return false;
   const auto &level_offsets = workspace->node_level_offsets;
   const auto &level_counts = workspace->node_level_counts;
   std::vector<ScanShape> leaves(node_count);
+  std::vector<int> key;
+  key.reserve(node_count);
   for (int node = 0; node < node_count; ++node) {
     const int left = workspace->host_state_dimensions[2 * node + 1];
     const int right = node == stage_count
                           ? 0
                           : workspace->host_state_dimensions[2 * node + 3];
     leaves[node] = {left, right};
+    key.push_back(left);
   }
 
   const int internal_count =
@@ -2071,19 +2109,34 @@ void PrepareValueStorage(WorkspaceStorage *workspace, int stage_count) {
                      internal_capacity[node]);
   Require(cursor == workspace->value_data.get() + entries,
           "internal CUDA value layout size mismatch");
+  workspace->value_layout_key = std::move(key);
+  return true;
 }
 
-void PrepareMapStorage(WorkspaceStorage *workspace, int stage_count) {
+bool PrepareMapStorage(WorkspaceStorage *workspace, int stage_count) {
   if (stage_count == 0)
-    return;
+    return false;
+  const int node_count = stage_count + 1;
+  bool layout_matches =
+      workspace->map_layout_key.size() == static_cast<std::size_t>(node_count);
+  for (int node = 0; node < node_count && layout_matches; ++node) {
+    layout_matches &= workspace->map_layout_key[node] ==
+                      workspace->host_state_dimensions[2 * node + 1];
+  }
+  if (layout_matches)
+    return false;
   const auto &level_offsets = workspace->stage_level_offsets;
   const auto &level_counts = workspace->stage_level_counts;
   std::vector<ScanShape> leaves(stage_count);
+  std::vector<int> key;
+  key.reserve(stage_count + 1);
+  key.push_back(workspace->host_state_dimensions[1]);
   std::vector<MapCapacity> leaf_capacity(stage_count);
   for (int stage = 0; stage < stage_count; ++stage) {
     leaves[stage] = {workspace->host_state_dimensions[2 * stage + 1],
                      workspace->host_state_dimensions[2 * stage + 3]};
     leaf_capacity[stage].Include(leaves[stage]);
+    key.push_back(leaves[stage].right);
   }
 
   const int internal_count = static_cast<int>(workspace->host_map_scan.size());
@@ -2159,6 +2212,8 @@ void PrepareMapStorage(WorkspaceStorage *workspace, int stage_count) {
                    internal_capacity[node]);
   Require(cursor == workspace->map_data.get() + entries,
           "internal CUDA map layout size mismatch");
+  workspace->map_layout_key = std::move(key);
+  return true;
 }
 
 struct DualValueCapacity {
@@ -2196,7 +2251,17 @@ void BindDualValueStorage(DualNodeValue *value, Scalar **cursor,
   *cursor += capacity.right;
 }
 
-void PrepareDualStorage(WorkspaceStorage *workspace, int stage_count) {
+bool PrepareDualStorage(WorkspaceStorage *workspace, int stage_count) {
+  bool layout_matches = workspace->dual_layout_key.size() ==
+                        static_cast<std::size_t>(stage_count);
+  for (int stage = 0; stage < stage_count && layout_matches; ++stage) {
+    layout_matches &= workspace->dual_layout_key[stage] ==
+                      workspace->host_dual_dimensions[stage];
+  }
+  if (layout_matches)
+    return false;
+  std::vector<int> key(workspace->host_dual_dimensions.begin(),
+                       workspace->host_dual_dimensions.end());
   const auto &level_offsets = workspace->stage_level_offsets;
   const auto &level_counts = workspace->stage_level_counts;
   const int tree_size = level_offsets.back() + level_counts.back();
@@ -2251,6 +2316,8 @@ void PrepareDualStorage(WorkspaceStorage *workspace, int stage_count) {
           "internal CUDA dual-relation layout size mismatch");
   Require(value_cursor == workspace->dual_value_data.get() + value_entries,
           "internal CUDA dual-value layout size mismatch");
+  workspace->dual_layout_key = std::move(key);
+  return true;
 }
 
 Scalar ObjectiveFromCompact(const Problem &problem, const int *state_offsets,
@@ -2326,7 +2393,8 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     stage_level_counts.push_back((stage_level_counts.back() + 1) / 2);
     stage_tree_size += stage_level_counts.back();
   }
-  PrepareRelationStorage(problem, &workspace);
+  const bool relation_layout_changed =
+      PrepareRelationStorage(problem, &workspace);
   auto &host_stages = workspace.host_stages;
   Scalar *host_problem_cursor = workspace.host_problem_data.data();
   Scalar *device_problem_cursor = workspace.device_problem_data.get();
@@ -2365,17 +2433,19 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &reduced_initial = workspace.reduced_initial;
 
   solution.timings.upload_ms = TimeGpu(workspace, [&] {
-    CudaCheck(cudaMemcpyAsync(
-                  relation_a.get(), workspace.host_relation_leaves.data(),
-                  workspace.host_relation_leaves.size() * sizeof(Relation),
-                  cudaMemcpyHostToDevice),
-              "upload compact relation leaves");
-    if (workspace.host_relation_scan.size() > 0) {
+    if (relation_layout_changed) {
       CudaCheck(cudaMemcpyAsync(
-                    relation_b.get(), workspace.host_relation_scan.data(),
-                    workspace.host_relation_scan.size() * sizeof(Relation),
+                    relation_a.get(), workspace.host_relation_leaves.data(),
+                    workspace.host_relation_leaves.size() * sizeof(Relation),
                     cudaMemcpyHostToDevice),
-                "upload compact relation tree");
+                "upload compact relation leaves");
+      if (workspace.host_relation_scan.size() > 0) {
+        CudaCheck(cudaMemcpyAsync(
+                      relation_b.get(), workspace.host_relation_scan.data(),
+                      workspace.host_relation_scan.size() * sizeof(Relation),
+                      cudaMemcpyHostToDevice),
+                  "upload compact relation tree");
+      }
     }
     if (stage_count > 0) {
       CudaCheck(cudaMemcpyAsync(device_stages.get(), host_stages.data(),
@@ -2540,8 +2610,9 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     return solution;
   }
 
-  PrepareValueStorage(&workspace, stage_count);
-  PrepareMapStorage(&workspace, stage_count);
+  const bool value_layout_changed =
+      PrepareValueStorage(&workspace, stage_count);
+  const bool map_layout_changed = PrepareMapStorage(&workspace, stage_count);
 
   auto &value_a = workspace.value_leaves;
   auto &value_b = workspace.value_scan;
@@ -2551,17 +2622,19 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   int &host_parallel_ok = workspace.host_parallel_ok[0];
   host_parallel_ok = 1;
   solution.timings.riccati_ms = TimeGpu(workspace, [&] {
-    CudaCheck(cudaMemcpyAsync(value_a.get(), workspace.host_value_leaves.data(),
-                              workspace.host_value_leaves.size() *
-                                  sizeof(ValueElement),
-                              cudaMemcpyHostToDevice),
-              "upload compact value leaves");
-    if (workspace.host_value_scan.size() > 0) {
-      CudaCheck(cudaMemcpyAsync(value_b.get(), workspace.host_value_scan.data(),
-                                workspace.host_value_scan.size() *
-                                    sizeof(ValueElement),
-                                cudaMemcpyHostToDevice),
-                "upload compact value tree");
+    if (value_layout_changed) {
+      CudaCheck(cudaMemcpyAsync(
+                    value_a.get(), workspace.host_value_leaves.data(),
+                    workspace.host_value_leaves.size() * sizeof(ValueElement),
+                    cudaMemcpyHostToDevice),
+                "upload compact value leaves");
+      if (workspace.host_value_scan.size() > 0) {
+        CudaCheck(cudaMemcpyAsync(
+                      value_b.get(), workspace.host_value_scan.data(),
+                      workspace.host_value_scan.size() * sizeof(ValueElement),
+                      cudaMemcpyHostToDevice),
+                  "upload compact value tree");
+      }
     }
     CudaCheck(cudaMemcpyAsync(parallel_ok.get(), &host_parallel_ok, sizeof(int),
                               cudaMemcpyHostToDevice),
@@ -2661,17 +2734,19 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   AffineMap *prefix = map_a.get();
   solution.timings.reconstruction_ms = TimeGpu(workspace, [&] {
     if (stage_count > 0) {
-      CudaCheck(
-          cudaMemcpyAsync(map_a.get(), workspace.host_map_leaves.data(),
-                          workspace.host_map_leaves.size() * sizeof(AffineMap),
-                          cudaMemcpyHostToDevice),
-          "upload compact affine leaves");
-      if (workspace.host_map_scan.size() > 0) {
-        CudaCheck(
-            cudaMemcpyAsync(map_b.get(), workspace.host_map_scan.data(),
-                            workspace.host_map_scan.size() * sizeof(AffineMap),
-                            cudaMemcpyHostToDevice),
-            "upload compact affine tree");
+      if (map_layout_changed) {
+        CudaCheck(cudaMemcpyAsync(map_a.get(), workspace.host_map_leaves.data(),
+                                  workspace.host_map_leaves.size() *
+                                      sizeof(AffineMap),
+                                  cudaMemcpyHostToDevice),
+                  "upload compact affine leaves");
+        if (workspace.host_map_scan.size() > 0) {
+          CudaCheck(cudaMemcpyAsync(map_b.get(), workspace.host_map_scan.data(),
+                                    workspace.host_map_scan.size() *
+                                        sizeof(AffineMap),
+                                    cudaMemcpyHostToDevice),
+                    "upload compact affine tree");
+        }
       }
       InitializeAffineMapsKernel<<<stage_count, kThreads>>>(
           feedback.get(), stage_count, map_a.get());
@@ -2790,15 +2865,15 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               .count();
       return solution;
     }
-    if (host_dual_scan_needed != 0) {
-      PrepareDualStorage(&workspace, stage_count);
-    }
+    const bool dual_layout_changed =
+        host_dual_scan_needed != 0 ? PrepareDualStorage(&workspace, stage_count)
+                                   : false;
     DualRelation *dual_relations =
         host_dual_scan_needed != 0 ? dual_tree.get() : nullptr;
     DualNodeValue *dual_leaf_values =
         host_dual_scan_needed != 0 ? dual_values.get() : nullptr;
     solution.timings.multiplier_ms += TimeGpu(workspace, [&] {
-      if (host_dual_scan_needed != 0) {
+      if (dual_layout_changed) {
         CudaCheck(cudaMemcpyAsync(
                       dual_tree.get(), workspace.host_dual_tree.data(),
                       workspace.host_dual_tree.size() * sizeof(DualRelation),
