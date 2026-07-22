@@ -1442,9 +1442,12 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   }
   const Scalar multiplier_rank_tolerance =
       std::max(options.tolerance, kMinimumMultiplierRankTolerance);
-  const Scalar multiplier_consistency_tolerance = std::max(
-      multiplier_rank_tolerance,
-      kMultiplierConsistencyTolerancePerTreeLevel * level_counts.size());
+  const Scalar multiplier_consistency_tolerance =
+      options.enforce_multiplier_consistency
+          ? std::max(multiplier_rank_tolerance,
+                     kMultiplierConsistencyTolerancePerTreeLevel *
+                         level_counts.size())
+          : kScalarMax;
   DeviceBuffer<Relation> dual_tree(total_nodes);
   DeviceBuffer<NodeValue> dual_values(total_nodes);
   DeviceBuffer<Scalar> initial_multiplier(kMaxStateDimension);
@@ -1630,6 +1633,8 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   solution.message = solution.used_parallel_riccati
                          ? "optimal (parallel CUDA Riccati scan)"
                          : "optimal (CUDA sequential Riccati fallback)";
+  if (!options.enforce_multiplier_consistency)
+    solution.message += "; multiplier consistency unchecked";
   solution.timings.total_ms =
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - total_start)

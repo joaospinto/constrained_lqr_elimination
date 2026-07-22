@@ -16,6 +16,9 @@ struct Options {
   Scalar tolerance = 1e-10;
 #endif
   int device = 0;
+  // Keep enabled in applications. Benchmarks may disable this to inspect and
+  // report the KKT residual of a best-effort multiplier reconstruction.
+  bool enforce_multiplier_consistency = true;
 };
 
 struct Timings {

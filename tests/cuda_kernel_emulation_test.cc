@@ -241,7 +241,7 @@ Problem MoreMixedRowsThanControlsProblem() {
 }
 
 Problem LongHorizonStateConstraintProblem() {
-  return clqr::benchmark::StateOnlyProblem(2048, 8, 4, 2);
+  return clqr::benchmark::StateOnlyProblem(16384, 8, 4, 2);
 }
 
 template <std::size_t Size>

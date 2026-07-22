@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -7,13 +8,17 @@
 #include <string>
 #include <vector>
 
-#include "cuda_benchmark_problem.h"
 #include "clqr/cuda.h"
+#include "cuda_benchmark_problem.h"
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using clqr::Matrix;
 using clqr::Problem;
+using clqr::Scalar;
+using clqr::Stage;
+using clqr::Vector;
 
 double Median(std::vector<double> values) {
   std::sort(values.begin(), values.end());
@@ -24,6 +29,101 @@ double DeviceTotal(const clqr::cuda::Timings& timings) {
   return timings.upload_ms + timings.feasibility_ms + timings.reduction_ms +
          timings.riccati_ms + timings.reconstruction_ms +
          timings.multiplier_ms + timings.download_ms;
+}
+
+Scalar BenchmarkMaxAbs(const Vector& vector) {
+  Scalar value = Scalar{0};
+  for (std::size_t i = 0; i < vector.size(); ++i)
+    value = std::max(value, std::abs(vector[i]));
+  return value;
+}
+
+Scalar MaxScaledMixedResidual(const Stage& stage, const Vector& state,
+                              const Vector& control) {
+  Scalar residual = Scalar{0};
+  for (std::size_t row = 0; row < stage.C.rows(); ++row) {
+    Scalar value = stage.d[row];
+    Scalar scale = std::max(Scalar{1}, std::abs(stage.d[row]));
+    for (std::size_t col = 0; col < stage.C.cols(); ++col) {
+      value += stage.C(row, col) * state[col];
+      scale = std::max(scale, std::abs(stage.C(row, col)));
+    }
+    for (std::size_t col = 0; col < stage.D.cols(); ++col) {
+      value += stage.D(row, col) * control[col];
+      scale = std::max(scale, std::abs(stage.D(row, col)));
+    }
+    residual = std::max(residual, std::abs(value) / scale);
+  }
+  return residual;
+}
+
+Scalar MaxScaledStateResidual(const Matrix& matrix, const Vector& offset,
+                              const Vector& state) {
+  Scalar residual = Scalar{0};
+  for (std::size_t row = 0; row < matrix.rows(); ++row) {
+    Scalar value = offset[row];
+    Scalar scale = std::max(Scalar{1}, std::abs(offset[row]));
+    for (std::size_t col = 0; col < matrix.cols(); ++col) {
+      value += matrix(row, col) * state[col];
+      scale = std::max(scale, std::abs(matrix(row, col)));
+    }
+    residual = std::max(residual, std::abs(value) / scale);
+  }
+  return residual;
+}
+
+void AddTransposeProduct(const Matrix& matrix, const Vector& multiplier,
+                         Vector* target) {
+  for (std::size_t col = 0; col < matrix.cols(); ++col) {
+    for (std::size_t row = 0; row < matrix.rows(); ++row)
+      (*target)[col] += matrix(row, col) * multiplier[row];
+  }
+}
+
+Scalar MaxKktResidual(const Problem& problem,
+                      const clqr::cuda::Solution& solution) {
+  Scalar residual = Scalar{0};
+  const std::size_t horizon = problem.stages.size();
+  for (std::size_t i = 0; i < horizon; ++i) {
+    const Stage& stage = problem.stages[i];
+    residual = std::max(
+        residual,
+        BenchmarkMaxAbs(solution.states[i + 1] - stage.A * solution.states[i] -
+                        stage.B * solution.controls[i] - stage.c));
+    residual =
+        std::max(residual, MaxScaledMixedResidual(stage, solution.states[i],
+                                                  solution.controls[i]));
+    residual = std::max(
+        residual, MaxScaledStateResidual(stage.E, stage.e, solution.states[i]));
+
+    Vector gx = stage.Q * solution.states[i] + stage.M * solution.controls[i] +
+                stage.q -
+                clqr::Transpose(stage.A) * solution.dynamics_multipliers[i];
+    gx = gx + (i == 0 ? solution.initial_multiplier
+                      : solution.dynamics_multipliers[i - 1]);
+    AddTransposeProduct(stage.C, solution.mixed_multipliers[i], &gx);
+    AddTransposeProduct(stage.E, solution.state_multipliers[i], &gx);
+    residual = std::max(residual, BenchmarkMaxAbs(gx));
+
+    Vector gu = clqr::Transpose(stage.M) * solution.states[i] +
+                stage.R * solution.controls[i] + stage.r -
+                clqr::Transpose(stage.B) * solution.dynamics_multipliers[i];
+    AddTransposeProduct(stage.D, solution.mixed_multipliers[i], &gu);
+    residual = std::max(residual, BenchmarkMaxAbs(gu));
+  }
+  residual = std::max(residual, BenchmarkMaxAbs(solution.states.front() -
+                                                problem.initial_state));
+  residual = std::max(
+      residual, MaxScaledStateResidual(problem.terminal_E, problem.terminal_e,
+                                       solution.states.back()));
+  Vector terminal_gradient =
+      problem.terminal_Q * solution.states.back() + problem.terminal_q;
+  terminal_gradient =
+      terminal_gradient + (horizon == 0 ? solution.initial_multiplier
+                                        : solution.dynamics_multipliers.back());
+  AddTransposeProduct(problem.terminal_E, solution.terminal_state_multiplier,
+                      &terminal_gradient);
+  return std::max(residual, BenchmarkMaxAbs(terminal_gradient));
 }
 
 }  // namespace
@@ -61,10 +161,12 @@ int main(int argc, char** argv) {
          "of event-timed transfer and kernel phases.\n";
   std::cout << "# CPU columns are nan above N=" << cpu_max_horizon
             << "; larger CPU cases are skipped to limit benchmark time.\n";
+  std::cout << "# A failed strict multiplier check is retried in diagnostic "
+               "mode; strict_check and kkt_residual expose that result.\n";
   std::cout << "N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_device_ms,"
                "wall_speedup,feasibility_ms,reduction_ms,riccati_ms,"
                "reconstruction_ms,multiplier_ms,min_reduced_n,"
-               "min_reduced_m,parallel_riccati\n";
+               "min_reduced_m,parallel_riccati,strict_check,kkt_residual\n";
   for (std::size_t horizon : horizons) {
     Problem problem = clqr::benchmark::StateOnlyProblem(horizon, n, m, p);
     clqr::Workspace workspace;
@@ -80,7 +182,16 @@ int main(int argc, char** argv) {
         }
       }
     }
-    clqr::cuda::Solution gpu = clqr::cuda::Solve(problem);
+    clqr::cuda::Options cuda_options;
+    clqr::cuda::Solution gpu = clqr::cuda::Solve(problem, cuda_options);
+    const bool strict_check_passed = gpu.status == clqr::SolveStatus::kOptimal;
+    if (!strict_check_passed) {
+      std::cerr << "CUDA strict multiplier check failed at N=" << horizon
+                << ": " << gpu.message
+                << "; retrying in benchmark diagnostic mode\n";
+      cuda_options.enforce_multiplier_consistency = false;
+      gpu = clqr::cuda::Solve(problem, cuda_options);
+    }
     if (gpu.status != clqr::SolveStatus::kOptimal) {
       std::cerr << "CUDA warmup failed at N=" << horizon << ": " << gpu.message
                 << "\n";
@@ -107,7 +218,7 @@ int main(int argc, char** argv) {
       }
 
       const auto gpu_start = Clock::now();
-      gpu = clqr::cuda::Solve(problem);
+      gpu = clqr::cuda::Solve(problem, cuda_options);
       const auto gpu_stop = Clock::now();
       if (gpu.status != clqr::SolveStatus::kOptimal) return 1;
       gpu_wall_times.push_back(
@@ -129,6 +240,7 @@ int main(int argc, char** argv) {
       min_reduced_n = std::min(min_reduced_n, value);
     for (int value : gpu.reduced_control_dimensions)
       min_reduced_m = std::min(min_reduced_m, value);
+    const Scalar kkt_residual = MaxKktResidual(problem, gpu);
     std::cout << horizon << ',' << n << ',' << m << ',' << p << ',' << repeats
               << ',' << std::fixed << std::setprecision(6) << cpu_ms << ','
               << gpu_wall_ms << ',' << Median(gpu_device_times) << ','
@@ -136,7 +248,9 @@ int main(int argc, char** argv) {
               << Median(reduction) << ',' << Median(riccati) << ','
               << Median(reconstruction) << ',' << Median(multiplier) << ','
               << min_reduced_n << ',' << min_reduced_m << ','
-              << (gpu.used_parallel_riccati ? "yes" : "no") << '\n';
+              << (gpu.used_parallel_riccati ? "yes" : "no") << ','
+              << (strict_check_passed ? "pass" : "failed") << ','
+              << std::scientific << kkt_residual << '\n';
   }
   return 0;
 }
