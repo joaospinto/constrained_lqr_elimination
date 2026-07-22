@@ -328,6 +328,53 @@ Problem RiccatiFallbackProblem() {
   return problem;
 }
 
+Problem ZeroHorizonProblem() {
+  Problem problem;
+  problem.initial_state = Vector{0.4, -0.2, 0.7};
+  problem.terminal_Q = PositiveDefinite(3, 3200, 1.2);
+  problem.terminal_q = GeneratedVector(3, 3210, 0.2);
+  problem.terminal_E = Matrix(0, 3);
+  problem.terminal_e = Vector(0);
+  return problem;
+}
+
+Problem MaximumConstraintProblem() {
+  constexpr int seed = 110;
+  constexpr std::size_t dimension = clqr::cuda::kMaxStateDimension;
+  Problem problem =
+      GeneratedProblem(seed, 1, dimension, dimension, 0, ConstraintMode::kNone);
+  Stage& stage = problem.stages[0];
+  const Vector nominal_u = GeneratedVector(dimension, seed + 200, 0.5);
+
+  stage.C = GeneratedMatrix(dimension, dimension, 3300, 0.1);
+  stage.D = clqr::Identity(dimension);
+  stage.d = Vector(dimension);
+  for (std::size_t row = 0; row < dimension; ++row) {
+    stage.d[row] =
+        -(RowDot(stage.C, row, problem.initial_state) + nominal_u[row]);
+  }
+  stage.E = clqr::Identity(dimension);
+  stage.e = Vector(dimension);
+  for (std::size_t row = 0; row < dimension; ++row)
+    stage.e[row] = -problem.initial_state[row];
+  return problem;
+}
+
+Problem RescaledMixedRowsProblem() {
+  Problem problem = GeneratedProblem(120, 4, 4, 2, 3, ConstraintMode::kMixed);
+  for (Stage& stage : problem.stages) {
+    for (std::size_t row = 0; row < stage.C.rows(); ++row) {
+      const double scale = row == 0 ? 1e-7 : (row == 2 ? 1e7 : 1.0);
+      for (std::size_t col = 0; col < stage.C.cols(); ++col)
+        stage.C(row, col) *= scale;
+      for (std::size_t col = 0; col < stage.D.cols(); ++col)
+        stage.D(row, col) *= scale;
+      stage.d[row] *= scale;
+    }
+  }
+  return problem;
+}
+
 void InfeasibleCase() {
   Problem problem = GeneratedProblem(90, 2, 3, 2, 0, ConstraintMode::kNone);
   problem.stages[0].E = Matrix(2, 3, {1.0, 0.0, 0.0, 1.0, 0.0, 0.0});
@@ -335,6 +382,19 @@ void InfeasibleCase() {
   const clqr::cuda::Solution solution = clqr::cuda::Solve(problem);
   Expect(solution.status == SolveStatus::kInfeasible,
          "inconsistent redundant rows are infeasible");
+}
+
+void InvalidDeviceCases() {
+  const Problem problem = ZeroHorizonProblem();
+  clqr::cuda::Options options;
+  options.device = -1;
+  Expect(
+      clqr::cuda::Solve(problem, options).status == SolveStatus::kInvalidInput,
+      "negative CUDA device index is invalid input");
+  options.device = 1000000;
+  Expect(
+      clqr::cuda::Solve(problem, options).status == SolveStatus::kInvalidInput,
+      "out-of-range CUDA device index is invalid input");
 }
 
 }  // namespace
@@ -361,7 +421,19 @@ int main() {
                  "terminal constraints");
   CompareWithCpu(NonuniformProblem(), "nonuniform dimensions");
   CompareWithCpu(RiccatiFallbackProblem(), "Riccati fallback", false);
+  CompareWithCpu(ZeroHorizonProblem(), "zero horizon");
+  CompareWithCpu(GeneratedProblem(100, 3, clqr::cuda::kMaxStateDimension,
+                                  clqr::cuda::kMaxControlDimension, 0,
+                                  ConstraintMode::kNone),
+                 "maximum active dimensions");
+  CompareWithCpu(GeneratedProblem(101, 4, 3, 0, 1, ConstraintMode::kState),
+                 "zero control dimension");
+  CompareWithCpu(GeneratedProblem(102, 5, 4, 1, 3, ConstraintMode::kMixed),
+                 "more mixed rows than controls");
+  CompareWithCpu(RescaledMixedRowsProblem(), "independently rescaled rows");
+  CompareWithCpu(MaximumConstraintProblem(), "maximum constraint dimensions");
   InfeasibleCase();
+  InvalidDeviceCases();
   std::cout << "all CUDA cross-validation tests passed\n";
   return 0;
 }

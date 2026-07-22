@@ -33,9 +33,13 @@ ctest --test-dir "${build_dir}" --output-on-failure
 
 if command -v compute-sanitizer >/dev/null 2>&1 && \
    [[ "${CLQR_SKIP_SANITIZER:-0}" != "1" ]]; then
-  echo "=== CUDA synchronization check ==="
-  compute-sanitizer --tool synccheck --error-exitcode 99 \
-    "${build_dir}/clqr_cuda_test"
+  read -r -a sanitizer_tools <<< \
+    "${CLQR_SANITIZER_TOOLS:-memcheck initcheck racecheck synccheck}"
+  for sanitizer_tool in "${sanitizer_tools[@]}"; do
+    echo "=== CUDA ${sanitizer_tool} check ==="
+    compute-sanitizer --tool "${sanitizer_tool}" --error-exitcode 99 \
+      "${build_dir}/clqr_cuda_test"
+  done
 fi
 
 if [[ "${CLQR_SKIP_JAX:-0}" != "1" ]]; then

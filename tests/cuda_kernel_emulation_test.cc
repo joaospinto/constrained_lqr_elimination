@@ -118,6 +118,98 @@ Problem MakeProblem() {
   return problem;
 }
 
+Problem UniformProblem(int seed, std::size_t horizon, std::size_t n,
+                       std::size_t m) {
+  Problem problem;
+  std::vector<Vector> x(horizon + 1);
+  std::vector<Vector> u(horizon);
+  for (std::size_t i = 0; i <= horizon; ++i)
+    x[i] = GeneratedVector(n, seed + 100 + static_cast<int>(i), 0.5);
+  for (std::size_t i = 0; i < horizon; ++i)
+    u[i] = GeneratedVector(m, seed + 200 + static_cast<int>(i), 0.4);
+  problem.initial_state = x.front();
+  problem.stages.resize(horizon);
+  for (std::size_t i = 0; i < horizon; ++i) {
+    Stage& stage = problem.stages[i];
+    stage.A = GeneratedMatrix(n, n, seed + 300 + static_cast<int>(i), 0.08);
+    for (std::size_t row = 0; row < n; ++row) stage.A(row, row) += 0.9;
+    stage.B = GeneratedMatrix(n, m, seed + 400 + static_cast<int>(i), 0.2);
+    stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
+    stage.Q = PositiveDefinite(n, seed + 500 + static_cast<int>(i), 1.0);
+    stage.R = PositiveDefinite(m, seed + 600 + static_cast<int>(i), 1.4);
+    stage.M = GeneratedMatrix(n, m, seed + 700 + static_cast<int>(i), 0.02);
+    stage.q = GeneratedVector(n, seed + 800 + static_cast<int>(i), 0.15);
+    stage.r = GeneratedVector(m, seed + 900 + static_cast<int>(i), 0.15);
+    stage.C = Matrix(0, n);
+    stage.D = Matrix(0, m);
+    stage.d = Vector(0);
+    stage.E = Matrix(0, n);
+    stage.e = Vector(0);
+  }
+  problem.terminal_Q = PositiveDefinite(n, seed + 1000, 1.5);
+  problem.terminal_q = GeneratedVector(n, seed + 1100, 0.15);
+  problem.terminal_E = Matrix(0, n);
+  problem.terminal_e = Vector(0);
+  return problem;
+}
+
+Problem ZeroHorizonProblem() {
+  Problem problem;
+  problem.initial_state = Vector{0.4, -0.2, 0.7};
+  problem.terminal_Q = PositiveDefinite(3, 1600, 1.2);
+  problem.terminal_q = GeneratedVector(3, 1610, 0.2);
+  problem.terminal_E = Matrix(0, 3);
+  problem.terminal_e = Vector(0);
+  return problem;
+}
+
+Problem MaximumConstraintProblem() {
+  constexpr int seed = 1700;
+  constexpr std::size_t dimension = kMaxStateDimension;
+  Problem problem = UniformProblem(seed, 1, dimension, dimension);
+  Stage& stage = problem.stages[0];
+  const Vector nominal_u = GeneratedVector(dimension, seed + 200, 0.4);
+  stage.C = GeneratedMatrix(dimension, dimension, seed + 1200, 0.1);
+  stage.D = clqr::Identity(dimension);
+  stage.d = Vector(dimension);
+  for (std::size_t row = 0; row < dimension; ++row) {
+    stage.d[row] =
+        -(RowDot(stage.C, row, problem.initial_state) + nominal_u[row]);
+  }
+  stage.E = clqr::Identity(dimension);
+  stage.e = Vector(dimension);
+  for (std::size_t row = 0; row < dimension; ++row)
+    stage.e[row] = -problem.initial_state[row];
+  return problem;
+}
+
+Problem MoreMixedRowsThanControlsProblem() {
+  constexpr int seed = 2000;
+  constexpr std::size_t horizon = 4;
+  constexpr std::size_t n = 4;
+  constexpr std::size_t m = 1;
+  constexpr std::size_t rows = 3;
+  Problem problem = UniformProblem(seed, horizon, n, m);
+  for (std::size_t i = 0; i < horizon; ++i) {
+    Stage& stage = problem.stages[i];
+    const Vector nominal_x =
+        GeneratedVector(n, seed + 100 + static_cast<int>(i), 0.5);
+    const Vector nominal_u =
+        GeneratedVector(m, seed + 200 + static_cast<int>(i), 0.4);
+    stage.C = GeneratedMatrix(rows, n, seed + 1200 + static_cast<int>(i), 0.3);
+    stage.D = GeneratedMatrix(rows, m, seed + 1300 + static_cast<int>(i), 0.3);
+    stage.d = Vector(rows);
+    for (std::size_t row = 0; row < rows; ++row) {
+      const double scale = row == 0 ? 1e-7 : (row == 2 ? 1e7 : 1.0);
+      for (std::size_t col = 0; col < n; ++col) stage.C(row, col) *= scale;
+      for (std::size_t col = 0; col < m; ++col) stage.D(row, col) *= scale;
+      stage.d[row] =
+          -(RowDot(stage.C, row, nominal_x) + RowDot(stage.D, row, nominal_u));
+    }
+  }
+  return problem;
+}
+
 template <std::size_t Size>
 void PackMatrix(const Matrix& source, double (&target)[Size],
                 std::size_t stride) {
@@ -264,8 +356,8 @@ double MaxResidual(const Problem& problem, const std::vector<double>& states,
   return residual;
 }
 
-void RunEmulation() {
-  const Problem problem = MakeProblem();
+void RunEmulation(const Problem& problem, const std::string& name,
+                  bool expect_reduced_state, bool expect_reduced_control) {
   const int horizon = static_cast<int>(problem.stages.size());
   const int nodes = horizon + 1;
   std::vector<PackedStage> stages;
@@ -321,8 +413,10 @@ void RunEmulation() {
     reduced_a_state |= param.reduced_dim < param.physical_dim;
   for (const ControlParam& param : control_params)
     reduced_a_control |= param.reduced_dim < param.physical_dim;
-  Expect(reduced_a_state, "emulation exercises smaller state dimensions");
-  Expect(reduced_a_control, "emulation exercises smaller control dimensions");
+  if (expect_reduced_state)
+    Expect(reduced_a_state, name + " exercises smaller state dimensions");
+  if (expect_reduced_control)
+    Expect(reduced_a_control, name + " exercises smaller control dimensions");
 
   std::vector<ValueElement> value_a(nodes), value_b(nodes);
   std::vector<Feedback> feedback(horizon);
@@ -502,13 +596,22 @@ void RunEmulation() {
       MaxResidual(problem, states, controls, initial_multiplier, dynamics,
                   mixed, state_multipliers, terminal_multiplier);
   Expect(residual < 2e-7, "emulated full KKT residual");
-  std::cout << "CUDA kernel emulation matched CPU; KKT residual=" << residual
+  std::cout << name
+            << " CUDA kernel emulation matched CPU; KKT residual=" << residual
             << '\n';
 }
 
 }  // namespace
 
 int main() {
-  RunEmulation();
+  RunEmulation(MakeProblem(), "rank-deficient constrained", true, true);
+  RunEmulation(ZeroHorizonProblem(), "zero-horizon", false, false);
+  RunEmulation(
+      UniformProblem(1800, 3, kMaxStateDimension, kMaxControlDimension),
+      "maximum-active-dimension", false, false);
+  RunEmulation(UniformProblem(1900, 4, 3, 0), "zero-control", false, false);
+  RunEmulation(MaximumConstraintProblem(), "maximum-constraint", true, true);
+  RunEmulation(MoreMixedRowsThanControlsProblem(), "more-mixed-than-controls",
+               true, true);
   return 0;
 }

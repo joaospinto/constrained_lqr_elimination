@@ -81,7 +81,9 @@ build-cuda/clqr_cuda_benchmark
 
 The CUDA test compares states, controls, and objective values against the existing C++ solver,
 then checks the complete primal-dual KKT residual. It covers unconstrained, state-only, mixed,
-terminal, nonuniform, rank-deficient/redundant, infeasible, and sequential-fallback cases.
+terminal, nonuniform, rank-deficient/redundant, independently rescaled, infeasible,
+sequential-fallback, zero-horizon, zero-control, more-constraints-than-controls, and declared
+dimension-limit cases.
 CUDA-free test builds additionally execute every numerical kernel in a one-thread CPU-emulation
 mode, comparing both Riccati paths and the recovered KKT point with the C++ solver.
 
@@ -95,8 +97,9 @@ bash scripts/colab_t4.sh
 The script defaults to architecture 75 and five benchmark repetitions. Override these with
 `CLQR_CUDA_ARCH` and `CLQR_BENCHMARK_REPEATS`. Set `CLQR_JAX_DIR` to reuse an existing checkout
 of `joaospinto/constrained_lqr_jax`, or `CLQR_SKIP_JAX=1` to omit only that cross-check. When
-`compute-sanitizer` is available, the script also runs its synchronization checker; set
-`CLQR_SKIP_SANITIZER=1` to omit that extra pass.
+`compute-sanitizer` is available, the script also runs its memory, initialization, shared-memory
+race, and synchronization checkers. Set `CLQR_SKIP_SANITIZER=1` to omit those passes, or set
+`CLQR_SANITIZER_TOOLS` to a space-separated subset.
 
 Build and test:
 

@@ -33,6 +33,12 @@ def main() -> None:
         command, check=True, text=True, capture_output=True
     ).stdout
     data = json.loads(raw)
+    print(
+        "JAX backend:",
+        jax.default_backend(),
+        "; devices:",
+        ", ".join(str(device) for device in jax.devices()),
+    )
     A = jnp.asarray(data["A"], dtype=jnp.float64)
     B = jnp.asarray(data["B"], dtype=jnp.float64)
     Q = jnp.asarray(data["Q"], dtype=jnp.float64)

@@ -606,9 +606,12 @@ void Require(bool condition, const std::string& message) {
 void ValidateCudaProblem(const Problem& problem, const Options& options) {
   Require(std::isfinite(options.tolerance) && options.tolerance > 0.0,
           "CUDA tolerance must be finite and positive");
+  Require(options.device >= 0, "CUDA device index must be nonnegative");
+  // node_count, its next power of two, and the resulting 2*padded-1 tree size
+  // are all stored in signed ints.
   Require(problem.stages.size() <=
-              static_cast<std::size_t>(std::numeric_limits<int>::max() - 1),
-          "too many stages for CUDA backend");
+              static_cast<std::size_t>(std::numeric_limits<int>::max() / 2),
+          "too many stages for CUDA tree indices");
   const std::size_t count = problem.stages.size();
   Require(problem.terminal_Q.rows() == problem.terminal_Q.cols(),
           "terminal_Q must be square");
@@ -791,6 +794,9 @@ double ObjectiveFromPacked(const std::vector<PackedStage>& stages,
 
 Solution SolveImpl(const Problem& problem, const Options& options) {
   ValidateCudaProblem(problem, options);
+  int device_count = 0;
+  CudaCheck(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
+  Require(options.device < device_count, "CUDA device index is out of range");
   CudaCheck(cudaSetDevice(options.device), "cudaSetDevice");
   const auto total_start = std::chrono::steady_clock::now();
   Solution solution;
@@ -2791,7 +2797,7 @@ __global__ void ReduceTerminalKernel(const PackedTerminal* terminal_ptr,
                                      ReducedTerminal* reduced) {
   const PackedTerminal& terminal = *terminal_ptr;
   const StateParam& param = state_params[terminal_index];
-  reduced->n = param.reduced_dim;
+  if (threadIdx.x == 0) reduced->n = param.reduced_dim;
   for (int linear = threadIdx.x; linear < param.reduced_dim * param.reduced_dim;
        linear += blockDim.x) {
     const int a = linear / param.reduced_dim;
