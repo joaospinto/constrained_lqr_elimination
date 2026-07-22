@@ -90,19 +90,25 @@ __device__ void RrefBlock(double* matrix, int rows, int columns,
       }
     }
     __syncthreads();
-    if (*best_row < 0) continue;
+    const int selected_row = *best_row;
+    // A no-pivot iteration skips the barriers below.  Ensure every thread has
+    // consumed best_row before thread 0 reuses it in the next iteration.
+    __syncthreads();
+    if (selected_row < 0) continue;
 
     const int pivot_row = *rank;
-    if (*best_row != pivot_row) {
+    if (selected_row != pivot_row) {
       for (int j = threadIdx.x; j < columns; j += blockDim.x) {
         const double tmp = matrix[pivot_row * columns + j];
-        matrix[pivot_row * columns + j] = matrix[*best_row * columns + j];
-        matrix[*best_row * columns + j] = tmp;
+        matrix[pivot_row * columns + j] = matrix[selected_row * columns + j];
+        matrix[selected_row * columns + j] = tmp;
       }
     }
     __syncthreads();
 
     const double pivot = matrix[pivot_row * columns + col];
+    // All threads must load the pivot before any thread normalizes its entry.
+    __syncthreads();
     for (int j = col + threadIdx.x; j < columns; j += blockDim.x) {
       matrix[pivot_row * columns + j] /= pivot;
     }
