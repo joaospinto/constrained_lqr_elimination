@@ -36,6 +36,22 @@ __device__ void SetFailure(DeviceStatus* status, int code, int stage,
   }
 }
 
+// A global failure can be reported by another block at any time.  Sampling it
+// independently in every thread before a later __syncthreads() can therefore
+// make only part of a block return.  Have one thread sample the flag and
+// broadcast a block-uniform decision instead.
+__device__ bool BlockEnabled(const DeviceStatus* status, int* enabled) {
+  if (threadIdx.x == 0) *enabled = status->code == kDeviceOk;
+  __syncthreads();
+  return *enabled != 0;
+}
+
+__device__ bool BlockEnabled(const int* flag, int* enabled) {
+  if (threadIdx.x == 0) *enabled = *flag != 0;
+  __syncthreads();
+  return *enabled != 0;
+}
+
 // Scale each nonzero equation before pivoting, then use partial row pivoting.
 // This makes rank decisions invariant to independent equation rescaling while
 // retaining the deterministic free-column convention of the CPU RREF path.
@@ -173,7 +189,9 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage* stages,
                                         double tolerance, Relation* leaves,
                                         DeviceStatus* status) {
   const int index = blockIdx.x;
-  if (index > stage_count || status->code != kDeviceOk) return;
+  if (index > stage_count) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(status, &block_enabled)) return;
   __shared__ double matrix[kMaxRrefEntries];
   __shared__ double factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
@@ -185,6 +203,7 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage* stages,
   __shared__ int eliminated;
   __shared__ int left_dim;
   __shared__ int right_dim;
+  __shared__ int local_ok;
 
   const PackedTerminal& terminal = *terminal_ptr;
 
@@ -269,12 +288,12 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage* stages,
   __syncthreads();
   RrefBlock(matrix, rows, columns, columns - 1, tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
-  if (threadIdx.x == 0 &&
-      InconsistentRref(matrix, rows, columns, columns - 1, tolerance)) {
-    SetFailure(status, kDeviceInfeasible, index, 1);
+  if (threadIdx.x == 0) {
+    local_ok = !InconsistentRref(matrix, rows, columns, columns - 1, tolerance);
+    if (!local_ok) SetFailure(status, kDeviceInfeasible, index, 1);
   }
   __syncthreads();
-  if (status->code != kDeviceOk) return;
+  if (!local_ok) return;
   ExtractResidualRelation(matrix, columns, rank, pivot_columns, eliminated,
                           left_dim, right_dim, &leaves[index]);
 }
@@ -284,10 +303,10 @@ __device__ void ComposeRelationsBlock(const Relation& first,
                                       Relation* output, DeviceStatus* status,
                                       int stage, double* matrix,
                                       double* factors, int* pivot_columns,
-                                      int* pivot_rows, int* rank,
-                                      int* best_row) {
+                                      int* pivot_rows, int* rank, int* best_row,
+                                      int* local_ok) {
   if (first.right_dim != second.left_dim) {
-    SetFailure(status, kDeviceNumericalFailure, stage, 2);
+    if (threadIdx.x == 0) SetFailure(status, kDeviceNumericalFailure, stage, 2);
     return;
   }
   const int shared = first.right_dim;
@@ -332,12 +351,13 @@ __device__ void ComposeRelationsBlock(const Relation& first,
   __syncthreads();
   RrefBlock(matrix, rows, columns, columns - 1, tolerance, pivot_columns,
             pivot_rows, rank, best_row, factors);
-  if (threadIdx.x == 0 &&
-      InconsistentRref(matrix, rows, columns, columns - 1, tolerance)) {
-    SetFailure(status, kDeviceInfeasible, stage, 3);
+  if (threadIdx.x == 0) {
+    *local_ok =
+        !InconsistentRref(matrix, rows, columns, columns - 1, tolerance);
+    if (!*local_ok) SetFailure(status, kDeviceInfeasible, stage, 3);
   }
   __syncthreads();
-  if (status->code != kDeviceOk) return;
+  if (!*local_ok) return;
   ExtractResidualRelation(matrix, columns, *rank, pivot_columns, shared,
                           first.left_dim, second.right_dim, output);
 }
@@ -370,7 +390,9 @@ __global__ void SuffixRelationsKernel(const Relation* input, int count,
                                       int offset, double tolerance,
                                       Relation* output, DeviceStatus* status) {
   const int index = blockIdx.x;
-  if (index >= count || status->code != kDeviceOk) return;
+  if (index >= count) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(status, &block_enabled)) return;
   if (index + offset >= count) {
     CopyRelationBlock(input[index], &output[index]);
     return;
@@ -381,9 +403,10 @@ __global__ void SuffixRelationsKernel(const Relation* input, int count,
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
   __shared__ int best_row;
+  __shared__ int local_ok;
   ComposeRelationsBlock(input[index], input[index + offset], tolerance,
                         &output[index], status, index, matrix, factors,
-                        pivot_columns, pivot_rows, &rank, &best_row);
+                        pivot_columns, pivot_rows, &rank, &best_row, &local_ok);
 }
 
 __global__ void StateParamKernel(const Relation* suffix, int count,
@@ -1421,7 +1444,9 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
                                       const double* controls, double tolerance,
                                       Relation* tree, DeviceStatus* status) {
   const int index = blockIdx.x;
-  if (index >= padded_count || status->code != kDeviceOk) return;
+  if (index >= padded_count) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(status, &block_enabled)) return;
   if (index > stage_count) {
     if (threadIdx.x == 0) {
       tree[index].left_dim = 0;
@@ -1441,6 +1466,7 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
   __shared__ int eliminated;
   __shared__ int left_dim;
   __shared__ int right_dim;
+  __shared__ int local_ok;
   const PackedTerminal& terminal = *terminal_ptr;
   if (threadIdx.x == 0) {
     if (index == stage_count) {
@@ -1534,12 +1560,12 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
   __syncthreads();
   RrefBlock(matrix, rows, columns, columns - 1, tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
-  if (threadIdx.x == 0 &&
-      InconsistentRref(matrix, rows, columns, columns - 1, tolerance)) {
-    SetFailure(status, kDeviceNumericalFailure, index, 12);
+  if (threadIdx.x == 0) {
+    local_ok = !InconsistentRref(matrix, rows, columns, columns - 1, tolerance);
+    if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 12);
   }
   __syncthreads();
-  if (status->code != kDeviceOk) return;
+  if (!local_ok) return;
   ExtractResidualRelation(matrix, columns, rank, pivot_columns, eliminated,
                           left_dim, right_dim, &tree[index]);
 }
@@ -1550,17 +1576,20 @@ __global__ void ReduceDualTreeLevelKernel(const Relation* tree,
                                           Relation* mutable_tree,
                                           DeviceStatus* status) {
   const int index = blockIdx.x;
-  if (index >= parent_count || status->code != kDeviceOk) return;
+  if (index >= parent_count) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(status, &block_enabled)) return;
   __shared__ double matrix[kMaxRrefEntries];
   __shared__ double factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
   __shared__ int best_row;
+  __shared__ int local_ok;
   ComposeRelationsBlock(
       tree[child_offset + 2 * index], tree[child_offset + 2 * index + 1],
       tolerance, &mutable_tree[parent_offset + index], status, index, matrix,
-      factors, pivot_columns, pivot_rows, &rank, &best_row);
+      factors, pivot_columns, pivot_rows, &rank, &best_row, &local_ok);
 }
 
 __global__ void SolveDualRootKernel(const Relation* relation, NodeValue* value,
@@ -1599,13 +1628,16 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
                                           NodeValue* values,
                                           DeviceStatus* status) {
   const int index = blockIdx.x;
-  if (index >= parent_count || status->code != kDeviceOk) return;
+  if (index >= parent_count) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(status, &block_enabled)) return;
   const Relation& left = tree[child_offset + 2 * index];
   const Relation& right = tree[child_offset + 2 * index + 1];
   const NodeValue& parent = parent_values[parent_offset + index];
   if (left.left_dim != parent.left_dim || right.right_dim != parent.right_dim ||
       left.right_dim != right.left_dim) {
-    SetFailure(status, kDeviceNumericalFailure, index, 15);
+    if (threadIdx.x == 0)
+      SetFailure(status, kDeviceNumericalFailure, index, 15);
     return;
   }
   const int shared = left.right_dim;
@@ -1617,6 +1649,7 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
   __shared__ int best_row;
+  __shared__ int local_ok;
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
     matrix[i] = 0.0;
   __syncthreads();
@@ -1650,12 +1683,12 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
   __syncthreads();
   RrefBlock(matrix, rows, columns, shared, tolerance, pivot_columns, pivot_rows,
             &rank, &best_row, factors);
-  if (threadIdx.x == 0 &&
-      InconsistentRref(matrix, rows, columns, shared, tolerance)) {
-    SetFailure(status, kDeviceNumericalFailure, index, 16);
+  if (threadIdx.x == 0) {
+    local_ok = !InconsistentRref(matrix, rows, columns, shared, tolerance);
+    if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 16);
   }
   __syncthreads();
-  if (status->code != kDeviceOk) return;
+  if (!local_ok) return;
   if (threadIdx.x == 0) {
     NodeValue& left_value = values[child_offset + 2 * index];
     NodeValue& right_value = values[child_offset + 2 * index + 1];
@@ -1687,7 +1720,9 @@ __global__ void RecoverLocalMultipliersKernel(
     double* state_multipliers, double* terminal_multiplier,
     DeviceStatus* status) {
   const int index = blockIdx.x;
-  if (index > stage_count || status->code != kDeviceOk) return;
+  if (index > stage_count) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(status, &block_enabled)) return;
   __shared__ double
       matrix[kMaxRrefRows * (kMaxMixedConstraints + kMaxStateConstraints + 1)];
   __shared__ double factors[kMaxRrefRows];
@@ -1697,6 +1732,7 @@ __global__ void RecoverLocalMultipliersKernel(
   __shared__ int best_row;
   __shared__ int rows;
   __shared__ int variables;
+  __shared__ int local_ok;
   const PackedTerminal& terminal = *terminal_ptr;
   if (threadIdx.x == 0) {
     if (index == stage_count) {
@@ -1778,12 +1814,12 @@ __global__ void RecoverLocalMultipliersKernel(
   __syncthreads();
   RrefBlock(matrix, rows, columns, variables, tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
-  if (threadIdx.x == 0 &&
-      InconsistentRref(matrix, rows, columns, variables, tolerance)) {
-    SetFailure(status, kDeviceNumericalFailure, index, 17);
+  if (threadIdx.x == 0) {
+    local_ok = !InconsistentRref(matrix, rows, columns, variables, tolerance);
+    if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 17);
   }
   __syncthreads();
-  if (status->code != kDeviceOk) return;
+  if (!local_ok) return;
   if (threadIdx.x == 0) {
     double solution[kMaxMixedConstraints + kMaxStateConstraints]{};
     for (int p = 0; p < rank; ++p) {
@@ -1832,7 +1868,9 @@ __global__ void BuildValueElementsKernel(const ReducedStage* stages,
                                          int* parallel_ok,
                                          DeviceStatus* status) {
   const int index = blockIdx.x;
-  if (index > stage_count || status->code != kDeviceOk) return;
+  if (index > stage_count) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(status, &block_enabled)) return;
   if (index == stage_count) {
     const ReducedTerminal& terminal = *terminal_ptr;
     if (threadIdx.x == 0) {
@@ -2188,7 +2226,9 @@ __global__ void SuffixValueElementsKernel(const ValueElement* input, int count,
                                           ValueElement* output,
                                           int* parallel_ok) {
   const int index = blockIdx.x;
-  if (index >= count || *parallel_ok == 0) return;
+  if (index >= count) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(parallel_ok, &block_enabled)) return;
   if (index + offset >= count) {
     CopyValueElementBlock(input[index], &output[index]);
     return;
@@ -2287,7 +2327,9 @@ __global__ void FeedbackKernel(const ReducedStage* stages,
                                double tolerance, Feedback* feedback,
                                DeviceStatus* status) {
   const int index = blockIdx.x;
-  if (index >= stage_count || status->code != kDeviceOk) return;
+  if (index >= stage_count) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(status, &block_enabled)) return;
   const ReducedStage& s = stages[index];
   const ValueElement& next = suffix[index + 1];
   Feedback& out = feedback[index];
@@ -2321,7 +2363,7 @@ __global__ void FeedbackKernel(const ReducedStage* stages,
   RrefBlock(augmented, s.m, columns, s.m, tolerance, pivot_columns, pivot_rows,
             &rank, &best_row, factors);
   if (rank != s.m) {
-    SetFailure(status, kDeviceNumericalFailure, index, 9);
+    if (threadIdx.x == 0) SetFailure(status, kDeviceNumericalFailure, index, 9);
     return;
   }
   ExtractFeedback(s, augmented, columns, &out);
@@ -2332,7 +2374,9 @@ __global__ void SequentialRiccatiKernel(const ReducedStage* stages,
                                         ValueElement* suffix,
                                         Feedback* feedback,
                                         DeviceStatus* status) {
-  if (blockIdx.x != 0 || status->code != kDeviceOk) return;
+  if (blockIdx.x != 0) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(status, &block_enabled)) return;
   __shared__ double augmented[kMaxControlDimension *
                               (kMaxControlDimension + kMaxStateDimension + 1)];
   __shared__ double factors[kMaxRrefRows];
@@ -2367,7 +2411,8 @@ __global__ void SequentialRiccatiKernel(const ReducedStage* stages,
       RrefBlock(augmented, s.m, columns, s.m, tolerance, pivot_columns,
                 pivot_rows, &rank, &best_row, factors);
       if (rank != s.m) {
-        SetFailure(status, kDeviceNumericalFailure, index, 10);
+        if (threadIdx.x == 0)
+          SetFailure(status, kDeviceNumericalFailure, index, 10);
         return;
       }
       ExtractFeedback(s, augmented, columns, &fb);
@@ -2455,7 +2500,9 @@ __global__ void ReduceStagesKernel(
     const StateParam* state_params, int stage_count, double tolerance,
     ControlParam* control_params, ReducedStage* reduced, DeviceStatus* status) {
   const int index = blockIdx.x;
-  if (index >= stage_count || status->code != kDeviceOk) return;
+  if (index >= stage_count) return;
+  __shared__ int block_enabled;
+  if (!BlockEnabled(status, &block_enabled)) return;
   const PackedStage& s = stages[index];
   const StateParam& current = state_params[index];
   const StateParam& next = state_params[index + 1];
@@ -2469,6 +2516,7 @@ __global__ void ReduceStagesKernel(
   __shared__ int rows;
   __shared__ int columns;
   __shared__ int control_rank;
+  __shared__ int local_ok;
 
   if (threadIdx.x == 0) {
     rows = s.mixed + next_relation.rows;
@@ -2548,8 +2596,10 @@ __global__ void ReduceStagesKernel(
   RrefBlock(matrix, rows, columns, columns - 1, tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
+    local_ok = 1;
     if (InconsistentRref(matrix, rows, columns, columns - 1, tolerance)) {
       SetFailure(status, kDeviceInfeasible, index, 6);
+      local_ok = 0;
     }
     control_rank = 0;
     while (control_rank < rank && pivot_columns[control_rank] < s.m)
@@ -2558,38 +2608,41 @@ __global__ void ReduceStagesKernel(
       // The suffix relation says every current reduced state is feasible, so
       // elimination must not discover an additional condition on z.
       SetFailure(status, kDeviceNumericalFailure, index, 7);
+      local_ok = 0;
     }
-    ControlParam& cp = control_params[index];
-    cp.physical_dim = s.m;
-    cp.state_dim = current.reduced_dim;
-    cp.reduced_dim = s.m - control_rank;
-    bool pivot[kMaxControlDimension]{};
-    for (int p = 0; p < control_rank; ++p) pivot[pivot_columns[p]] = true;
-    int free = 0;
-    for (int u = 0; u < s.m; ++u) {
-      if (!pivot[u]) cp.free_columns[free++] = u;
-    }
-    for (int p = 0; p < control_rank; ++p) {
-      const int u = pivot_columns[p];
-      cp.y[u] = matrix[p * columns + columns - 1];
-      for (int z = 0; z < current.reduced_dim; ++z) {
-        cp.Y[u * kMaxStateDimension + z] = -matrix[p * columns + s.m + z];
+    if (local_ok) {
+      ControlParam& cp = control_params[index];
+      cp.physical_dim = s.m;
+      cp.state_dim = current.reduced_dim;
+      cp.reduced_dim = s.m - control_rank;
+      bool pivot[kMaxControlDimension]{};
+      for (int p = 0; p < control_rank; ++p) pivot[pivot_columns[p]] = true;
+      int free = 0;
+      for (int u = 0; u < s.m; ++u) {
+        if (!pivot[u]) cp.free_columns[free++] = u;
+      }
+      for (int p = 0; p < control_rank; ++p) {
+        const int u = pivot_columns[p];
+        cp.y[u] = matrix[p * columns + columns - 1];
+        for (int z = 0; z < current.reduced_dim; ++z) {
+          cp.Y[u * kMaxStateDimension + z] = -matrix[p * columns + s.m + z];
+        }
+        for (int v = 0; v < cp.reduced_dim; ++v) {
+          cp.Z[u * kMaxControlDimension + v] =
+              -matrix[p * columns + cp.free_columns[v]];
+        }
       }
       for (int v = 0; v < cp.reduced_dim; ++v) {
-        cp.Z[u * kMaxControlDimension + v] =
-            -matrix[p * columns + cp.free_columns[v]];
+        cp.Z[cp.free_columns[v] * kMaxControlDimension + v] = 1.0;
       }
+      ReducedStage& rs = reduced[index];
+      rs.n = current.reduced_dim;
+      rs.next_n = next.reduced_dim;
+      rs.m = cp.reduced_dim;
     }
-    for (int v = 0; v < cp.reduced_dim; ++v) {
-      cp.Z[cp.free_columns[v] * kMaxControlDimension + v] = 1.0;
-    }
-    ReducedStage& rs = reduced[index];
-    rs.n = current.reduced_dim;
-    rs.next_n = next.reduced_dim;
-    rs.m = cp.reduced_dim;
   }
   __syncthreads();
-  if (status->code != kDeviceOk) return;
+  if (!local_ok) return;
 
   const ControlParam& cp = control_params[index];
   ReducedStage& rs = reduced[index];

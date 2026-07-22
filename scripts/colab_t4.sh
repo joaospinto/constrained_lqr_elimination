@@ -31,6 +31,13 @@ cmake -S "${repo_dir}" -B "${build_dir}" \
 cmake --build "${build_dir}" --parallel 2
 ctest --test-dir "${build_dir}" --output-on-failure
 
+if command -v compute-sanitizer >/dev/null 2>&1 && \
+   [[ "${CLQR_SKIP_SANITIZER:-0}" != "1" ]]; then
+  echo "=== CUDA synchronization check ==="
+  compute-sanitizer --tool synccheck --error-exitcode 99 \
+    "${build_dir}/clqr_cuda_test"
+fi
+
 if [[ "${CLQR_SKIP_JAX:-0}" != "1" ]]; then
   if [[ ! -d "${jax_dir}/.git" ]]; then
     git clone --depth 1 https://github.com/joaospinto/constrained_lqr_jax.git "${jax_dir}"

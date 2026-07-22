@@ -94,7 +94,9 @@ bash scripts/colab_t4.sh
 
 The script defaults to architecture 75 and five benchmark repetitions. Override these with
 `CLQR_CUDA_ARCH` and `CLQR_BENCHMARK_REPEATS`. Set `CLQR_JAX_DIR` to reuse an existing checkout
-of `joaospinto/constrained_lqr_jax`, or `CLQR_SKIP_JAX=1` to omit only that cross-check.
+of `joaospinto/constrained_lqr_jax`, or `CLQR_SKIP_JAX=1` to omit only that cross-check. When
+`compute-sanitizer` is available, the script also runs its synchronization checker; set
+`CLQR_SKIP_SANITIZER=1` to omit that extra pass.
 
 Build and test:
 
