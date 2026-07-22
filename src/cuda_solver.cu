@@ -164,8 +164,7 @@ __device__ bool InconsistentRref(const Scalar* matrix, int rows, int columns,
         break;
       }
     }
-    if (zero &&
-        DeviceAbs(matrix[row * columns + lhs_columns]) > rhs_tolerance)
+    if (zero && DeviceAbs(matrix[row * columns + lhs_columns]) > rhs_tolerance)
       return true;
   }
   return false;
@@ -177,9 +176,9 @@ __device__ bool InconsistentRref(const Scalar* matrix, int rows, int columns,
                           tolerance);
 }
 
-// RrefBlock normalizes each equation by its largest left-hand-side
-// coefficient.  Measure the right-hand side on that same scale before the
-// matrix is overwritten so long multiplier chains are tested relatively.
+// Measure the right-hand side relative to each equation's largest coefficient
+// before the matrix is overwritten, so long multiplier chains are tested on a
+// scale-independent residual.
 __device__ Scalar ConditionedRhsScale(const Scalar* matrix, int rows,
                                       int columns, int lhs_columns,
                                       Scalar rank_tolerance) {
@@ -228,6 +227,309 @@ __device__ void ExtractResidualRelation(const Scalar* matrix, int columns,
   }
   for (int row = threadIdx.x; row < output->rows; row += blockDim.x) {
     output->rhs[row] = matrix[(eliminated_rank + row) * columns + columns - 1];
+  }
+  __syncthreads();
+}
+
+// Eliminate the leading variables by orthogonally projecting the equations
+// onto their left nullspace, then retain an orthonormal basis of the resulting
+// affine relation.  Pivoted, reorthogonalized modified Gram--Schmidt is used in
+// both directions.  Stage dimensions are bounded, so the serial work within a
+// block is constant with respect to the horizon while independent tree nodes
+// remain fully parallel.
+__device__ void EliminateRelationOrthogonally(
+    Scalar* matrix, int rows, int columns, int eliminated_columns, int left_dim,
+    int right_dim, Scalar rank_tolerance, Scalar consistency_tolerance,
+    Relation* relation, int* local_ok) {
+  if (threadIdx.x == 0) {
+    const Scalar rank_threshold_squared = rank_tolerance * rank_tolerance;
+    Scalar rhs_scale = Scalar{1};
+    for (int row = 0; row < rows; ++row)
+      rhs_scale =
+          fmax(rhs_scale, DeviceAbs(matrix[row * columns + columns - 1]));
+
+    int eliminated_rank = 0;
+    for (int basis = 0; basis < eliminated_columns; ++basis) {
+      int best_column = basis;
+      Scalar best_norm_squared = Scalar{-1};
+      for (int candidate = basis; candidate < eliminated_columns; ++candidate) {
+        Scalar norm_squared = Scalar{0};
+        for (int row = 0; row < rows; ++row) {
+          const Scalar value = matrix[row * columns + candidate];
+          norm_squared += value * value;
+        }
+        if (norm_squared > best_norm_squared) {
+          best_norm_squared = norm_squared;
+          best_column = candidate;
+        }
+      }
+      if (!(best_norm_squared > rank_threshold_squared)) break;
+      if (best_column != basis) {
+        for (int row = 0; row < rows; ++row) {
+          const Scalar value = matrix[row * columns + basis];
+          matrix[row * columns + basis] = matrix[row * columns + best_column];
+          matrix[row * columns + best_column] = value;
+        }
+      }
+      for (int pass = 0; pass < 2; ++pass) {
+        for (int previous = 0; previous < basis; ++previous) {
+          Scalar projection = Scalar{0};
+          for (int row = 0; row < rows; ++row) {
+            projection += matrix[row * columns + basis] *
+                          matrix[row * columns + previous];
+          }
+          for (int row = 0; row < rows; ++row) {
+            matrix[row * columns + basis] -=
+                projection * matrix[row * columns + previous];
+          }
+        }
+      }
+      Scalar norm_squared = Scalar{0};
+      for (int row = 0; row < rows; ++row) {
+        const Scalar value = matrix[row * columns + basis];
+        norm_squared += value * value;
+      }
+      if (!(norm_squared > rank_threshold_squared)) break;
+      const Scalar inverse_norm = Scalar{1} / sqrt(norm_squared);
+      for (int row = 0; row < rows; ++row)
+        matrix[row * columns + basis] *= inverse_norm;
+      for (int candidate = basis + 1; candidate < eliminated_columns;
+           ++candidate) {
+        for (int pass = 0; pass < 2; ++pass) {
+          Scalar projection = Scalar{0};
+          for (int row = 0; row < rows; ++row)
+            projection += matrix[row * columns + candidate] *
+                          matrix[row * columns + basis];
+          for (int row = 0; row < rows; ++row)
+            matrix[row * columns + candidate] -=
+                projection * matrix[row * columns + basis];
+        }
+      }
+      ++eliminated_rank;
+    }
+
+    // Apply the orthogonal projector to the outer coefficients and right-hand
+    // side. The remaining rows are precisely the equations that cannot be
+    // satisfied by choosing the eliminated variables.
+    for (int col = eliminated_columns; col < columns; ++col) {
+      for (int basis = 0; basis < eliminated_rank; ++basis) {
+        for (int pass = 0; pass < 2; ++pass) {
+          Scalar projection = Scalar{0};
+          for (int row = 0; row < rows; ++row)
+            projection +=
+                matrix[row * columns + col] * matrix[row * columns + basis];
+          for (int row = 0; row < rows; ++row)
+            matrix[row * columns + col] -=
+                projection * matrix[row * columns + basis];
+        }
+      }
+    }
+
+    const int outer_columns = left_dim + right_dim;
+    int relation_rank = 0;
+    while (relation_rank < rows) {
+      int best_row = relation_rank;
+      Scalar best_norm_squared = Scalar{-1};
+      for (int candidate = relation_rank; candidate < rows; ++candidate) {
+        Scalar norm_squared = Scalar{0};
+        for (int col = 0; col < outer_columns; ++col) {
+          const Scalar value =
+              matrix[candidate * columns + eliminated_columns + col];
+          norm_squared += value * value;
+        }
+        if (norm_squared > best_norm_squared) {
+          best_norm_squared = norm_squared;
+          best_row = candidate;
+        }
+      }
+      if (!(best_norm_squared > rank_threshold_squared)) break;
+      if (best_row != relation_rank) {
+        for (int col = eliminated_columns; col < columns; ++col) {
+          const Scalar value = matrix[relation_rank * columns + col];
+          matrix[relation_rank * columns + col] =
+              matrix[best_row * columns + col];
+          matrix[best_row * columns + col] = value;
+        }
+      }
+      for (int pass = 0; pass < 2; ++pass) {
+        for (int previous = 0; previous < relation_rank; ++previous) {
+          Scalar projection = Scalar{0};
+          for (int col = 0; col < outer_columns; ++col) {
+            projection +=
+                matrix[relation_rank * columns + eliminated_columns + col] *
+                matrix[previous * columns + eliminated_columns + col];
+          }
+          for (int col = 0; col <= outer_columns; ++col) {
+            matrix[relation_rank * columns + eliminated_columns + col] -=
+                projection *
+                matrix[previous * columns + eliminated_columns + col];
+          }
+        }
+      }
+      Scalar norm_squared = Scalar{0};
+      for (int col = 0; col < outer_columns; ++col) {
+        const Scalar value =
+            matrix[relation_rank * columns + eliminated_columns + col];
+        norm_squared += value * value;
+      }
+      if (!(norm_squared > rank_threshold_squared)) break;
+      const Scalar inverse_norm = Scalar{1} / sqrt(norm_squared);
+      for (int col = 0; col <= outer_columns; ++col)
+        matrix[relation_rank * columns + eliminated_columns + col] *=
+            inverse_norm;
+      for (int row = relation_rank + 1; row < rows; ++row) {
+        for (int pass = 0; pass < 2; ++pass) {
+          Scalar projection = Scalar{0};
+          for (int col = 0; col < outer_columns; ++col) {
+            projection +=
+                matrix[row * columns + eliminated_columns + col] *
+                matrix[relation_rank * columns + eliminated_columns + col];
+          }
+          for (int col = 0; col <= outer_columns; ++col) {
+            matrix[row * columns + eliminated_columns + col] -=
+                projection *
+                matrix[relation_rank * columns + eliminated_columns + col];
+          }
+        }
+      }
+      ++relation_rank;
+    }
+
+    *local_ok = 1;
+    for (int row = relation_rank; row < rows; ++row) {
+      if (DeviceAbs(matrix[row * columns + columns - 1]) >
+          consistency_tolerance * rhs_scale) {
+        *local_ok = 0;
+        break;
+      }
+    }
+    relation->left_dim = left_dim;
+    relation->right_dim = right_dim;
+    relation->rows = relation_rank;
+    if (*local_ok) {
+      for (int row = 0; row < relation_rank; ++row) {
+        for (int col = 0; col < left_dim; ++col) {
+          relation->left[row * kMaxStateDimension + col] =
+              matrix[row * columns + eliminated_columns + col];
+        }
+        for (int col = 0; col < right_dim; ++col) {
+          relation->right[row * kMaxStateDimension + col] =
+              matrix[row * columns + eliminated_columns + left_dim + col];
+        }
+        relation->rhs[row] = matrix[row * columns + columns - 1];
+      }
+    }
+  }
+  __syncthreads();
+}
+
+// Solve an overdetermined system with column-pivoted, reorthogonalized QR.
+// Free variables are set to zero in the pivoted coordinates.  The coefficient
+// matrix is overwritten by the orthonormal columns.
+__device__ void SolveSystemOrthogonally(Scalar* matrix, int rows, int columns,
+                                        int variables, Scalar rank_tolerance,
+                                        Scalar consistency_tolerance,
+                                        Scalar rhs_scale, Scalar* residual_rhs,
+                                        Scalar* upper, Scalar* rhs_projection,
+                                        Scalar* solution, int* permutation,
+                                        int* rank, int* local_ok) {
+  if (threadIdx.x == 0) {
+    for (int index = 0; index < variables * variables; ++index)
+      upper[index] = Scalar{0};
+    for (int variable = 0; variable < variables; ++variable) {
+      permutation[variable] = variable;
+      rhs_projection[variable] = Scalar{0};
+      solution[variable] = Scalar{0};
+    }
+    for (int row = 0; row < rows; ++row)
+      residual_rhs[row] = matrix[row * columns + variables];
+
+    *rank = 0;
+    const Scalar rank_threshold_squared = rank_tolerance * rank_tolerance;
+    for (int basis = 0; basis < variables; ++basis) {
+      int best_column = basis;
+      Scalar best_norm_squared = Scalar{-1};
+      for (int candidate = basis; candidate < variables; ++candidate) {
+        Scalar norm_squared = Scalar{0};
+        for (int row = 0; row < rows; ++row) {
+          const Scalar value = matrix[row * columns + candidate];
+          norm_squared += value * value;
+        }
+        if (norm_squared > best_norm_squared) {
+          best_norm_squared = norm_squared;
+          best_column = candidate;
+        }
+      }
+      if (!(best_norm_squared > rank_threshold_squared)) break;
+      if (best_column != basis) {
+        for (int row = 0; row < rows; ++row) {
+          const Scalar value = matrix[row * columns + basis];
+          matrix[row * columns + basis] = matrix[row * columns + best_column];
+          matrix[row * columns + best_column] = value;
+        }
+        for (int previous = 0; previous < basis; ++previous) {
+          const Scalar value = upper[previous * variables + basis];
+          upper[previous * variables + basis] =
+              upper[previous * variables + best_column];
+          upper[previous * variables + best_column] = value;
+        }
+        const int variable = permutation[basis];
+        permutation[basis] = permutation[best_column];
+        permutation[best_column] = variable;
+      }
+
+      Scalar norm_squared = Scalar{0};
+      for (int row = 0; row < rows; ++row) {
+        const Scalar value = matrix[row * columns + basis];
+        norm_squared += value * value;
+      }
+      if (!(norm_squared > rank_threshold_squared)) break;
+      const Scalar norm = sqrt(norm_squared);
+      upper[basis * variables + basis] = norm;
+      for (int row = 0; row < rows; ++row)
+        matrix[row * columns + basis] /= norm;
+
+      for (int pass = 0; pass < 2; ++pass) {
+        Scalar projection = Scalar{0};
+        for (int row = 0; row < rows; ++row)
+          projection += matrix[row * columns + basis] * residual_rhs[row];
+        rhs_projection[basis] += projection;
+        for (int row = 0; row < rows; ++row)
+          residual_rhs[row] -= projection * matrix[row * columns + basis];
+      }
+      for (int candidate = basis + 1; candidate < variables; ++candidate) {
+        for (int pass = 0; pass < 2; ++pass) {
+          Scalar projection = Scalar{0};
+          for (int row = 0; row < rows; ++row) {
+            projection += matrix[row * columns + basis] *
+                          matrix[row * columns + candidate];
+          }
+          upper[basis * variables + candidate] += projection;
+          for (int row = 0; row < rows; ++row) {
+            matrix[row * columns + candidate] -=
+                projection * matrix[row * columns + basis];
+          }
+        }
+      }
+      ++(*rank);
+    }
+
+    Scalar maximum_residual = Scalar{0};
+    for (int row = 0; row < rows; ++row)
+      maximum_residual = fmax(maximum_residual, DeviceAbs(residual_rhs[row]));
+    *local_ok = maximum_residual <= consistency_tolerance * rhs_scale;
+    if (*local_ok) {
+      Scalar pivoted_solution[kMaxStateDimension]{};
+      for (int reverse = 0; reverse < *rank; ++reverse) {
+        const int row = *rank - 1 - reverse;
+        Scalar value = rhs_projection[row];
+        for (int col = row + 1; col < *rank; ++col)
+          value -= upper[row * variables + col] * pivoted_solution[col];
+        pivoted_solution[row] = value / upper[row * variables + row];
+      }
+      for (int variable = 0; variable < *rank; ++variable)
+        solution[permutation[variable]] = pivoted_solution[variable];
+    }
   }
   __syncthreads();
 }
@@ -352,7 +654,7 @@ __device__ void ComposeRelationsBlock(
     Scalar consistency_tolerance, Relation* output, DeviceStatus* status,
     int stage, int inconsistency_code, int inconsistency_detail, Scalar* matrix,
     Scalar* factors, int* pivot_columns, int* pivot_rows, int* rank,
-    int* best_row, int* local_ok) {
+    int* best_row, int* local_ok, bool orthonormalize_output = false) {
   if (first.right_dim != second.left_dim) {
     if (threadIdx.x == 0) SetFailure(status, kDeviceNumericalFailure, stage, 2);
     return;
@@ -397,6 +699,15 @@ __device__ void ComposeRelationsBlock(
     matrix[(first.rows + row) * columns + columns - 1] = second.rhs[row];
   }
   __syncthreads();
+  if (orthonormalize_output) {
+    EliminateRelationOrthogonally(matrix, rows, columns, shared, first.left_dim,
+                                  second.right_dim, rank_tolerance,
+                                  consistency_tolerance, output, local_ok);
+    if (threadIdx.x == 0 && !*local_ok)
+      SetFailure(status, inconsistency_code, stage, inconsistency_detail);
+    __syncthreads();
+    return;
+  }
   RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
             pivot_rows, rank, best_row, factors);
   if (threadIdx.x == 0) {
@@ -1172,8 +1483,7 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
     BuildDualLeavesKernel<<<padded, kThreads>>>(
         device_stages.get(), device_terminal.get(), stage_count, padded,
         states.get(), controls.get(), multiplier_rank_tolerance,
-        multiplier_consistency_tolerance, dual_tree.get(),
-        device_status.get());
+        multiplier_consistency_tolerance, dual_tree.get(), device_status.get());
     for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
       ReduceDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
           dual_tree.get(), level_offsets[level], level_offsets[level + 1],
@@ -1531,11 +1841,6 @@ __global__ void BuildDualLeavesKernel(
     return;
   }
   __shared__ Scalar matrix[kMaxRrefEntries];
-  __shared__ Scalar factors[kMaxRrefRows];
-  __shared__ int pivot_columns[kMaxRrefRows];
-  __shared__ int pivot_rows[kMaxRrefRows];
-  __shared__ int rank;
-  __shared__ int best_row;
   __shared__ int rows;
   __shared__ int columns;
   __shared__ int eliminated;
@@ -1676,17 +1981,11 @@ __global__ void BuildDualLeavesKernel(
     }
   }
   __syncthreads();
-  RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
-            pivot_rows, &rank, &best_row, factors);
-  if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(matrix, rows, columns, columns - 1,
-                                 consistency_tolerance);
-    if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 12);
-  }
-  __syncthreads();
-  if (!local_ok) return;
-  ExtractResidualRelation(matrix, columns, rank, pivot_columns, eliminated,
-                          left_dim, right_dim, &tree[index]);
+  EliminateRelationOrthogonally(matrix, rows, columns, eliminated, left_dim,
+                                right_dim, rank_tolerance,
+                                consistency_tolerance, &tree[index], &local_ok);
+  if (threadIdx.x == 0 && !local_ok)
+    SetFailure(status, kDeviceNumericalFailure, index, 12);
 }
 
 __global__ void ReduceDualTreeLevelKernel(
@@ -1704,12 +2003,12 @@ __global__ void ReduceDualTreeLevelKernel(
   __shared__ int rank;
   __shared__ int best_row;
   __shared__ int local_ok;
-  ComposeRelationsBlock(tree[child_offset + 2 * index],
-                        tree[child_offset + 2 * index + 1], rank_tolerance,
-                        consistency_tolerance,
-                        &mutable_tree[parent_offset + index], status, index,
-                        kDeviceNumericalFailure, 18, matrix, factors,
-                        pivot_columns, pivot_rows, &rank, &best_row, &local_ok);
+  ComposeRelationsBlock(
+      tree[child_offset + 2 * index], tree[child_offset + 2 * index + 1],
+      rank_tolerance, consistency_tolerance,
+      &mutable_tree[parent_offset + index], status, index,
+      kDeviceNumericalFailure, 18, matrix, factors, pivot_columns, pivot_rows,
+      &rank, &best_row, &local_ok, true);
 }
 
 __global__ void SolveDualRootKernel(const Relation* relation, NodeValue* value,
@@ -1721,23 +2020,27 @@ __global__ void SolveDualRootKernel(const Relation* relation, NodeValue* value,
   }
   value->left_dim = relation->left_dim;
   value->right_dim = 0;
-  bool used[kMaxStateDimension]{};
-  for (int row = 0; row < relation->rows; ++row) {
-    int pivot = -1;
-    for (int col = 0; col < relation->left_dim; ++col) {
-      if (DeviceAbs(relation->left[row * kMaxStateDimension + col]) >
-          tolerance) {
-        pivot = col;
-        break;
-      }
+  // The contraction stores an orthonormal row basis.  Its transpose therefore
+  // maps the affine right-hand side to the minimum-norm root endpoint.
+  for (int col = 0; col < relation->left_dim; ++col) {
+    Scalar endpoint = Scalar{0};
+    for (int row = 0; row < relation->rows; ++row) {
+      endpoint +=
+          relation->left[row * kMaxStateDimension + col] * relation->rhs[row];
     }
-    if (pivot < 0 || used[pivot]) {
+    value->left[col] = endpoint;
+  }
+  for (int row = 0; row < relation->rows; ++row) {
+    Scalar residual = -relation->rhs[row];
+    for (int col = 0; col < relation->left_dim; ++col) {
+      residual +=
+          relation->left[row * kMaxStateDimension + col] * value->left[col];
+    }
+    if (DeviceAbs(residual) >
+        tolerance * fmax(Scalar{1}, DeviceAbs(relation->rhs[row]))) {
       SetFailure(status, kDeviceNumericalFailure, 0, 14);
       return;
     }
-    used[pivot] = true;
-    value->left[pivot] =
-        relation->rhs[row] / relation->left[row * kMaxStateDimension + pivot];
   }
 }
 
@@ -1762,11 +2065,12 @@ __global__ void ExpandDualTreeLevelKernel(
   const int rows = left.rows + right.rows;
   const int columns = shared + 1;
   __shared__ Scalar matrix[kMaxRrefRows * (kMaxStateDimension + 1)];
-  __shared__ Scalar factors[kMaxRrefRows];
-  __shared__ int pivot_columns[kMaxRrefRows];
-  __shared__ int pivot_rows[kMaxRrefRows];
+  __shared__ Scalar residual_rhs[kMaxRrefRows];
+  __shared__ Scalar upper[kMaxStateDimension * kMaxStateDimension];
+  __shared__ Scalar rhs_projection[kMaxStateDimension];
+  __shared__ Scalar shared_solution[kMaxStateDimension];
+  __shared__ int permutation[kMaxStateDimension];
   __shared__ int rank;
-  __shared__ int best_row;
   __shared__ int local_ok;
   __shared__ Scalar conditioned_rhs_scale;
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
@@ -1805,14 +2109,12 @@ __global__ void ExpandDualTreeLevelKernel(
         ConditionedRhsScale(matrix, rows, columns, shared, rank_tolerance);
   }
   __syncthreads();
-  RrefBlock(matrix, rows, columns, shared, rank_tolerance, pivot_columns,
-            pivot_rows, &rank, &best_row, factors);
-  if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(
-        matrix, rows, columns, shared, consistency_tolerance,
-        consistency_tolerance * conditioned_rhs_scale);
-    if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 16);
-  }
+  SolveSystemOrthogonally(matrix, rows, columns, shared, rank_tolerance,
+                          consistency_tolerance, conditioned_rhs_scale,
+                          residual_rhs, upper, rhs_projection, shared_solution,
+                          permutation, &rank, &local_ok);
+  if (threadIdx.x == 0 && !local_ok)
+    SetFailure(status, kDeviceNumericalFailure, index, 16);
   __syncthreads();
   if (!local_ok) return;
   if (threadIdx.x == 0) {
@@ -1826,14 +2128,9 @@ __global__ void ExpandDualTreeLevelKernel(
       left_value.left[col] = parent.left[col];
     for (int col = 0; col < right.right_dim; ++col)
       right_value.right[col] = parent.right[col];
-    Scalar shared_value[kMaxStateDimension]{};
-    for (int p = 0; p < rank; ++p) {
-      if (pivot_columns[p] < shared)
-        shared_value[pivot_columns[p]] = matrix[p * columns + shared];
-    }
     for (int col = 0; col < shared; ++col) {
-      left_value.right[col] = shared_value[col];
-      right_value.left[col] = shared_value[col];
+      left_value.right[col] = shared_solution[col];
+      right_value.left[col] = shared_solution[col];
     }
   }
 }
@@ -1852,12 +2149,11 @@ __global__ void RecoverLocalMultipliersKernel(
   if (!BlockEnabled(status, &block_enabled)) return;
   __shared__ Scalar
       matrix[kMaxRrefRows * (kMaxMixedConstraints + kMaxStateConstraints + 1)];
-  __shared__ Scalar original_matrix[
-      (kMaxStateDimension + kMaxControlDimension) *
-      (kMaxMixedConstraints + kMaxStateConstraints + 1)];
-  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ Scalar
-      local_solution[kMaxMixedConstraints + kMaxStateConstraints];
+      original_matrix[(kMaxStateDimension + kMaxControlDimension) *
+                      (kMaxMixedConstraints + kMaxStateConstraints + 1)];
+  __shared__ Scalar factors[kMaxRrefRows];
+  __shared__ Scalar local_solution[kMaxMixedConstraints + kMaxStateConstraints];
   __shared__ int pivot_columns[kMaxRrefRows];
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
@@ -2011,8 +2307,8 @@ __global__ void RecoverLocalMultipliersKernel(
         scale += DeviceAbs(term);
       }
       if (scale < Scalar{1}) scale = Scalar{1};
-      const Scalar residual = DeviceAbs(
-          value - original_matrix[row * columns + variables]);
+      const Scalar residual =
+          DeviceAbs(value - original_matrix[row * columns + variables]);
       if (residual > consistency_tolerance * scale) {
         local_ok = 0;
         break;
@@ -2025,8 +2321,7 @@ __global__ void RecoverLocalMultipliersKernel(
   if (threadIdx.x == 0) {
     if (index == stage_count) {
       for (int row = 0; row < terminal.state; ++row)
-        terminal_multiplier[row] =
-            local_solution[row] / constraint_scales[row];
+        terminal_multiplier[row] = local_solution[row] / constraint_scales[row];
       if (stage_count == 0) {
         for (int row = 0; row < terminal.n; ++row)
           initial_multiplier[row] = endpoints.left[row];
@@ -2038,8 +2333,7 @@ __global__ void RecoverLocalMultipliersKernel(
             local_solution[row] / constraint_scales[row];
       for (int row = 0; row < s.state; ++row)
         state_multipliers[index * kMaxStateConstraints + row] =
-            local_solution[s.mixed + row] /
-            constraint_scales[s.mixed + row];
+            local_solution[s.mixed + row] / constraint_scales[s.mixed + row];
       if (index == 0) {
         for (int row = 0; row < s.n; ++row)
           initial_multiplier[row] = endpoints.left[row];

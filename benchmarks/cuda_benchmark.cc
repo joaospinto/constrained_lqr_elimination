@@ -48,7 +48,8 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
-  const std::vector<std::size_t> horizons{32, 64, 128, 256, 512, 1024, 2048};
+  const std::vector<std::size_t> horizons{32,   64,   128,  256,  512,
+                                          1024, 2048, 4096, 8192, 16384};
   constexpr std::size_t n = 8;
   constexpr std::size_t m = 4;
   constexpr std::size_t p = 2;

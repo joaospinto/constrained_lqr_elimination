@@ -63,11 +63,12 @@ multiplier contraction/expansion. The scan implementation favors simple Hillis--
 which use `O(N log N)` local compositions while retaining `O(log N)` depth and `O(N)` space;
 the balanced multiplier tree uses `O(N)` compositions.
 
-Rank decisions use row equilibration and partial pivoting. Redundant equalities are accepted,
-and free multiplier components are set to zero. If a reduced stage cost `R_i` is not positive
-definite, the backend retains the same reduced coordinates but uses a GPU-side sequential
-Riccati fallback; this avoids making positive definiteness of each `R_i` a new correctness
-requirement.
+Primal rank decisions use row equilibration and partial pivoting. The multiplier tree uses
+pivoted, reorthogonalized reductions during contraction and expansion. Redundant equalities
+are accepted, and free multiplier components are set to zero. If a reduced stage cost `R_i`
+is not positive definite, the backend retains the same reduced coordinates but uses a
+GPU-side sequential Riccati fallback; this avoids making positive definiteness of each `R_i`
+a new correctness requirement.
 
 The public numeric type is `clqr::Scalar`. CMake selects it consistently for the C++ API,
 CPU solver, and CUDA backend with `CLQR_PRECISION=FP64` (the default) or `FP32`; use separate

@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "../benchmarks/cuda_benchmark_problem.h"
 #include "../src/cuda_solver.cu"
 #include "cuda_jax_problem.h"
 
@@ -240,20 +241,7 @@ Problem MoreMixedRowsThanControlsProblem() {
 }
 
 Problem LongHorizonStateConstraintProblem() {
-  constexpr int seed = 2200;
-  constexpr std::size_t horizon = 256;
-  constexpr std::size_t n = 8;
-  Problem problem = UniformProblem(seed, horizon, n, 4);
-  for (std::size_t i = 0; i < horizon; ++i) {
-    Stage& stage = problem.stages[i];
-    const Vector nominal_x =
-        GeneratedVector(n, seed + 100 + static_cast<int>(i), 0.5);
-    stage.E = GeneratedMatrix(2, n, seed + 1200 + static_cast<int>(i), 0.3);
-    stage.e = Vector(2);
-    for (std::size_t row = 0; row < 2; ++row)
-      stage.e[row] = -RowDot(stage.E, row, nominal_x);
-  }
-  return problem;
+  return clqr::benchmark::StateOnlyProblem(2048, 8, 4, 2);
 }
 
 template <std::size_t Size>
@@ -658,10 +646,9 @@ void RunEmulation(const Problem& problem, const std::string& name,
         dynamics.data(), mixed.data(), state_multipliers.data(),
         terminal_multiplier.data(), &status);
   });
-  Expect(
-      status.code == kDeviceOk,
-      "emulated multiplier recovery (stage=" + std::to_string(status.stage) +
-          ", detail=" + std::to_string(status.detail) + ")");
+  Expect(status.code == kDeviceOk,
+         "emulated multiplier recovery (stage=" + std::to_string(status.stage) +
+             ", detail=" + std::to_string(status.detail) + ")");
 
   if (compare_cpu) {
     for (int i = 0; i < nodes; ++i) {

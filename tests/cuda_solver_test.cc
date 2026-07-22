@@ -426,7 +426,7 @@ Problem RescaledMixedRowsProblem(const Problem& unscaled) {
 void LongHorizonCase() {
   const std::string name = "long-horizon state constraints";
   std::cout << "case: " << name << std::endl;
-  const Problem problem = clqr::benchmark::StateOnlyProblem(256, 8, 4, 2);
+  const Problem problem = clqr::benchmark::StateOnlyProblem(2048, 8, 4, 2);
   const clqr::cuda::Solution solution = clqr::cuda::Solve(problem);
   Expect(solution.status == SolveStatus::kOptimal,
          name + " CUDA status: " + solution.message);
