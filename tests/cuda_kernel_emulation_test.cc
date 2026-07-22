@@ -524,7 +524,8 @@ void RunEmulation(const Problem &problem, const std::string &name,
   Relation *suffix = relation_a.data();
   std::vector<StateParam> state_params(nodes);
   Launch(nodes, [&] {
-    StateParamKernel(suffix, nodes, state_params.data(), &status, kTolerance);
+    StateParamKernel(suffix, nodes, state_params.data(), nullptr, &status,
+                     kTolerance);
   });
   Expect(status.code == kDeviceOk,
          name + " emulated feasibility scan (stage=" +
@@ -538,7 +539,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
   Launch(horizon, [&] {
     ReduceStagesKernel(stages.data(), suffix, state_params.data(), horizon,
                        kTolerance, feasibility_consistency_tolerance,
-                       control_params.data(), reduced.data(), &status);
+                       control_params.data(), reduced.data(), nullptr, &status);
   });
   Launch(1, [&] {
     ReduceTerminalKernel(&terminal, state_params.data(), horizon,
@@ -621,7 +622,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
   Expect(parallel_ok == 1, "parallel value scan");
   Launch(horizon, [&] {
     FeedbackKernel(reduced.data(), value_suffix, horizon, kTolerance,
-                   feedback.data(), &status);
+                   feedback.data(), &parallel_ok, &status);
   });
   Expect(status.code == kDeviceOk, "emulated feedback solve");
 
@@ -745,16 +746,11 @@ void RunEmulation(const Problem &problem, const std::string &name,
   std::vector<Scalar> states(nodes * kMaxStateDimension);
   std::vector<Scalar> controls(horizon * kMaxControlDimension);
   Launch(nodes, [&] {
-    EvaluateReducedStatesKernel(
-        prefix, horizon, state_params.data(), reduced_initial.data(),
-        reduced_state_offsets.data(), reduced_states.data());
-  });
-  Launch(nodes, [&] {
-    ReconstructPrimalKernel(state_params.data(), control_params.data(),
-                            feedback.data(), reduced_states.data(),
-                            reduced_state_offsets.data(), state_offsets.data(),
-                            control_offsets.data(), horizon, states.data(),
-                            controls.data());
+    ReconstructPrimalKernel(
+        prefix, state_params.data(), control_params.data(), feedback.data(),
+        reduced_initial.data(), reduced_state_offsets.data(),
+        state_offsets.data(), control_offsets.data(), horizon,
+        reduced_states.data(), states.data(), controls.data());
   });
   Expect(status.code == kDeviceOk, "emulated affine rollout");
 
@@ -835,7 +831,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
           reduced_state_offsets.data(), state_offsets.data(),
           control_offsets.data(), horizon, multiplier_rank_tolerance,
           multiplier_consistency_tolerance, dual_params.data(),
-          &dual_scan_needed, &status);
+          &dual_scan_needed, nullptr, &status);
     });
     Launch(horizon, [&] {
       BuildDualParameterRelationsKernel(
@@ -874,15 +870,11 @@ void RunEmulation(const Problem &problem, const std::string &name,
       });
     }
     Launch(horizon, [&] {
-      RecoverParameterizedDynamicsAndMixedKernel(
-          dual_params.data(), dual_values.data(), dynamics_offsets.data(),
-          mixed_offsets.data(), horizon, dynamics.data(), mixed.data());
-    });
-    Launch(horizon, [&] {
-      RecoverStateMultipliersFromParametersKernel(
-          state_dual_params.data(), dual_values.data(),
-          state_constraint_offsets.data(), horizon, state_multipliers.data(),
-          terminal_multiplier.data());
+      RecoverParameterizedMultipliersKernel(
+          dual_params.data(), state_dual_params.data(), dual_values.data(),
+          dynamics_offsets.data(), mixed_offsets.data(),
+          state_constraint_offsets.data(), horizon, dynamics.data(),
+          mixed.data(), state_multipliers.data(), terminal_multiplier.data());
     });
   }
   Launch(1, [&] {

@@ -1105,8 +1105,8 @@ __global__ void FinalizeRelationSuffixFromParentsKernel(
 }
 
 __global__ void StateParamKernel(const Relation *suffix, int count,
-                                 StateParam *params, DeviceStatus *status,
-                                 Scalar tolerance) {
+                                 StateParam *params, int *state_dimensions,
+                                 DeviceStatus *status, Scalar tolerance) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= count || status->code != kDeviceOk)
     return;
@@ -1163,33 +1163,10 @@ __global__ void StateParamKernel(const Relation *suffix, int count,
   for (int free = 0; free < reduced; ++free) {
     out.T[out.free_columns[free] * reduced + free] = Scalar{1};
   }
-}
-
-__global__ void PackStateDimensionsKernel(const StateParam *state_params,
-                                          int count, int *state_dimensions) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= count)
-    return;
-  state_dimensions[2 * index] = state_params[index].physical_dim;
-  state_dimensions[2 * index + 1] = state_params[index].reduced_dim;
-}
-
-__global__ void PackControlDimensionsKernel(const ControlParam *control_params,
-                                            int count,
-                                            int *control_dimensions) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= count)
-    return;
-  control_dimensions[2 * index] = control_params[index].physical_dim;
-  control_dimensions[2 * index + 1] = control_params[index].reduced_dim;
-}
-
-__global__ void PackDualDimensionsKernel(const DualParam *dual_params,
-                                         int count, int *dual_dimensions) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= count)
-    return;
-  dual_dimensions[index] = dual_params[index].free_dim;
+  if (state_dimensions != nullptr) {
+    state_dimensions[2 * index] = out.physical_dim;
+    state_dimensions[2 * index + 1] = out.reduced_dim;
+  }
 }
 
 } // namespace
@@ -1205,7 +1182,7 @@ namespace {
 
 __global__ void ReduceStagesKernel(const PackedStage *, const Relation *,
                                    const StateParam *, int, Scalar, Scalar,
-                                   ControlParam *, ReducedStage *,
+                                   ControlParam *, ReducedStage *, int *,
                                    DeviceStatus *);
 __global__ void ReduceTerminalKernel(const PackedTerminal *, const StateParam *,
                                      int, ReducedTerminal *);
@@ -1225,7 +1202,7 @@ __global__ void FinalizeValueSuffixFromParentsKernel(ValueElement *, int,
                                                      const ValueElement *, int,
                                                      Scalar, int *);
 __global__ void FeedbackKernel(const ReducedStage *, const ValueElement *, int,
-                               Scalar, Feedback *, DeviceStatus *);
+                               Scalar, Feedback *, const int *, DeviceStatus *);
 __global__ void SequentialRiccatiKernel(const ReducedStage *, int, Scalar,
                                         ValueElement *, Feedback *,
                                         DeviceStatus *);
@@ -1240,29 +1217,27 @@ __global__ void ExpandAffineContextLevelKernel(AffineMap *, int, int, int, int,
 __global__ void FinalizeAffinePrefixFromParentsKernel(AffineMap *, int,
                                                       const AffineMap *, int,
                                                       DeviceStatus *);
-__global__ void EvaluateReducedStatesKernel(const AffineMap *, int,
-                                            const StateParam *, const Scalar *,
-                                            const int *, Scalar *);
-__global__ void ReconstructPrimalKernel(const StateParam *,
+__global__ void ReconstructPrimalKernel(const AffineMap *, const StateParam *,
                                         const ControlParam *, const Feedback *,
                                         const Scalar *, const int *,
                                         const int *, const int *, int, Scalar *,
-                                        Scalar *);
-__global__ void BuildDualParametersKernel(
-    const PackedStage *, const StateParam *, const ValueElement *,
-    const Scalar *, const Scalar *, const Scalar *, const int *, const int *,
-    const int *, int, Scalar, Scalar, DualParam *, int *, DeviceStatus *);
+                                        Scalar *, Scalar *);
+__global__ void BuildDualParametersKernel(const PackedStage *,
+                                          const StateParam *,
+                                          const ValueElement *, const Scalar *,
+                                          const Scalar *, const Scalar *,
+                                          const int *, const int *, const int *,
+                                          int, Scalar, Scalar, DualParam *,
+                                          int *, int *, DeviceStatus *);
 __global__ void BuildDualParameterRelationsKernel(
     const PackedStage *, const PackedTerminal *, const DualParam *, int,
     const Scalar *, const Scalar *, const int *, const int *, Scalar, Scalar,
     DualRelation *, const int *, StateDualParam *, DeviceStatus *);
-__global__ void RecoverParameterizedDynamicsAndMixedKernel(
-    const DualParam *, const DualNodeValue *, const int *, const int *, int,
-    Scalar *, Scalar *);
 __global__ void
-RecoverStateMultipliersFromParametersKernel(const StateDualParam *,
-                                            const DualNodeValue *, const int *,
-                                            int, Scalar *, Scalar *);
+RecoverParameterizedMultipliersKernel(const DualParam *, const StateDualParam *,
+                                      const DualNodeValue *, const int *,
+                                      const int *, const int *, int, Scalar *,
+                                      Scalar *, Scalar *, Scalar *);
 __global__ void RecoverInitialMultiplierKernel(
     const PackedStage *, const PackedTerminal *, int, const Scalar *,
     const Scalar *, const Scalar *, const Scalar *, const int *, const int *,
@@ -2535,10 +2510,8 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     }
     const int blocks = (node_count + kThreads - 1) / kThreads;
     StateParamKernel<<<blocks, kThreads>>>(
-        relation_a.get(), node_count, state_params.get(), device_status.get(),
-        options.tolerance);
-    PackStateDimensionsKernel<<<blocks, kThreads>>>(
-        state_params.get(), node_count, state_dimensions.get());
+        relation_a.get(), node_count, state_params.get(),
+        state_dimensions.get(), device_status.get(), options.tolerance);
     CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
                               sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
               "read feasibility status");
@@ -2578,7 +2551,8 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       ReduceStagesKernel<<<stage_count, kThreads>>>(
           device_stages.get(), suffix, state_params.get(), stage_count,
           options.tolerance, feasibility_consistency_tolerance,
-          control_params.get(), reduced_stages.get(), device_status.get());
+          control_params.get(), reduced_stages.get(), control_dimensions.get(),
+          device_status.get());
     }
     ReduceTerminalKernel<<<1, kThreads>>>(device_terminal.get(),
                                           state_params.get(), stage_count,
@@ -2587,9 +2561,6 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         state_params.get(), device_initial.get(), reduced_initial.get(),
         options.tolerance, device_status.get());
     if (stage_count > 0) {
-      const int control_blocks = (stage_count + kThreads - 1) / kThreads;
-      PackControlDimensionsKernel<<<control_blocks, kThreads>>>(
-          control_params.get(), stage_count, control_dimensions.get());
       CudaCheck(cudaMemcpyAsync(workspace.host_control_dimensions.data(),
                                 control_dimensions.get(),
                                 workspace.host_control_dimensions.size() *
@@ -2643,57 +2614,45 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         reduced_stages.get(), reduced_terminal.get(), stage_count,
         options.tolerance, value_a.get(), parallel_ok.get(),
         device_status.get());
+    if (node_count > 1) {
+      const int first_parent_count = level_counts[1];
+      ReduceValueLeavesKernel<<<first_parent_count, kThreads>>>(
+          value_a.get(), node_count, first_parent_count, options.tolerance,
+          parallel_ok.get(), value_b.get());
+      for (std::size_t level = 1; level + 1 < level_counts.size(); ++level) {
+        ReduceValueTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
+            value_b.get(), level_offsets[level] - node_count,
+            level_offsets[level + 1] - node_count, level_counts[level],
+            level_counts[level + 1], options.tolerance, parallel_ok.get());
+      }
+      InitializeValueContextRootKernel<<<1, kThreads>>>(
+          value_b.get(), level_offsets.back() - node_count);
+      for (int level = static_cast<int>(level_counts.size()) - 2; level >= 1;
+           --level) {
+        ExpandValueContextLevelKernel<<<level_counts[level + 1], kThreads>>>(
+            value_b.get(), level_offsets[level] - node_count,
+            level_offsets[level + 1] - node_count, level_counts[level],
+            level_counts[level + 1], options.tolerance, parallel_ok.get());
+      }
+      FinalizeValueSuffixFromParentsKernel<<<first_parent_count, kThreads>>>(
+          value_a.get(), node_count, value_b.get(), first_parent_count,
+          options.tolerance, parallel_ok.get());
+    }
+    if (stage_count > 0) {
+      FeedbackKernel<<<stage_count, kThreads>>>(
+          reduced_stages.get(), value_suffix, stage_count, options.tolerance,
+          feedback.get(), parallel_ok.get(), device_status.get());
+    }
     CudaCheck(cudaMemcpyAsync(&host_parallel_ok, parallel_ok.get(), sizeof(int),
                               cudaMemcpyDeviceToHost),
-              "read parallel Riccati flag");
+              "read value scan status");
+    CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
+                              sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
+              "read Riccati status");
   });
 
   if (host_parallel_ok != 0) {
-    solution.timings.riccati_ms += TimeGpu(workspace, [&] {
-      if (node_count > 1) {
-        const int first_parent_count = level_counts[1];
-        ReduceValueLeavesKernel<<<first_parent_count, kThreads>>>(
-            value_a.get(), node_count, first_parent_count, options.tolerance,
-            parallel_ok.get(), value_b.get());
-        for (std::size_t level = 1; level + 1 < level_counts.size(); ++level) {
-          ReduceValueTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
-              value_b.get(), level_offsets[level] - node_count,
-              level_offsets[level + 1] - node_count, level_counts[level],
-              level_counts[level + 1], options.tolerance, parallel_ok.get());
-        }
-        InitializeValueContextRootKernel<<<1, kThreads>>>(
-            value_b.get(), level_offsets.back() - node_count);
-        for (int level = static_cast<int>(level_counts.size()) - 2; level >= 1;
-             --level) {
-          ExpandValueContextLevelKernel<<<level_counts[level + 1], kThreads>>>(
-              value_b.get(), level_offsets[level] - node_count,
-              level_offsets[level + 1] - node_count, level_counts[level],
-              level_counts[level + 1], options.tolerance, parallel_ok.get());
-        }
-        FinalizeValueSuffixFromParentsKernel<<<first_parent_count, kThreads>>>(
-            value_a.get(), node_count, value_b.get(), first_parent_count,
-            options.tolerance, parallel_ok.get());
-      }
-      value_suffix = value_a.get();
-      CudaCheck(cudaMemcpyAsync(&host_parallel_ok, parallel_ok.get(),
-                                sizeof(int), cudaMemcpyDeviceToHost),
-                "read value scan status");
-    });
-  }
-
-  if (host_parallel_ok != 0) {
     solution.used_parallel_riccati = true;
-    solution.timings.riccati_ms += TimeGpu(workspace, [&] {
-      if (stage_count > 0) {
-        FeedbackKernel<<<stage_count, kThreads>>>(
-            reduced_stages.get(), value_suffix, stage_count, options.tolerance,
-            feedback.get(), device_status.get());
-      }
-      CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
-                                device_status.get(), sizeof(DeviceStatus),
-                                cudaMemcpyDeviceToHost),
-                "read Riccati status");
-    });
   } else {
     solution.used_parallel_riccati = false;
     solution.timings.riccati_ms += TimeGpu(workspace, [&] {
@@ -2782,13 +2741,11 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       prefix = map_a.get();
     }
     const int state_blocks = (node_count + kThreads - 1) / kThreads;
-    EvaluateReducedStatesKernel<<<state_blocks, kThreads>>>(
-        prefix, stage_count, state_params.get(), reduced_initial.get(),
-        reduced_state_offsets.get(), reduced_states.get());
     ReconstructPrimalKernel<<<state_blocks, kThreads>>>(
-        state_params.get(), control_params.get(), feedback.get(),
-        reduced_states.get(), reduced_state_offsets.get(), state_offsets.get(),
-        control_offsets.get(), stage_count, states.get(), controls.get());
+        prefix, state_params.get(), control_params.get(), feedback.get(),
+        reduced_initial.get(), reduced_state_offsets.get(), state_offsets.get(),
+        control_offsets.get(), stage_count, reduced_states.get(), states.get(),
+        controls.get());
     CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
                               sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
               "read reconstruction status");
@@ -2839,10 +2796,7 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
           reduced_state_offsets.get(), state_offsets.get(),
           control_offsets.get(), stage_count, multiplier_rank_tolerance,
           multiplier_consistency_tolerance, dual_params.get(),
-          dual_scan_needed.get(), device_status.get());
-      const int dual_dimension_blocks = (stage_count + kThreads - 1) / kThreads;
-      PackDualDimensionsKernel<<<dual_dimension_blocks, kThreads>>>(
-          dual_params.get(), stage_count, dual_dimensions.get());
+          dual_scan_needed.get(), dual_dimensions.get(), device_status.get());
       CudaCheck(cudaMemcpyAsync(&host_dual_scan_needed, dual_scan_needed.get(),
                                 sizeof(int), cudaMemcpyDeviceToHost),
                 "read dual scan flag");
@@ -2919,29 +2873,40 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         }
       }
       const int recovery_blocks = (stage_count + kThreads - 1) / kThreads;
-      RecoverParameterizedDynamicsAndMixedKernel<<<recovery_blocks, kThreads>>>(
-          dual_params.get(), dual_leaf_values, dynamics_offsets.get(),
-          mixed_offsets.get(), stage_count, dynamics_multipliers.get(),
-          mixed_multipliers.get());
-      RecoverStateMultipliersFromParametersKernel<<<recovery_blocks,
-                                                    kThreads>>>(
-          state_dual_params.get(), dual_leaf_values,
-          state_constraint_offsets.get(), stage_count, state_multipliers.get(),
+      RecoverParameterizedMultipliersKernel<<<recovery_blocks, kThreads>>>(
+          dual_params.get(), state_dual_params.get(), dual_leaf_values,
+          dynamics_offsets.get(), mixed_offsets.get(),
+          state_constraint_offsets.get(), stage_count,
+          dynamics_multipliers.get(), mixed_multipliers.get(),
+          state_multipliers.get(), terminal_multiplier.get());
+      RecoverInitialMultiplierKernel<<<1, kThreads>>>(
+          device_stages.get(), device_terminal.get(), stage_count, states.get(),
+          controls.get(), dynamics_multipliers.get(), mixed_multipliers.get(),
+          state_offsets.get(), control_offsets.get(), dynamics_offsets.get(),
+          mixed_offsets.get(), state_constraint_offsets.get(),
+          initial_multiplier.get(), state_multipliers.get(),
           terminal_multiplier.get());
+      CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
+                                device_status.get(), sizeof(DeviceStatus),
+                                cudaMemcpyDeviceToHost),
+                "read multiplier status");
     });
   }
-  solution.timings.multiplier_ms += TimeGpu(workspace, [&] {
-    RecoverInitialMultiplierKernel<<<1, kThreads>>>(
-        device_stages.get(), device_terminal.get(), stage_count, states.get(),
-        controls.get(), dynamics_multipliers.get(), mixed_multipliers.get(),
-        state_offsets.get(), control_offsets.get(), dynamics_offsets.get(),
-        mixed_offsets.get(), state_constraint_offsets.get(),
-        initial_multiplier.get(), state_multipliers.get(),
-        terminal_multiplier.get());
-    CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
-                              sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
-              "read multiplier status");
-  });
+  if (stage_count == 0) {
+    solution.timings.multiplier_ms += TimeGpu(workspace, [&] {
+      RecoverInitialMultiplierKernel<<<1, kThreads>>>(
+          device_stages.get(), device_terminal.get(), stage_count, states.get(),
+          controls.get(), dynamics_multipliers.get(), mixed_multipliers.get(),
+          state_offsets.get(), control_offsets.get(), dynamics_offsets.get(),
+          mixed_offsets.get(), state_constraint_offsets.get(),
+          initial_multiplier.get(), state_multipliers.get(),
+          terminal_multiplier.get());
+      CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
+                                device_status.get(), sizeof(DeviceStatus),
+                                cudaMemcpyDeviceToHost),
+                "read multiplier status");
+    });
+  }
   status = workspace.host_status[0];
   if (ApplyDeviceFailure(status, &solution)) {
     solution.timings.total_ms =
@@ -3348,42 +3313,31 @@ FinalizeAffinePrefixFromParentsKernel(AffineMap *leaves, int count,
   CopyAffineMapBlock(composed, &leaves[right]);
 }
 
-__global__ void EvaluateReducedStatesKernel(const AffineMap *prefix,
-                                            int stage_count,
-                                            const StateParam *state_params,
-                                            const Scalar *initial,
-                                            const int *reduced_state_offsets,
-                                            Scalar *reduced_states) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index > stage_count)
-    return;
-  if (index == 0) {
-    for (int col = 0; col < state_params[0].reduced_dim; ++col)
-      reduced_states[reduced_state_offsets[0] + col] = initial[col];
-    return;
-  }
-  const AffineMap &map = prefix[index - 1];
-  for (int row = 0; row < map.right_dim; ++row) {
-    Scalar value = map.offset[row];
-    for (int col = 0; col < map.left_dim; ++col) {
-      value += map.linear[row * map.left_dim + col] * initial[col];
-    }
-    reduced_states[reduced_state_offsets[index] + row] = value;
-  }
-}
-
-__global__ void
-ReconstructPrimalKernel(const StateParam *state_params,
-                        const ControlParam *control_params,
-                        const Feedback *feedback, const Scalar *reduced_states,
-                        const int *reduced_state_offsets,
-                        const int *state_offsets, const int *control_offsets,
-                        int stage_count, Scalar *states, Scalar *controls) {
+__global__ void ReconstructPrimalKernel(
+    const AffineMap *prefix, const StateParam *state_params,
+    const ControlParam *control_params, const Feedback *feedback,
+    const Scalar *initial, const int *reduced_state_offsets,
+    const int *state_offsets, const int *control_offsets, int stage_count,
+    Scalar *reduced_states, Scalar *states, Scalar *controls) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index > stage_count)
     return;
   const StateParam &state = state_params[index];
-  const Scalar *z = reduced_states + reduced_state_offsets[index];
+  Scalar z[kMaxStateDimension];
+  if (index == 0) {
+    for (int col = 0; col < state.reduced_dim; ++col)
+      z[col] = initial[col];
+  } else {
+    const AffineMap &map = prefix[index - 1];
+    for (int row = 0; row < map.right_dim; ++row) {
+      Scalar value = map.offset[row];
+      for (int col = 0; col < map.left_dim; ++col)
+        value += map.linear[row * map.left_dim + col] * initial[col];
+      z[row] = value;
+    }
+  }
+  for (int row = 0; row < state.reduced_dim; ++row)
+    reduced_states[reduced_state_offsets[index] + row] = z[row];
   for (int x = 0; x < state.physical_dim; ++x) {
     Scalar value = state.t[x];
     for (int col = 0; col < state.reduced_dim; ++col) {
@@ -3422,7 +3376,7 @@ __global__ void BuildDualParametersKernel(
     const int *reduced_state_offsets, const int *state_offsets,
     const int *control_offsets, int stage_count, Scalar rank_tolerance,
     Scalar consistency_tolerance, DualParam *params, int *scan_needed,
-    DeviceStatus *status) {
+    int *dual_dimensions, DeviceStatus *status) {
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
@@ -3519,6 +3473,8 @@ __global__ void BuildDualParametersKernel(
       out.mixed_dim = stage.mixed;
       out.physical_dim = variables;
       out.free_dim = variables - rank;
+      if (dual_dimensions != nullptr)
+        dual_dimensions[index] = out.free_dim;
       for (int free = 0; free < out.free_dim; ++free)
         out.free_columns[free] = permutation[rank + free];
       if (out.free_dim > 0)
@@ -3708,10 +3664,12 @@ __global__ void BuildDualParameterRelationsKernel(
   }
 }
 
-__global__ void RecoverParameterizedDynamicsAndMixedKernel(
-    const DualParam *params, const DualNodeValue *leaf_values,
-    const int *dynamics_offsets, const int *mixed_offsets, int stage_count,
-    Scalar *dynamics_multipliers, Scalar *mixed_multipliers) {
+__global__ void RecoverParameterizedMultipliersKernel(
+    const DualParam *params, const StateDualParam *state_params,
+    const DualNodeValue *leaf_values, const int *dynamics_offsets,
+    const int *mixed_offsets, const int *state_constraint_offsets,
+    int stage_count, Scalar *dynamics_multipliers, Scalar *mixed_multipliers,
+    Scalar *state_multipliers, Scalar *terminal_multiplier) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= stage_count)
     return;
@@ -3728,26 +3686,19 @@ __global__ void RecoverParameterizedDynamicsAndMixedKernel(
       mixed_multipliers[mixed_offsets[index] + row - param.state_dim] = result;
     }
   }
-}
-
-__global__ void RecoverStateMultipliersFromParametersKernel(
-    const StateDualParam *params, const DualNodeValue *leaf_values,
-    const int *state_constraint_offsets, int stage_count,
-    Scalar *state_multipliers, Scalar *terminal_multiplier) {
-  const int relation_index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (relation_index >= stage_count)
-    return;
-  const int node = relation_index + 1;
-  const StateDualParam &param = params[relation_index];
-  for (int constraint = 0; constraint < param.constraint_dim; ++constraint) {
-    Scalar multiplier = param.offset[constraint];
-    for (int free = 0; free < param.left_dim; ++free) {
-      multiplier += param.left[constraint * param.left_dim + free] *
-                    leaf_values[relation_index].left[free];
+  const int node = index + 1;
+  const StateDualParam &state_param = state_params[index];
+  for (int constraint = 0; constraint < state_param.constraint_dim;
+       ++constraint) {
+    Scalar multiplier = state_param.offset[constraint];
+    for (int free = 0; free < state_param.left_dim; ++free) {
+      multiplier += state_param.left[constraint * state_param.left_dim + free] *
+                    leaf_values[index].left[free];
     }
-    for (int free = 0; free < param.right_dim; ++free) {
-      multiplier += param.right[constraint * param.right_dim + free] *
-                    leaf_values[relation_index].right[free];
+    for (int free = 0; free < state_param.right_dim; ++free) {
+      multiplier +=
+          state_param.right[constraint * state_param.right_dim + free] *
+          leaf_values[index].right[free];
     }
     if (node == stage_count) {
       terminal_multiplier[constraint] = multiplier;
@@ -4616,12 +4567,14 @@ __device__ void ExtractFeedback(const ReducedStage &s, const Scalar *augmented,
 __global__ void FeedbackKernel(const ReducedStage *stages,
                                const ValueElement *suffix, int stage_count,
                                Scalar tolerance, Feedback *feedback,
-                               DeviceStatus *status) {
+                               const int *parallel_ok, DeviceStatus *status) {
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
   __shared__ int block_enabled;
   if (!BlockEnabled(status, &block_enabled))
+    return;
+  if (!BlockEnabled(parallel_ok, &block_enabled))
     return;
   const ReducedStage &s = stages[index];
   const ValueElement &next = suffix[index + 1];
@@ -4792,7 +4745,7 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
                    const StateParam *state_params, int stage_count,
                    Scalar rank_tolerance, Scalar consistency_tolerance,
                    ControlParam *control_params, ReducedStage *reduced,
-                   DeviceStatus *status) {
+                   int *control_dimensions, DeviceStatus *status) {
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
@@ -4968,6 +4921,10 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
       rs.n = current.reduced_dim;
       rs.next_n = next.reduced_dim;
       rs.m = cp.reduced_dim;
+      if (control_dimensions != nullptr) {
+        control_dimensions[2 * index] = cp.physical_dim;
+        control_dimensions[2 * index + 1] = cp.reduced_dim;
+      }
     }
   }
   WarpSynchronize();
