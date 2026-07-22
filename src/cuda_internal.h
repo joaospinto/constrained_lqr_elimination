@@ -15,130 +15,176 @@ constexpr int kMaxRelationRows = 2 * kMaxStateDimension;
 constexpr int kMaxRelationColumns =
     3 * kMaxStateDimension +
     1; // eliminated boundary, two outer boundaries, rhs
-constexpr int kMaxDualColumns =
-    ConstexprMax(kMaxRelationColumns,
-                 ConstexprMax(kMaxControlDimension + 2 * kMaxStateDimension + 1,
-                              kMaxMixedConstraints + kMaxStateConstraints +
-                                  2 * kMaxStateDimension + 1));
+constexpr int kMaxDualParameterDimension =
+    kMaxStateDimension + kMaxMixedConstraints;
+constexpr int kMaxDualColumns = ConstexprMax(
+    kMaxRelationColumns,
+    ConstexprMax(
+        kMaxControlDimension + 2 * kMaxStateDimension + 1,
+        ConstexprMax(kMaxMixedConstraints + kMaxStateConstraints +
+                         2 * kMaxStateDimension + 1,
+                     ConstexprMax(kMaxStateConstraints +
+                                      2 * kMaxDualParameterDimension + 1,
+                                  3 * kMaxDualParameterDimension + 1))));
 constexpr int kMaxStageConstraintRows =
     kMaxMixedConstraints + kMaxStateDimension;
 constexpr int kMaxStageReductionColumns =
     kMaxControlDimension + kMaxStateDimension + 1;
 
 struct PackedStage {
-  int n = 0;
-  int next_n = 0;
-  int m = 0;
-  int mixed = 0;
-  int state = 0;
-  Scalar A[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar B[kMaxStateDimension * kMaxControlDimension]{};
-  Scalar c[kMaxStateDimension]{};
-  Scalar Q[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar R[kMaxControlDimension * kMaxControlDimension]{};
-  Scalar M[kMaxStateDimension * kMaxControlDimension]{};
-  Scalar q[kMaxStateDimension]{};
-  Scalar r[kMaxControlDimension]{};
-  Scalar C[kMaxMixedConstraints * kMaxStateDimension]{};
-  Scalar D[kMaxMixedConstraints * kMaxControlDimension]{};
-  Scalar d[kMaxMixedConstraints]{};
-  Scalar E[kMaxStateConstraints * kMaxStateDimension]{};
-  Scalar e[kMaxStateConstraints]{};
+  int n;
+  int next_n;
+  int m;
+  int mixed;
+  int state;
+  const Scalar *A;
+  const Scalar *B;
+  const Scalar *c;
+  const Scalar *Q;
+  const Scalar *R;
+  const Scalar *M;
+  const Scalar *q;
+  const Scalar *r;
+  const Scalar *C;
+  const Scalar *D;
+  const Scalar *d;
+  const Scalar *E;
+  const Scalar *e;
 };
 
 struct PackedTerminal {
-  int n = 0;
-  int state = 0;
-  Scalar Q[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar q[kMaxStateDimension]{};
-  Scalar E[kMaxStateConstraints * kMaxStateDimension]{};
-  Scalar e[kMaxStateConstraints]{};
+  int n;
+  int state;
+  const Scalar *Q;
+  const Scalar *q;
+  const Scalar *E;
+  const Scalar *e;
 };
 
 // A relation L*x + R*y = h. Only rows, left_dim, and right_dim are active.
 struct Relation {
-  int left_dim = 0;
-  int right_dim = 0;
-  int rows = 0;
-  Scalar left[kMaxRelationRows * kMaxStateDimension]{};
-  Scalar right[kMaxRelationRows * kMaxStateDimension]{};
-  Scalar rhs[kMaxRelationRows]{};
+  static constexpr int kMaxDimension = kMaxStateDimension;
+  int left_dim;
+  int right_dim;
+  int rows;
+  Scalar left[kMaxRelationRows * kMaxStateDimension];
+  Scalar right[kMaxRelationRows * kMaxStateDimension];
+  Scalar rhs[kMaxRelationRows];
+};
+
+// Multiplier recovery contracts only the genuinely free components left after
+// enforcing reduced-costate and control-stationarity equations.  Their count
+// can include mixed-multiplier directions, so it has its own endpoint capacity
+// rather than padding or truncating them to the physical state dimension.
+struct DualRelation {
+  static constexpr int kMaxDimension = kMaxDualParameterDimension;
+  int left_dim;
+  int right_dim;
+  int rows;
+  Scalar left[2 * kMaxDualParameterDimension * kMaxDualParameterDimension];
+  Scalar right[2 * kMaxDualParameterDimension * kMaxDualParameterDimension];
+  Scalar rhs[2 * kMaxDualParameterDimension];
 };
 
 // x = T*z + t. The physical and reduced dimensions are carried separately.
 struct StateParam {
-  int physical_dim = 0;
-  int reduced_dim = 0;
-  int free_columns[kMaxStateDimension]{};
-  Scalar T[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar t[kMaxStateDimension]{};
+  int physical_dim;
+  int reduced_dim;
+  int free_columns[kMaxStateDimension];
+  Scalar T[kMaxStateDimension * kMaxStateDimension];
+  Scalar t[kMaxStateDimension];
 };
 
 // u = Y*z + Z*v + y.
 struct ControlParam {
-  int physical_dim = 0;
-  int state_dim = 0;
-  int reduced_dim = 0;
-  int free_columns[kMaxControlDimension]{};
-  Scalar Y[kMaxControlDimension * kMaxStateDimension]{};
-  Scalar Z[kMaxControlDimension * kMaxControlDimension]{};
-  Scalar y[kMaxControlDimension]{};
+  int physical_dim;
+  int state_dim;
+  int reduced_dim;
+  int free_columns[kMaxControlDimension];
+  Scalar Y[kMaxControlDimension * kMaxStateDimension];
+  Scalar Z[kMaxControlDimension * kMaxControlDimension];
+  Scalar y[kMaxControlDimension];
 };
 
 struct ReducedStage {
-  int n = 0;
-  int next_n = 0;
-  int m = 0;
-  Scalar A[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar B[kMaxStateDimension * kMaxControlDimension]{};
-  Scalar c[kMaxStateDimension]{};
-  Scalar Q[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar R[kMaxControlDimension * kMaxControlDimension]{};
-  Scalar M[kMaxStateDimension * kMaxControlDimension]{};
-  Scalar q[kMaxStateDimension]{};
-  Scalar r[kMaxControlDimension]{};
+  int n;
+  int next_n;
+  int m;
+  Scalar A[kMaxStateDimension * kMaxStateDimension];
+  Scalar B[kMaxStateDimension * kMaxControlDimension];
+  Scalar c[kMaxStateDimension];
+  Scalar Q[kMaxStateDimension * kMaxStateDimension];
+  Scalar R[kMaxControlDimension * kMaxControlDimension];
+  Scalar M[kMaxStateDimension * kMaxControlDimension];
+  Scalar q[kMaxStateDimension];
+  Scalar r[kMaxControlDimension];
 };
 
 struct ReducedTerminal {
-  int n = 0;
-  Scalar Q[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar q[kMaxStateDimension]{};
+  int n;
+  Scalar Q[kMaxStateDimension * kMaxStateDimension];
+  Scalar q[kMaxStateDimension];
 };
 
 // Associative conditional-value element for an interval. J and eta live at
 // the left endpoint; C and b live at the right endpoint; A maps left to right.
 struct ValueElement {
-  int left_dim = 0;
-  int right_dim = 0;
-  Scalar A[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar b[kMaxStateDimension]{};
-  Scalar C[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar eta[kMaxStateDimension]{};
-  Scalar J[kMaxStateDimension * kMaxStateDimension]{};
+  int left_dim;
+  int right_dim;
+  Scalar A[kMaxStateDimension * kMaxStateDimension];
+  Scalar b[kMaxStateDimension];
+  Scalar C[kMaxStateDimension * kMaxStateDimension];
+  Scalar eta[kMaxStateDimension];
+  Scalar J[kMaxStateDimension * kMaxStateDimension];
 };
 
 struct Feedback {
-  int state_dim = 0;
-  int next_state_dim = 0;
-  int control_dim = 0;
-  Scalar K[kMaxControlDimension * kMaxStateDimension]{};
-  Scalar k[kMaxControlDimension]{};
-  Scalar transition[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar offset[kMaxStateDimension]{};
+  int state_dim;
+  int next_state_dim;
+  int control_dim;
+  Scalar K[kMaxControlDimension * kMaxStateDimension];
+  Scalar k[kMaxControlDimension];
+  Scalar transition[kMaxStateDimension * kMaxStateDimension];
+  Scalar offset[kMaxStateDimension];
 };
 
 struct AffineMap {
-  int left_dim = 0;
-  int right_dim = 0;
-  Scalar linear[kMaxStateDimension * kMaxStateDimension]{};
-  Scalar offset[kMaxStateDimension]{};
+  int left_dim;
+  int right_dim;
+  Scalar linear[kMaxStateDimension * kMaxStateDimension];
+  Scalar offset[kMaxStateDimension];
 };
 
-struct NodeValue {
-  int left_dim = 0;
-  int right_dim = 0;
-  Scalar left[kMaxStateDimension]{};
-  Scalar right[kMaxStateDimension]{};
+struct DualNodeValue {
+  int left_dim;
+  int right_dim;
+  Scalar left[kMaxDualParameterDimension];
+  Scalar right[kMaxDualParameterDimension];
+};
+
+// [y_i; lambda_i] = offset + basis * s_i, where y_i is the physical
+// dynamics multiplier and lambda_i is the stage mixed-equality multiplier.
+// Only physical_dim-by-free_dim entries of basis are active.
+struct DualParam {
+  int state_dim;
+  int mixed_dim;
+  int physical_dim;
+  int free_dim;
+  int free_columns[kMaxDualParameterDimension];
+  Scalar basis[kMaxDualParameterDimension * kMaxDualParameterDimension];
+  Scalar offset[kMaxDualParameterDimension];
+};
+
+// State-only multiplier at node i as an affine function of the free dual
+// coordinates on the adjacent stages.  It is obtained from the same RREF that
+// emits the residual relation, so recovery does not refactor E_i^T.
+struct StateDualParam {
+  int constraint_dim;
+  int left_dim;
+  int right_dim;
+  Scalar offset[kMaxStateConstraints];
+  Scalar left[kMaxStateConstraints * kMaxDualParameterDimension];
+  Scalar right[kMaxStateConstraints * kMaxDualParameterDimension];
 };
 
 enum DeviceCode : int {
@@ -148,9 +194,9 @@ enum DeviceCode : int {
 };
 
 struct DeviceStatus {
-  int code = kDeviceOk;
-  int stage = -1;
-  int detail = 0;
+  int code;
+  int stage;
+  int detail;
 };
 
 } // namespace detail

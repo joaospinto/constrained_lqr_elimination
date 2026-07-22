@@ -101,10 +101,11 @@ build-cuda/clqr_cuda_benchmark
 ```
 
 For FP32, configure a distinct directory with `-DCLQR_PRECISION=FP32`.
-The four `CLQR_CUDA_MAX_*` CMake settings can reduce the state, control, mixed-constraint,
-and state-constraint capacities from their defaults of 16. These settings change the CUDA ABI;
-choosing the smallest valid application envelope reduces transfers, global storage, shared
-memory, and register pressure without changing the algorithm.
+The four `CLQR_CUDA_MAX_*` CMake settings bound the state, control, mixed-constraint,
+and state-constraint dimensions (all default to 8). These settings change the CUDA ABI and
+determine the kernels' shared-memory envelope. Problem data, trajectories, and multipliers are
+stored compactly using each stage's active dimensions; choosing a tighter envelope further
+reduces shared memory and register pressure without padding the numerical work.
 
 The CUDA test compares states, controls, and objective values against the existing C++ solver,
 then checks the complete primal-dual KKT residual. It covers unconstrained, state-only, mixed,

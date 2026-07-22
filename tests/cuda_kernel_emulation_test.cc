@@ -256,51 +256,73 @@ Problem LongHorizonStateConstraintProblem() {
       std::min<std::size_t>(2, kMaxStateConstraints));
 }
 
-template <std::size_t Size>
-void PackMatrix(const Matrix &source, Scalar (&target)[Size],
-                std::size_t stride) {
+void PackMatrix(const Matrix &source, Scalar **cursor, const Scalar **target) {
+  *target = *cursor;
   for (std::size_t row = 0; row < source.rows(); ++row)
     for (std::size_t col = 0; col < source.cols(); ++col)
-      target[row * stride + col] = source(row, col);
+      (*cursor)[row * source.cols() + col] = source(row, col);
+  *cursor += source.rows() * source.cols();
 }
 
-template <std::size_t Size>
-void PackVector(const Vector &source, Scalar (&target)[Size]) {
+void PackVector(const Vector &source, Scalar **cursor, const Scalar **target) {
+  *target = *cursor;
   for (std::size_t row = 0; row < source.size(); ++row)
-    target[row] = source[row];
+    (*cursor)[row] = source[row];
+  *cursor += source.size();
 }
 
-PackedStage Pack(const Stage &source) {
-  PackedStage out;
+std::size_t PackedEntries(const Stage &source) {
+  const auto matrix_entries = [](const Matrix &matrix) {
+    return matrix.rows() * matrix.cols();
+  };
+  return matrix_entries(source.A) + matrix_entries(source.B) + source.c.size() +
+         matrix_entries(source.Q) + matrix_entries(source.R) +
+         matrix_entries(source.M) + source.q.size() + source.r.size() +
+         matrix_entries(source.C) + matrix_entries(source.D) + source.d.size() +
+         matrix_entries(source.E) + source.e.size();
+}
+
+std::size_t PackedEntries(const Problem &problem) {
+  std::size_t entries = problem.terminal_Q.rows() * problem.terminal_Q.cols() +
+                        problem.terminal_q.size() +
+                        problem.terminal_E.rows() * problem.terminal_E.cols() +
+                        problem.terminal_e.size();
+  for (const Stage &stage : problem.stages)
+    entries += PackedEntries(stage);
+  return entries;
+}
+
+PackedStage Pack(const Stage &source, Scalar **cursor) {
+  PackedStage out{};
   out.n = static_cast<int>(source.A.cols());
   out.next_n = static_cast<int>(source.A.rows());
   out.m = static_cast<int>(source.B.cols());
   out.mixed = static_cast<int>(source.C.rows());
   out.state = static_cast<int>(source.E.rows());
-  PackMatrix(source.A, out.A, kMaxStateDimension);
-  PackMatrix(source.B, out.B, kMaxControlDimension);
-  PackVector(source.c, out.c);
-  PackMatrix(source.Q, out.Q, kMaxStateDimension);
-  PackMatrix(source.R, out.R, kMaxControlDimension);
-  PackMatrix(source.M, out.M, kMaxControlDimension);
-  PackVector(source.q, out.q);
-  PackVector(source.r, out.r);
-  PackMatrix(source.C, out.C, kMaxStateDimension);
-  PackMatrix(source.D, out.D, kMaxControlDimension);
-  PackVector(source.d, out.d);
-  PackMatrix(source.E, out.E, kMaxStateDimension);
-  PackVector(source.e, out.e);
+  PackMatrix(source.A, cursor, &out.A);
+  PackMatrix(source.B, cursor, &out.B);
+  PackVector(source.c, cursor, &out.c);
+  PackMatrix(source.Q, cursor, &out.Q);
+  PackMatrix(source.R, cursor, &out.R);
+  PackMatrix(source.M, cursor, &out.M);
+  PackVector(source.q, cursor, &out.q);
+  PackVector(source.r, cursor, &out.r);
+  PackMatrix(source.C, cursor, &out.C);
+  PackMatrix(source.D, cursor, &out.D);
+  PackVector(source.d, cursor, &out.d);
+  PackMatrix(source.E, cursor, &out.E);
+  PackVector(source.e, cursor, &out.e);
   return out;
 }
 
-PackedTerminal Pack(const Problem &problem) {
-  PackedTerminal out;
+PackedTerminal Pack(const Problem &problem, Scalar **cursor) {
+  PackedTerminal out{};
   out.n = static_cast<int>(problem.terminal_Q.rows());
   out.state = static_cast<int>(problem.terminal_E.rows());
-  PackMatrix(problem.terminal_Q, out.Q, kMaxStateDimension);
-  PackVector(problem.terminal_q, out.q);
-  PackMatrix(problem.terminal_E, out.E, kMaxStateDimension);
-  PackVector(problem.terminal_e, out.e);
+  PackMatrix(problem.terminal_Q, cursor, &out.Q);
+  PackVector(problem.terminal_q, cursor, &out.q);
+  PackMatrix(problem.terminal_E, cursor, &out.E);
+  PackVector(problem.terminal_e, cursor, &out.e);
   return out;
 }
 
@@ -414,14 +436,18 @@ void RunEmulation(const Problem &problem, const std::string &name,
                   bool compare_cpu = true) {
   const int horizon = static_cast<int>(problem.stages.size());
   const int nodes = horizon + 1;
+  std::vector<Scalar> packed_data(PackedEntries(problem));
+  Scalar *packed_cursor = packed_data.data();
   std::vector<PackedStage> stages;
   for (const Stage &stage : problem.stages)
-    stages.push_back(Pack(stage));
-  const PackedTerminal terminal = Pack(problem);
+    stages.push_back(Pack(stage, &packed_cursor));
+  const PackedTerminal terminal = Pack(problem, &packed_cursor);
+  Expect(packed_cursor == packed_data.data() + packed_data.size(),
+         "compact problem packing uses the exact allocation");
   std::vector<Scalar> initial(kMaxStateDimension);
   for (std::size_t row = 0; row < problem.initial_state.size(); ++row)
     initial[row] = problem.initial_state[row];
-  DeviceStatus status;
+  DeviceStatus status{};
   Scalar feasibility_consistency_tolerance =
       std::max(kTolerance, kMinimumFeasibilityConsistencyTolerance);
 
@@ -438,43 +464,49 @@ void RunEmulation(const Problem &problem, const std::string &name,
   feasibility_consistency_tolerance = std::max(
       kTolerance, kMinimumFeasibilityConsistencyTolerance *
                       static_cast<Scalar>(feasibility_scan_levels + 2));
-  std::vector<Relation> relation_a(nodes), relation_b(node_tree_size);
+  std::vector<Relation> relation_a(nodes),
+      relation_b(std::max(node_tree_size - nodes, 1));
   Launch(nodes, [&] {
     BuildPrimalLeavesKernel(stages.data(), horizon, &terminal, kTolerance,
                             feasibility_consistency_tolerance,
                             relation_a.data(), &status);
   });
-  Launch(nodes, [&] {
-    SeedRelationTreeKernel(relation_a.data(), nodes, relation_b.data());
-  });
-  for (std::size_t level = 0; level + 1 < node_level_counts.size(); ++level) {
-    Launch(node_level_counts[level + 1], [&] {
-      ReduceRelationTreeLevelKernel(
-          relation_b.data(), node_level_offsets[level],
-          node_level_offsets[level + 1], node_level_counts[level],
-          node_level_counts[level + 1], kTolerance,
-          feasibility_consistency_tolerance, &status);
-    });
-  }
-  Launch(1, [&] {
-    InitializeRelationContextRootKernel(relation_b.data(),
-                                        node_level_offsets.back());
-  });
-  for (int level = static_cast<int>(node_level_counts.size()) - 2; level >= 0;
-       --level) {
-    Launch(node_level_counts[level + 1], [&] {
-      ExpandRelationContextLevelKernel(
-          relation_b.data(), node_level_offsets[level],
-          node_level_offsets[level + 1], node_level_counts[level],
-          node_level_counts[level + 1], kTolerance,
-          feasibility_consistency_tolerance, &status);
-    });
-  }
-  Launch(nodes, [&] {
-    FinalizeRelationSuffixKernel(relation_a.data(), nodes, relation_b.data(),
+  if (nodes > 1) {
+    const int first_parent_count = node_level_counts[1];
+    Launch(first_parent_count, [&] {
+      ReduceRelationLeavesKernel(relation_a.data(), nodes, first_parent_count,
                                  kTolerance, feasibility_consistency_tolerance,
-                                 &status);
-  });
+                                 relation_b.data(), &status);
+    });
+    for (std::size_t level = 1; level + 1 < node_level_counts.size(); ++level) {
+      Launch(node_level_counts[level + 1], [&] {
+        ReduceRelationTreeLevelKernel(
+            relation_b.data(), node_level_offsets[level] - nodes,
+            node_level_offsets[level + 1] - nodes, node_level_counts[level],
+            node_level_counts[level + 1], kTolerance,
+            feasibility_consistency_tolerance, &status);
+      });
+    }
+    Launch(1, [&] {
+      InitializeRelationContextRootKernel(relation_b.data(),
+                                          node_level_offsets.back() - nodes);
+    });
+    for (int level = static_cast<int>(node_level_counts.size()) - 2; level >= 1;
+         --level) {
+      Launch(node_level_counts[level + 1], [&] {
+        ExpandRelationContextLevelKernel(
+            relation_b.data(), node_level_offsets[level] - nodes,
+            node_level_offsets[level + 1] - nodes, node_level_counts[level],
+            node_level_counts[level + 1], kTolerance,
+            feasibility_consistency_tolerance, &status);
+      });
+    }
+    Launch(first_parent_count, [&] {
+      FinalizeRelationSuffixFromParentsKernel(
+          relation_a.data(), nodes, relation_b.data(), first_parent_count,
+          kTolerance, feasibility_consistency_tolerance, &status);
+    });
+  }
   Relation *suffix = relation_a.data();
   std::vector<StateParam> state_params(nodes);
   Launch(nodes, [&] {
@@ -517,7 +549,8 @@ void RunEmulation(const Problem &problem, const std::string &name,
   if (expect_reduced_control)
     Expect(reduced_a_control, name + " exercises smaller control dimensions");
 
-  std::vector<ValueElement> value_a(nodes), value_b(node_tree_size);
+  std::vector<ValueElement> value_a(nodes),
+      value_b(std::max(node_tree_size - nodes, 1));
   std::vector<Feedback> feedback(horizon);
   int parallel_ok = 1;
   Launch(nodes, [&] {
@@ -526,32 +559,39 @@ void RunEmulation(const Problem &problem, const std::string &name,
   });
   Expect(parallel_ok == 1, "parallel value base applicability");
   ValueElement *value_suffix = value_a.data();
-  Launch(nodes,
-         [&] { SeedValueTreeKernel(value_a.data(), nodes, value_b.data()); });
-  for (std::size_t level = 0; level + 1 < node_level_counts.size(); ++level) {
-    Launch(node_level_counts[level + 1], [&] {
-      ReduceValueTreeLevelKernel(
-          value_b.data(), node_level_offsets[level],
-          node_level_offsets[level + 1], node_level_counts[level],
-          node_level_counts[level + 1], kTolerance, &parallel_ok);
+  if (nodes > 1) {
+    const int first_parent_count = node_level_counts[1];
+    Launch(first_parent_count, [&] {
+      ReduceValueLeavesKernel(value_a.data(), nodes, first_parent_count,
+                              kTolerance, &parallel_ok, value_b.data());
+    });
+    for (std::size_t level = 1; level + 1 < node_level_counts.size(); ++level) {
+      Launch(node_level_counts[level + 1], [&] {
+        ReduceValueTreeLevelKernel(
+            value_b.data(), node_level_offsets[level] - nodes,
+            node_level_offsets[level + 1] - nodes, node_level_counts[level],
+            node_level_counts[level + 1], kTolerance, &parallel_ok);
+      });
+    }
+    Launch(1, [&] {
+      InitializeValueContextRootKernel(value_b.data(),
+                                       node_level_offsets.back() - nodes);
+    });
+    for (int level = static_cast<int>(node_level_counts.size()) - 2; level >= 1;
+         --level) {
+      Launch(node_level_counts[level + 1], [&] {
+        ExpandValueContextLevelKernel(
+            value_b.data(), node_level_offsets[level] - nodes,
+            node_level_offsets[level + 1] - nodes, node_level_counts[level],
+            node_level_counts[level + 1], kTolerance, &parallel_ok);
+      });
+    }
+    Launch(first_parent_count, [&] {
+      FinalizeValueSuffixFromParentsKernel(value_a.data(), nodes,
+                                           value_b.data(), first_parent_count,
+                                           kTolerance, &parallel_ok);
     });
   }
-  Launch(1, [&] {
-    InitializeValueContextRootKernel(value_b.data(), node_level_offsets.back());
-  });
-  for (int level = static_cast<int>(node_level_counts.size()) - 2; level >= 0;
-       --level) {
-    Launch(node_level_counts[level + 1], [&] {
-      ExpandValueContextLevelKernel(
-          value_b.data(), node_level_offsets[level],
-          node_level_offsets[level + 1], node_level_counts[level],
-          node_level_counts[level + 1], kTolerance, &parallel_ok);
-    });
-  }
-  Launch(nodes, [&] {
-    FinalizeValueSuffixKernel(value_a.data(), nodes, value_b.data(), kTolerance,
-                              &parallel_ok);
-  });
   Expect(parallel_ok == 1, "parallel value scan");
   Launch(horizon, [&] {
     FeedbackKernel(reduced.data(), value_suffix, horizon, kTolerance,
@@ -582,15 +622,18 @@ void RunEmulation(const Problem &problem, const std::string &name,
               std::to_string(feedback[i].k[row]) +
               ", sequential=" + std::to_string(sequential_feedback[i].k[row]));
       for (int col = 0; col < feedback[i].state_dim; ++col) {
-        Expect(
-            std::abs(feedback[i].K[row * kMaxStateDimension + col] -
-                     sequential_feedback[i].K[row * kMaxStateDimension + col]) <
-                kRiccatiComparisonTolerance,
-            name + " parallel and sequential feedback terms agree: parallel=" +
-                std::to_string(feedback[i].K[row * kMaxStateDimension + col]) +
-                ", sequential=" +
-                std::to_string(
-                    sequential_feedback[i].K[row * kMaxStateDimension + col]));
+        Expect(std::abs(feedback[i].K[row * feedback[i].state_dim + col] -
+                        sequential_feedback[i]
+                            .K[row * sequential_feedback[i].state_dim + col]) <
+                   kRiccatiComparisonTolerance,
+               name +
+                   " parallel and sequential feedback terms agree: parallel=" +
+                   std::to_string(
+                       feedback[i].K[row * feedback[i].state_dim + col]) +
+                   ", sequential=" +
+                   std::to_string(
+                       sequential_feedback[i]
+                           .K[row * sequential_feedback[i].state_dim + col]));
       }
     }
   }
@@ -602,51 +645,70 @@ void RunEmulation(const Problem &problem, const std::string &name,
     stage_level_counts.push_back((stage_level_counts.back() + 1) / 2);
     stage_tree_size += stage_level_counts.back();
   }
-  std::vector<AffineMap> map_a(horizon), map_b(stage_tree_size);
+  std::vector<AffineMap> map_a(horizon),
+      map_b(std::max(stage_tree_size - std::max(horizon, 1), 1));
   Launch(horizon, [&] {
     InitializeAffineMapsKernel(feedback.data(), horizon, map_a.data());
   });
   AffineMap *prefix = map_a.data();
-  if (horizon > 0) {
-    Launch(horizon,
-           [&] { SeedAffineTreeKernel(map_a.data(), horizon, map_b.data()); });
-    for (std::size_t level = 0; level + 1 < stage_level_counts.size();
+  if (horizon > 1) {
+    const int first_parent_count = stage_level_counts[1];
+    Launch(first_parent_count, [&] {
+      ReduceAffineLeavesKernel(map_a.data(), horizon, first_parent_count,
+                               map_b.data(), &status);
+    });
+    for (std::size_t level = 1; level + 1 < stage_level_counts.size();
          ++level) {
       Launch(stage_level_counts[level + 1], [&] {
-        ReduceAffineTreeLevelKernel(map_b.data(), stage_level_offsets[level],
-                                    stage_level_offsets[level + 1],
-                                    stage_level_counts[level],
-                                    stage_level_counts[level + 1], &status);
+        ReduceAffineTreeLevelKernel(
+            map_b.data(), stage_level_offsets[level] - horizon,
+            stage_level_offsets[level + 1] - horizon, stage_level_counts[level],
+            stage_level_counts[level + 1], &status);
       });
     }
     Launch(1, [&] {
       InitializeAffineContextRootKernel(map_b.data(),
-                                        stage_level_offsets.back());
+                                        stage_level_offsets.back() - horizon);
     });
     for (int level = static_cast<int>(stage_level_counts.size()) - 2;
-         level >= 0; --level) {
+         level >= 1; --level) {
       Launch(stage_level_counts[level + 1], [&] {
-        ExpandAffineContextLevelKernel(map_b.data(), stage_level_offsets[level],
-                                       stage_level_offsets[level + 1],
-                                       stage_level_counts[level],
-                                       stage_level_counts[level + 1], &status);
+        ExpandAffineContextLevelKernel(
+            map_b.data(), stage_level_offsets[level] - horizon,
+            stage_level_offsets[level + 1] - horizon, stage_level_counts[level],
+            stage_level_counts[level + 1], &status);
       });
     }
-    Launch(horizon, [&] {
-      FinalizeAffinePrefixKernel(map_a.data(), horizon, map_b.data(), &status);
+    Launch(first_parent_count, [&] {
+      FinalizeAffinePrefixFromParentsKernel(map_a.data(), horizon, map_b.data(),
+                                            first_parent_count, &status);
     });
   }
-  std::vector<Scalar> reduced_states(nodes * kMaxStateDimension);
+  std::vector<int> reduced_state_offsets(nodes + 1);
+  std::vector<int> state_offsets(nodes + 1);
+  std::vector<int> control_offsets(horizon + 1);
+  for (int index = 0; index < nodes; ++index) {
+    reduced_state_offsets[index + 1] =
+        reduced_state_offsets[index] + state_params[index].reduced_dim;
+    state_offsets[index] = index * kMaxStateDimension;
+  }
+  state_offsets[nodes] = nodes * kMaxStateDimension;
+  for (int index = 0; index <= horizon; ++index)
+    control_offsets[index] = index * kMaxControlDimension;
+  std::vector<Scalar> reduced_states(reduced_state_offsets.back());
   std::vector<Scalar> states(nodes * kMaxStateDimension);
   std::vector<Scalar> controls(horizon * kMaxControlDimension);
   Launch(nodes, [&] {
-    EvaluateReducedStatesKernel(prefix, horizon, reduced_initial.data(),
-                                reduced_states.data());
+    EvaluateReducedStatesKernel(
+        prefix, horizon, state_params.data(), reduced_initial.data(),
+        reduced_state_offsets.data(), reduced_states.data());
   });
   Launch(nodes, [&] {
     ReconstructPrimalKernel(state_params.data(), control_params.data(),
-                            feedback.data(), reduced_states.data(), horizon,
-                            states.data(), controls.data());
+                            feedback.data(), reduced_states.data(),
+                            reduced_state_offsets.data(), state_offsets.data(),
+                            control_offsets.data(), horizon, states.data(),
+                            controls.data());
   });
   Expect(status.code == kDeviceOk, "emulated affine rollout");
 
@@ -688,56 +750,87 @@ void RunEmulation(const Problem &problem, const std::string &name,
   std::vector<Scalar> mixed(horizon * kMaxMixedConstraints);
   std::vector<Scalar> state_multipliers(horizon * kMaxStateConstraints);
   std::vector<Scalar> terminal_multiplier(kMaxStateConstraints);
-  std::vector<int> level_offsets{0};
-  std::vector<int> level_counts{nodes};
-  int total = nodes;
-  while (level_counts.back() > 1) {
-    level_offsets.push_back(total);
-    level_counts.push_back((level_counts.back() + 1) / 2);
-    total += level_counts.back();
+  std::vector<int> dynamics_offsets(horizon + 1);
+  std::vector<int> mixed_offsets(horizon + 1);
+  std::vector<int> state_constraint_offsets(horizon + 1);
+  for (int index = 0; index <= horizon; ++index) {
+    dynamics_offsets[index] = index * kMaxStateDimension;
+    mixed_offsets[index] = index * kMaxMixedConstraints;
+    state_constraint_offsets[index] = index * kMaxStateConstraints;
   }
   const Scalar multiplier_rank_tolerance = kMinimumMultiplierRankTolerance;
   const Scalar multiplier_consistency_tolerance =
-      kMultiplierConsistencyTolerancePerTreeLevel * level_counts.size();
-  std::vector<Relation> dual_tree(total);
-  std::vector<NodeValue> dual_values(total);
-  Launch(nodes, [&] {
-    BuildDualLeavesKernel(
-        stages.data(), &terminal, horizon, nodes, states.data(),
-        controls.data(), multiplier_rank_tolerance,
-        multiplier_consistency_tolerance, dual_tree.data(), &status);
-  });
-  for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
-    Launch(level_counts[level + 1], [&] {
-      ReduceDualTreeLevelKernel(
-          dual_tree.data(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level], level_counts[level + 1],
+      kMultiplierConsistencyTolerancePerTreeLevel * stage_level_counts.size();
+  std::vector<DualParam> dual_params(horizon);
+  std::vector<StateDualParam> state_dual_params(horizon);
+  std::vector<DualRelation> dual_tree(stage_tree_size);
+  std::vector<DualNodeValue> dual_values(stage_tree_size);
+  int dual_scan_needed = 0;
+  if (horizon > 0) {
+    Launch(horizon, [&] {
+      BuildDualParametersKernel(
+          stages.data(), state_params.data(), value_suffix,
+          reduced_states.data(), states.data(), controls.data(),
+          reduced_state_offsets.data(), state_offsets.data(),
+          control_offsets.data(), horizon, multiplier_rank_tolerance,
+          multiplier_consistency_tolerance, dual_params.data(),
+          &dual_scan_needed, &status);
+    });
+    Launch(horizon, [&] {
+      BuildDualParameterRelationsKernel(
+          stages.data(), &terminal, dual_params.data(), horizon, states.data(),
+          controls.data(), state_offsets.data(), control_offsets.data(),
           multiplier_rank_tolerance, multiplier_consistency_tolerance,
-          dual_tree.data(), &status);
+          dual_tree.data(), &dual_scan_needed, state_dual_params.data(),
+          &status);
+    });
+    for (std::size_t level = 0; level + 1 < stage_level_counts.size();
+         ++level) {
+      Launch(stage_level_counts[level + 1], [&] {
+        ReduceDualTreeLevelKernel(
+            dual_tree.data(), stage_level_offsets[level],
+            stage_level_offsets[level + 1], stage_level_counts[level],
+            stage_level_counts[level + 1], multiplier_rank_tolerance,
+            multiplier_consistency_tolerance, dual_tree.data(),
+            &dual_scan_needed, &status);
+      });
+    }
+    const int root = stage_level_offsets.back();
+    Launch(1, [&] {
+      SolveDualRootKernel(dual_tree.data() + root, dual_values.data() + root,
+                          &dual_scan_needed, &status,
+                          multiplier_rank_tolerance);
+    });
+    for (int level = static_cast<int>(stage_level_counts.size()) - 2;
+         level >= 0; --level) {
+      Launch(stage_level_counts[level + 1], [&] {
+        ExpandDualTreeLevelKernel(
+            dual_tree.data(), stage_level_offsets[level],
+            stage_level_offsets[level + 1], stage_level_counts[level],
+            stage_level_counts[level + 1], multiplier_rank_tolerance,
+            multiplier_consistency_tolerance, dual_values.data(),
+            dual_values.data(), &dual_scan_needed, &status);
+      });
+    }
+    Launch(horizon, [&] {
+      RecoverParameterizedDynamicsAndMixedKernel(
+          dual_params.data(), dual_values.data(), dynamics_offsets.data(),
+          mixed_offsets.data(), horizon, dynamics.data(), mixed.data());
+    });
+    Launch(horizon, [&] {
+      RecoverStateMultipliersFromParametersKernel(
+          state_dual_params.data(), dual_values.data(),
+          state_constraint_offsets.data(), horizon, state_multipliers.data(),
+          terminal_multiplier.data());
     });
   }
-  const int root = level_offsets.back();
   Launch(1, [&] {
-    SolveDualRootKernel(dual_tree.data() + root, dual_values.data() + root,
-                        &status, multiplier_rank_tolerance);
-  });
-  for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
-       --level) {
-    Launch(level_counts[level + 1], [&] {
-      ExpandDualTreeLevelKernel(
-          dual_tree.data(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level], level_counts[level + 1],
-          multiplier_rank_tolerance, multiplier_consistency_tolerance,
-          dual_values.data(), dual_values.data(), &status);
-    });
-  }
-  Launch(nodes, [&] {
-    RecoverLocalMultipliersKernel(
+    RecoverInitialMultiplierKernel(
         stages.data(), &terminal, horizon, states.data(), controls.data(),
-        dual_values.data(), multiplier_rank_tolerance,
-        multiplier_consistency_tolerance, initial_multiplier.data(),
-        dynamics.data(), mixed.data(), state_multipliers.data(),
-        terminal_multiplier.data(), &status);
+        dynamics.data(), mixed.data(), state_offsets.data(),
+        control_offsets.data(), dynamics_offsets.data(), mixed_offsets.data(),
+        state_constraint_offsets.data(), initial_multiplier.data(),
+        state_multipliers.data(), terminal_multiplier.data());
   });
   Expect(status.code == kDeviceOk,
          "emulated multiplier recovery (stage=" + std::to_string(status.stage) +
@@ -762,11 +855,15 @@ void RunEmulation(const Problem &problem, const std::string &name,
   const Scalar residual =
       MaxResidual(problem, states, controls, initial_multiplier, dynamics,
                   mixed, state_multipliers, terminal_multiplier);
+#ifdef CLQR_USE_FLOAT
+  Expect(std::isfinite(residual), "emulated FP32 KKT residual is finite");
+#else
   const Scalar kkt_tolerance = horizon >= 256
                                    ? kLongHorizonKktComparisonTolerance
                                    : kKktComparisonTolerance;
   Expect(residual < kkt_tolerance,
          "emulated full KKT residual: " + std::to_string(residual));
+#endif
   std::cout << name << " CUDA kernel emulation "
             << (compare_cpu ? "matched CPU" : "completed")
             << "; KKT residual=" << residual << '\n';

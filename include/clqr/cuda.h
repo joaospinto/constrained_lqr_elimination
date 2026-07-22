@@ -50,22 +50,20 @@ struct Solution {
   Timings timings;
 };
 
-// Capacities are compile-time parameters because they determine the public
-// CUDA ABI and each kernel's fixed local/shared storage. CMake defaults all of
-// them to 16; smaller application-specific builds substantially reduce memory
-// traffic and increase occupancy while still carrying each stage's active
-// dimensions at run time.
+// Capacities are compile-time parameters because they bound each kernel's
+// small dense shared-memory workspace. Global problem and trajectory buffers
+// are packed using the active dimensions of every individual stage.
 #ifndef CLQR_CUDA_MAX_STATE_DIMENSION
-#define CLQR_CUDA_MAX_STATE_DIMENSION 16
+#define CLQR_CUDA_MAX_STATE_DIMENSION 8
 #endif
 #ifndef CLQR_CUDA_MAX_CONTROL_DIMENSION
-#define CLQR_CUDA_MAX_CONTROL_DIMENSION 16
+#define CLQR_CUDA_MAX_CONTROL_DIMENSION 8
 #endif
 #ifndef CLQR_CUDA_MAX_MIXED_CONSTRAINTS
-#define CLQR_CUDA_MAX_MIXED_CONSTRAINTS 16
+#define CLQR_CUDA_MAX_MIXED_CONSTRAINTS 8
 #endif
 #ifndef CLQR_CUDA_MAX_STATE_CONSTRAINTS
-#define CLQR_CUDA_MAX_STATE_CONSTRAINTS 16
+#define CLQR_CUDA_MAX_STATE_CONSTRAINTS 8
 #endif
 constexpr int kMaxStateDimension = CLQR_CUDA_MAX_STATE_DIMENSION;
 constexpr int kMaxControlDimension = CLQR_CUDA_MAX_CONTROL_DIMENSION;
