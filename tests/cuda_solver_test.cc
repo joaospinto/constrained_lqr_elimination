@@ -255,11 +255,14 @@ double MaxKktResidual(const Problem& problem,
 }
 
 void CompareWithCpu(const Problem& problem, const std::string& name,
-                    bool expect_parallel = true) {
+                    bool expect_parallel = true,
+                    const Problem* cpu_reference_problem = nullptr) {
   std::cout << "case: " << name << std::endl;
+  const Problem& cpu_problem =
+      cpu_reference_problem == nullptr ? problem : *cpu_reference_problem;
   clqr::Workspace workspace;
-  workspace.Reserve(problem);
-  const clqr::SolutionView cpu = clqr::Solve(problem, workspace);
+  workspace.Reserve(cpu_problem);
+  const clqr::SolutionView cpu = clqr::Solve(cpu_problem, workspace);
   const clqr::cuda::Solution gpu = clqr::cuda::Solve(problem);
   Expect(cpu.status == SolveStatus::kOptimal,
          name + " CPU status: " + cpu.message);
@@ -360,8 +363,8 @@ Problem MaximumConstraintProblem() {
   return problem;
 }
 
-Problem RescaledMixedRowsProblem() {
-  Problem problem = GeneratedProblem(120, 4, 4, 2, 3, ConstraintMode::kMixed);
+Problem RescaledMixedRowsProblem(const Problem& unscaled) {
+  Problem problem = unscaled;
   for (Stage& stage : problem.stages) {
     for (std::size_t row = 0; row < stage.C.rows(); ++row) {
       const double scale = row == 0 ? 1e-7 : (row == 2 ? 1e7 : 1.0);
@@ -430,7 +433,12 @@ int main() {
                  "zero control dimension");
   CompareWithCpu(GeneratedProblem(102, 5, 4, 1, 3, ConstraintMode::kMixed),
                  "more mixed rows than controls");
-  CompareWithCpu(RescaledMixedRowsProblem(), "independently rescaled rows");
+  const Problem unscaled_rows =
+      GeneratedProblem(120, 4, 4, 2, 3, ConstraintMode::kMixed);
+  // Keep the CPU reference well scaled so this case specifically tests
+  // whether CUDA rank decisions are invariant to independent row scaling.
+  CompareWithCpu(RescaledMixedRowsProblem(unscaled_rows),
+                 "independently rescaled rows", true, &unscaled_rows);
   CompareWithCpu(MaximumConstraintProblem(), "maximum constraint dimensions");
   InfeasibleCase();
   InvalidDeviceCases();
