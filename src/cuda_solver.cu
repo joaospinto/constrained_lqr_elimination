@@ -190,19 +190,27 @@ __device__ void RrefBlock(Scalar* matrix, int rows, int columns,
 }
 
 __device__ bool InconsistentRref(const Scalar* matrix, int rows, int columns,
-                                 int lhs_columns, Scalar tolerance) {
+                                 int lhs_columns, Scalar lhs_tolerance,
+                                 Scalar rhs_tolerance) {
   for (int row = 0; row < rows; ++row) {
     bool zero = true;
     for (int col = 0; col < lhs_columns; ++col) {
-      if (DeviceAbs(matrix[row * columns + col]) > tolerance) {
+      if (DeviceAbs(matrix[row * columns + col]) > lhs_tolerance) {
         zero = false;
         break;
       }
     }
-    if (zero && DeviceAbs(matrix[row * columns + lhs_columns]) > tolerance)
+    if (zero &&
+        DeviceAbs(matrix[row * columns + lhs_columns]) > rhs_tolerance)
       return true;
   }
   return false;
+}
+
+__device__ bool InconsistentRref(const Scalar* matrix, int rows, int columns,
+                                 int lhs_columns, Scalar tolerance) {
+  return InconsistentRref(matrix, rows, columns, lhs_columns, tolerance,
+                          tolerance);
 }
 
 // RrefBlock normalizes each equation by its largest left-hand-side
@@ -1878,9 +1886,9 @@ __global__ void ExpandDualTreeLevelKernel(
   RrefBlock(matrix, rows, columns, shared, rank_tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(matrix, rows, columns, shared,
-                                 consistency_tolerance *
-                                     conditioned_rhs_scale);
+    local_ok = !InconsistentRref(
+        matrix, rows, columns, shared, consistency_tolerance,
+        consistency_tolerance * conditioned_rhs_scale);
     if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 16);
   }
   __syncthreads();
@@ -1930,6 +1938,7 @@ __global__ void RecoverLocalMultipliersKernel(
   __shared__ int rows;
   __shared__ int variables;
   __shared__ int local_ok;
+  __shared__ Scalar conditioned_rhs_scale;
   __shared__ Scalar
       constraint_scales[kMaxMixedConstraints + kMaxStateConstraints];
   const PackedTerminal& terminal = *terminal_ptr;
@@ -2052,11 +2061,17 @@ __global__ void RecoverLocalMultipliersKernel(
     }
   }
   __syncthreads();
+  if (threadIdx.x == 0) {
+    conditioned_rhs_scale = ConditionedRhsScale(
+        matrix, rows, columns, variables, rank_tolerance);
+  }
+  __syncthreads();
   RrefBlock(matrix, rows, columns, variables, rank_tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(matrix, rows, columns, variables,
-                                 consistency_tolerance);
+    local_ok = !InconsistentRref(
+        matrix, rows, columns, variables, consistency_tolerance,
+        consistency_tolerance * conditioned_rhs_scale);
     if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 17);
   }
   __syncthreads();
