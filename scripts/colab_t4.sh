@@ -10,6 +10,10 @@ fi
 build_root="${CLQR_CUDA_BUILD_DIR:-${notebook_work_dir}/clqr_cuda_build}"
 jax_dir="${CLQR_JAX_DIR:-${notebook_work_dir}/constrained_lqr_jax}"
 cuda_arch="${CLQR_CUDA_ARCH:-75}"
+max_state_dimension="${CLQR_CUDA_MAX_STATE_DIMENSION:-8}"
+max_control_dimension="${CLQR_CUDA_MAX_CONTROL_DIMENSION:-4}"
+max_mixed_constraints="${CLQR_CUDA_MAX_MIXED_CONSTRAINTS:-2}"
+max_state_constraints="${CLQR_CUDA_MAX_STATE_CONSTRAINTS:-2}"
 read -r -a precisions <<< "${CLQR_PRECISIONS:-FP64 FP32}"
 
 if ! command -v nvcc >/dev/null 2>&1; then
@@ -75,12 +79,17 @@ for precision in "${precisions[@]}"; do
   precision_suffix="$(printf '%s' "${precision}" | tr '[:upper:]' '[:lower:]')"
   build_dir="${build_root}_${precision_suffix}"
   echo "=== ${precision} build and tests ==="
+  echo "CUDA capacities: state=${max_state_dimension}, control=${max_control_dimension}, mixed=${max_mixed_constraints}, state constraints=${max_state_constraints}"
   cmake -S "${repo_dir}" -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCLQR_ENABLE_CUDA=ON \
     -DCLQR_BUILD_TESTS=ON \
     -DCLQR_BUILD_BENCHMARKS=ON \
     -DCLQR_PRECISION="${precision}" \
+    -DCLQR_CUDA_MAX_STATE_DIMENSION="${max_state_dimension}" \
+    -DCLQR_CUDA_MAX_CONTROL_DIMENSION="${max_control_dimension}" \
+    -DCLQR_CUDA_MAX_MIXED_CONSTRAINTS="${max_mixed_constraints}" \
+    -DCLQR_CUDA_MAX_STATE_CONSTRAINTS="${max_state_constraints}" \
     -DCMAKE_CUDA_ARCHITECTURES="${cuda_arch}"
   cmake --build "${build_dir}" --parallel 2
   ctest --test-dir "${build_dir}" --output-on-failure

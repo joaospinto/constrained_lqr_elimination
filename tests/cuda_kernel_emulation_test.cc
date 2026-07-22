@@ -35,7 +35,7 @@ constexpr Scalar kKktComparisonTolerance = 2e-7;
 constexpr Scalar kLongHorizonKktComparisonTolerance = 2e-5;
 #endif
 
-void Expect(bool condition, const std::string& message) {
+void Expect(bool condition, const std::string &message) {
   if (!condition) {
     std::cerr << "FAIL: " << message << '\n';
     std::exit(1);
@@ -66,11 +66,12 @@ Vector GeneratedVector(std::size_t size, int seed, Scalar scale) {
 Matrix PositiveDefinite(std::size_t size, int seed, Scalar diagonal) {
   Matrix g = GeneratedMatrix(size, size, seed, 0.18);
   Matrix out = clqr::Transpose(g) * g;
-  for (std::size_t row = 0; row < size; ++row) out(row, row) += diagonal;
+  for (std::size_t row = 0; row < size; ++row)
+    out(row, row) += diagonal;
   return out;
 }
 
-Scalar RowDot(const Matrix& matrix, std::size_t row, const Vector& vector) {
+Scalar RowDot(const Matrix &matrix, std::size_t row, const Vector &vector) {
   Scalar value = 0.0;
   for (std::size_t col = 0; col < vector.size(); ++col)
     value += matrix(row, col) * vector[col];
@@ -92,9 +93,10 @@ Problem MakeProblem() {
   problem.initial_state = x[0];
   problem.stages.resize(horizon);
   for (std::size_t i = 0; i < horizon; ++i) {
-    Stage& stage = problem.stages[i];
+    Stage &stage = problem.stages[i];
     stage.A = GeneratedMatrix(n, n, 300 + static_cast<int>(i), 0.12);
-    for (std::size_t row = 0; row < n; ++row) stage.A(row, row) += 0.8;
+    for (std::size_t row = 0; row < n; ++row)
+      stage.A(row, row) += 0.8;
     stage.B = GeneratedMatrix(n, m, 400 + static_cast<int>(i), 0.22);
     stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
     stage.Q = PositiveDefinite(n, 500 + static_cast<int>(i), 1.0);
@@ -145,9 +147,10 @@ Problem UniformProblem(int seed, std::size_t horizon, std::size_t n,
   problem.initial_state = x.front();
   problem.stages.resize(horizon);
   for (std::size_t i = 0; i < horizon; ++i) {
-    Stage& stage = problem.stages[i];
+    Stage &stage = problem.stages[i];
     stage.A = GeneratedMatrix(n, n, seed + 300 + static_cast<int>(i), 0.08);
-    for (std::size_t row = 0; row < n; ++row) stage.A(row, row) += 0.9;
+    for (std::size_t row = 0; row < n; ++row)
+      stage.A(row, row) += 0.9;
     stage.B = GeneratedMatrix(n, m, seed + 400 + static_cast<int>(i), 0.2);
     stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
     stage.Q = PositiveDefinite(n, seed + 500 + static_cast<int>(i), 1.0);
@@ -184,7 +187,7 @@ Problem ZeroControlStateConstraintProblem() {
   constexpr std::size_t n = 3;
   Problem problem = UniformProblem(seed, horizon, n, 0);
   for (std::size_t i = 0; i < horizon; ++i) {
-    Stage& stage = problem.stages[i];
+    Stage &stage = problem.stages[i];
     const Vector nominal_x =
         GeneratedVector(n, seed + 100 + static_cast<int>(i), 0.5);
     stage.E = GeneratedMatrix(1, n, seed + 1200 + static_cast<int>(i), 0.3);
@@ -195,21 +198,24 @@ Problem ZeroControlStateConstraintProblem() {
 
 Problem MaximumConstraintProblem() {
   constexpr int seed = 1700;
-  constexpr std::size_t dimension = kMaxStateDimension;
-  Problem problem = UniformProblem(seed, 1, dimension, dimension);
-  Stage& stage = problem.stages[0];
-  const Vector nominal_u = GeneratedVector(dimension, seed + 200, 0.4);
-  stage.C = GeneratedMatrix(dimension, dimension, seed + 1200, 0.1);
-  stage.D = clqr::Identity(dimension);
-  stage.d = Vector(dimension);
-  for (std::size_t row = 0; row < dimension; ++row) {
-    stage.d[row] =
-        -(RowDot(stage.C, row, problem.initial_state) + nominal_u[row]);
+  constexpr std::size_t n = kMaxStateDimension;
+  constexpr std::size_t m = kMaxControlDimension;
+  constexpr std::size_t constraints =
+      std::min(kMaxMixedConstraints, kMaxStateConstraints);
+  Problem problem = UniformProblem(seed, 1, n, m);
+  Stage &stage = problem.stages[0];
+  const Vector nominal_u = GeneratedVector(m, seed + 200, 0.4);
+  stage.C = GeneratedMatrix(constraints, n, seed + 1200, 0.1);
+  stage.D = GeneratedMatrix(constraints, m, seed + 1210, 0.1);
+  stage.d = Vector(constraints);
+  for (std::size_t row = 0; row < constraints; ++row) {
+    stage.d[row] = -(RowDot(stage.C, row, problem.initial_state) +
+                     RowDot(stage.D, row, nominal_u));
   }
-  stage.E = clqr::Identity(dimension);
-  stage.e = Vector(dimension);
-  for (std::size_t row = 0; row < dimension; ++row)
-    stage.e[row] = -problem.initial_state[row];
+  stage.E = GeneratedMatrix(constraints, n, seed + 1220, 0.1);
+  stage.e = Vector(constraints);
+  for (std::size_t row = 0; row < constraints; ++row)
+    stage.e[row] = -RowDot(stage.E, row, problem.initial_state);
   return problem;
 }
 
@@ -218,10 +224,10 @@ Problem MoreMixedRowsThanControlsProblem() {
   constexpr std::size_t horizon = 4;
   constexpr std::size_t n = 4;
   constexpr std::size_t m = 1;
-  constexpr std::size_t rows = 3;
+  constexpr std::size_t rows = std::min<std::size_t>(3, kMaxMixedConstraints);
   Problem problem = UniformProblem(seed, horizon, n, m);
   for (std::size_t i = 0; i < horizon; ++i) {
-    Stage& stage = problem.stages[i];
+    Stage &stage = problem.stages[i];
     const Vector nominal_x =
         GeneratedVector(n, seed + 100 + static_cast<int>(i), 0.5);
     const Vector nominal_u =
@@ -230,9 +236,12 @@ Problem MoreMixedRowsThanControlsProblem() {
     stage.D = GeneratedMatrix(rows, m, seed + 1300 + static_cast<int>(i), 0.3);
     stage.d = Vector(rows);
     for (std::size_t row = 0; row < rows; ++row) {
-      const Scalar scale = row == 0 ? 1e-7 : (row == 2 ? 1e7 : 1.0);
-      for (std::size_t col = 0; col < n; ++col) stage.C(row, col) *= scale;
-      for (std::size_t col = 0; col < m; ++col) stage.D(row, col) *= scale;
+      const Scalar scale =
+          rows >= 3 && row == 0 ? 1e-7 : (row == 2 ? 1e7 : 1.0);
+      for (std::size_t col = 0; col < n; ++col)
+        stage.C(row, col) *= scale;
+      for (std::size_t col = 0; col < m; ++col)
+        stage.D(row, col) *= scale;
       stage.d[row] =
           -(RowDot(stage.C, row, nominal_x) + RowDot(stage.D, row, nominal_u));
     }
@@ -241,11 +250,14 @@ Problem MoreMixedRowsThanControlsProblem() {
 }
 
 Problem LongHorizonStateConstraintProblem() {
-  return clqr::benchmark::StateOnlyProblem(16384, 8, 4, 2);
+  return clqr::benchmark::StateOnlyProblem(
+      16384, std::min<std::size_t>(8, kMaxStateDimension),
+      std::min<std::size_t>(4, kMaxControlDimension),
+      std::min<std::size_t>(2, kMaxStateConstraints));
 }
 
 template <std::size_t Size>
-void PackMatrix(const Matrix& source, Scalar (&target)[Size],
+void PackMatrix(const Matrix &source, Scalar (&target)[Size],
                 std::size_t stride) {
   for (std::size_t row = 0; row < source.rows(); ++row)
     for (std::size_t col = 0; col < source.cols(); ++col)
@@ -253,12 +265,12 @@ void PackMatrix(const Matrix& source, Scalar (&target)[Size],
 }
 
 template <std::size_t Size>
-void PackVector(const Vector& source, Scalar (&target)[Size]) {
+void PackVector(const Vector &source, Scalar (&target)[Size]) {
   for (std::size_t row = 0; row < source.size(); ++row)
     target[row] = source[row];
 }
 
-PackedStage Pack(const Stage& source) {
+PackedStage Pack(const Stage &source) {
   PackedStage out;
   out.n = static_cast<int>(source.A.cols());
   out.next_n = static_cast<int>(source.A.rows());
@@ -281,7 +293,7 @@ PackedStage Pack(const Stage& source) {
   return out;
 }
 
-PackedTerminal Pack(const Problem& problem) {
+PackedTerminal Pack(const Problem &problem) {
   PackedTerminal out;
   out.n = static_cast<int>(problem.terminal_Q.rows());
   out.state = static_cast<int>(problem.terminal_E.rows());
@@ -292,8 +304,7 @@ PackedTerminal Pack(const Problem& problem) {
   return out;
 }
 
-template <typename Function>
-void Launch(int blocks, Function function) {
+template <typename Function> void Launch(int blocks, Function function) {
   threadIdx.x = 0;
   blockDim.x = 1;
   gridDim.x = blocks;
@@ -303,22 +314,22 @@ void Launch(int blocks, Function function) {
   }
 }
 
-Scalar MaxResidual(const Problem& problem, const std::vector<Scalar>& states,
-                   const std::vector<Scalar>& controls,
-                   const std::vector<Scalar>& initial_multiplier,
-                   const std::vector<Scalar>& dynamics,
-                   const std::vector<Scalar>& mixed,
-                   const std::vector<Scalar>& state_multipliers,
-                   const std::vector<Scalar>& terminal_multiplier) {
+Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
+                   const std::vector<Scalar> &controls,
+                   const std::vector<Scalar> &initial_multiplier,
+                   const std::vector<Scalar> &dynamics,
+                   const std::vector<Scalar> &mixed,
+                   const std::vector<Scalar> &state_multipliers,
+                   const std::vector<Scalar> &terminal_multiplier) {
   Scalar residual = 0.0;
   const int horizon = static_cast<int>(problem.stages.size());
   for (int i = 0; i < horizon; ++i) {
-    const Stage& s = problem.stages[i];
-    const Scalar* x = states.data() + i * kMaxStateDimension;
-    const Scalar* xp = states.data() + (i + 1) * kMaxStateDimension;
-    const Scalar* u = controls.data() + i * kMaxControlDimension;
-    const Scalar* right = dynamics.data() + i * kMaxStateDimension;
-    const Scalar* left = i == 0
+    const Stage &s = problem.stages[i];
+    const Scalar *x = states.data() + i * kMaxStateDimension;
+    const Scalar *xp = states.data() + (i + 1) * kMaxStateDimension;
+    const Scalar *u = controls.data() + i * kMaxControlDimension;
+    const Scalar *right = dynamics.data() + i * kMaxStateDimension;
+    const Scalar *left = i == 0
                              ? initial_multiplier.data()
                              : dynamics.data() + (i - 1) * kMaxStateDimension;
     for (std::size_t row = 0; row < s.A.rows(); ++row) {
@@ -381,8 +392,8 @@ Scalar MaxResidual(const Problem& problem, const std::vector<Scalar>& states,
       residual = std::max(residual, std::abs(value));
     }
   }
-  const Scalar* terminal = states.data() + horizon * kMaxStateDimension;
-  const Scalar* left =
+  const Scalar *terminal = states.data() + horizon * kMaxStateDimension;
+  const Scalar *left =
       horizon == 0 ? initial_multiplier.data()
                    : dynamics.data() + (horizon - 1) * kMaxStateDimension;
   for (std::size_t row = 0; row < problem.terminal_Q.rows(); ++row) {
@@ -398,13 +409,14 @@ Scalar MaxResidual(const Problem& problem, const std::vector<Scalar>& states,
   return residual;
 }
 
-void RunEmulation(const Problem& problem, const std::string& name,
+void RunEmulation(const Problem &problem, const std::string &name,
                   bool expect_reduced_state, bool expect_reduced_control,
                   bool compare_cpu = true) {
   const int horizon = static_cast<int>(problem.stages.size());
   const int nodes = horizon + 1;
   std::vector<PackedStage> stages;
-  for (const Stage& stage : problem.stages) stages.push_back(Pack(stage));
+  for (const Stage &stage : problem.stages)
+    stages.push_back(Pack(stage));
   const PackedTerminal terminal = Pack(problem);
   std::vector<Scalar> initial(kMaxStateDimension);
   for (std::size_t row = 0; row < problem.initial_state.size(); ++row)
@@ -413,32 +425,65 @@ void RunEmulation(const Problem& problem, const std::string& name,
   Scalar feasibility_consistency_tolerance =
       std::max(kTolerance, kMinimumFeasibilityConsistencyTolerance);
 
-  std::vector<Relation> relation_a(nodes), relation_b(nodes);
+  std::vector<int> node_level_offsets{0};
+  std::vector<int> node_level_counts{nodes};
+  int node_tree_size = nodes;
+  while (node_level_counts.back() > 1) {
+    node_level_offsets.push_back(node_tree_size);
+    node_level_counts.push_back((node_level_counts.back() + 1) / 2);
+    node_tree_size += node_level_counts.back();
+  }
+  const int feasibility_scan_levels =
+      static_cast<int>(node_level_counts.size()) - 1;
+  feasibility_consistency_tolerance = std::max(
+      kTolerance, kMinimumFeasibilityConsistencyTolerance *
+                      static_cast<Scalar>(feasibility_scan_levels + 2));
+  std::vector<Relation> relation_a(nodes), relation_b(node_tree_size);
   Launch(nodes, [&] {
     BuildPrimalLeavesKernel(stages.data(), horizon, &terminal, kTolerance,
                             feasibility_consistency_tolerance,
                             relation_a.data(), &status);
   });
-  Relation* suffix = relation_a.data();
-  Relation* relation_output = relation_b.data();
-  int scan_level = 1;
-  for (int offset = 1; offset < nodes; offset *= 2) {
-    std::fill(relation_output, relation_output + nodes, Relation{});
-    feasibility_consistency_tolerance =
-        std::max(kTolerance, kMinimumFeasibilityConsistencyTolerance *
-                                 static_cast<Scalar>(++scan_level));
-    Launch(nodes, [&] {
-      SuffixRelationsKernel(suffix, nodes, offset, kTolerance,
-                            feasibility_consistency_tolerance, relation_output,
-                            &status);
+  Launch(nodes, [&] {
+    SeedRelationTreeKernel(relation_a.data(), nodes, relation_b.data());
+  });
+  for (std::size_t level = 0; level + 1 < node_level_counts.size(); ++level) {
+    Launch(node_level_counts[level + 1], [&] {
+      ReduceRelationTreeLevelKernel(
+          relation_b.data(), node_level_offsets[level],
+          node_level_offsets[level + 1], node_level_counts[level],
+          node_level_counts[level + 1], kTolerance,
+          feasibility_consistency_tolerance, &status);
     });
-    std::swap(suffix, relation_output);
   }
+  Launch(1, [&] {
+    InitializeRelationContextRootKernel(relation_b.data(),
+                                        node_level_offsets.back());
+  });
+  for (int level = static_cast<int>(node_level_counts.size()) - 2; level >= 0;
+       --level) {
+    Launch(node_level_counts[level + 1], [&] {
+      ExpandRelationContextLevelKernel(
+          relation_b.data(), node_level_offsets[level],
+          node_level_offsets[level + 1], node_level_counts[level],
+          node_level_counts[level + 1], kTolerance,
+          feasibility_consistency_tolerance, &status);
+    });
+  }
+  Launch(nodes, [&] {
+    FinalizeRelationSuffixKernel(relation_a.data(), nodes, relation_b.data(),
+                                 kTolerance, feasibility_consistency_tolerance,
+                                 &status);
+  });
+  Relation *suffix = relation_a.data();
   std::vector<StateParam> state_params(nodes);
   Launch(nodes, [&] {
     StateParamKernel(suffix, nodes, state_params.data(), &status, kTolerance);
   });
-  Expect(status.code == kDeviceOk, "emulated feasibility scan");
+  Expect(status.code == kDeviceOk,
+         name + " emulated feasibility scan (stage=" +
+             std::to_string(status.stage) +
+             ", detail=" + std::to_string(status.detail) + ")");
 
   std::vector<ControlParam> control_params(horizon);
   std::vector<ReducedStage> reduced(horizon);
@@ -463,16 +508,16 @@ void RunEmulation(const Problem& problem, const std::string& name,
              ", detail=" + std::to_string(status.detail) + ")");
   bool reduced_a_state = false;
   bool reduced_a_control = false;
-  for (const StateParam& param : state_params)
+  for (const StateParam &param : state_params)
     reduced_a_state |= param.reduced_dim < param.physical_dim;
-  for (const ControlParam& param : control_params)
+  for (const ControlParam &param : control_params)
     reduced_a_control |= param.reduced_dim < param.physical_dim;
   if (expect_reduced_state)
     Expect(reduced_a_state, name + " exercises smaller state dimensions");
   if (expect_reduced_control)
     Expect(reduced_a_control, name + " exercises smaller control dimensions");
 
-  std::vector<ValueElement> value_a(nodes), value_b(nodes);
+  std::vector<ValueElement> value_a(nodes), value_b(node_tree_size);
   std::vector<Feedback> feedback(horizon);
   int parallel_ok = 1;
   Launch(nodes, [&] {
@@ -480,16 +525,33 @@ void RunEmulation(const Problem& problem, const std::string& name,
                              kTolerance, value_a.data(), &parallel_ok, &status);
   });
   Expect(parallel_ok == 1, "parallel value base applicability");
-  ValueElement* value_suffix = value_a.data();
-  ValueElement* value_output = value_b.data();
-  for (int offset = 1; offset < nodes; offset *= 2) {
-    std::fill(value_output, value_output + nodes, ValueElement{});
-    Launch(nodes, [&] {
-      SuffixValueElementsKernel(value_suffix, nodes, offset, kTolerance,
-                                value_output, &parallel_ok);
+  ValueElement *value_suffix = value_a.data();
+  Launch(nodes,
+         [&] { SeedValueTreeKernel(value_a.data(), nodes, value_b.data()); });
+  for (std::size_t level = 0; level + 1 < node_level_counts.size(); ++level) {
+    Launch(node_level_counts[level + 1], [&] {
+      ReduceValueTreeLevelKernel(
+          value_b.data(), node_level_offsets[level],
+          node_level_offsets[level + 1], node_level_counts[level],
+          node_level_counts[level + 1], kTolerance, &parallel_ok);
     });
-    std::swap(value_suffix, value_output);
   }
+  Launch(1, [&] {
+    InitializeValueContextRootKernel(value_b.data(), node_level_offsets.back());
+  });
+  for (int level = static_cast<int>(node_level_counts.size()) - 2; level >= 0;
+       --level) {
+    Launch(node_level_counts[level + 1], [&] {
+      ExpandValueContextLevelKernel(
+          value_b.data(), node_level_offsets[level],
+          node_level_offsets[level + 1], node_level_counts[level],
+          node_level_counts[level + 1], kTolerance, &parallel_ok);
+    });
+  }
+  Launch(nodes, [&] {
+    FinalizeValueSuffixKernel(value_a.data(), nodes, value_b.data(), kTolerance,
+                              &parallel_ok);
+  });
   Expect(parallel_ok == 1, "parallel value scan");
   Launch(horizon, [&] {
     FeedbackKernel(reduced.data(), value_suffix, horizon, kTolerance,
@@ -532,18 +594,47 @@ void RunEmulation(const Problem& problem, const std::string& name,
       }
     }
   }
-  std::vector<AffineMap> map_a(horizon), map_b(horizon);
+  std::vector<int> stage_level_offsets{0};
+  std::vector<int> stage_level_counts{std::max(horizon, 1)};
+  int stage_tree_size = stage_level_counts.front();
+  while (stage_level_counts.back() > 1) {
+    stage_level_offsets.push_back(stage_tree_size);
+    stage_level_counts.push_back((stage_level_counts.back() + 1) / 2);
+    stage_tree_size += stage_level_counts.back();
+  }
+  std::vector<AffineMap> map_a(horizon), map_b(stage_tree_size);
   Launch(horizon, [&] {
     InitializeAffineMapsKernel(feedback.data(), horizon, map_a.data());
   });
-  AffineMap* prefix = map_a.data();
-  AffineMap* map_output = map_b.data();
-  for (int offset = 1; offset < horizon; offset *= 2) {
-    std::fill(map_output, map_output + horizon, AffineMap{});
-    Launch(horizon, [&] {
-      PrefixAffineMapsKernel(prefix, horizon, offset, map_output, &status);
+  AffineMap *prefix = map_a.data();
+  if (horizon > 0) {
+    Launch(horizon,
+           [&] { SeedAffineTreeKernel(map_a.data(), horizon, map_b.data()); });
+    for (std::size_t level = 0; level + 1 < stage_level_counts.size();
+         ++level) {
+      Launch(stage_level_counts[level + 1], [&] {
+        ReduceAffineTreeLevelKernel(map_b.data(), stage_level_offsets[level],
+                                    stage_level_offsets[level + 1],
+                                    stage_level_counts[level],
+                                    stage_level_counts[level + 1], &status);
+      });
+    }
+    Launch(1, [&] {
+      InitializeAffineContextRootKernel(map_b.data(),
+                                        stage_level_offsets.back());
     });
-    std::swap(prefix, map_output);
+    for (int level = static_cast<int>(stage_level_counts.size()) - 2;
+         level >= 0; --level) {
+      Launch(stage_level_counts[level + 1], [&] {
+        ExpandAffineContextLevelKernel(map_b.data(), stage_level_offsets[level],
+                                       stage_level_offsets[level + 1],
+                                       stage_level_counts[level],
+                                       stage_level_counts[level + 1], &status);
+      });
+    }
+    Launch(horizon, [&] {
+      FinalizeAffinePrefixKernel(map_a.data(), horizon, map_b.data(), &status);
+    });
   }
   std::vector<Scalar> reduced_states(nodes * kMaxStateDimension);
   std::vector<Scalar> states(nodes * kMaxStateDimension);
@@ -564,7 +655,10 @@ void RunEmulation(const Problem& problem, const std::string& name,
   if (compare_cpu) {
     workspace.Reserve(problem);
     cpu = clqr::Solve(problem, workspace);
-    Expect(cpu.status == clqr::SolveStatus::kOptimal, "CPU reference status");
+    Expect(cpu.status == clqr::SolveStatus::kOptimal,
+           name + " CPU reference status=" +
+               std::to_string(static_cast<int>(cpu.status)) +
+               ", message=" + cpu.message);
     for (int i = 0; i < nodes; ++i) {
       for (std::size_t row = 0; row < cpu.states[i].size; ++row) {
         Expect(std::abs(states[i * kMaxStateDimension + row] -
@@ -594,14 +688,12 @@ void RunEmulation(const Problem& problem, const std::string& name,
   std::vector<Scalar> mixed(horizon * kMaxMixedConstraints);
   std::vector<Scalar> state_multipliers(horizon * kMaxStateConstraints);
   std::vector<Scalar> terminal_multiplier(kMaxStateConstraints);
-  int padded = 1;
-  while (padded < nodes) padded *= 2;
   std::vector<int> level_offsets{0};
-  std::vector<int> level_counts{padded};
-  int total = padded;
+  std::vector<int> level_counts{nodes};
+  int total = nodes;
   while (level_counts.back() > 1) {
     level_offsets.push_back(total);
-    level_counts.push_back(level_counts.back() / 2);
+    level_counts.push_back((level_counts.back() + 1) / 2);
     total += level_counts.back();
   }
   const Scalar multiplier_rank_tolerance = kMinimumMultiplierRankTolerance;
@@ -609,9 +701,9 @@ void RunEmulation(const Problem& problem, const std::string& name,
       kMultiplierConsistencyTolerancePerTreeLevel * level_counts.size();
   std::vector<Relation> dual_tree(total);
   std::vector<NodeValue> dual_values(total);
-  Launch(padded, [&] {
+  Launch(nodes, [&] {
     BuildDualLeavesKernel(
-        stages.data(), &terminal, horizon, padded, states.data(),
+        stages.data(), &terminal, horizon, nodes, states.data(),
         controls.data(), multiplier_rank_tolerance,
         multiplier_consistency_tolerance, dual_tree.data(), &status);
   });
@@ -619,8 +711,9 @@ void RunEmulation(const Problem& problem, const std::string& name,
     Launch(level_counts[level + 1], [&] {
       ReduceDualTreeLevelKernel(
           dual_tree.data(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], multiplier_rank_tolerance,
-          multiplier_consistency_tolerance, dual_tree.data(), &status);
+          level_counts[level], level_counts[level + 1],
+          multiplier_rank_tolerance, multiplier_consistency_tolerance,
+          dual_tree.data(), &status);
     });
   }
   const int root = level_offsets.back();
@@ -633,9 +726,9 @@ void RunEmulation(const Problem& problem, const std::string& name,
     Launch(level_counts[level + 1], [&] {
       ExpandDualTreeLevelKernel(
           dual_tree.data(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], multiplier_rank_tolerance,
-          multiplier_consistency_tolerance, dual_values.data(),
-          dual_values.data(), &status);
+          level_counts[level], level_counts[level + 1],
+          multiplier_rank_tolerance, multiplier_consistency_tolerance,
+          dual_values.data(), dual_values.data(), &status);
     });
   }
   Launch(nodes, [&] {
@@ -679,7 +772,7 @@ void RunEmulation(const Problem& problem, const std::string& name,
             << "; KKT residual=" << residual << '\n';
 }
 
-}  // namespace
+} // namespace
 
 int main() {
   RunEmulation(MakeProblem(), "rank-deficient constrained", true, true);

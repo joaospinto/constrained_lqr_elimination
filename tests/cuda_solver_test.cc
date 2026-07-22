@@ -29,7 +29,7 @@ constexpr Scalar kLongHorizonKktTolerance = 2e-4;
 constexpr bool kRedundantUsesParallelRiccati = true;
 #endif
 
-void Expect(bool condition, const std::string& message) {
+void Expect(bool condition, const std::string &message) {
   if (!condition) {
     std::cerr << "FAIL: " << message << "\n";
     std::exit(1);
@@ -62,11 +62,12 @@ Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed,
 Matrix PositiveDefinite(std::size_t size, int seed, Scalar diagonal) {
   Matrix g = GeneratedMatrix(size, size, seed, 0.2);
   Matrix out = clqr::Transpose(g) * g;
-  for (std::size_t i = 0; i < size; ++i) out(i, i) += diagonal;
+  for (std::size_t i = 0; i < size; ++i)
+    out(i, i) += diagonal;
   return out;
 }
 
-Scalar RowDot(const Matrix& matrix, std::size_t row, const Vector& vector) {
+Scalar RowDot(const Matrix &matrix, std::size_t row, const Vector &vector) {
   Scalar value = 0.0;
   for (std::size_t col = 0; col < vector.size(); ++col)
     value += matrix(row, col) * vector[col];
@@ -94,9 +95,10 @@ Problem GeneratedProblem(int seed, std::size_t horizon, std::size_t n,
   problem.initial_state = nominal_x[0];
   problem.stages.resize(horizon);
   for (std::size_t i = 0; i < horizon; ++i) {
-    Stage& stage = problem.stages[i];
+    Stage &stage = problem.stages[i];
     stage.A = GeneratedMatrix(n, n, seed + 10 * static_cast<int>(i), 0.15);
-    for (std::size_t row = 0; row < n; ++row) stage.A(row, row) += 0.75;
+    for (std::size_t row = 0; row < n; ++row)
+      stage.A(row, row) += 0.75;
     stage.B = GeneratedMatrix(n, m, seed + 300 + static_cast<int>(i), 0.25);
     stage.c =
         nominal_x[i + 1] - stage.A * nominal_x[i] - stage.B * nominal_u[i];
@@ -166,7 +168,7 @@ Problem NonuniformProblem() {
   problem.initial_state = nominal_x.front();
   problem.stages.resize(controls.size());
   for (std::size_t i = 0; i < controls.size(); ++i) {
-    Stage& stage = problem.stages[i];
+    Stage &stage = problem.stages[i];
     const std::size_t n = dimensions[i];
     const std::size_t next = dimensions[i + 1];
     const std::size_t m = controls[i];
@@ -201,15 +203,15 @@ Problem NonuniformProblem() {
   return problem;
 }
 
-Scalar TestMaxAbs(const Vector& vector) {
+Scalar TestMaxAbs(const Vector &vector) {
   Scalar value = 0.0;
   for (std::size_t i = 0; i < vector.size(); ++i)
     value = std::max(value, std::abs(vector[i]));
   return value;
 }
 
-Scalar MaxScaledMixedResidual(const Stage& stage, const Vector& state,
-                              const Vector& control) {
+Scalar MaxScaledMixedResidual(const Stage &stage, const Vector &state,
+                              const Vector &control) {
   Scalar residual = Scalar{0};
   for (std::size_t row = 0; row < stage.C.rows(); ++row) {
     Scalar value = stage.d[row];
@@ -227,8 +229,8 @@ Scalar MaxScaledMixedResidual(const Stage& stage, const Vector& state,
   return residual;
 }
 
-Scalar MaxScaledStateResidual(const Matrix& matrix, const Vector& offset,
-                              const Vector& state) {
+Scalar MaxScaledStateResidual(const Matrix &matrix, const Vector &offset,
+                              const Vector &state) {
   Scalar residual = Scalar{0};
   for (std::size_t row = 0; row < matrix.rows(); ++row) {
     Scalar value = offset[row];
@@ -242,24 +244,24 @@ Scalar MaxScaledStateResidual(const Matrix& matrix, const Vector& offset,
   return residual;
 }
 
-void AddTransposeProduct(const Matrix& matrix, const Vector& multiplier,
-                         Vector* target) {
+void AddTransposeProduct(const Matrix &matrix, const Vector &multiplier,
+                         Vector *target) {
   for (std::size_t col = 0; col < matrix.cols(); ++col) {
     for (std::size_t row = 0; row < matrix.rows(); ++row)
       (*target)[col] += matrix(row, col) * multiplier[row];
   }
 }
 
-Scalar MaxKktResidual(const Problem& problem,
-                      const clqr::cuda::Solution& solution) {
+Scalar MaxKktResidual(const Problem &problem,
+                      const clqr::cuda::Solution &solution) {
   Scalar residual = 0.0;
   const std::size_t horizon = problem.stages.size();
   for (std::size_t i = 0; i < horizon; ++i) {
-    const Stage& stage = problem.stages[i];
-    residual = std::max(
-        residual,
-        TestMaxAbs(solution.states[i + 1] - stage.A * solution.states[i] -
-                   stage.B * solution.controls[i] - stage.c));
+    const Stage &stage = problem.stages[i];
+    residual = std::max(residual,
+                        TestMaxAbs(solution.states[i + 1] -
+                                   stage.A * solution.states[i] -
+                                   stage.B * solution.controls[i] - stage.c));
     if (stage.C.rows() > 0)
       residual =
           std::max(residual, MaxScaledMixedResidual(stage, solution.states[i],
@@ -299,16 +301,26 @@ Scalar MaxKktResidual(const Problem& problem,
   return std::max(residual, TestMaxAbs(terminal_gradient));
 }
 
-void CompareWithCpu(const Problem& problem, const std::string& name,
+void CompareWithCpu(const Problem &problem, const std::string &name,
                     bool expect_parallel = true,
-                    const Problem* cpu_reference_problem = nullptr) {
+                    const Problem *cpu_reference_problem = nullptr,
+                    clqr::cuda::Workspace *cuda_workspace = nullptr,
+                    clqr::cuda::Solution *reusable_solution = nullptr) {
   std::cout << "case: " << name << std::endl;
-  const Problem& cpu_problem =
+  const Problem &cpu_problem =
       cpu_reference_problem == nullptr ? problem : *cpu_reference_problem;
   clqr::Workspace workspace;
   workspace.Reserve(cpu_problem);
   const clqr::SolutionView cpu = clqr::Solve(cpu_problem, workspace);
-  const clqr::cuda::Solution gpu = clqr::cuda::Solve(problem);
+  clqr::cuda::Solution owned_gpu;
+  clqr::cuda::Solution *gpu_result = &owned_gpu;
+  if (cuda_workspace != nullptr && reusable_solution != nullptr) {
+    gpu_result = reusable_solution;
+    clqr::cuda::Solve(problem, *cuda_workspace, *gpu_result);
+  } else {
+    owned_gpu = clqr::cuda::Solve(problem);
+  }
+  const clqr::cuda::Solution &gpu = *gpu_result;
   Expect(cpu.status == SolveStatus::kOptimal,
          name + " CPU status: " + cpu.message);
   Expect(gpu.status == SolveStatus::kOptimal,
@@ -328,10 +340,10 @@ void CompareWithCpu(const Problem& problem, const std::string& name,
     Expect(gpu.controls[i].size() == cpu.controls[i].size,
            name + " control size");
     for (std::size_t row = 0; row < cpu.controls[i].size; ++row) {
-      Expect(
-          std::abs(gpu.controls[i][row] - cpu.controls[i][row]) <= kTolerance,
-          name + " control mismatch at " + std::to_string(i) + "," +
-              std::to_string(row));
+      Expect(std::abs(gpu.controls[i][row] - cpu.controls[i][row]) <=
+                 kTolerance,
+             name + " control mismatch at " + std::to_string(i) + "," +
+                 std::to_string(row));
     }
   }
   Expect(std::abs(gpu.objective - cpu.objective) <=
@@ -355,7 +367,7 @@ Problem RiccatiFallbackProblem() {
   Problem problem;
   problem.initial_state = Vector{0.4};
   problem.stages.resize(1);
-  Stage& stage = problem.stages[0];
+  Stage &stage = problem.stages[0];
   stage.A = Matrix(1, 1, {1.0});
   stage.B = Matrix(1, 1, {1.0});
   stage.c = Vector{0.0};
@@ -388,29 +400,31 @@ Problem ZeroHorizonProblem() {
 
 Problem MaximumConstraintProblem() {
   constexpr int seed = 110;
-  constexpr std::size_t dimension = clqr::cuda::kMaxStateDimension;
-  Problem problem =
-      GeneratedProblem(seed, 1, dimension, dimension, 0, ConstraintMode::kNone);
-  Stage& stage = problem.stages[0];
-  const Vector nominal_u = GeneratedVector(dimension, seed + 200, 0.5);
+  constexpr std::size_t n = clqr::cuda::kMaxStateDimension;
+  constexpr std::size_t m = clqr::cuda::kMaxControlDimension;
+  constexpr std::size_t constraints = std::min(
+      clqr::cuda::kMaxMixedConstraints, clqr::cuda::kMaxStateConstraints);
+  Problem problem = GeneratedProblem(seed, 1, n, m, 0, ConstraintMode::kNone);
+  Stage &stage = problem.stages[0];
+  const Vector nominal_u = GeneratedVector(m, seed + 200, 0.5);
 
-  stage.C = GeneratedMatrix(dimension, dimension, 3300, 0.1);
-  stage.D = clqr::Identity(dimension);
-  stage.d = Vector(dimension);
-  for (std::size_t row = 0; row < dimension; ++row) {
-    stage.d[row] =
-        -(RowDot(stage.C, row, problem.initial_state) + nominal_u[row]);
+  stage.C = GeneratedMatrix(constraints, n, 3300, 0.1);
+  stage.D = GeneratedMatrix(constraints, m, 3310, 0.1);
+  stage.d = Vector(constraints);
+  for (std::size_t row = 0; row < constraints; ++row) {
+    stage.d[row] = -(RowDot(stage.C, row, problem.initial_state) +
+                     RowDot(stage.D, row, nominal_u));
   }
-  stage.E = clqr::Identity(dimension);
-  stage.e = Vector(dimension);
-  for (std::size_t row = 0; row < dimension; ++row)
-    stage.e[row] = -problem.initial_state[row];
+  stage.E = GeneratedMatrix(constraints, n, 3320, 0.1);
+  stage.e = Vector(constraints);
+  for (std::size_t row = 0; row < constraints; ++row)
+    stage.e[row] = -RowDot(stage.E, row, problem.initial_state);
   return problem;
 }
 
-Problem RescaledMixedRowsProblem(const Problem& unscaled) {
+Problem RescaledMixedRowsProblem(const Problem &unscaled) {
   Problem problem = unscaled;
-  for (Stage& stage : problem.stages) {
+  for (Stage &stage : problem.stages) {
     for (std::size_t row = 0; row < stage.C.rows(); ++row) {
       const Scalar scale = row == 0 ? 1e-7 : (row == 2 ? 1e7 : 1.0);
       for (std::size_t col = 0; col < stage.C.cols(); ++col)
@@ -426,7 +440,10 @@ Problem RescaledMixedRowsProblem(const Problem& unscaled) {
 void LongHorizonCase() {
   const std::string name = "long-horizon state constraints";
   std::cout << "case: " << name << std::endl;
-  const Problem problem = clqr::benchmark::StateOnlyProblem(2048, 8, 4, 2);
+  const Problem problem = clqr::benchmark::StateOnlyProblem(
+      2048, std::min<std::size_t>(8, clqr::cuda::kMaxStateDimension),
+      std::min<std::size_t>(4, clqr::cuda::kMaxControlDimension),
+      std::min<std::size_t>(2, clqr::cuda::kMaxStateConstraints));
   const clqr::cuda::Solution solution = clqr::cuda::Solve(problem);
   Expect(solution.status == SolveStatus::kOptimal,
          name + " CUDA status: " + solution.message);
@@ -448,16 +465,16 @@ void InvalidDeviceCases() {
   const Problem problem = ZeroHorizonProblem();
   clqr::cuda::Options options;
   options.device = -1;
-  Expect(
-      clqr::cuda::Solve(problem, options).status == SolveStatus::kInvalidInput,
-      "negative CUDA device index is invalid input");
+  Expect(clqr::cuda::Solve(problem, options).status ==
+             SolveStatus::kInvalidInput,
+         "negative CUDA device index is invalid input");
   options.device = 1000000;
-  Expect(
-      clqr::cuda::Solve(problem, options).status == SolveStatus::kInvalidInput,
-      "out-of-range CUDA device index is invalid input");
+  Expect(clqr::cuda::Solve(problem, options).status ==
+             SolveStatus::kInvalidInput,
+         "out-of-range CUDA device index is invalid input");
 }
 
-}  // namespace
+} // namespace
 
 int main() {
   if (!clqr::cuda::Available()) {
@@ -488,15 +505,26 @@ int main() {
                  "maximum active dimensions");
   CompareWithCpu(GeneratedProblem(101, 4, 3, 0, 1, ConstraintMode::kState),
                  "zero control dimension");
-  CompareWithCpu(GeneratedProblem(102, 5, 4, 1, 3, ConstraintMode::kMixed),
-                 "more mixed rows than controls");
+  const std::size_t many_mixed_rows =
+      std::min<std::size_t>(3, clqr::cuda::kMaxMixedConstraints);
+  CompareWithCpu(
+      GeneratedProblem(102, 5, 4, 1, many_mixed_rows, ConstraintMode::kMixed),
+      "more mixed rows than controls");
   const Problem unscaled_rows =
-      GeneratedProblem(120, 4, 4, 2, 3, ConstraintMode::kMixed);
+      GeneratedProblem(120, 4, 4, 2, many_mixed_rows, ConstraintMode::kMixed);
   // Keep the CPU reference well scaled so this case specifically tests
   // whether CUDA rank decisions are invariant to independent row scaling.
   CompareWithCpu(RescaledMixedRowsProblem(unscaled_rows),
                  "independently rescaled rows", true, &unscaled_rows);
   CompareWithCpu(MaximumConstraintProblem(), "maximum constraint dimensions");
+  clqr::cuda::Workspace reusable_cuda_workspace;
+  clqr::cuda::Solution reusable_cuda_solution;
+  CompareWithCpu(MaximumConstraintProblem(), "reusable workspace large case",
+                 true, nullptr, &reusable_cuda_workspace,
+                 &reusable_cuda_solution);
+  CompareWithCpu(GeneratedProblem(111, 3, 3, 1, 1, ConstraintMode::kState),
+                 "reusable workspace smaller case", true, nullptr,
+                 &reusable_cuda_workspace, &reusable_cuda_solution);
   LongHorizonCase();
   InfeasibleCase();
   InvalidDeviceCases();

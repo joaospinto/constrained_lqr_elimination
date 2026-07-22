@@ -7,12 +7,19 @@ namespace clqr {
 namespace cuda {
 namespace detail {
 
+constexpr int ConstexprMax(int first, int second) {
+  return first > second ? first : second;
+}
+
 constexpr int kMaxRelationRows = 2 * kMaxStateDimension;
 constexpr int kMaxRelationColumns =
     3 * kMaxStateDimension +
-    1;  // eliminated boundary, two outer boundaries, rhs
+    1; // eliminated boundary, two outer boundaries, rhs
 constexpr int kMaxDualColumns =
-    kMaxMixedConstraints + kMaxStateConstraints + 2 * kMaxStateDimension + 1;
+    ConstexprMax(kMaxRelationColumns,
+                 ConstexprMax(kMaxControlDimension + 2 * kMaxStateDimension + 1,
+                              kMaxMixedConstraints + kMaxStateConstraints +
+                                  2 * kMaxStateDimension + 1));
 constexpr int kMaxStageConstraintRows =
     kMaxMixedConstraints + kMaxStateDimension;
 constexpr int kMaxStageReductionColumns =
@@ -146,8 +153,8 @@ struct DeviceStatus {
   int detail = 0;
 };
 
-}  // namespace detail
-}  // namespace cuda
-}  // namespace clqr
+} // namespace detail
+} // namespace cuda
+} // namespace clqr
 
-#endif  // CLQR_CUDA_INTERNAL_H_
+#endif // CLQR_CUDA_INTERNAL_H_

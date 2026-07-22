@@ -59,9 +59,8 @@ The GPU algorithm consists of:
 
 For fixed stage dimensions, every GPU-resident array is linear in the horizon. The normal GPU
 path has logarithmic kernel-launch depth for the feasibility scan, Riccati scan, rollout, and
-multiplier contraction/expansion. The scan implementation favors simple Hillis--Steele passes,
-which use `O(N log N)` local compositions while retaining `O(log N)` depth and `O(N)` space;
-the balanced multiplier tree uses `O(N)` compositions.
+multiplier contraction/expansion. All scans and the multiplier tree use work-efficient balanced
+contraction/expansion: `O(N)` local compositions, `O(log N)` depth, and `O(N)` storage.
 
 Primal rank decisions use row equilibration and partial pivoting. The multiplier tree uses
 pivoted, reorthogonalized reductions during contraction and expansion. Redundant equalities
@@ -80,6 +79,7 @@ this diagnostic mode is not the default solver behavior.
 
 The CUDA benchmark is precision matched: an FP32 build reports FP32 sequential C++ CPU times
 against FP32 CUDA times, while an FP64 build compares the corresponding FP64 implementations.
+It reserves and reuses both CPU and CUDA workspaces before timing each horizon.
 
 The default build remains CUDA-free:
 
@@ -101,6 +101,10 @@ build-cuda/clqr_cuda_benchmark
 ```
 
 For FP32, configure a distinct directory with `-DCLQR_PRECISION=FP32`.
+The four `CLQR_CUDA_MAX_*` CMake settings can reduce the state, control, mixed-constraint,
+and state-constraint capacities from their defaults of 16. These settings change the CUDA ABI;
+choosing the smallest valid application envelope reduces transfers, global storage, shared
+memory, and register pressure without changing the algorithm.
 
 The CUDA test compares states, controls, and objective values against the existing C++ solver,
 then checks the complete primal-dual KKT residual. It covers unconstrained, state-only, mixed,

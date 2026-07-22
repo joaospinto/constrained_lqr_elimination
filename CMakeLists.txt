@@ -10,14 +10,39 @@ option(CLQR_BUILD_TESTS "Build tests" ON)
 option(CLQR_BUILD_BENCHMARKS "Build benchmarks" ON)
 set(CLQR_PRECISION "FP64" CACHE STRING "Arithmetic precision: FP64 or FP32")
 set_property(CACHE CLQR_PRECISION PROPERTY STRINGS FP64 FP32)
+set(CLQR_CUDA_MAX_STATE_DIMENSION 16 CACHE STRING
+    "Maximum CUDA state dimension")
+set(CLQR_CUDA_MAX_CONTROL_DIMENSION 16 CACHE STRING
+    "Maximum CUDA control dimension")
+set(CLQR_CUDA_MAX_MIXED_CONSTRAINTS 16 CACHE STRING
+    "Maximum CUDA mixed constraints per stage")
+set(CLQR_CUDA_MAX_STATE_CONSTRAINTS 16 CACHE STRING
+    "Maximum CUDA state constraints per stage")
 if(NOT CLQR_PRECISION STREQUAL "FP64" AND
    NOT CLQR_PRECISION STREQUAL "FP32")
   message(FATAL_ERROR "CLQR_PRECISION must be FP64 or FP32")
 endif()
+foreach(limit
+        CLQR_CUDA_MAX_STATE_DIMENSION
+        CLQR_CUDA_MAX_CONTROL_DIMENSION
+        CLQR_CUDA_MAX_MIXED_CONSTRAINTS
+        CLQR_CUDA_MAX_STATE_CONSTRAINTS)
+  if(${limit} LESS 1 OR ${limit} GREATER 16)
+    message(FATAL_ERROR "${limit} must be between 1 and 16")
+  endif()
+endforeach()
 
 add_library(clqr STATIC src/clqr.cc src/linalg.cc)
 target_include_directories(clqr PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(clqr PRIVATE $<$<CONFIG:Release>:-O3>)
+target_compile_definitions(
+  clqr
+  PUBLIC
+    CLQR_CUDA_MAX_STATE_DIMENSION=${CLQR_CUDA_MAX_STATE_DIMENSION}
+    CLQR_CUDA_MAX_CONTROL_DIMENSION=${CLQR_CUDA_MAX_CONTROL_DIMENSION}
+    CLQR_CUDA_MAX_MIXED_CONSTRAINTS=${CLQR_CUDA_MAX_MIXED_CONSTRAINTS}
+    CLQR_CUDA_MAX_STATE_CONSTRAINTS=${CLQR_CUDA_MAX_STATE_CONSTRAINTS}
+)
 if(CLQR_PRECISION STREQUAL "FP32")
   target_compile_definitions(clqr PUBLIC CLQR_USE_FLOAT=1)
 endif()

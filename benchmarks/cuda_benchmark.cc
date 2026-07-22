@@ -25,21 +25,21 @@ double Median(std::vector<double> values) {
   return values[values.size() / 2];
 }
 
-double DeviceTotal(const clqr::cuda::Timings& timings) {
+double DeviceTotal(const clqr::cuda::Timings &timings) {
   return timings.upload_ms + timings.feasibility_ms + timings.reduction_ms +
          timings.riccati_ms + timings.reconstruction_ms +
          timings.multiplier_ms + timings.download_ms;
 }
 
-Scalar BenchmarkMaxAbs(const Vector& vector) {
+Scalar BenchmarkMaxAbs(const Vector &vector) {
   Scalar value = Scalar{0};
   for (std::size_t i = 0; i < vector.size(); ++i)
     value = std::max(value, std::abs(vector[i]));
   return value;
 }
 
-Scalar MaxScaledMixedResidual(const Stage& stage, const Vector& state,
-                              const Vector& control) {
+Scalar MaxScaledMixedResidual(const Stage &stage, const Vector &state,
+                              const Vector &control) {
   Scalar residual = Scalar{0};
   for (std::size_t row = 0; row < stage.C.rows(); ++row) {
     Scalar value = stage.d[row];
@@ -57,8 +57,8 @@ Scalar MaxScaledMixedResidual(const Stage& stage, const Vector& state,
   return residual;
 }
 
-Scalar MaxScaledStateResidual(const Matrix& matrix, const Vector& offset,
-                              const Vector& state) {
+Scalar MaxScaledStateResidual(const Matrix &matrix, const Vector &offset,
+                              const Vector &state) {
   Scalar residual = Scalar{0};
   for (std::size_t row = 0; row < matrix.rows(); ++row) {
     Scalar value = offset[row];
@@ -72,20 +72,20 @@ Scalar MaxScaledStateResidual(const Matrix& matrix, const Vector& offset,
   return residual;
 }
 
-void AddTransposeProduct(const Matrix& matrix, const Vector& multiplier,
-                         Vector* target) {
+void AddTransposeProduct(const Matrix &matrix, const Vector &multiplier,
+                         Vector *target) {
   for (std::size_t col = 0; col < matrix.cols(); ++col) {
     for (std::size_t row = 0; row < matrix.rows(); ++row)
       (*target)[col] += matrix(row, col) * multiplier[row];
   }
 }
 
-Scalar MaxKktResidual(const Problem& problem,
-                      const clqr::cuda::Solution& solution) {
+Scalar MaxKktResidual(const Problem &problem,
+                      const clqr::cuda::Solution &solution) {
   Scalar residual = Scalar{0};
   const std::size_t horizon = problem.stages.size();
   for (std::size_t i = 0; i < horizon; ++i) {
-    const Stage& stage = problem.stages[i];
+    const Stage &stage = problem.stages[i];
     residual = std::max(
         residual,
         BenchmarkMaxAbs(solution.states[i + 1] - stage.A * solution.states[i] -
@@ -113,9 +113,9 @@ Scalar MaxKktResidual(const Problem& problem,
   }
   residual = std::max(residual, BenchmarkMaxAbs(solution.states.front() -
                                                 problem.initial_state));
-  residual = std::max(
-      residual, MaxScaledStateResidual(problem.terminal_E, problem.terminal_e,
-                                       solution.states.back()));
+  residual = std::max(residual, MaxScaledStateResidual(problem.terminal_E,
+                                                       problem.terminal_e,
+                                                       solution.states.back()));
   Vector terminal_gradient =
       problem.terminal_Q * solution.states.back() + problem.terminal_q;
   terminal_gradient =
@@ -126,9 +126,9 @@ Scalar MaxKktResidual(const Problem& problem,
   return std::max(residual, BenchmarkMaxAbs(terminal_gradient));
 }
 
-}  // namespace
+} // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   if (!clqr::cuda::Available()) {
     std::cerr << "No CUDA device available: " << clqr::cuda::DeviceDescription()
               << "\n";
@@ -155,10 +155,16 @@ int main(int argc, char** argv) {
   constexpr std::size_t p = 2;
   std::cout << "# device=" << clqr::cuda::DeviceDescription() << "\n";
   std::cout << "# precision=" << clqr::kPrecisionName << "\n";
+  std::cout << "# CUDA capacities: state=" << clqr::cuda::kMaxStateDimension
+            << ", control=" << clqr::cuda::kMaxControlDimension
+            << ", mixed=" << clqr::cuda::kMaxMixedConstraints
+            << ", state constraints=" << clqr::cuda::kMaxStateConstraints
+            << "\n";
   std::cout << "# cpp_cpu_ms and CUDA timings use the same scalar precision.\n";
   std::cout
-      << "# CUDA wall time includes allocation; cuda_device_ms is the sum "
-         "of event-timed transfer and kernel phases.\n";
+      << "# CUDA wall time reuses reserved storage and includes packing, "
+         "transfers, kernels, and result construction; cuda_device_ms is the "
+         "sum of event-timed transfer and kernel phases.\n";
   if (cpu_max_horizon == std::numeric_limits<std::size_t>::max()) {
     std::cout << "# The sequential C++ solver is timed at every horizon.\n";
   } else {
@@ -170,6 +176,7 @@ int main(int argc, char** argv) {
                "wall_speedup,feasibility_ms,reduction_ms,riccati_ms,"
                "reconstruction_ms,multiplier_ms,min_reduced_n,"
                "min_reduced_m,parallel_riccati,kkt_residual\n";
+  clqr::cuda::Workspace cuda_workspace;
   for (std::size_t horizon : horizons) {
     Problem problem = clqr::benchmark::StateOnlyProblem(horizon, n, m, p);
     clqr::Workspace workspace;
@@ -187,7 +194,9 @@ int main(int argc, char** argv) {
     }
     clqr::cuda::Options cuda_options;
     cuda_options.enforce_multiplier_consistency = false;
-    clqr::cuda::Solution gpu = clqr::cuda::Solve(problem, cuda_options);
+    cuda_workspace.Reserve(problem, cuda_options);
+    clqr::cuda::Solution gpu;
+    clqr::cuda::Solve(problem, cuda_workspace, gpu, cuda_options);
     if (gpu.status != clqr::SolveStatus::kOptimal) {
       std::cerr << "CUDA warmup failed at N=" << horizon << ": " << gpu.message
                 << "\n";
@@ -207,16 +216,18 @@ int main(int argc, char** argv) {
         const auto cpu_start = Clock::now();
         const clqr::SolutionView cpu = clqr::Solve(problem, workspace);
         const auto cpu_stop = Clock::now();
-        if (cpu.status != clqr::SolveStatus::kOptimal) return 1;
+        if (cpu.status != clqr::SolveStatus::kOptimal)
+          return 1;
         cpu_times.push_back(
             std::chrono::duration<double, std::milli>(cpu_stop - cpu_start)
                 .count());
       }
 
       const auto gpu_start = Clock::now();
-      gpu = clqr::cuda::Solve(problem, cuda_options);
+      clqr::cuda::Solve(problem, cuda_workspace, gpu, cuda_options);
       const auto gpu_stop = Clock::now();
-      if (gpu.status != clqr::SolveStatus::kOptimal) return 1;
+      if (gpu.status != clqr::SolveStatus::kOptimal)
+        return 1;
       gpu_wall_times.push_back(
           std::chrono::duration<double, std::milli>(gpu_stop - gpu_start)
               .count());

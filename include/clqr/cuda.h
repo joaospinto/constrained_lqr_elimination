@@ -1,6 +1,7 @@
 #ifndef CLQR_CUDA_H_
 #define CLQR_CUDA_H_
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -49,19 +50,53 @@ struct Solution {
   Timings timings;
 };
 
-// The CUDA backend currently targets stage dimensions up to 16. Storage is
-// bounded, but every kernel also carries the active per-stage dimensions and
-// skips padded rows and columns.
-constexpr int kMaxStateDimension = 16;
-constexpr int kMaxControlDimension = 16;
-constexpr int kMaxMixedConstraints = 16;
-constexpr int kMaxStateConstraints = 16;
+// Capacities are compile-time parameters because they determine the public
+// CUDA ABI and each kernel's fixed local/shared storage. CMake defaults all of
+// them to 16; smaller application-specific builds substantially reduce memory
+// traffic and increase occupancy while still carrying each stage's active
+// dimensions at run time.
+#ifndef CLQR_CUDA_MAX_STATE_DIMENSION
+#define CLQR_CUDA_MAX_STATE_DIMENSION 16
+#endif
+#ifndef CLQR_CUDA_MAX_CONTROL_DIMENSION
+#define CLQR_CUDA_MAX_CONTROL_DIMENSION 16
+#endif
+#ifndef CLQR_CUDA_MAX_MIXED_CONSTRAINTS
+#define CLQR_CUDA_MAX_MIXED_CONSTRAINTS 16
+#endif
+#ifndef CLQR_CUDA_MAX_STATE_CONSTRAINTS
+#define CLQR_CUDA_MAX_STATE_CONSTRAINTS 16
+#endif
+constexpr int kMaxStateDimension = CLQR_CUDA_MAX_STATE_DIMENSION;
+constexpr int kMaxControlDimension = CLQR_CUDA_MAX_CONTROL_DIMENSION;
+constexpr int kMaxMixedConstraints = CLQR_CUDA_MAX_MIXED_CONSTRAINTS;
+constexpr int kMaxStateConstraints = CLQR_CUDA_MAX_STATE_CONSTRAINTS;
+
+class Workspace {
+public:
+  Workspace();
+  ~Workspace();
+  Workspace(Workspace &&) noexcept;
+  Workspace &operator=(Workspace &&) noexcept;
+  Workspace(const Workspace &) = delete;
+  Workspace &operator=(const Workspace &) = delete;
+
+  void Reserve(const Problem &problem, const Options &options = Options{});
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+  friend Solution &Solve(const Problem &, Workspace &, Solution &,
+                         const Options &);
+};
 
 bool Available();
 std::string DeviceDescription(int device = 0);
-Solution Solve(const Problem& problem, const Options& options = Options{});
+Solution &Solve(const Problem &problem, Workspace &workspace, Solution &result,
+                const Options &options = Options{});
+Solution Solve(const Problem &problem, const Options &options = Options{});
 
-}  // namespace cuda
-}  // namespace clqr
+} // namespace cuda
+} // namespace clqr
 
-#endif  // CLQR_CUDA_H_
+#endif // CLQR_CUDA_H_
