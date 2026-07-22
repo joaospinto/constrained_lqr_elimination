@@ -19,10 +19,12 @@ using clqr::Vector;
 #ifdef CLQR_USE_FLOAT
 constexpr Scalar kTolerance = 2e-2f;
 constexpr Scalar kKktTolerance = 1e-2f;
+constexpr Scalar kLongHorizonKktTolerance = 1e-1f;
 constexpr bool kRedundantUsesParallelRiccati = false;
 #else
 constexpr Scalar kTolerance = 3e-6;
 constexpr Scalar kKktTolerance = 2e-5;
+constexpr Scalar kLongHorizonKktTolerance = 2e-4;
 constexpr bool kRedundantUsesParallelRiccati = true;
 #endif
 
@@ -423,6 +425,19 @@ Problem RescaledMixedRowsProblem(const Problem& unscaled) {
   return problem;
 }
 
+void LongHorizonCase() {
+  const std::string name = "long-horizon state constraints";
+  std::cout << "case: " << name << std::endl;
+  const Problem problem =
+      GeneratedProblem(220, 256, 8, 4, 2, ConstraintMode::kState);
+  const clqr::cuda::Solution solution = clqr::cuda::Solve(problem);
+  Expect(solution.status == SolveStatus::kOptimal,
+         name + " CUDA status: " + solution.message);
+  Expect(solution.used_parallel_riccati, name + " Riccati path");
+  Expect(MaxKktResidual(problem, solution) <= kLongHorizonKktTolerance,
+         name + " full primal-dual KKT residual");
+}
+
 void InfeasibleCase() {
   Problem problem = GeneratedProblem(90, 2, 3, 2, 0, ConstraintMode::kNone);
   problem.stages[0].E = Matrix(2, 3, {1.0, 0.0, 0.0, 1.0, 0.0, 0.0});
@@ -486,6 +501,7 @@ int main() {
   CompareWithCpu(RescaledMixedRowsProblem(unscaled_rows),
                  "independently rescaled rows", true, &unscaled_rows);
   CompareWithCpu(MaximumConstraintProblem(), "maximum constraint dimensions");
+  LongHorizonCase();
   InfeasibleCase();
   InvalidDeviceCases();
   std::cout << "all CUDA cross-validation tests passed\n";

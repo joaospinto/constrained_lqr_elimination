@@ -205,6 +205,26 @@ __device__ bool InconsistentRref(const Scalar* matrix, int rows, int columns,
   return false;
 }
 
+// RrefBlock normalizes each equation by its largest left-hand-side
+// coefficient.  Measure the right-hand side on that same scale before the
+// matrix is overwritten so long multiplier chains are tested relatively.
+__device__ Scalar ConditionedRhsScale(const Scalar* matrix, int rows,
+                                      int columns, int lhs_columns,
+                                      Scalar rank_tolerance) {
+  Scalar scale = Scalar{1};
+  for (int row = 0; row < rows; ++row) {
+    Scalar lhs_scale = Scalar{0};
+    for (int col = 0; col < lhs_columns; ++col) {
+      const Scalar value = DeviceAbs(matrix[row * columns + col]);
+      if (value > lhs_scale) lhs_scale = value;
+    }
+    Scalar rhs_scale = DeviceAbs(matrix[row * columns + lhs_columns]);
+    if (lhs_scale > rank_tolerance) rhs_scale /= lhs_scale;
+    if (rhs_scale > scale) scale = rhs_scale;
+  }
+  return scale;
+}
+
 __device__ void ExtractResidualRelation(const Scalar* matrix, int columns,
                                         int rank, const int* pivot_columns,
                                         int eliminated_columns, int left_dim,
@@ -1818,6 +1838,7 @@ __global__ void ExpandDualTreeLevelKernel(
   __shared__ int rank;
   __shared__ int best_row;
   __shared__ int local_ok;
+  __shared__ Scalar conditioned_rhs_scale;
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
     matrix[i] = Scalar{0};
   __syncthreads();
@@ -1849,11 +1870,17 @@ __global__ void ExpandDualTreeLevelKernel(
     matrix[(left.rows + row) * columns + shared] = rhs;
   }
   __syncthreads();
+  if (threadIdx.x == 0) {
+    conditioned_rhs_scale =
+        ConditionedRhsScale(matrix, rows, columns, shared, rank_tolerance);
+  }
+  __syncthreads();
   RrefBlock(matrix, rows, columns, shared, rank_tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
-    local_ok =
-        !InconsistentRref(matrix, rows, columns, shared, consistency_tolerance);
+    local_ok = !InconsistentRref(matrix, rows, columns, shared,
+                                 consistency_tolerance *
+                                     conditioned_rhs_scale);
     if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 16);
   }
   __syncthreads();
