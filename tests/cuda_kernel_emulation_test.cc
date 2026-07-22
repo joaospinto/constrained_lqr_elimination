@@ -415,12 +415,6 @@ void RunEmulation(const Problem& problem, const std::string& name,
                   bool compare_cpu = true) {
   const int horizon = static_cast<int>(problem.stages.size());
   const int nodes = horizon + 1;
-#ifdef CLQR_USE_FLOAT
-  const bool use_host_multiplier_recovery =
-      horizon <= 64 && HasDependentEqualityRows(problem, kTolerance);
-#else
-  const bool use_host_multiplier_recovery = false;
-#endif
   std::vector<PackedStage> stages;
   for (const Stage& stage : problem.stages) stages.push_back(Pack(stage));
   const PackedTerminal terminal = Pack(problem);
@@ -550,8 +544,6 @@ void RunEmulation(const Problem& problem, const std::string& name,
       }
     }
   }
-  if (use_host_multiplier_recovery) feedback = sequential_feedback;
-
   std::vector<AffineMap> map_a(horizon), map_b(horizon);
   Launch(horizon, [&] {
     InitializeAffineMapsKernel(feedback.data(), horizon, map_a.data());
@@ -627,84 +619,49 @@ void RunEmulation(const Problem& problem, const std::string& name,
   const Scalar multiplier_rank_tolerance = kMinimumMultiplierRankTolerance;
   const Scalar multiplier_consistency_tolerance =
       kMultiplierConsistencyTolerancePerTreeLevel * level_counts.size();
-  if (use_host_multiplier_recovery) {
-    std::vector<Vector> trajectory_states(nodes);
-    std::vector<Vector> trajectory_controls(horizon);
-    for (int i = 0; i < nodes; ++i) {
-      trajectory_states[i] = Vector(state_params[i].physical_dim);
-      for (int row = 0; row < state_params[i].physical_dim; ++row) {
-        trajectory_states[i][row] = states[i * kMaxStateDimension + row];
-      }
-    }
-    for (int i = 0; i < horizon; ++i) {
-      trajectory_controls[i] = Vector(control_params[i].physical_dim);
-      for (int row = 0; row < control_params[i].physical_dim; ++row) {
-        trajectory_controls[i][row] = controls[i * kMaxControlDimension + row];
-      }
-    }
-    clqr::internal::MultiplierRecovery recovery =
-        clqr::internal::RecoverMultipliersForTrajectory(
-            problem, trajectory_states, trajectory_controls, kTolerance);
-    Expect(recovery.success,
-           "emulated host multiplier recovery: " + recovery.message);
-    for (std::size_t row = 0; row < recovery.initial.size(); ++row)
-      initial_multiplier[row] = recovery.initial[row];
-    for (int i = 0; i < horizon; ++i) {
-      for (std::size_t row = 0; row < recovery.dynamics[i].size(); ++row)
-        dynamics[i * kMaxStateDimension + row] = recovery.dynamics[i][row];
-      for (std::size_t row = 0; row < recovery.mixed[i].size(); ++row)
-        mixed[i * kMaxMixedConstraints + row] = recovery.mixed[i][row];
-      for (std::size_t row = 0; row < recovery.state[i].size(); ++row)
-        state_multipliers[i * kMaxStateConstraints + row] =
-            recovery.state[i][row];
-    }
-    for (std::size_t row = 0; row < recovery.terminal.size(); ++row)
-      terminal_multiplier[row] = recovery.terminal[row];
-  } else {
-    std::vector<Relation> dual_tree(total);
-    std::vector<NodeValue> dual_values(total);
-    Launch(padded, [&] {
-      BuildDualLeavesKernel(
-          stages.data(), &terminal, horizon, padded, states.data(),
-          controls.data(), multiplier_rank_tolerance,
+  std::vector<Relation> dual_tree(total);
+  std::vector<NodeValue> dual_values(total);
+  Launch(padded, [&] {
+    BuildDualLeavesKernel(
+        stages.data(), &terminal, horizon, padded, states.data(),
+        controls.data(), multiplier_rank_tolerance,
+        multiplier_consistency_tolerance, dual_tree.data(), &status);
+  });
+  for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
+    Launch(level_counts[level + 1], [&] {
+      ReduceDualTreeLevelKernel(
+          dual_tree.data(), level_offsets[level], level_offsets[level + 1],
+          level_counts[level + 1], multiplier_rank_tolerance,
           multiplier_consistency_tolerance, dual_tree.data(), &status);
     });
-    for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
-      Launch(level_counts[level + 1], [&] {
-        ReduceDualTreeLevelKernel(
-            dual_tree.data(), level_offsets[level], level_offsets[level + 1],
-            level_counts[level + 1], multiplier_rank_tolerance,
-            multiplier_consistency_tolerance, dual_tree.data(), &status);
-      });
-    }
-    const int root = level_offsets.back();
-    Launch(1, [&] {
-      SolveDualRootKernel(dual_tree.data() + root, dual_values.data() + root,
-                          &status, multiplier_rank_tolerance);
-    });
-    for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
-         --level) {
-      Launch(level_counts[level + 1], [&] {
-        ExpandDualTreeLevelKernel(
-            dual_tree.data(), level_offsets[level], level_offsets[level + 1],
-            level_counts[level + 1], multiplier_rank_tolerance,
-            multiplier_consistency_tolerance, dual_values.data(),
-            dual_values.data(), &status);
-      });
-    }
-    Launch(nodes, [&] {
-      RecoverLocalMultipliersKernel(
-          stages.data(), &terminal, horizon, states.data(), controls.data(),
-          dual_values.data(), multiplier_rank_tolerance,
-          multiplier_consistency_tolerance, initial_multiplier.data(),
-          dynamics.data(), mixed.data(), state_multipliers.data(),
-          terminal_multiplier.data(), &status);
-    });
-    Expect(
-        status.code == kDeviceOk,
-        "emulated multiplier recovery (stage=" + std::to_string(status.stage) +
-            ", detail=" + std::to_string(status.detail) + ")");
   }
+  const int root = level_offsets.back();
+  Launch(1, [&] {
+    SolveDualRootKernel(dual_tree.data() + root, dual_values.data() + root,
+                        &status, multiplier_rank_tolerance);
+  });
+  for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
+       --level) {
+    Launch(level_counts[level + 1], [&] {
+      ExpandDualTreeLevelKernel(
+          dual_tree.data(), level_offsets[level], level_offsets[level + 1],
+          level_counts[level + 1], multiplier_rank_tolerance,
+          multiplier_consistency_tolerance, dual_values.data(),
+          dual_values.data(), &status);
+    });
+  }
+  Launch(nodes, [&] {
+    RecoverLocalMultipliersKernel(
+        stages.data(), &terminal, horizon, states.data(), controls.data(),
+        dual_values.data(), multiplier_rank_tolerance,
+        multiplier_consistency_tolerance, initial_multiplier.data(),
+        dynamics.data(), mixed.data(), state_multipliers.data(),
+        terminal_multiplier.data(), &status);
+  });
+  Expect(
+      status.code == kDeviceOk,
+      "emulated multiplier recovery (stage=" + std::to_string(status.stage) +
+          ", detail=" + std::to_string(status.detail) + ")");
 
   if (compare_cpu) {
     for (int i = 0; i < nodes; ++i) {

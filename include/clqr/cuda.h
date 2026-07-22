@@ -42,7 +42,6 @@ struct Solution {
   std::vector<int> reduced_state_dimensions;
   std::vector<int> reduced_control_dimensions;
   bool used_parallel_riccati = false;
-  bool used_host_multiplier_recovery = false;
   Scalar objective = Scalar{0};
   Timings timings;
 };

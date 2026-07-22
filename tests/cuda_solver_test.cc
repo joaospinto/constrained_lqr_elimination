@@ -301,8 +301,7 @@ Scalar MaxKktResidual(const Problem& problem,
 
 void CompareWithCpu(const Problem& problem, const std::string& name,
                     bool expect_parallel = true,
-                    const Problem* cpu_reference_problem = nullptr,
-                    bool expect_host_multiplier_recovery = false) {
+                    const Problem* cpu_reference_problem = nullptr) {
   std::cout << "case: " << name << std::endl;
   const Problem& cpu_problem =
       cpu_reference_problem == nullptr ? problem : *cpu_reference_problem;
@@ -315,8 +314,6 @@ void CompareWithCpu(const Problem& problem, const std::string& name,
   Expect(gpu.status == SolveStatus::kOptimal,
          name + " CUDA status: " + gpu.message);
   Expect(gpu.used_parallel_riccati == expect_parallel, name + " Riccati path");
-  Expect(gpu.used_host_multiplier_recovery == expect_host_multiplier_recovery,
-         name + " multiplier recovery path");
   Expect(gpu.states.size() == cpu.state_count, name + " state count");
   Expect(gpu.controls.size() == cpu.control_count, name + " control count");
   for (std::size_t i = 0; i < cpu.state_count; ++i) {
@@ -479,8 +476,7 @@ int main() {
                  "alternating");
   CompareWithCpu(
       GeneratedProblem(5, 5, 4, 2, 2, ConstraintMode::kRedundantMixed),
-      "rank-deficient redundant", kRedundantUsesParallelRiccati, nullptr,
-      !kRedundantUsesParallelRiccati);
+      "rank-deficient redundant", kRedundantUsesParallelRiccati);
   CompareWithCpu(GeneratedProblem(6, 4, 4, 2, 2, ConstraintMode::kTerminal),
                  "terminal constraints");
   CompareWithCpu(NonuniformProblem(), "nonuniform dimensions");

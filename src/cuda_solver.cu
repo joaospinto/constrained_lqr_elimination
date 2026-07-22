@@ -15,47 +15,11 @@
 
 #include "clqr/cuda.h"
 #include "cuda_internal.h"
-#include "multiplier_recovery.h"
 
 namespace clqr {
 namespace cuda {
 namespace detail {
 namespace {
-
-#ifdef CLQR_USE_FLOAT
-bool HasDependentRows(const Matrix& matrix, Scalar tolerance) {
-  if (matrix.rows() == 0) return false;
-  Matrix scaled = matrix;
-  for (std::size_t row = 0; row < scaled.rows(); ++row) {
-    Scalar scale = Scalar{0};
-    for (std::size_t col = 0; col < scaled.cols(); ++col)
-      scale = std::max(scale, std::abs(scaled(row, col)));
-    if (scale > Scalar{0}) {
-      for (std::size_t col = 0; col < scaled.cols(); ++col)
-        scaled(row, col) /= scale;
-    }
-  }
-  return Rref(std::move(scaled), matrix.cols(), tolerance)
-             .pivot_columns.size() < matrix.rows();
-}
-
-bool HasDependentEqualityRows(const Problem& problem, Scalar tolerance) {
-  for (const Stage& stage : problem.stages) {
-    Matrix mixed(stage.C.rows(), stage.C.cols() + stage.D.cols());
-    for (std::size_t row = 0; row < stage.C.rows(); ++row) {
-      for (std::size_t col = 0; col < stage.C.cols(); ++col)
-        mixed(row, col) = stage.C(row, col);
-      for (std::size_t col = 0; col < stage.D.cols(); ++col)
-        mixed(row, stage.C.cols() + col) = stage.D(row, col);
-    }
-    if (HasDependentRows(mixed, tolerance) ||
-        HasDependentRows(stage.E, tolerance)) {
-      return true;
-    }
-  }
-  return HasDependentRows(problem.terminal_E, tolerance);
-}
-#endif
 
 constexpr int kThreads = 128;
 #ifdef CLQR_USE_FLOAT
@@ -890,18 +854,6 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   Solution solution;
   const int stage_count = static_cast<int>(problem.stages.size());
   const int node_count = stage_count + 1;
-#ifdef CLQR_USE_FLOAT
-  // In single precision, dependent local equality rows can make the balanced
-  // dual relation tree unnecessarily ill-conditioned. Small such problems
-  // use the stable linear-space pullback shared with the CPU solver. The cap
-  // limits sequential fallback latency and leaves large CUDA solves parallel.
-  bool use_host_multiplier_recovery =
-      stage_count <= 64 && HasDependentEqualityRows(problem, options.tolerance);
-#else
-  bool use_host_multiplier_recovery = false;
-#endif
-  int multiplier_fallback_detail = 0;
-  solution.used_host_multiplier_recovery = use_host_multiplier_recovery;
   std::vector<PackedStage> host_stages;
   host_stages.reserve(problem.stages.size());
   for (const Stage& stage : problem.stages)
@@ -1026,7 +978,7 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   DeviceBuffer<Feedback> feedback(stage_count);
   DeviceBuffer<int> parallel_ok(1);
   ValueElement* value_suffix = value_a.get();
-  int host_parallel_ok = use_host_multiplier_recovery ? 0 : 1;
+  int host_parallel_ok = 1;
   solution.timings.riccati_ms = TimeGpu([&] {
     CudaCheck(cudaMemset(value_a.get(), 0, node_count * sizeof(ValueElement)),
               "clear value elements A");
@@ -1217,51 +1169,40 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
     CudaCheck(cudaMemset(terminal_multiplier.get(), 0,
                          kMaxStateConstraints * sizeof(Scalar)),
               "clear terminal multipliers");
-    if (!use_host_multiplier_recovery) {
-      BuildDualLeavesKernel<<<padded, kThreads>>>(
-          device_stages.get(), device_terminal.get(), stage_count, padded,
-          states.get(), controls.get(), multiplier_rank_tolerance,
+    BuildDualLeavesKernel<<<padded, kThreads>>>(
+        device_stages.get(), device_terminal.get(), stage_count, padded,
+        states.get(), controls.get(), multiplier_rank_tolerance,
+        multiplier_consistency_tolerance, dual_tree.get(),
+        device_status.get());
+    for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
+      ReduceDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
+          dual_tree.get(), level_offsets[level], level_offsets[level + 1],
+          level_counts[level + 1], multiplier_rank_tolerance,
           multiplier_consistency_tolerance, dual_tree.get(),
           device_status.get());
-      for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
-        ReduceDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
-            dual_tree.get(), level_offsets[level], level_offsets[level + 1],
-            level_counts[level + 1], multiplier_rank_tolerance,
-            multiplier_consistency_tolerance, dual_tree.get(),
-            device_status.get());
-      }
-      const int root_offset = level_offsets.back();
-      SolveDualRootKernel<<<1, 1>>>(
-          dual_tree.get() + root_offset, dual_values.get() + root_offset,
-          device_status.get(), multiplier_rank_tolerance);
-      for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
-           --level) {
-        ExpandDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
-            dual_tree.get(), level_offsets[level], level_offsets[level + 1],
-            level_counts[level + 1], multiplier_rank_tolerance,
-            multiplier_consistency_tolerance, dual_values.get(),
-            dual_values.get(), device_status.get());
-      }
-      RecoverLocalMultipliersKernel<<<node_count, kThreads>>>(
-          device_stages.get(), device_terminal.get(), stage_count, states.get(),
-          controls.get(), dual_values.get(), multiplier_rank_tolerance,
-          multiplier_consistency_tolerance, initial_multiplier.get(),
-          dynamics_multipliers.get(), mixed_multipliers.get(),
-          state_multipliers.get(), terminal_multiplier.get(),
-          device_status.get());
     }
+    const int root_offset = level_offsets.back();
+    SolveDualRootKernel<<<1, 1>>>(
+        dual_tree.get() + root_offset, dual_values.get() + root_offset,
+        device_status.get(), multiplier_rank_tolerance);
+    for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
+         --level) {
+      ExpandDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
+          dual_tree.get(), level_offsets[level], level_offsets[level + 1],
+          level_counts[level + 1], multiplier_rank_tolerance,
+          multiplier_consistency_tolerance, dual_values.get(),
+          dual_values.get(), device_status.get());
+    }
+    RecoverLocalMultipliersKernel<<<node_count, kThreads>>>(
+        device_stages.get(), device_terminal.get(), stage_count, states.get(),
+        controls.get(), dual_values.get(), multiplier_rank_tolerance,
+        multiplier_consistency_tolerance, initial_multiplier.get(),
+        dynamics_multipliers.get(), mixed_multipliers.get(),
+        state_multipliers.get(), terminal_multiplier.get(),
+        device_status.get());
   });
   status = ReadStatus(device_status);
-  if (!use_host_multiplier_recovery &&
-      status.code == kDeviceNumericalFailure) {
-    // The primal trajectory is already available. If finite-precision error
-    // makes the parallel dual relation tree reject its own multiplier chain,
-    // retain that trajectory and recover only the multipliers through the
-    // linear-space elimination pullback on the host.
-    use_host_multiplier_recovery = true;
-    solution.used_host_multiplier_recovery = true;
-    multiplier_fallback_detail = status.detail;
-  } else if (ApplyDeviceFailure(status, &solution)) {
+  if (ApplyDeviceFailure(status, &solution)) {
     solution.timings.total_ms =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - total_start)
@@ -1373,48 +1314,12 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   solution.terminal_state_multiplier = Vector(terminal.state);
   for (int row = 0; row < terminal.state; ++row)
     solution.terminal_state_multiplier[row] = host_terminal_multiplier[row];
-  if (use_host_multiplier_recovery) {
-    const auto recovery_start = std::chrono::steady_clock::now();
-    internal::MultiplierRecovery recovery =
-        internal::RecoverMultipliersForTrajectory(
-            problem, solution.states, solution.controls, options.tolerance);
-    solution.timings.multiplier_ms +=
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - recovery_start)
-            .count();
-    if (!recovery.success) {
-      solution.status = SolveStatus::kNumericalFailure;
-      solution.message = "host multiplier recovery failed: " + recovery.message;
-      solution.timings.total_ms =
-          std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - total_start)
-              .count();
-      return solution;
-    }
-    solution.initial_multiplier = std::move(recovery.initial);
-    solution.dynamics_multipliers = std::move(recovery.dynamics);
-    solution.mixed_multipliers = std::move(recovery.mixed);
-    solution.state_multipliers = std::move(recovery.state);
-    solution.terminal_state_multiplier = std::move(recovery.terminal);
-  }
   solution.objective =
       ObjectiveFromPacked(host_stages, terminal, host_states, host_controls);
   solution.status = SolveStatus::kOptimal;
-  if (solution.used_host_multiplier_recovery) {
-    std::ostringstream message;
-    message << "optimal ("
-            << (solution.used_parallel_riccati ? "parallel" : "sequential")
-            << " CUDA Riccati and host multiplier fallback";
-    if (multiplier_fallback_detail != 0) {
-      message << " after GPU diagnostic " << multiplier_fallback_detail;
-    }
-    message << ")";
-    solution.message = message.str();
-  } else {
-    solution.message = solution.used_parallel_riccati
-                           ? "optimal (parallel CUDA Riccati scan)"
-                           : "optimal (CUDA sequential Riccati fallback)";
-  }
+  solution.message = solution.used_parallel_riccati
+                         ? "optimal (parallel CUDA Riccati scan)"
+                         : "optimal (CUDA sequential Riccati fallback)";
   solution.timings.total_ms =
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - total_start)

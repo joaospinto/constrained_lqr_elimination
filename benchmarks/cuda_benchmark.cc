@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
   std::cout << "N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_device_ms,"
                "wall_speedup,feasibility_ms,reduction_ms,riccati_ms,"
                "reconstruction_ms,multiplier_ms,min_reduced_n,"
-               "min_reduced_m,parallel_riccati,host_multiplier\n";
+               "min_reduced_m,parallel_riccati\n";
   for (std::size_t horizon : horizons) {
     Problem problem = clqr::benchmark::StateOnlyProblem(horizon, n, m, p);
     clqr::Workspace workspace;
@@ -135,9 +135,7 @@ int main(int argc, char** argv) {
               << Median(reduction) << ',' << Median(riccati) << ','
               << Median(reconstruction) << ',' << Median(multiplier) << ','
               << min_reduced_n << ',' << min_reduced_m << ','
-              << (gpu.used_parallel_riccati ? "yes" : "no") << ','
-              << (gpu.used_host_multiplier_recovery ? "yes" : "no")
-              << '\n';
+              << (gpu.used_parallel_riccati ? "yes" : "no") << '\n';
   }
   return 0;
 }
