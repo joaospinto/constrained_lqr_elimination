@@ -83,7 +83,7 @@ if(CLQR_ENABLE_CUDA)
   target_compile_options(
     clqr_cuda
     PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo;-Wno-deprecated-gpu-targets>
   )
 
   if(CLQR_BUILD_TESTS)

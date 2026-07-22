@@ -33,7 +33,7 @@ constexpr Scalar kMinimumDualRelationRowScale = 1e-6f;
 constexpr Scalar kMinimumFeasibilityConsistencyTolerance = Scalar{0};
 constexpr Scalar kMinimumMultiplierRankTolerance = 1e-7;
 constexpr Scalar kMultiplierConsistencyTolerancePerTreeLevel = 1e-6;
-constexpr Scalar kMinimumDualRelationRowScale = 1e-12;
+constexpr Scalar kMinimumDualRelationRowScale = 1e-14;
 #endif
 constexpr int kMaxRrefRows = ConstexprMax(
     4 * kMaxDualParameterDimension,
@@ -49,10 +49,12 @@ constexpr int kMaxAffineMapEntries =
     kMaxStateDimension * kMaxStateDimension + kMaxStateDimension;
 constexpr int kMaxRelationScratchEntries =
     2 * kMaxRelationRows * kMaxStateDimension + kMaxRelationRows;
+#ifdef CLQR_CUDA_EMULATION
 constexpr int kMaxDualRelationScratchEntries =
     4 * kMaxDualParameterDimension * kMaxDualParameterDimension +
     2 * kMaxDualParameterDimension;
 constexpr int kMaxDualValueScratchEntries = 2 * kMaxDualParameterDimension;
+#endif
 constexpr std::size_t kConservativeSharedMemoryLimit = 48 * 1024;
 constexpr std::size_t kMaximumRrefSharedBytes =
     static_cast<std::size_t>(kMaxRrefEntries + 2 * kMaxRrefRows) *
@@ -127,6 +129,7 @@ __device__ void BindRelationScratch(Relation *relation, Scalar *storage) {
   relation->rhs = relation->right + kMaxRelationRows * kMaxStateDimension;
 }
 
+#ifdef CLQR_CUDA_EMULATION
 __device__ void BindDualRelationScratch(DualRelation *relation,
                                         Scalar *storage) {
   relation->left = storage;
@@ -140,6 +143,7 @@ __device__ void BindDualValueScratch(DualNodeValue *value, Scalar *storage) {
   value->left = storage;
   value->right = value->left + kMaxDualParameterDimension;
 }
+#endif
 
 __device__ void SetFailure(DeviceStatus *status, int code, int stage,
                            int detail) {

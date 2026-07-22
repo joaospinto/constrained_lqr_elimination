@@ -349,8 +349,10 @@ void CompareWithCpu(const Problem &problem, const std::string &name,
   Expect(std::abs(gpu.objective - cpu.objective) <=
              kTolerance * (1.0 + std::abs(cpu.objective)),
          name + " objective mismatch");
-  Expect(MaxKktResidual(problem, gpu) <= kKktTolerance,
-         name + " full primal-dual KKT residual");
+  const Scalar kkt_residual = MaxKktResidual(problem, gpu);
+  Expect(kkt_residual <= kKktTolerance,
+         name + " full primal-dual KKT residual=" +
+             std::to_string(kkt_residual));
   for (std::size_t i = 0; i < gpu.reduced_state_dimensions.size(); ++i) {
     Expect(gpu.reduced_state_dimensions[i] <=
                static_cast<int>(gpu.states[i].size()),
@@ -517,6 +519,8 @@ int main() {
   CompareWithCpu(RescaledMixedRowsProblem(unscaled_rows),
                  "independently rescaled rows", true, &unscaled_rows);
   CompareWithCpu(MaximumConstraintProblem(), "maximum constraint dimensions");
+  CompareWithCpu(GeneratedProblem(111, 3, 3, 1, 1, ConstraintMode::kState),
+                 "small state-only standalone");
   clqr::cuda::Workspace reusable_cuda_workspace;
   clqr::cuda::Solution reusable_cuda_solution;
   CompareWithCpu(MaximumConstraintProblem(), "reusable workspace large case",

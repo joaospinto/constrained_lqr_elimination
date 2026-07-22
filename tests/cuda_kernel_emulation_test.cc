@@ -951,6 +951,8 @@ int main() {
   RunEmulation(MaximumConstraintProblem(), "maximum-constraint", true, true);
   RunEmulation(MoreMixedRowsThanControlsProblem(), "more-mixed-than-controls",
                true, true);
+  RunEmulation(clqr::benchmark::StateOnlyProblem(3, 3, 1, 1),
+               "short-horizon-state", true, false);
   RunEmulation(clqr::test::MakeJaxCrossValidationProblem(), "exact-JAX-fixture",
                true, false);
   RunEmulation(LongHorizonStateConstraintProblem(), "long-horizon-state", true,
