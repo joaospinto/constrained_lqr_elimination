@@ -67,9 +67,9 @@ struct Relation {
   int left_dim;
   int right_dim;
   int rows;
-  Scalar left[kMaxRelationRows * kMaxStateDimension];
-  Scalar right[kMaxRelationRows * kMaxStateDimension];
-  Scalar rhs[kMaxRelationRows];
+  Scalar *left;
+  Scalar *right;
+  Scalar *rhs;
 };
 
 // Multiplier recovery contracts only the genuinely free components left after
@@ -81,9 +81,9 @@ struct DualRelation {
   int left_dim;
   int right_dim;
   int rows;
-  Scalar left[2 * kMaxDualParameterDimension * kMaxDualParameterDimension];
-  Scalar right[2 * kMaxDualParameterDimension * kMaxDualParameterDimension];
-  Scalar rhs[2 * kMaxDualParameterDimension];
+  Scalar *left;
+  Scalar *right;
+  Scalar *rhs;
 };
 
 // x = T*z + t. The physical and reduced dimensions are carried separately.
@@ -158,8 +158,8 @@ struct AffineMap {
 struct DualNodeValue {
   int left_dim;
   int right_dim;
-  Scalar left[kMaxDualParameterDimension];
-  Scalar right[kMaxDualParameterDimension];
+  Scalar *left;
+  Scalar *right;
 };
 
 // [y_i; lambda_i] = offset + basis * s_i, where y_i is the physical

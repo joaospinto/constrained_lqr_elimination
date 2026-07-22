@@ -45,12 +45,18 @@ constexpr int kMaxValueElementEntries =
     3 * kMaxStateDimension * kMaxStateDimension + 2 * kMaxStateDimension;
 constexpr int kMaxAffineMapEntries =
     kMaxStateDimension * kMaxStateDimension + kMaxStateDimension;
+constexpr int kMaxRelationScratchEntries =
+    2 * kMaxRelationRows * kMaxStateDimension + kMaxRelationRows;
+constexpr int kMaxDualRelationScratchEntries =
+    4 * kMaxDualParameterDimension * kMaxDualParameterDimension +
+    2 * kMaxDualParameterDimension;
+constexpr int kMaxDualValueScratchEntries = 2 * kMaxDualParameterDimension;
 constexpr std::size_t kConservativeSharedMemoryLimit = 48 * 1024;
 constexpr std::size_t kMaximumRrefSharedBytes =
     static_cast<std::size_t>(kMaxRrefEntries + 2 * kMaxRrefRows) *
         sizeof(Scalar) +
     static_cast<std::size_t>(2 * kMaxRrefRows + 16) * sizeof(int) +
-    sizeof(Relation) +
+    static_cast<std::size_t>(kMaxRelationScratchEntries) * sizeof(Scalar) +
     static_cast<std::size_t>(kMaxDualParameterDimension) * sizeof(Scalar);
 static_assert(
     kMaximumRrefSharedBytes <= kConservativeSharedMemoryLimit,
@@ -111,6 +117,26 @@ __device__ void BindValueElementScratch(ValueElement *element,
 __device__ void BindAffineMapScratch(AffineMap *map, Scalar *storage) {
   map->linear = storage;
   map->offset = map->linear + kMaxStateDimension * kMaxStateDimension;
+}
+
+__device__ void BindRelationScratch(Relation *relation, Scalar *storage) {
+  relation->left = storage;
+  relation->right = relation->left + kMaxRelationRows * kMaxStateDimension;
+  relation->rhs = relation->right + kMaxRelationRows * kMaxStateDimension;
+}
+
+__device__ void BindDualRelationScratch(DualRelation *relation,
+                                        Scalar *storage) {
+  relation->left = storage;
+  relation->right = relation->left +
+                    2 * kMaxDualParameterDimension * kMaxDualParameterDimension;
+  relation->rhs = relation->right +
+                  2 * kMaxDualParameterDimension * kMaxDualParameterDimension;
+}
+
+__device__ void BindDualValueScratch(DualNodeValue *value, Scalar *storage) {
+  value->left = storage;
+  value->right = value->left + kMaxDualParameterDimension;
 }
 
 __device__ void SetFailure(DeviceStatus *status, int code, int stage,
@@ -1038,6 +1064,7 @@ __global__ void FinalizeRelationSuffixFromParentsKernel(
   const int left = 2 * index;
   const Relation &parent = parent_contexts[index];
   __shared__ Relation composed;
+  __shared__ Scalar composed_storage[kMaxRelationScratchEntries];
   __shared__ Scalar matrix[kMaxRrefRows * kMaxRelationColumns];
   __shared__ Scalar factors[kMaxRrefRows];
   __shared__ int pivot_columns[kMaxRrefRows];
@@ -1045,6 +1072,9 @@ __global__ void FinalizeRelationSuffixFromParentsKernel(
   __shared__ int rank;
   __shared__ int best_row;
   __shared__ int local_ok;
+  if (threadIdx.x == 0)
+    BindRelationScratch(&composed, composed_storage);
+  WarpSynchronize();
   if (left + 1 >= count) {
     if (!InvalidScanRelation(parent)) {
       ComposeScanRelationBlock(leaves[left], parent, rank_tolerance,
@@ -1152,6 +1182,14 @@ __global__ void PackControlDimensionsKernel(const ControlParam *control_params,
     return;
   control_dimensions[2 * index] = control_params[index].physical_dim;
   control_dimensions[2 * index + 1] = control_params[index].reduced_dim;
+}
+
+__global__ void PackDualDimensionsKernel(const DualParam *dual_params,
+                                         int count, int *dual_dimensions) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count)
+    return;
+  dual_dimensions[index] = dual_params[index].free_dim;
 }
 
 } // namespace
@@ -1344,6 +1382,7 @@ struct WorkspaceStorage {
   DeviceBuffer<DeviceStatus> device_status;
   DeviceBuffer<Relation> relation_leaves;
   DeviceBuffer<Relation> relation_scan;
+  DeviceBuffer<Scalar> relation_data;
   DeviceBuffer<StateParam> state_params;
   DeviceBuffer<ControlParam> control_params;
   DeviceBuffer<ReducedStage> reduced_stages;
@@ -1369,10 +1408,13 @@ struct WorkspaceStorage {
   DeviceBuffer<int> state_dimensions;
   DeviceBuffer<int> control_dimensions;
   DeviceBuffer<DualParam> dual_params;
+  DeviceBuffer<int> dual_dimensions;
   DeviceBuffer<int> dual_scan_needed;
   DeviceBuffer<StateDualParam> state_dual_params;
   DeviceBuffer<DualRelation> dual_tree;
   DeviceBuffer<DualNodeValue> dual_values;
+  DeviceBuffer<Scalar> dual_relation_data;
+  DeviceBuffer<Scalar> dual_value_data;
   DeviceBuffer<Scalar> initial_multiplier;
   DeviceBuffer<Scalar> dynamics_multipliers;
   DeviceBuffer<Scalar> mixed_multipliers;
@@ -1398,12 +1440,17 @@ struct WorkspaceStorage {
   PinnedBuffer<int> host_state_constraint_offsets;
   PinnedBuffer<int> host_state_dimensions;
   PinnedBuffer<int> host_control_dimensions;
+  PinnedBuffer<Relation> host_relation_leaves;
+  PinnedBuffer<Relation> host_relation_scan;
   PinnedBuffer<ValueElement> host_value_leaves;
   PinnedBuffer<ValueElement> host_value_scan;
   PinnedBuffer<AffineMap> host_map_leaves;
   PinnedBuffer<AffineMap> host_map_scan;
   PinnedBuffer<int> host_parallel_ok;
   PinnedBuffer<int> host_dual_scan_needed;
+  PinnedBuffer<int> host_dual_dimensions;
+  PinnedBuffer<DualRelation> host_dual_tree;
+  PinnedBuffer<DualNodeValue> host_dual_values;
   PinnedBuffer<DeviceStatus> host_status;
   std::vector<int> node_level_offsets;
   std::vector<int> node_level_counts;
@@ -1475,6 +1522,7 @@ struct WorkspaceStorage {
     state_dimensions.Reserve(static_cast<std::size_t>(2) * node_count);
     control_dimensions.Reserve(static_cast<std::size_t>(2) * stage_count);
     dual_params.Reserve(stage_count);
+    dual_dimensions.Reserve(stage_count);
     dual_scan_needed.Reserve(1);
     state_dual_params.Reserve(stage_count);
     initial_multiplier.Reserve(initial_state_dimension);
@@ -1502,12 +1550,15 @@ struct WorkspaceStorage {
     host_state_constraint_offsets.Resize(stage_count + 1);
     host_state_dimensions.Resize(static_cast<std::size_t>(2) * node_count);
     host_control_dimensions.Resize(static_cast<std::size_t>(2) * stage_count);
+    host_relation_leaves.Resize(node_count);
+    host_relation_scan.Resize(total_tree_nodes - node_count);
     host_value_leaves.Resize(node_count);
     host_value_scan.Resize(total_tree_nodes - node_count);
     host_map_leaves.Resize(stage_count);
     host_map_scan.Resize(total_stage_tree_nodes - std::max(stage_count, 1));
     host_parallel_ok.Resize(1);
     host_dual_scan_needed.Resize(1);
+    host_dual_dimensions.Resize(stage_count);
     host_status.Resize(1);
   }
 };
@@ -1802,6 +1853,25 @@ struct ValueCapacity {
   std::size_t Entries() const { return a + b + c + eta + j; }
 };
 
+struct RelationCapacity {
+  std::size_t left = 0;
+  std::size_t right = 0;
+  std::size_t rhs = 0;
+
+  void Include(const ScanShape &shape) {
+    if (shape.left < 0)
+      return;
+    const std::size_t left_dimension = static_cast<std::size_t>(shape.left);
+    const std::size_t right_dimension = static_cast<std::size_t>(shape.right);
+    const std::size_t rows = left_dimension + right_dimension;
+    left = std::max(left, rows * left_dimension);
+    right = std::max(right, rows * right_dimension);
+    rhs = std::max(rhs, rows);
+  }
+
+  std::size_t Entries() const { return left + right + rhs; }
+};
+
 struct MapCapacity {
   std::size_t linear = 0;
   std::size_t offset = 0;
@@ -1816,6 +1886,84 @@ struct MapCapacity {
 
   std::size_t Entries() const { return linear + offset; }
 };
+
+template <typename Capacity>
+void PlanSuffixScanStorage(const std::vector<ScanShape> &leaves,
+                           const std::vector<int> &level_offsets,
+                           const std::vector<int> &level_counts,
+                           std::vector<Capacity> *leaf_capacity,
+                           std::vector<Capacity> *internal_capacity) {
+  const int leaf_count = static_cast<int>(leaves.size());
+  const int internal_count =
+      level_offsets.back() + level_counts.back() - leaf_count;
+  leaf_capacity->assign(leaf_count, Capacity{});
+  internal_capacity->assign(internal_count, Capacity{});
+  for (int leaf = 0; leaf < leaf_count; ++leaf)
+    (*leaf_capacity)[leaf].Include(leaves[leaf]);
+
+  std::vector<ScanShape> reductions(internal_count);
+  std::vector<ScanShape> contexts(internal_count);
+  for (std::size_t level = 1; level < level_counts.size(); ++level) {
+    const int offset = level_offsets[level] - leaf_count;
+    const int child_count = level_counts[level - 1];
+    const int child_offset = level_offsets[level - 1] - leaf_count;
+    for (int parent = 0; parent < level_counts[level]; ++parent) {
+      const int child = 2 * parent;
+      const ScanShape first =
+          level == 1 ? leaves[child] : reductions[child_offset + child];
+      ScanShape result = first;
+      if (child + 1 < child_count) {
+        const ScanShape second = level == 1
+                                     ? leaves[child + 1]
+                                     : reductions[child_offset + child + 1];
+        result = ComposeScanShapes(first, second);
+      }
+      reductions[offset + parent] = result;
+      (*internal_capacity)[offset + parent].Include(result);
+    }
+  }
+
+  if (leaf_count == 1)
+    return;
+  contexts[level_offsets.back() - leaf_count] = ScanShape{};
+  for (int level = static_cast<int>(level_counts.size()) - 2; level >= 1;
+       --level) {
+    const int child_offset = level_offsets[level] - leaf_count;
+    const int parent_offset = level_offsets[level + 1] - leaf_count;
+    for (int parent = 0; parent < level_counts[level + 1]; ++parent) {
+      const int child = 2 * parent;
+      const ScanShape parent_context = contexts[parent_offset + parent];
+      if (child + 1 >= level_counts[level]) {
+        contexts[child_offset + child] = parent_context;
+        (*internal_capacity)[child_offset + child].Include(parent_context);
+        continue;
+      }
+      const ScanShape left_context = ComposeScanShapes(
+          reductions[child_offset + child + 1], parent_context);
+      contexts[child_offset + child] = left_context;
+      contexts[child_offset + child + 1] = parent_context;
+      (*internal_capacity)[child_offset + child].Include(left_context);
+      (*internal_capacity)[child_offset + child + 1].Include(parent_context);
+    }
+  }
+
+  const int parent_offset = level_offsets[1] - leaf_count;
+  for (int parent = 0; parent < level_counts[1]; ++parent) {
+    const int child = 2 * parent;
+    const ScanShape parent_context = contexts[parent_offset + parent];
+    if (child + 1 >= leaf_count) {
+      (*leaf_capacity)[child].Include(
+          ComposeScanShapes(leaves[child], parent_context));
+      continue;
+    }
+    const ScanShape right_suffix =
+        ComposeScanShapes(leaves[child + 1], parent_context);
+    const ScanShape left_suffix =
+        ComposeScanShapes(leaves[child], right_suffix);
+    (*leaf_capacity)[child + 1].Include(right_suffix);
+    (*leaf_capacity)[child].Include(left_suffix);
+  }
+}
 
 void BindValueStorage(ValueElement *element, Scalar **cursor,
                       const ValueCapacity &capacity) {
@@ -1833,6 +1981,19 @@ void BindValueStorage(ValueElement *element, Scalar **cursor,
   *cursor += capacity.j;
 }
 
+void BindRelationStorage(Relation *relation, Scalar **cursor,
+                         const RelationCapacity &capacity) {
+  relation->left_dim = -1;
+  relation->right_dim = 0;
+  relation->rows = 0;
+  relation->left = *cursor;
+  *cursor += capacity.left;
+  relation->right = *cursor;
+  *cursor += capacity.right;
+  relation->rhs = *cursor;
+  *cursor += capacity.rhs;
+}
+
 void BindMapStorage(AffineMap *map, Scalar **cursor,
                     const MapCapacity &capacity) {
   map->left_dim = -1;
@@ -1843,86 +2004,57 @@ void BindMapStorage(AffineMap *map, Scalar **cursor,
   *cursor += capacity.offset;
 }
 
+void PrepareRelationStorage(const Problem &problem,
+                            WorkspaceStorage *workspace) {
+  const int stage_count = static_cast<int>(problem.stages.size());
+  const int node_count = stage_count + 1;
+  std::vector<ScanShape> leaves(node_count);
+  for (int stage = 0; stage < stage_count; ++stage) {
+    leaves[stage] = {static_cast<int>(problem.stages[stage].A.cols()),
+                     static_cast<int>(problem.stages[stage].A.rows())};
+  }
+  leaves[stage_count] = {static_cast<int>(problem.terminal_Q.rows()), 0};
+  std::vector<RelationCapacity> leaf_capacity;
+  std::vector<RelationCapacity> internal_capacity;
+  PlanSuffixScanStorage(leaves, workspace->node_level_offsets,
+                        workspace->node_level_counts, &leaf_capacity,
+                        &internal_capacity);
+  std::size_t entries = 0;
+  for (const RelationCapacity &capacity : leaf_capacity)
+    entries += capacity.Entries();
+  for (const RelationCapacity &capacity : internal_capacity)
+    entries += capacity.Entries();
+  workspace->relation_data.Reserve(entries);
+  Scalar *cursor = workspace->relation_data.get();
+  for (int node = 0; node < node_count; ++node)
+    BindRelationStorage(&workspace->host_relation_leaves[node], &cursor,
+                        leaf_capacity[node]);
+  for (std::size_t node = 0; node < internal_capacity.size(); ++node)
+    BindRelationStorage(&workspace->host_relation_scan[node], &cursor,
+                        internal_capacity[node]);
+  Require(cursor == workspace->relation_data.get() + entries,
+          "internal CUDA relation layout size mismatch");
+}
+
 void PrepareValueStorage(WorkspaceStorage *workspace, int stage_count) {
   const int node_count = stage_count + 1;
   const auto &level_offsets = workspace->node_level_offsets;
   const auto &level_counts = workspace->node_level_counts;
   std::vector<ScanShape> leaves(node_count);
-  std::vector<ValueCapacity> leaf_capacity(node_count);
   for (int node = 0; node < node_count; ++node) {
     const int left = workspace->host_state_dimensions[2 * node + 1];
     const int right = node == stage_count
                           ? 0
                           : workspace->host_state_dimensions[2 * node + 3];
     leaves[node] = {left, right};
-    leaf_capacity[node].Include(leaves[node]);
   }
 
   const int internal_count =
       static_cast<int>(workspace->host_value_scan.size());
-  std::vector<ScanShape> reductions(internal_count);
-  std::vector<ScanShape> contexts(internal_count);
-  std::vector<ValueCapacity> internal_capacity(internal_count);
-  for (std::size_t level = 1; level < level_counts.size(); ++level) {
-    const int offset = level_offsets[level] - node_count;
-    const int child_count = level_counts[level - 1];
-    const int child_offset = level_offsets[level - 1] - node_count;
-    for (int parent = 0; parent < level_counts[level]; ++parent) {
-      const int child = 2 * parent;
-      const ScanShape first =
-          level == 1 ? leaves[child] : reductions[child_offset + child];
-      ScanShape result = first;
-      if (child + 1 < child_count) {
-        const ScanShape second = level == 1
-                                     ? leaves[child + 1]
-                                     : reductions[child_offset + child + 1];
-        result = ComposeScanShapes(first, second);
-      }
-      reductions[offset + parent] = result;
-      internal_capacity[offset + parent].Include(result);
-    }
-  }
-
-  if (node_count > 1) {
-    contexts[level_offsets.back() - node_count] = ScanShape{};
-    for (int level = static_cast<int>(level_counts.size()) - 2; level >= 1;
-         --level) {
-      const int child_offset = level_offsets[level] - node_count;
-      const int parent_offset = level_offsets[level + 1] - node_count;
-      for (int parent = 0; parent < level_counts[level + 1]; ++parent) {
-        const int child = 2 * parent;
-        const ScanShape parent_context = contexts[parent_offset + parent];
-        if (child + 1 >= level_counts[level]) {
-          contexts[child_offset + child] = parent_context;
-          internal_capacity[child_offset + child].Include(parent_context);
-          continue;
-        }
-        const ScanShape left_context = ComposeScanShapes(
-            reductions[child_offset + child + 1], parent_context);
-        contexts[child_offset + child] = left_context;
-        contexts[child_offset + child + 1] = parent_context;
-        internal_capacity[child_offset + child].Include(left_context);
-        internal_capacity[child_offset + child + 1].Include(parent_context);
-      }
-    }
-
-    const int parent_offset = level_offsets[1] - node_count;
-    for (int parent = 0; parent < level_counts[1]; ++parent) {
-      const int child = 2 * parent;
-      const ScanShape parent_context = contexts[parent_offset + parent];
-      if (child + 1 >= node_count) {
-        leaf_capacity[child].Include(
-            ComposeScanShapes(leaves[child], parent_context));
-        continue;
-      }
-      const ScanShape right_suffix =
-          ComposeScanShapes(leaves[child + 1], parent_context);
-      const ScanShape left_suffix =
-          ComposeScanShapes(leaves[child], right_suffix);
-      leaf_capacity[child + 1].Include(right_suffix);
-      leaf_capacity[child].Include(left_suffix);
-    }
-  }
+  std::vector<ValueCapacity> leaf_capacity;
+  std::vector<ValueCapacity> internal_capacity;
+  PlanSuffixScanStorage(leaves, level_offsets, level_counts, &leaf_capacity,
+                        &internal_capacity);
 
   std::size_t entries = 0;
   for (const ValueCapacity &capacity : leaf_capacity)
@@ -2029,6 +2161,98 @@ void PrepareMapStorage(WorkspaceStorage *workspace, int stage_count) {
           "internal CUDA map layout size mismatch");
 }
 
+struct DualValueCapacity {
+  std::size_t left = 0;
+  std::size_t right = 0;
+
+  void Include(const ScanShape &shape) {
+    left = std::max(left, static_cast<std::size_t>(shape.left));
+    right = std::max(right, static_cast<std::size_t>(shape.right));
+  }
+
+  std::size_t Entries() const { return left + right; }
+};
+
+void BindDualRelationStorage(DualRelation *relation, Scalar **cursor,
+                             const RelationCapacity &capacity) {
+  relation->left_dim = -1;
+  relation->right_dim = 0;
+  relation->rows = 0;
+  relation->left = *cursor;
+  *cursor += capacity.left;
+  relation->right = *cursor;
+  *cursor += capacity.right;
+  relation->rhs = *cursor;
+  *cursor += capacity.rhs;
+}
+
+void BindDualValueStorage(DualNodeValue *value, Scalar **cursor,
+                          const DualValueCapacity &capacity) {
+  value->left_dim = -1;
+  value->right_dim = 0;
+  value->left = *cursor;
+  *cursor += capacity.left;
+  value->right = *cursor;
+  *cursor += capacity.right;
+}
+
+void PrepareDualStorage(WorkspaceStorage *workspace, int stage_count) {
+  const auto &level_offsets = workspace->stage_level_offsets;
+  const auto &level_counts = workspace->stage_level_counts;
+  const int tree_size = level_offsets.back() + level_counts.back();
+  std::vector<ScanShape> shapes(tree_size);
+  std::vector<RelationCapacity> relation_capacity(tree_size);
+  std::vector<DualValueCapacity> value_capacity(tree_size);
+  for (int stage = 0; stage < stage_count; ++stage) {
+    const int right = stage + 1 == stage_count
+                          ? 0
+                          : workspace->host_dual_dimensions[stage + 1];
+    shapes[stage] = {workspace->host_dual_dimensions[stage], right};
+    relation_capacity[stage].Include(shapes[stage]);
+    value_capacity[stage].Include(shapes[stage]);
+  }
+  for (std::size_t level = 1; level < level_counts.size(); ++level) {
+    const int child_offset = level_offsets[level - 1];
+    const int parent_offset = level_offsets[level];
+    for (int parent = 0; parent < level_counts[level]; ++parent) {
+      const int child = 2 * parent;
+      ScanShape shape = shapes[child_offset + child];
+      if (child + 1 < level_counts[level - 1]) {
+        shape = ComposeScanShapes(shape, shapes[child_offset + child + 1]);
+      }
+      shapes[parent_offset + parent] = shape;
+      relation_capacity[parent_offset + parent].Include(shape);
+      value_capacity[parent_offset + parent].Include(shape);
+    }
+  }
+
+  std::size_t relation_entries = 0;
+  std::size_t value_entries = 0;
+  for (int node = 0; node < tree_size; ++node) {
+    relation_entries += relation_capacity[node].Entries();
+    value_entries += value_capacity[node].Entries();
+  }
+  workspace->dual_tree.Reserve(tree_size);
+  workspace->dual_values.Reserve(tree_size);
+  workspace->dual_relation_data.Reserve(relation_entries);
+  workspace->dual_value_data.Reserve(value_entries);
+  workspace->host_dual_tree.Resize(tree_size);
+  workspace->host_dual_values.Resize(tree_size);
+  Scalar *relation_cursor = workspace->dual_relation_data.get();
+  Scalar *value_cursor = workspace->dual_value_data.get();
+  for (int node = 0; node < tree_size; ++node) {
+    BindDualRelationStorage(&workspace->host_dual_tree[node], &relation_cursor,
+                            relation_capacity[node]);
+    BindDualValueStorage(&workspace->host_dual_values[node], &value_cursor,
+                         value_capacity[node]);
+  }
+  Require(relation_cursor ==
+              workspace->dual_relation_data.get() + relation_entries,
+          "internal CUDA dual-relation layout size mismatch");
+  Require(value_cursor == workspace->dual_value_data.get() + value_entries,
+          "internal CUDA dual-value layout size mismatch");
+}
+
 Scalar ObjectiveFromCompact(const Problem &problem, const int *state_offsets,
                             const int *control_offsets, const Scalar *states,
                             const Scalar *controls) {
@@ -2102,6 +2326,7 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     stage_level_counts.push_back((stage_level_counts.back() + 1) / 2);
     stage_tree_size += stage_level_counts.back();
   }
+  PrepareRelationStorage(problem, &workspace);
   auto &host_stages = workspace.host_stages;
   Scalar *host_problem_cursor = workspace.host_problem_data.data();
   Scalar *device_problem_cursor = workspace.device_problem_data.get();
@@ -2140,6 +2365,18 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &reduced_initial = workspace.reduced_initial;
 
   solution.timings.upload_ms = TimeGpu(workspace, [&] {
+    CudaCheck(cudaMemcpyAsync(
+                  relation_a.get(), workspace.host_relation_leaves.data(),
+                  workspace.host_relation_leaves.size() * sizeof(Relation),
+                  cudaMemcpyHostToDevice),
+              "upload compact relation leaves");
+    if (workspace.host_relation_scan.size() > 0) {
+      CudaCheck(cudaMemcpyAsync(
+                    relation_b.get(), workspace.host_relation_scan.data(),
+                    workspace.host_relation_scan.size() * sizeof(Relation),
+                    cudaMemcpyHostToDevice),
+                "upload compact relation tree");
+    }
     if (stage_count > 0) {
       CudaCheck(cudaMemcpyAsync(device_stages.get(), host_stages.data(),
                                 host_stages.size() * sizeof(PackedStage),
@@ -2504,6 +2741,7 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                          stage_level_counts.size())
           : kScalarMax;
   auto &dual_params = workspace.dual_params;
+  auto &dual_dimensions = workspace.dual_dimensions;
   auto &dual_scan_needed = workspace.dual_scan_needed;
   auto &state_dual_params = workspace.state_dual_params;
   auto &dual_tree = workspace.dual_tree;
@@ -2527,9 +2765,18 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
           control_offsets.get(), stage_count, multiplier_rank_tolerance,
           multiplier_consistency_tolerance, dual_params.get(),
           dual_scan_needed.get(), device_status.get());
+      const int dual_dimension_blocks = (stage_count + kThreads - 1) / kThreads;
+      PackDualDimensionsKernel<<<dual_dimension_blocks, kThreads>>>(
+          dual_params.get(), stage_count, dual_dimensions.get());
       CudaCheck(cudaMemcpyAsync(&host_dual_scan_needed, dual_scan_needed.get(),
                                 sizeof(int), cudaMemcpyDeviceToHost),
                 "read dual scan flag");
+      CudaCheck(
+          cudaMemcpyAsync(workspace.host_dual_dimensions.data(),
+                          dual_dimensions.get(),
+                          workspace.host_dual_dimensions.size() * sizeof(int),
+                          cudaMemcpyDeviceToHost),
+          "read dual dimensions");
       CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
                                 device_status.get(), sizeof(DeviceStatus),
                                 cudaMemcpyDeviceToHost),
@@ -2544,14 +2791,25 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       return solution;
     }
     if (host_dual_scan_needed != 0) {
-      dual_tree.Reserve(stage_tree_size);
-      dual_values.Reserve(stage_tree_size);
+      PrepareDualStorage(&workspace, stage_count);
     }
     DualRelation *dual_relations =
         host_dual_scan_needed != 0 ? dual_tree.get() : nullptr;
     DualNodeValue *dual_leaf_values =
         host_dual_scan_needed != 0 ? dual_values.get() : nullptr;
     solution.timings.multiplier_ms += TimeGpu(workspace, [&] {
+      if (host_dual_scan_needed != 0) {
+        CudaCheck(cudaMemcpyAsync(
+                      dual_tree.get(), workspace.host_dual_tree.data(),
+                      workspace.host_dual_tree.size() * sizeof(DualRelation),
+                      cudaMemcpyHostToDevice),
+                  "upload compact dual relation tree");
+        CudaCheck(cudaMemcpyAsync(
+                      dual_values.get(), workspace.host_dual_values.data(),
+                      workspace.host_dual_values.size() * sizeof(DualNodeValue),
+                      cudaMemcpyHostToDevice),
+                  "upload compact dual value tree");
+      }
       BuildDualParameterRelationsKernel<<<stage_count, kThreads>>>(
           device_stages.get(), device_terminal.get(), dual_params.get(),
           stage_count, states.get(), controls.get(), state_offsets.get(),

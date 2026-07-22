@@ -466,6 +466,20 @@ void RunEmulation(const Problem &problem, const std::string &name,
                       static_cast<Scalar>(feasibility_scan_levels + 2));
   std::vector<Relation> relation_a(nodes),
       relation_b(std::max(node_tree_size - nodes, 1));
+  std::vector<Scalar> relation_a_storage(static_cast<std::size_t>(nodes) *
+                                         kMaxRelationScratchEntries);
+  std::vector<Scalar> relation_b_storage(relation_b.size() *
+                                         kMaxRelationScratchEntries);
+  for (int node = 0; node < nodes; ++node) {
+    BindRelationScratch(&relation_a[node], relation_a_storage.data() +
+                                               static_cast<std::size_t>(node) *
+                                                   kMaxRelationScratchEntries);
+  }
+  for (std::size_t node = 0; node < relation_b.size(); ++node) {
+    BindRelationScratch(&relation_b[node],
+                        relation_b_storage.data() +
+                            node * kMaxRelationScratchEntries);
+  }
   Launch(nodes, [&] {
     BuildPrimalLeavesKernel(stages.data(), horizon, &terminal, kTolerance,
                             feasibility_consistency_tolerance,
@@ -797,6 +811,21 @@ void RunEmulation(const Problem &problem, const std::string &name,
   std::vector<StateDualParam> state_dual_params(horizon);
   std::vector<DualRelation> dual_tree(stage_tree_size);
   std::vector<DualNodeValue> dual_values(stage_tree_size);
+  std::vector<Scalar> dual_tree_storage(
+      static_cast<std::size_t>(stage_tree_size) *
+      kMaxDualRelationScratchEntries);
+  std::vector<Scalar> dual_value_storage(
+      static_cast<std::size_t>(stage_tree_size) * kMaxDualValueScratchEntries);
+  for (int node = 0; node < stage_tree_size; ++node) {
+    BindDualRelationScratch(&dual_tree[node],
+                            dual_tree_storage.data() +
+                                static_cast<std::size_t>(node) *
+                                    kMaxDualRelationScratchEntries);
+    BindDualValueScratch(&dual_values[node],
+                         dual_value_storage.data() +
+                             static_cast<std::size_t>(node) *
+                                 kMaxDualValueScratchEntries);
+  }
   int dual_scan_needed = 0;
   if (horizon > 0) {
     Launch(horizon, [&] {
