@@ -36,6 +36,66 @@ original KKT stationarity equations. Redundant equality rows mark the Newton-KKT
 singular; a reduced control Hessian with the wrong inertia is reported separately when the
 candidate solve can still proceed.
 
+## Optional CUDA backend
+
+The CMake build has an optional CUDA backend for problems whose state, control, mixed-
+constraint, and state-constraint dimensions are each at most 16. The limit bounds kernel
+storage; every relation, state parameterization, control parameterization, and Riccati element
+also carries its active dimension. Consequently, a reduction from `(n_i, m_i)` to
+`(r_i, s_i)` causes the later kernels to perform `r_i`- and `s_i`-dimensional algebra rather
+than padded `n_i`- and `m_i`-dimensional algebra.
+
+The GPU algorithm consists of:
+
+1. a reverse associative scan of affine endpoint relations to compute all feasible-state
+   parameterizations `x_i = T_i z_i + t_i`;
+2. independent per-stage control elimination and construction of the reduced LQR;
+3. an associative conditional-value scan for the reduced Riccati solve, followed by an
+   affine prefix scan for state rollout; and
+4. balanced contraction and expansion of the original stationarity relations to recover one
+   globally consistent set of multipliers.
+
+Rank decisions use row equilibration and partial pivoting. Redundant equalities are accepted,
+and free multiplier components are set to zero. If a reduced stage cost `R_i` is not positive
+definite, the backend retains the same reduced coordinates but uses a GPU-side sequential
+Riccati fallback; this avoids making positive definiteness of each `R_i` a new correctness
+requirement. All CUDA calculations use `double` precision.
+
+The default build remains CUDA-free:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+Build for a Tesla T4 (compute capability 7.5) with:
+
+```sh
+cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
+  -DCLQR_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build-cuda --parallel
+ctest --test-dir build-cuda --output-on-failure
+build-cuda/clqr_cuda_benchmark
+```
+
+The CUDA test compares states, controls, and objective values against the existing C++ solver,
+then checks the complete primal-dual KKT residual. It covers unconstrained, state-only, mixed,
+terminal, nonuniform, rank-deficient/redundant, infeasible, and sequential-fallback cases.
+CUDA-free test builds additionally execute every numerical kernel in a one-thread CPU-emulation
+mode, comparing both Riccati paths and the recovered KKT point with the C++ solver.
+
+On Google Colab, select a GPU runtime, clone this repository, and run the complete hardware
+report, build, C++/CUDA tests, JAX cross-validation, and benchmark with one command:
+
+```sh
+bash scripts/colab_t4.sh
+```
+
+The script defaults to architecture 75 and five benchmark repetitions. Override these with
+`CLQR_CUDA_ARCH` and `CLQR_BENCHMARK_REPEATS`. Set `CLQR_JAX_DIR` to reuse an existing checkout
+of `joaospinto/constrained_lqr_jax`, or `CLQR_SKIP_JAX=1` to omit only that cross-check.
+
 Build and test:
 
 ```sh

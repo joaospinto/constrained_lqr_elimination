@@ -29,6 +29,43 @@ cc_test(
     deps = [":clqr"],
 )
 
+cc_library(
+    name = "clqr_cuda_stub",
+    srcs = ["src/cuda_stub.cc"],
+    hdrs = ["include/clqr/cuda.h"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [":clqr"],
+)
+
+cc_test(
+    name = "cuda_stub_test",
+    srcs = ["tests/cuda_stub_test.cc"],
+    deps = [":clqr_cuda_stub"],
+)
+
+cc_library(
+    name = "cuda_kernel_emulation_sources",
+    hdrs = [
+        "src/cuda_internal.h",
+        "tests/emulated_cuda/cuda_runtime.h",
+    ],
+    includes = ["tests/emulated_cuda"],
+    textual_hdrs = ["src/cuda_solver.cu"],
+    deps = [":clqr"],
+)
+
+cc_test(
+    name = "cuda_kernel_emulation_test",
+    srcs = ["tests/cuda_kernel_emulation_test.cc"],
+    copts = ["-Wno-sometimes-uninitialized"],
+    deps = [
+        ":clqr",
+        ":clqr_cuda_stub",
+        ":cuda_kernel_emulation_sources",
+    ],
+)
+
 nanobind_extension(
     name = "_clqr",
     srcs = ["python/clqr_module.cc"],
