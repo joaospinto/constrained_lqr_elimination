@@ -1,4 +1,5 @@
 #include "clqr/clqr.h"
+#include "../src/multiplier_recovery.h"
 
 #include <algorithm>
 #include <array>
@@ -25,9 +26,11 @@ using clqr::Workspace;
 #ifdef CLQR_USE_FLOAT
 constexpr Scalar kTol = 2e-4f;
 constexpr Scalar kLinearSolveTolerance = 1e-7f;
+constexpr Scalar kTrajectoryMultiplierTolerance = 1e-2f;
 #else
 constexpr Scalar kTol = 1e-7;
 constexpr Scalar kLinearSolveTolerance = 1e-10;
+constexpr Scalar kTrajectoryMultiplierTolerance = kTol;
 #endif
 
 struct Solution {
@@ -684,6 +687,27 @@ void GeneratedCasesMatchKkt() {
   }
 }
 
+void TrajectoryMultiplierRecoveryMatchesKkt() {
+  Problem problem =
+      GeneratedFeasibleProblem(519, 64, 4, 2, 1, ConstraintMode::kStateOnly);
+  Solution solution = SolveWithWorkspace(problem);
+  Expect(solution.status == SolveStatus::kOptimal,
+         "trajectory multiplier source solve status");
+  clqr::internal::MultiplierRecovery recovery =
+      clqr::internal::RecoverMultipliersForTrajectory(
+          problem, solution.states, solution.controls, kLinearSolveTolerance);
+  Expect(recovery.success,
+         "trajectory multiplier recovery: " + recovery.message);
+  solution.initial_multiplier = std::move(recovery.initial);
+  solution.dynamics_multipliers = std::move(recovery.dynamics);
+  solution.mixed_multipliers = std::move(recovery.mixed);
+  solution.state_multipliers = std::move(recovery.state);
+  solution.terminal_state_multiplier = std::move(recovery.terminal);
+  ExpectNear(MaxKktResidual(problem, solution), 0.0,
+             kTrajectoryMultiplierTolerance,
+             "trajectory multiplier recovery KKT residual");
+}
+
 void WrongInertiaReportedWithCandidate() {
   Problem p;
   p.initial_state = Vector{0.0};
@@ -755,6 +779,7 @@ int main() {
   RankDeficientMixedConstraintMatchesKkt();
   StateConstraintMatchesKkt();
   GeneratedCasesMatchKkt();
+  TrajectoryMultiplierRecoveryMatchesKkt();
   WrongInertiaReportedWithCandidate();
   SingularReducedHessianReported();
   InfeasibleConstraintDetected();

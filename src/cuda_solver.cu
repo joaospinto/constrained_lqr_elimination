@@ -893,8 +893,8 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
 #ifdef CLQR_USE_FLOAT
   // In single precision, dependent local equality rows can make the balanced
   // dual relation tree unnecessarily ill-conditioned. Small such problems
-  // use the stable sequential recovery already shared with the CPU solver;
-  // the horizon cap avoids its worst-case cubic multiplier workspace.
+  // use the stable linear-space pullback shared with the CPU solver. The cap
+  // limits sequential fallback latency and leaves large CUDA solves parallel.
   const bool use_host_multiplier_recovery =
       stage_count <= 64 && HasDependentEqualityRows(problem, options.tolerance);
 #else

@@ -59,8 +59,7 @@ int main(int argc, char** argv) {
       << "# CUDA wall time includes allocation; cuda_device_ms is the sum "
          "of event-timed transfer and kernel phases.\n";
   std::cout << "# CPU columns are nan above N=" << cpu_max_horizon
-            << "; the current general CPU multiplier-workspace bound is cubic "
-               "in N for state-only equalities.\n";
+            << "; larger CPU cases are skipped to limit benchmark time.\n";
   std::cout << "N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_device_ms,"
                "wall_speedup,feasibility_ms,reduction_ms,riccati_ms,"
                "reconstruction_ms,multiplier_ms,min_reduced_n,"

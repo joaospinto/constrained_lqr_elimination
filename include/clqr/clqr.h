@@ -184,9 +184,11 @@ class Workspace {
     const std::size_t state_pivot_bound = Min(state_dim, state_rows_bound);
     const std::size_t mixed_stage_ops = stages;
     const std::size_t mixed_stage_scalars =
-        2 * mixed_rows_bound * (control_dim + state_dim + 1) +
+        2 * mixed_rows_bound *
+            (control_dim + state_dim + 1 + mixed_rows_bound) +
         control_dim * state_dim + control_dim * control_dim + control_dim +
-        mixed_rows_bound * state_dim + mixed_rows_bound +
+        control_dim * mixed_rows_bound + mixed_rows_bound * state_dim +
+        mixed_rows_bound + mixed_rows_bound * mixed_rows_bound +
         state_dim * state_dim + control_dim * control_dim +
         state_dim * control_dim + state_dim * control_dim + state_dim +
         control_dim + state_dim + 8 * state_dim * state_dim +
@@ -197,19 +199,25 @@ class Workspace {
         mixed_rows_bound + 2 * control_dim * state_dim +
         2 * control_dim * control_dim + 3 * control_dim;
     const std::size_t state_stage_scalars =
-        2 * state_rows_bound * (state_dim + 1) + state_dim * state_dim +
-        state_dim + 3 * state_dim * state_dim + 3 * state_dim * control_dim +
-        4 * state_dim + 8 * state_dim * state_dim +
+        2 * state_rows_bound * (state_dim + 1 + state_rows_bound) +
+        state_dim * state_dim + state_dim + state_dim * state_rows_bound +
+        3 * state_dim * state_dim + 3 * state_dim * control_dim + 4 * state_dim +
+        8 * state_dim * state_dim +
         4 * state_dim * control_dim + 2 * control_dim * state_dim +
         4 * state_dim + 2 * control_dim +
         (state_pivot_bound + mixed_constraints_per_stage) *
             (state_dim + control_dim + 1) +
         3 * state_dim * state_dim + 2 * state_dim +
         2 * control_dim * state_dim + control_dim * control_dim + control_dim;
-    const std::size_t parameter_bound = Max(
-        std::size_t{1}, total_mixed_scalars + total_state_multiplier_scalars +
-                            terminal_constraints + mixed_constraints_per_stage +
-                            state_constraints_per_stage + terminal_constraints);
+    const std::size_t pullback_stage_scalars =
+        40 * (2 * state_dim + control_dim + mixed_constraints_per_stage +
+              state_constraints_per_stage + terminal_constraints + 1);
+#ifdef CLQR_USE_FLOAT
+    using PullbackScalar = double;
+#else
+    using PullbackScalar = Scalar;
+#endif
+    using PullbackVector = WorkspaceVector<PullbackScalar>;
 
     std::size_t bytes = 0;
     bytes = AddAligned(bytes, alignof(Stage), sizeof(Stage) * stages);
@@ -278,17 +286,22 @@ class Workspace {
                        sizeof(Scalar) * total_state_multiplier_scalars);
     bytes = AddAligned(bytes, alignof(Scalar),
                        sizeof(Scalar) * terminal_constraints);
-    bytes = AddAligned(
-        bytes, alignof(Scalar),
-        sizeof(Scalar) * stages *
-            (control_dim * (parameter_bound + mixed_constraints_per_stage +
-                            state_constraints_per_stage) +
-             control_dim +
-             2 * control_dim *
-                 (parameter_bound + mixed_constraints_per_stage +
-                  state_constraints_per_stage + 1) +
-             parameter_bound * parameter_bound + parameter_bound +
-             state_dim * parameter_bound + state_dim + parameter_bound));
+    bytes = AddAligned(bytes, alignof(PullbackVector),
+                       sizeof(PullbackVector) * (2 * stages + 1));
+    bytes = AddAligned(bytes, alignof(PullbackScalar),
+                       sizeof(PullbackScalar) *
+                           (total_dynamics_scalars + total_state_scalars +
+                            stages * pullback_stage_scalars +
+                            4 * state_dim *
+                                (state_dim + terminal_constraints + 1)));
+    bytes = AddAligned(bytes, alignof(Vector),
+                       sizeof(Vector) * (5 * stages + 1));
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) *
+                           (total_state_scalars + total_control_scalars +
+                            total_dynamics_scalars + total_mixed_scalars +
+                            total_state_multiplier_scalars +
+                            terminal_constraints + state_dim));
     return bytes;
   }
 

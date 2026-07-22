@@ -31,10 +31,12 @@ from `N - 1` down to `0`. At each stage it:
 After the sweep, all explicit equality constraints have been folded into affine state and
 control maps, so the reduced problem is an unconstrained LQR solved by a standard Riccati
 backward/forward pass. The final state and control trajectories are mapped back through the
-stored affine maps, and the original multipliers are recovered by a backward pass over the
-original KKT stationarity equations. Redundant equality rows mark the Newton-KKT system as
-singular; a reduced control Hessian with the wrong inertia is reported separately when the
-candidate solve can still proceed.
+stored affine maps. For propagated state equalities, the original multipliers are recovered by
+applying the transpose of the recorded elimination operations from left to right; the
+mixed-only case retains its simpler backward stationarity pass. Both recovery paths use linear
+time and storage in the horizon. Redundant equality rows mark the Newton-KKT system as singular;
+a reduced control Hessian with the wrong inertia is reported separately when the candidate
+solve can still proceed.
 
 ## Optional CUDA backend
 
@@ -55,6 +57,12 @@ The GPU algorithm consists of:
 4. balanced contraction and expansion of the original stationarity relations to recover one
    globally consistent set of multipliers.
 
+For fixed stage dimensions, every GPU-resident array is linear in the horizon. The normal GPU
+path has logarithmic kernel-launch depth for the feasibility scan, Riccati scan, rollout, and
+multiplier contraction/expansion. The scan implementation favors simple Hillis--Steele passes,
+which use `O(N log N)` local compositions while retaining `O(log N)` depth and `O(N)` space;
+the balanced multiplier tree uses `O(N)` compositions.
+
 Rank decisions use row equilibration and partial pivoting. Redundant equalities are accepted,
 and free multiplier components are set to zero. If a reduced stage cost `R_i` is not positive
 definite, the backend retains the same reduced coordinates but uses a GPU-side sequential
@@ -65,8 +73,8 @@ The public numeric type is `clqr::Scalar`. CMake selects it consistently for the
 CPU solver, and CUDA backend with `CLQR_PRECISION=FP64` (the default) or `FP32`; use separate
 build directories because the choice changes the library ABI. FP32 uses precision-appropriate
 rank and consistency thresholds. For short FP32 problems with dependent equality rows, it
-conservatively uses the sequential CUDA Riccati path and host multiplier recovery; full-rank
-instances retain the parallel GPU path.
+conservatively uses the sequential CUDA Riccati path and the CPU's linear-time, linear-space
+multiplier pullback; full-rank instances retain the parallel GPU path.
 
 The CUDA benchmark is precision matched: an FP32 build reports FP32 sequential C++ CPU times
 against FP32 CUDA times, while an FP64 build compares the corresponding FP64 implementations.
