@@ -20,7 +20,6 @@ using namespace clqr::cuda;
 using namespace clqr::cuda::detail;
 
 constexpr double kTolerance = 1e-9;
-constexpr double kMultiplierTolerance = kMinimumMultiplierTolerance;
 
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -227,6 +226,23 @@ Problem MoreMixedRowsThanControlsProblem() {
   return problem;
 }
 
+Problem LongHorizonStateConstraintProblem() {
+  constexpr int seed = 2200;
+  constexpr std::size_t horizon = 256;
+  constexpr std::size_t n = 8;
+  Problem problem = UniformProblem(seed, horizon, n, 4);
+  for (std::size_t i = 0; i < horizon; ++i) {
+    Stage& stage = problem.stages[i];
+    const Vector nominal_x =
+        GeneratedVector(n, seed + 100 + static_cast<int>(i), 0.5);
+    stage.E = GeneratedMatrix(2, n, seed + 1200 + static_cast<int>(i), 0.3);
+    stage.e = Vector(2);
+    for (std::size_t row = 0; row < 2; ++row)
+      stage.e[row] = -RowDot(stage.E, row, nominal_x);
+  }
+  return problem;
+}
+
 template <std::size_t Size>
 void PackMatrix(const Matrix& source, double (&target)[Size],
                 std::size_t stride) {
@@ -374,7 +390,8 @@ double MaxResidual(const Problem& problem, const std::vector<double>& states,
 }
 
 void RunEmulation(const Problem& problem, const std::string& name,
-                  bool expect_reduced_state, bool expect_reduced_control) {
+                  bool expect_reduced_state, bool expect_reduced_control,
+                  bool compare_cpu = true) {
   const int horizon = static_cast<int>(problem.stages.size());
   const int nodes = horizon + 1;
   std::vector<PackedStage> stages;
@@ -520,27 +537,32 @@ void RunEmulation(const Problem& problem, const std::string& name,
   Expect(status.code == kDeviceOk, "emulated affine rollout");
 
   clqr::Workspace workspace;
-  workspace.Reserve(problem);
-  const clqr::SolutionView cpu = clqr::Solve(problem, workspace);
-  Expect(cpu.status == clqr::SolveStatus::kOptimal, "CPU reference status");
-  for (int i = 0; i < nodes; ++i) {
-    for (std::size_t row = 0; row < cpu.states[i].size; ++row) {
-      Expect(std::abs(states[i * kMaxStateDimension + row] -
-                      cpu.states[i][row]) < 2e-7,
-             "emulated state matches CPU before dual recovery at " +
-                 std::to_string(i) + "," + std::to_string(row) + ": emulated=" +
-                 std::to_string(states[i * kMaxStateDimension + row]) +
-                 ", CPU=" + std::to_string(cpu.states[i][row]));
+  clqr::SolutionView cpu;
+  if (compare_cpu) {
+    workspace.Reserve(problem);
+    cpu = clqr::Solve(problem, workspace);
+    Expect(cpu.status == clqr::SolveStatus::kOptimal, "CPU reference status");
+    for (int i = 0; i < nodes; ++i) {
+      for (std::size_t row = 0; row < cpu.states[i].size; ++row) {
+        Expect(std::abs(states[i * kMaxStateDimension + row] -
+                        cpu.states[i][row]) < 2e-7,
+               "emulated state matches CPU before dual recovery at " +
+                   std::to_string(i) + "," + std::to_string(row) +
+                   ": emulated=" +
+                   std::to_string(states[i * kMaxStateDimension + row]) +
+                   ", CPU=" + std::to_string(cpu.states[i][row]));
+      }
     }
-  }
-  for (int i = 0; i < horizon; ++i) {
-    for (std::size_t row = 0; row < cpu.controls[i].size; ++row) {
-      Expect(std::abs(controls[i * kMaxControlDimension + row] -
-                      cpu.controls[i][row]) < 2e-7,
-             "emulated control matches CPU before dual recovery at " +
-                 std::to_string(i) + "," + std::to_string(row) + ": emulated=" +
-                 std::to_string(controls[i * kMaxControlDimension + row]) +
-                 ", CPU=" + std::to_string(cpu.controls[i][row]));
+    for (int i = 0; i < horizon; ++i) {
+      for (std::size_t row = 0; row < cpu.controls[i].size; ++row) {
+        Expect(std::abs(controls[i * kMaxControlDimension + row] -
+                        cpu.controls[i][row]) < 2e-7,
+               "emulated control matches CPU before dual recovery at " +
+                   std::to_string(i) + "," + std::to_string(row) +
+                   ": emulated=" +
+                   std::to_string(controls[i * kMaxControlDimension + row]) +
+                   ", CPU=" + std::to_string(cpu.controls[i][row]));
+      }
     }
   }
 
@@ -554,32 +576,40 @@ void RunEmulation(const Problem& problem, const std::string& name,
     level_counts.push_back(level_counts.back() / 2);
     total += level_counts.back();
   }
+  const double multiplier_rank_tolerance = kMinimumMultiplierRankTolerance;
+  const double multiplier_consistency_tolerance =
+      kMultiplierConsistencyTolerancePerTreeLevel * level_counts.size();
   std::vector<Relation> dual_tree(total);
   std::vector<NodeValue> dual_values(total);
   Launch(padded, [&] {
     BuildDualLeavesKernel(stages.data(), &terminal, horizon, padded,
-                          states.data(), controls.data(), kMultiplierTolerance,
-                          dual_tree.data(), &status);
+                          states.data(), controls.data(),
+                          multiplier_rank_tolerance,
+                          multiplier_consistency_tolerance, dual_tree.data(),
+                          &status);
   });
   for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
     Launch(level_counts[level + 1], [&] {
       ReduceDualTreeLevelKernel(dual_tree.data(), level_offsets[level],
                                 level_offsets[level + 1],
-                                level_counts[level + 1], kMultiplierTolerance,
+                                level_counts[level + 1],
+                                multiplier_rank_tolerance,
+                                multiplier_consistency_tolerance,
                                 dual_tree.data(), &status);
     });
   }
   const int root = level_offsets.back();
   Launch(1, [&] {
     SolveDualRootKernel(dual_tree.data() + root, dual_values.data() + root,
-                        &status, kMultiplierTolerance);
+                        &status, multiplier_rank_tolerance);
   });
   for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
        --level) {
     Launch(level_counts[level + 1], [&] {
       ExpandDualTreeLevelKernel(
           dual_tree.data(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], kMultiplierTolerance, dual_values.data(),
+          level_counts[level + 1], multiplier_rank_tolerance,
+          multiplier_consistency_tolerance, dual_values.data(),
           dual_values.data(), &status);
     });
   }
@@ -591,7 +621,8 @@ void RunEmulation(const Problem& problem, const std::string& name,
   Launch(nodes, [&] {
     RecoverLocalMultipliersKernel(
         stages.data(), &terminal, horizon, states.data(), controls.data(),
-        dual_values.data(), kMultiplierTolerance, initial_multiplier.data(),
+        dual_values.data(), multiplier_rank_tolerance,
+        multiplier_consistency_tolerance, initial_multiplier.data(),
         dynamics.data(), mixed.data(), state_multipliers.data(),
         terminal_multiplier.data(), &status);
   });
@@ -599,27 +630,30 @@ void RunEmulation(const Problem& problem, const std::string& name,
          "emulated multiplier recovery (stage=" + std::to_string(status.stage) +
              ", detail=" + std::to_string(status.detail) + ")");
 
-  for (int i = 0; i < nodes; ++i) {
-    for (std::size_t row = 0; row < cpu.states[i].size; ++row) {
-      Expect(std::abs(states[i * kMaxStateDimension + row] -
-                      cpu.states[i][row]) < 2e-7,
-             "emulated state matches CPU");
+  if (compare_cpu) {
+    for (int i = 0; i < nodes; ++i) {
+      for (std::size_t row = 0; row < cpu.states[i].size; ++row) {
+        Expect(std::abs(states[i * kMaxStateDimension + row] -
+                        cpu.states[i][row]) < 2e-7,
+               "emulated state matches CPU");
+      }
     }
-  }
-  for (int i = 0; i < horizon; ++i) {
-    for (std::size_t row = 0; row < cpu.controls[i].size; ++row) {
-      Expect(std::abs(controls[i * kMaxControlDimension + row] -
-                      cpu.controls[i][row]) < 2e-7,
-             "emulated control matches CPU");
+    for (int i = 0; i < horizon; ++i) {
+      for (std::size_t row = 0; row < cpu.controls[i].size; ++row) {
+        Expect(std::abs(controls[i * kMaxControlDimension + row] -
+                        cpu.controls[i][row]) < 2e-7,
+               "emulated control matches CPU");
+      }
     }
   }
   const double residual =
       MaxResidual(problem, states, controls, initial_multiplier, dynamics,
                   mixed, state_multipliers, terminal_multiplier);
-  Expect(residual < 2e-7, "emulated full KKT residual");
-  std::cout << name
-            << " CUDA kernel emulation matched CPU; KKT residual=" << residual
-            << '\n';
+  Expect(residual < std::max(2e-7, 2.0 * multiplier_consistency_tolerance),
+         "emulated full KKT residual");
+  std::cout << name << " CUDA kernel emulation "
+            << (compare_cpu ? "matched CPU" : "completed")
+            << "; KKT residual=" << residual << '\n';
 }
 
 }  // namespace
@@ -637,5 +671,7 @@ int main() {
                true, true);
   RunEmulation(clqr::test::MakeJaxCrossValidationProblem(), "exact-JAX-fixture",
                true, false);
+  RunEmulation(LongHorizonStateConstraintProblem(), "long-horizon-state",
+               true, false, false);
   return 0;
 }

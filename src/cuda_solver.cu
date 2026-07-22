@@ -23,7 +23,8 @@ namespace detail {
 namespace {
 
 constexpr int kThreads = 128;
-constexpr double kMinimumMultiplierTolerance = 1e-7;
+constexpr double kMinimumMultiplierRankTolerance = 1e-7;
+constexpr double kMultiplierConsistencyTolerancePerTreeLevel = 1e-6;
 constexpr int kMaxRrefRows = 2 * kMaxRelationRows;
 constexpr int kMaxRrefColumns = kMaxDualColumns;
 constexpr int kMaxRrefEntries = kMaxRrefRows * kMaxRrefColumns;
@@ -311,9 +312,12 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage* stages,
 }
 
 __device__ void ComposeRelationsBlock(const Relation& first,
-                                      const Relation& second, double tolerance,
+                                      const Relation& second,
+                                      double rank_tolerance,
+                                      double consistency_tolerance,
                                       Relation* output, DeviceStatus* status,
-                                      int stage, double* matrix,
+                                      int stage, int inconsistency_code,
+                                      int inconsistency_detail, double* matrix,
                                       double* factors, int* pivot_columns,
                                       int* pivot_rows, int* rank, int* best_row,
                                       int* local_ok) {
@@ -361,12 +365,13 @@ __device__ void ComposeRelationsBlock(const Relation& first,
     matrix[(first.rows + row) * columns + columns - 1] = second.rhs[row];
   }
   __syncthreads();
-  RrefBlock(matrix, rows, columns, columns - 1, tolerance, pivot_columns,
+  RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
             pivot_rows, rank, best_row, factors);
   if (threadIdx.x == 0) {
-    *local_ok =
-        !InconsistentRref(matrix, rows, columns, columns - 1, tolerance);
-    if (!*local_ok) SetFailure(status, kDeviceInfeasible, stage, 3);
+    *local_ok = !InconsistentRref(matrix, rows, columns, columns - 1,
+                                 consistency_tolerance);
+    if (!*local_ok)
+      SetFailure(status, inconsistency_code, stage, inconsistency_detail);
   }
   __syncthreads();
   if (!*local_ok) return;
@@ -416,9 +421,10 @@ __global__ void SuffixRelationsKernel(const Relation* input, int count,
   __shared__ int rank;
   __shared__ int best_row;
   __shared__ int local_ok;
-  ComposeRelationsBlock(input[index], input[index + offset], tolerance,
-                        &output[index], status, index, matrix, factors,
-                        pivot_columns, pivot_rows, &rank, &best_row, &local_ok);
+  ComposeRelationsBlock(
+      input[index], input[index + offset], tolerance, tolerance, &output[index],
+      status, index, kDeviceInfeasible, 3, matrix, factors, pivot_columns,
+      pivot_rows, &rank, &best_row, &local_ok);
 }
 
 __global__ void StateParamKernel(const Relation* suffix, int count,
@@ -512,20 +518,21 @@ __global__ void ReconstructPrimalKernel(const StateParam*, const ControlParam*,
                                         double*, double*);
 __global__ void BuildDualLeavesKernel(const PackedStage*, const PackedTerminal*,
                                       int, int, const double*, const double*,
-                                      double, Relation*, DeviceStatus*);
+                                      double, double, Relation*, DeviceStatus*);
 __global__ void ReduceDualTreeLevelKernel(const Relation*, int, int, int,
-                                          double, Relation*, DeviceStatus*);
+                                          double, double, Relation*,
+                                          DeviceStatus*);
 __global__ void SolveDualRootKernel(const Relation*, NodeValue*, DeviceStatus*,
                                     double);
 __global__ void ExpandDualTreeLevelKernel(const Relation*, int, int, int,
-                                          double, const NodeValue*, NodeValue*,
-                                          DeviceStatus*);
+                                          double, double, const NodeValue*,
+                                          NodeValue*, DeviceStatus*);
 __global__ void RecoverLocalMultipliersKernel(const PackedStage*,
                                               const PackedTerminal*, int,
                                               const double*, const double*,
-                                              const NodeValue*, double, double*,
+                                              const NodeValue*, double, double,
                                               double*, double*, double*,
-                                              double*, DeviceStatus*);
+                                              double*, double*, DeviceStatus*);
 
 void CudaCheck(cudaError_t error, const char* operation) {
   if (error == cudaSuccess) return;
@@ -1072,8 +1079,6 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
   // original equality rows are redundant. Its right-hand side is formed from
   // the reconstructed primal solution, so use a separate numerical floor for
   // rank/consistency decisions after primal roundoff has accumulated.
-  const double multiplier_tolerance =
-      std::max(options.tolerance, kMinimumMultiplierTolerance);
   int padded = 1;
   while (padded < node_count) padded *= 2;
   std::vector<int> level_offsets{0};
@@ -1084,6 +1089,12 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
     level_counts.push_back(level_counts.back() / 2);
     total_nodes += level_counts.back();
   }
+  const double multiplier_rank_tolerance =
+      std::max(options.tolerance, kMinimumMultiplierRankTolerance);
+  const double multiplier_consistency_tolerance =
+      std::max(multiplier_rank_tolerance,
+               kMultiplierConsistencyTolerancePerTreeLevel *
+                   level_counts.size());
   DeviceBuffer<Relation> dual_tree(total_nodes);
   DeviceBuffer<NodeValue> dual_values(total_nodes);
   DeviceBuffer<double> initial_multiplier(kMaxStateDimension);
@@ -1121,28 +1132,32 @@ Solution SolveImpl(const Problem& problem, const Options& options) {
               "clear terminal multipliers");
     BuildDualLeavesKernel<<<padded, kThreads>>>(
         device_stages.get(), device_terminal.get(), stage_count, padded,
-        states.get(), controls.get(), multiplier_tolerance, dual_tree.get(),
-        device_status.get());
+        states.get(), controls.get(), multiplier_rank_tolerance,
+        multiplier_consistency_tolerance, dual_tree.get(), device_status.get());
     for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
       ReduceDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
           dual_tree.get(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], multiplier_tolerance, dual_tree.get(),
+          level_counts[level + 1], multiplier_rank_tolerance,
+          multiplier_consistency_tolerance, dual_tree.get(),
           device_status.get());
     }
     const int root_offset = level_offsets.back();
     SolveDualRootKernel<<<1, 1>>>(dual_tree.get() + root_offset,
                                   dual_values.get() + root_offset,
-                                  device_status.get(), multiplier_tolerance);
+                                  device_status.get(),
+                                  multiplier_rank_tolerance);
     for (int level = static_cast<int>(level_counts.size()) - 2; level >= 0;
          --level) {
       ExpandDualTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
           dual_tree.get(), level_offsets[level], level_offsets[level + 1],
-          level_counts[level + 1], multiplier_tolerance, dual_values.get(),
+          level_counts[level + 1], multiplier_rank_tolerance,
+          multiplier_consistency_tolerance, dual_values.get(),
           dual_values.get(), device_status.get());
     }
     RecoverLocalMultipliersKernel<<<node_count, kThreads>>>(
         device_stages.get(), device_terminal.get(), stage_count, states.get(),
-        controls.get(), dual_values.get(), multiplier_tolerance,
+        controls.get(), dual_values.get(), multiplier_rank_tolerance,
+        multiplier_consistency_tolerance,
         initial_multiplier.get(), dynamics_multipliers.get(),
         mixed_multipliers.get(), state_multipliers.get(),
         terminal_multiplier.get(), device_status.get());
@@ -1463,7 +1478,9 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
                                       const PackedTerminal* terminal_ptr,
                                       int stage_count, int padded_count,
                                       const double* states,
-                                      const double* controls, double tolerance,
+                                      const double* controls,
+                                      double rank_tolerance,
+                                      double consistency_tolerance,
                                       Relation* tree, DeviceStatus* status) {
   const int index = blockIdx.x;
   if (index >= padded_count) return;
@@ -1580,10 +1597,11 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
     }
   }
   __syncthreads();
-  RrefBlock(matrix, rows, columns, columns - 1, tolerance, pivot_columns,
+  RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(matrix, rows, columns, columns - 1, tolerance);
+    local_ok = !InconsistentRref(matrix, rows, columns, columns - 1,
+                                 consistency_tolerance);
     if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 12);
   }
   __syncthreads();
@@ -1594,7 +1612,9 @@ __global__ void BuildDualLeavesKernel(const PackedStage* stages,
 
 __global__ void ReduceDualTreeLevelKernel(const Relation* tree,
                                           int child_offset, int parent_offset,
-                                          int parent_count, double tolerance,
+                                          int parent_count,
+                                          double rank_tolerance,
+                                          double consistency_tolerance,
                                           Relation* mutable_tree,
                                           DeviceStatus* status) {
   const int index = blockIdx.x;
@@ -1610,8 +1630,10 @@ __global__ void ReduceDualTreeLevelKernel(const Relation* tree,
   __shared__ int local_ok;
   ComposeRelationsBlock(
       tree[child_offset + 2 * index], tree[child_offset + 2 * index + 1],
-      tolerance, &mutable_tree[parent_offset + index], status, index, matrix,
-      factors, pivot_columns, pivot_rows, &rank, &best_row, &local_ok);
+      rank_tolerance, consistency_tolerance,
+      &mutable_tree[parent_offset + index], status, index,
+      kDeviceNumericalFailure, 18, matrix, factors, pivot_columns, pivot_rows,
+      &rank, &best_row, &local_ok);
 }
 
 __global__ void SolveDualRootKernel(const Relation* relation, NodeValue* value,
@@ -1645,7 +1667,9 @@ __global__ void SolveDualRootKernel(const Relation* relation, NodeValue* value,
 
 __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
                                           int child_offset, int parent_offset,
-                                          int parent_count, double tolerance,
+                                          int parent_count,
+                                          double rank_tolerance,
+                                          double consistency_tolerance,
                                           const NodeValue* parent_values,
                                           NodeValue* values,
                                           DeviceStatus* status) {
@@ -1703,10 +1727,11 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
     matrix[(left.rows + row) * columns + shared] = rhs;
   }
   __syncthreads();
-  RrefBlock(matrix, rows, columns, shared, tolerance, pivot_columns, pivot_rows,
-            &rank, &best_row, factors);
+  RrefBlock(matrix, rows, columns, shared, rank_tolerance, pivot_columns,
+            pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(matrix, rows, columns, shared, tolerance);
+    local_ok = !InconsistentRref(matrix, rows, columns, shared,
+                                 consistency_tolerance);
     if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 16);
   }
   __syncthreads();
@@ -1737,7 +1762,8 @@ __global__ void ExpandDualTreeLevelKernel(const Relation* tree,
 __global__ void RecoverLocalMultipliersKernel(
     const PackedStage* stages, const PackedTerminal* terminal_ptr,
     int stage_count, const double* states, const double* controls,
-    const NodeValue* leaf_values, double tolerance, double* initial_multiplier,
+    const NodeValue* leaf_values, double rank_tolerance,
+    double consistency_tolerance, double* initial_multiplier,
     double* dynamics_multipliers, double* mixed_multipliers,
     double* state_multipliers, double* terminal_multiplier,
     DeviceStatus* status) {
@@ -1834,10 +1860,11 @@ __global__ void RecoverLocalMultipliersKernel(
     }
   }
   __syncthreads();
-  RrefBlock(matrix, rows, columns, variables, tolerance, pivot_columns,
+  RrefBlock(matrix, rows, columns, variables, rank_tolerance, pivot_columns,
             pivot_rows, &rank, &best_row, factors);
   if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(matrix, rows, columns, variables, tolerance);
+    local_ok = !InconsistentRref(matrix, rows, columns, variables,
+                                 consistency_tolerance);
     if (!local_ok) SetFailure(status, kDeviceNumericalFailure, index, 17);
   }
   __syncthreads();
