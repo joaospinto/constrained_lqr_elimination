@@ -117,6 +117,82 @@ __device__ void WarpSynchronize() {
 #endif
 }
 
+// Factor a small symmetric positive-definite matrix into a dense lower
+// Cholesky factor. The coefficient matrix may be the leading block of a wider
+// augmented matrix. Native CUDA and kernel emulation use this same source.
+__device__ bool FactorPositiveDefiniteBlock(const Scalar *coefficient,
+                                            int coefficient_stride,
+                                            int dimension, Scalar tolerance,
+                                            Scalar *lower,
+                                            int *positive_definite) {
+  for (int linear = threadIdx.x; linear < dimension * dimension;
+       linear += blockDim.x) {
+    const int row = linear / dimension;
+    const int col = linear % dimension;
+    lower[linear] = Scalar{0.5} * (coefficient[row * coefficient_stride + col] +
+                                   coefficient[col * coefficient_stride + row]);
+  }
+  WarpSynchronize();
+  if (threadIdx.x == 0) {
+    *positive_definite = 1;
+    Scalar scale = Scalar{0};
+    for (int diagonal = 0; diagonal < dimension; ++diagonal) {
+      scale = fmax(scale, DeviceAbs(lower[diagonal * dimension + diagonal]));
+    }
+    if (!(scale > Scalar{0}) || !DeviceFinite(scale))
+      *positive_definite = 0;
+    for (int col = 0; col < dimension && *positive_definite; ++col) {
+      Scalar diagonal = lower[col * dimension + col];
+      for (int k = 0; k < col; ++k) {
+        diagonal -= lower[col * dimension + k] * lower[col * dimension + k];
+      }
+      if (!(diagonal > tolerance * scale) || !DeviceFinite(diagonal)) {
+        *positive_definite = 0;
+        break;
+      }
+      lower[col * dimension + col] = sqrt(diagonal);
+      for (int row = col + 1; row < dimension; ++row) {
+        Scalar value = lower[row * dimension + col];
+        for (int k = 0; k < col; ++k) {
+          value -= lower[row * dimension + k] * lower[col * dimension + k];
+        }
+        lower[row * dimension + col] = value / lower[col * dimension + col];
+      }
+    }
+  }
+  WarpSynchronize();
+  return *positive_definite != 0;
+}
+
+// Solve L*L^T*X = B for several right-hand sides. B is overwritten by X and
+// may itself be a strided suffix of an augmented matrix.
+__device__ void SolvePositiveDefiniteMultipleRhsBlock(
+    const Scalar *lower, int dimension, Scalar *right_hand_sides,
+    int right_hand_side_stride, int right_hand_side_count) {
+  for (int rhs = threadIdx.x; rhs < right_hand_side_count; rhs += blockDim.x) {
+    for (int row = 0; row < dimension; ++row) {
+      Scalar value = right_hand_sides[row * right_hand_side_stride + rhs];
+      for (int col = 0; col < row; ++col) {
+        value -= lower[row * dimension + col] *
+                 right_hand_sides[col * right_hand_side_stride + rhs];
+      }
+      right_hand_sides[row * right_hand_side_stride + rhs] =
+          value / lower[row * dimension + row];
+    }
+    for (int reverse = 0; reverse < dimension; ++reverse) {
+      const int row = dimension - 1 - reverse;
+      Scalar value = right_hand_sides[row * right_hand_side_stride + rhs];
+      for (int col = row + 1; col < dimension; ++col) {
+        value -= lower[col * dimension + row] *
+                 right_hand_sides[col * right_hand_side_stride + rhs];
+      }
+      right_hand_sides[row * right_hand_side_stride + rhs] =
+          value / lower[row * dimension + row];
+    }
+  }
+  WarpSynchronize();
+}
+
 __device__ void BindValueElementScratch(ValueElement *element,
                                         Scalar *storage) {
   element->A = storage;
@@ -4112,86 +4188,47 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
     return;
   }
 
-  __shared__ Scalar
-      augmented[kMaxControlDimension * (2 * kMaxControlDimension)];
-  __shared__ Scalar factors[kMaxRrefRows];
   __shared__ Scalar cholesky[kMaxControlDimension * kMaxControlDimension];
-  __shared__ int pivot_columns[kMaxRrefRows];
-  __shared__ int pivot_rows[kMaxRrefRows];
-  __shared__ int rank;
-  __shared__ int best_row;
+  __shared__ Scalar
+      right_hand_sides[kMaxControlDimension * (2 * kMaxStateDimension + 1)];
   __shared__ int positive_definite;
-  const int columns = 2 * s.m;
-  for (int linear = threadIdx.x; linear < s.m * columns; linear += blockDim.x) {
-    const int row = linear / columns;
-    const int col = linear % columns;
-    augmented[linear] = col < s.m ? s.R[row * s.m + col]
-                                  : (col - s.m == row ? Scalar{1} : Scalar{0});
-  }
-  for (int linear = threadIdx.x; linear < s.m * s.m; linear += blockDim.x) {
-    const int row = linear / s.m;
-    const int col = linear % s.m;
-    cholesky[linear] =
-        Scalar{0.5} * (s.R[row * s.m + col] + s.R[col * s.m + row]);
-  }
-  WarpSynchronize();
-  if (threadIdx.x == 0) {
-    positive_definite = 1;
-    Scalar scale = Scalar{1};
-    for (int i = 0; i < s.m; ++i)
-      scale = fmax(scale, DeviceAbs(cholesky[i * s.m + i]));
-    for (int i = 0; i < s.m && positive_definite; ++i) {
-      Scalar diagonal = cholesky[i * s.m + i];
-      for (int k = 0; k < i; ++k) {
-        diagonal -= cholesky[i * s.m + k] * cholesky[i * s.m + k];
-      }
-      if (!(diagonal > tolerance * scale) || !DeviceFinite(diagonal)) {
-        positive_definite = 0;
-        break;
-      }
-      cholesky[i * s.m + i] = sqrt(diagonal);
-      for (int row = i + 1; row < s.m; ++row) {
-        Scalar value = cholesky[row * s.m + i];
-        for (int k = 0; k < i; ++k) {
-          value -= cholesky[row * s.m + k] * cholesky[i * s.m + k];
-        }
-        cholesky[row * s.m + i] = value / cholesky[i * s.m + i];
-      }
+  const int rhs_count = s.n + 1 + s.next_n;
+  for (int linear = threadIdx.x; linear < s.m * rhs_count;
+       linear += blockDim.x) {
+    const int row = linear / rhs_count;
+    const int col = linear % rhs_count;
+    if (col < s.n) {
+      right_hand_sides[linear] = s.M[col * s.m + row];
+    } else if (col == s.n) {
+      right_hand_sides[linear] = s.r[row];
+    } else {
+      right_hand_sides[linear] = s.B[(col - s.n - 1) * s.m + row];
     }
-    if (!positive_definite)
-      SetFailure(status, kDeviceNumericalFailure, index, 19);
   }
   WarpSynchronize();
-  if (!positive_definite)
-    return;
-
-  RrefBlock(augmented, s.m, columns, s.m, tolerance, pivot_columns, pivot_rows,
-            &rank, &best_row, factors);
-  if (rank != s.m) {
+  if (!FactorPositiveDefiniteBlock(s.R, s.m, s.m, tolerance, cholesky,
+                                   &positive_definite)) {
     if (threadIdx.x == 0)
       SetFailure(status, kDeviceNumericalFailure, index, 19);
     return;
   }
+  SolvePositiveDefiniteMultipleRhsBlock(cholesky, s.m, right_hand_sides,
+                                        rhs_count, rhs_count);
 
-  // R inverse occupies the right half of augmented.
+  // The solved columns are R^{-1}*M^T, R^{-1}*r, and R^{-1}*B^T.
   for (int linear = threadIdx.x; linear < s.n * s.n; linear += blockDim.x) {
     const int a = linear / s.n;
     const int b = linear % s.n;
     Scalar value = s.Q[a * s.n + b];
     for (int u = 0; u < s.m; ++u) {
-      for (int v = 0; v < s.m; ++v) {
-        value -= s.M[a * s.m + u] * augmented[u * columns + s.m + v] *
-                 s.M[b * s.m + v];
-      }
+      value -= s.M[a * s.m + u] * right_hand_sides[u * rhs_count + b];
     }
     out.J[a * s.n + b] = value;
   }
   for (int a = threadIdx.x; a < s.n; a += blockDim.x) {
     Scalar value = s.q[a];
     for (int u = 0; u < s.m; ++u) {
-      for (int v = 0; v < s.m; ++v) {
-        value -= s.M[a * s.m + u] * augmented[u * columns + s.m + v] * s.r[v];
-      }
+      value -= s.M[a * s.m + u] * right_hand_sides[u * rhs_count + s.n];
     }
     out.eta[a] = value;
   }
@@ -4201,19 +4238,14 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
     const int col = linear % s.n;
     Scalar value = s.A[row * s.n + col];
     for (int u = 0; u < s.m; ++u) {
-      for (int v = 0; v < s.m; ++v) {
-        value -= s.B[row * s.m + u] * augmented[u * columns + s.m + v] *
-                 s.M[col * s.m + v];
-      }
+      value -= s.B[row * s.m + u] * right_hand_sides[u * rhs_count + col];
     }
     out.A[row * s.n + col] = value;
   }
   for (int row = threadIdx.x; row < s.next_n; row += blockDim.x) {
     Scalar value = s.c[row];
     for (int u = 0; u < s.m; ++u) {
-      for (int v = 0; v < s.m; ++v) {
-        value -= s.B[row * s.m + u] * augmented[u * columns + s.m + v] * s.r[v];
-      }
+      value -= s.B[row * s.m + u] * right_hand_sides[u * rhs_count + s.n];
     }
     out.b[row] = value;
   }
@@ -4223,10 +4255,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
     const int b = linear % s.next_n;
     Scalar value = Scalar{0};
     for (int u = 0; u < s.m; ++u) {
-      for (int v = 0; v < s.m; ++v) {
-        value += s.B[a * s.m + u] * augmented[u * columns + s.m + v] *
-                 s.B[b * s.m + v];
-      }
+      value += s.B[a * s.m + u] * right_hand_sides[u * rhs_count + s.n + 1 + b];
     }
     out.C[a * s.next_n + b] = value;
   }
@@ -4670,11 +4699,12 @@ __device__ void ExtractFeedback(const ReducedStage &s, const Scalar *augmented,
   }
 }
 
-__device__ bool SolveFeedbackBlock(
-    const ReducedStage &stage, const ValueElement &next, Scalar tolerance,
-    Feedback *feedback, Scalar *augmented, Scalar *factors,
-    int *pivot_columns, int *pivot_rows, int *rank, int *best_row,
-    DeviceStatus *status, int stage_index, int diagnostic) {
+__device__ bool SolveFeedbackBlock(const ReducedStage &stage,
+                                   const ValueElement &next, Scalar tolerance,
+                                   Feedback *feedback, Scalar *augmented,
+                                   Scalar *cholesky, int *positive_definite,
+                                   DeviceStatus *status, int stage_index,
+                                   int diagnostic) {
   if (stage.m == 0) {
     if (threadIdx.x == 0) {
       feedback->state_dim = stage.n;
@@ -4685,8 +4715,7 @@ __device__ bool SolveFeedbackBlock(
          linear += blockDim.x) {
       const int row = linear / stage.n;
       const int col = linear % stage.n;
-      feedback->transition[row * stage.n + col] =
-          stage.A[row * stage.n + col];
+      feedback->transition[row * stage.n + col] = stage.A[row * stage.n + col];
     }
     for (int row = threadIdx.x; row < stage.next_n; row += blockDim.x)
       feedback->offset[row] = stage.c[row];
@@ -4696,13 +4725,14 @@ __device__ bool SolveFeedbackBlock(
   const int columns = stage.m + stage.n + 1;
   BuildFeedbackSystem(stage, next, augmented, columns);
   WarpSynchronize();
-  RrefBlock(augmented, stage.m, columns, stage.m, tolerance, pivot_columns,
-            pivot_rows, rank, best_row, factors);
-  if (*rank != stage.m) {
+  if (!FactorPositiveDefiniteBlock(augmented, columns, stage.m, tolerance,
+                                   cholesky, positive_definite)) {
     if (threadIdx.x == 0)
       SetFailure(status, kDeviceNumericalFailure, stage_index, diagnostic);
     return false;
   }
+  SolvePositiveDefiniteMultipleRhsBlock(cholesky, stage.m, augmented + stage.m,
+                                        columns, stage.n + 1);
   ExtractFeedback(stage, augmented, columns, feedback);
   return true;
 }
@@ -4721,14 +4751,10 @@ __global__ void FeedbackKernel(const ReducedStage *stages,
   Feedback &out = feedback[index];
   __shared__ Scalar augmented[kMaxControlDimension *
                               (kMaxControlDimension + kMaxStateDimension + 1)];
-  __shared__ Scalar factors[kMaxRrefRows];
-  __shared__ int pivot_columns[kMaxRrefRows];
-  __shared__ int pivot_rows[kMaxRrefRows];
-  __shared__ int rank;
-  __shared__ int best_row;
-  SolveFeedbackBlock(s, next, tolerance, &out, augmented, factors,
-                     pivot_columns, pivot_rows, &rank, &best_row, status,
-                     index, 9);
+  __shared__ Scalar cholesky[kMaxControlDimension * kMaxControlDimension];
+  __shared__ int positive_definite;
+  SolveFeedbackBlock(s, next, tolerance, &out, augmented, cholesky,
+                     &positive_definite, status, index, 9);
 }
 
 } // namespace

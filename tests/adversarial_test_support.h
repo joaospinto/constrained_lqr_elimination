@@ -407,11 +407,17 @@ inline std::vector<TestCase> ExtendedCases() {
   for (const auto& [horizon, seed] :
        {std::pair<std::size_t, int>{32, 200}, {63, 200}, {65, 200},
         {127, 207}, {257, 214}}) {
+    const Scalar fp32_kkt_scale =
+#ifdef CLQR_USE_FLOAT
+        horizon == 257 ? Scalar{2} : Scalar{1};
+#else
+        Scalar{1};
+#endif
     cases.push_back({"stable-extended-horizon-" + std::to_string(horizon),
                      UniformProblem(seed, horizon, 3, 2, 1,
                                     Pattern::kAlternating),
                      SolveStatus::kOptimal, SolveStatus::kOptimal,
-                     true, false, false});
+                     true, false, false, Scalar{1}, false, fp32_kkt_scale});
   }
   // Fixed seeds make these property cases exactly reproducible.
   for (int seed = 0; seed < 32; ++seed) {

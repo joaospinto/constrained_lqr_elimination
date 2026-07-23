@@ -118,6 +118,72 @@ void TinyCoefficientRrefCase() {
          "RREF removes a coefficient below its rank tolerance");
 }
 
+void IllConditionedPositiveDefiniteMultiRhsCase() {
+#ifdef CLQR_USE_FLOAT
+  constexpr Scalar small_eigenvalue = 5e-4f;
+  constexpr Scalar uniform_scale = 1e-3f;
+  constexpr Scalar solve_tolerance = 1e-5f;
+  constexpr Scalar comparison_tolerance = 2e-3f;
+#else
+  constexpr Scalar small_eigenvalue = 5e-8;
+  constexpr Scalar uniform_scale = 1e-12;
+  constexpr Scalar solve_tolerance = 1e-9;
+  constexpr Scalar comparison_tolerance = 2e-8;
+#endif
+  constexpr int dimension = 3;
+  constexpr int right_hand_side_count = 3;
+  // The leading block has eigenvalues 1 and small_eigenvalue, with a
+  // nontrivial rotation so that the test exercises both triangular solves.
+  const Scalar matrix[dimension * dimension]{
+      Scalar{0.64} + Scalar{0.36} * small_eigenvalue,
+      Scalar{0.48} * (Scalar{1} - small_eigenvalue),
+      Scalar{0},
+      Scalar{0.48} * (Scalar{1} - small_eigenvalue),
+      Scalar{0.36} + Scalar{0.64} * small_eigenvalue,
+      Scalar{0},
+      Scalar{0},
+      Scalar{0},
+      Scalar{0.2}};
+  const Scalar expected[dimension * right_hand_side_count]{
+      Scalar{0.25}, Scalar{-0.4}, Scalar{0.8},  Scalar{-0.7}, Scalar{0.3},
+      Scalar{0.1},  Scalar{0.5},  Scalar{-0.2}, Scalar{-0.6}};
+  const auto solve_and_check = [&](Scalar scale, const std::string &name) {
+    Scalar scaled_matrix[dimension * dimension]{};
+    Scalar right_hand_sides[dimension * right_hand_side_count]{};
+    for (int row = 0; row < dimension; ++row) {
+      for (int col = 0; col < dimension; ++col)
+        scaled_matrix[row * dimension + col] =
+            scale * matrix[row * dimension + col];
+      for (int rhs = 0; rhs < right_hand_side_count; ++rhs) {
+        for (int col = 0; col < dimension; ++col) {
+          right_hand_sides[row * right_hand_side_count + rhs] +=
+              scaled_matrix[row * dimension + col] *
+              expected[col * right_hand_side_count + rhs];
+        }
+      }
+    }
+    Scalar cholesky[dimension * dimension]{};
+    int positive_definite = 0;
+    threadIdx.x = 0;
+    blockDim.x = 1;
+    Expect(FactorPositiveDefiniteBlock(scaled_matrix, dimension, dimension,
+                                       solve_tolerance, cholesky,
+                                       &positive_definite),
+           name + " ill-conditioned SPD factorization");
+    SolvePositiveDefiniteMultipleRhsBlock(cholesky, dimension, right_hand_sides,
+                                          right_hand_side_count,
+                                          right_hand_side_count);
+    for (int entry = 0; entry < dimension * right_hand_side_count; ++entry) {
+      Expect(std::abs(right_hand_sides[entry] - expected[entry]) <
+                 comparison_tolerance,
+             name + " ill-conditioned SPD multi-RHS solution entry " +
+                 std::to_string(entry));
+    }
+  };
+  solve_and_check(Scalar{1}, "unit-scale");
+  solve_and_check(uniform_scale, "uniformly-scaled");
+}
+
 void InvalidValueElementCopyCase() {
   Scalar input_j = Scalar{17};
   Scalar output_j = Scalar{23};
@@ -1091,6 +1157,7 @@ int main(int argc, char **argv) {
     }
   }
   TinyCoefficientRrefCase();
+  IllConditionedPositiveDefiniteMultiRhsCase();
   InvalidValueElementCopyCase();
   FreeFixedFreeValueCompositionCase();
   NonPositiveDefiniteReducedControlCostCase();
