@@ -44,18 +44,20 @@ struct WorkingProblem {
   Vector terminal_e;
 };
 
-struct RrefOperations {
-  WorkspaceVector<std::size_t> pivot_rows;
-  WorkspaceVector<std::size_t> best_rows;
-  Vector pivot_values;
-  Matrix factors;
-  std::size_t count = 0;
+struct OrthogonalOperations {
+  // Row k stores Householder reflector k from column k onward. Its otherwise
+  // unused columns [0,k) store R(0:k,k), the strict upper triangle of R.
+  Matrix reflectors;
+  Vector betas;
+  Vector diagonal;
+  Vector row_scales;
+  std::size_t rank = 0;
 };
 
 struct AffineStateBasis {
   Matrix T;
   Vector offset;
-  RrefOperations rhs_operations;
+  OrthogonalOperations rhs_operations;
   WorkspaceVector<std::size_t> free_rows;
   WorkspaceVector<std::size_t> pivot_rows;
   bool active = false;
@@ -70,9 +72,9 @@ struct MixedElimination {
   Vector y;
   Matrix state_C;
   Vector state_d;
-  RrefOperations rhs_operations;
+  OrthogonalOperations rhs_operations;
   WorkspaceVector<std::size_t> pivot_columns;
-  WorkspaceVector<std::size_t> state_rref_rows;
+  WorkspaceVector<std::size_t> state_transformed_rows;
   bool active = false;
   bool infeasible = false;
   bool redundant = false;
@@ -125,6 +127,21 @@ struct LinearParametrization {
   bool inconsistent = false;
 };
 
+struct OrthogonalEchelonResult {
+  Matrix matrix;
+  OrthogonalOperations operations;
+  WorkspaceVector<std::size_t> pivot_columns;
+};
+
+class NumericalFailureError final : public std::exception {
+ public:
+  explicit NumericalFailureError(const char* message) : message_(message) {}
+  const char* what() const noexcept override { return message_; }
+
+ private:
+  const char* message_;
+};
+
 void Check(bool condition, const char* message) {
   if (!condition) throw std::invalid_argument(message);
 }
@@ -145,13 +162,158 @@ bool LazyIdentityControlLinear(const ControlMap& map) {
   return map.control_linear.rows() == 0 && map.control_linear.cols() == 0;
 }
 
-RectangularSolve SolveRectangularRref(const Matrix& a, const Vector& b,
-                                      Scalar tolerance) {
+OrthogonalEchelonResult OrthogonalEchelon(Matrix matrix,
+                                          std::size_t pivot_column_limit,
+                                          std::size_t equilibration_column_limit,
+                                          Scalar tolerance) {
+  OrthogonalEchelonResult result;
+  const std::size_t rows = matrix.rows();
+  const std::size_t columns = matrix.cols();
+  const std::size_t pivot_columns = std::min(pivot_column_limit, columns);
+  const std::size_t equilibration_columns =
+      std::min(equilibration_column_limit, columns);
+  const std::size_t maximum_rank = std::min(rows, pivot_columns);
+  result.operations.reflectors = Matrix(maximum_rank, rows);
+  result.operations.betas = Vector(maximum_rank);
+  result.operations.diagonal = Vector(maximum_rank);
+  result.operations.row_scales = Vector(rows);
+  for (std::size_t row = 0; row < rows; ++row)
+    result.operations.row_scales[row] = Scalar{1};
+  result.pivot_columns.reserve(maximum_rank);
+
+  // Equilibrate every equation by its largest coefficient (excluding its
+  // right-hand side). This makes rank decisions invariant to independent row
+  // rescaling while still judging an eliminand relative to the complete
+  // relation. Rows with no coefficient are left untouched.
+  for (std::size_t row = 0; row < rows; ++row) {
+    Scalar row_scale = Scalar{0};
+    for (std::size_t col = 0; col < equilibration_columns; ++col)
+      row_scale = std::max(row_scale, std::abs(matrix(row, col)));
+    if (row_scale > Scalar{0}) {
+      for (std::size_t col = 0; col < columns; ++col) {
+        matrix(row, col) /= row_scale;
+        if (!std::isfinite(matrix(row, col))) {
+          throw NumericalFailureError(
+              "constraint row equilibration is not representable");
+        }
+      }
+      result.operations.row_scales[row] = row_scale;
+    }
+  }
+
+  WorkspaceVector<std::size_t> permutation(pivot_columns);
+  Scalar matrix_scale = Scalar{0};
+  for (std::size_t col = 0; col < pivot_columns; ++col) {
+    permutation[col] = col;
+    Scalar squared_norm = Scalar{0};
+    for (std::size_t row = 0; row < rows; ++row)
+      squared_norm += matrix(row, col) * matrix(row, col);
+    matrix_scale = std::max(matrix_scale, std::sqrt(squared_norm));
+  }
+  const Scalar rank_threshold = tolerance * std::max(Scalar{1}, matrix_scale);
+
+  std::size_t rank = 0;
+  while (rank < maximum_rank) {
+    std::size_t best_column = rank;
+    Scalar best_norm = Scalar{0};
+    for (std::size_t col = rank; col < pivot_columns; ++col) {
+      Scalar squared_norm = Scalar{0};
+      for (std::size_t row = rank; row < rows; ++row)
+        squared_norm += matrix(row, col) * matrix(row, col);
+      const Scalar norm = std::sqrt(squared_norm);
+      if (norm > best_norm) {
+        best_norm = norm;
+        best_column = col;
+      }
+    }
+    if (!(best_norm > rank_threshold)) break;
+
+    if (best_column != rank) {
+      for (std::size_t row = 0; row < rows; ++row)
+        std::swap(matrix(row, rank), matrix(row, best_column));
+      std::swap(permutation[rank], permutation[best_column]);
+    }
+
+    const Scalar diagonal = matrix(rank, rank);
+    const Scalar alpha =
+        -std::copysign(best_norm, diagonal == Scalar{0} ? Scalar{1} : diagonal);
+    Scalar reflector_norm_squared = Scalar{0};
+    for (std::size_t row = rank; row < rows; ++row) {
+      result.operations.reflectors(rank, row) = matrix(row, rank);
+    }
+    result.operations.reflectors(rank, rank) -= alpha;
+    for (std::size_t row = rank; row < rows; ++row)
+      reflector_norm_squared +=
+          result.operations.reflectors(rank, row) *
+          result.operations.reflectors(rank, row);
+    if (!(reflector_norm_squared > Scalar{0})) break;
+    const Scalar beta = Scalar{2} / reflector_norm_squared;
+    result.operations.betas[rank] = beta;
+
+    for (std::size_t col = rank; col < columns; ++col) {
+      Scalar projection = Scalar{0};
+      for (std::size_t row = rank; row < rows; ++row)
+        projection +=
+            result.operations.reflectors(rank, row) * matrix(row, col);
+      projection *= beta;
+      for (std::size_t row = rank; row < rows; ++row)
+        matrix(row, col) -=
+            result.operations.reflectors(rank, row) * projection;
+    }
+    matrix(rank, rank) = alpha;
+    for (std::size_t row = rank + 1; row < rows; ++row)
+      matrix(row, rank) = Scalar{0};
+
+    result.pivot_columns.push_back(permutation[rank]);
+    ++rank;
+  }
+  result.operations.rank = rank;
+  for (std::size_t row = 0; row < rank; ++row) {
+    result.operations.diagonal[row] = matrix(row, row);
+    for (std::size_t col = row + 1; col < rank; ++col)
+      result.operations.reflectors(col, row) = matrix(row, col);
+  }
+
+  // Normalize the leading triangular block without forming its inverse.
+  for (std::size_t reverse = 0; reverse < rank; ++reverse) {
+    const std::size_t row = rank - 1 - reverse;
+    const Scalar diagonal = matrix(row, row);
+    for (std::size_t col = row; col < columns; ++col)
+      matrix(row, col) /= diagonal;
+    for (std::size_t upper = 0; upper < row; ++upper) {
+      const Scalar factor = matrix(upper, row);
+      for (std::size_t col = row; col < columns; ++col)
+        matrix(upper, col) -= factor * matrix(row, col);
+    }
+  }
+
+  // Restore the original variable-column order. Columns beyond the pivot
+  // limit were never permuted.
+  result.matrix = Matrix(rows, columns);
+  for (std::size_t col = 0; col < pivot_columns; ++col) {
+    const std::size_t original_column = permutation[col];
+    for (std::size_t row = 0; row < rows; ++row)
+      result.matrix(row, original_column) = matrix(row, col);
+  }
+  for (std::size_t col = pivot_columns; col < columns; ++col) {
+    for (std::size_t row = 0; row < rows; ++row)
+      result.matrix(row, col) = matrix(row, col);
+  }
+  for (std::size_t row = rank; row < rows; ++row) {
+    for (std::size_t col = 0; col < pivot_columns; ++col)
+      result.matrix(row, col) = Scalar{0};
+  }
+  return result;
+}
+
+RectangularSolve SolveRectangularOrthogonally(const Matrix& a, const Vector& b,
+                                              Scalar rank_tolerance,
+                                              Scalar consistency_tolerance) {
   Check(a.rows() == b.size(), "rectangular solve rhs shape mismatch");
   RectangularSolve out;
   out.x = Vector(a.cols());
   if (a.cols() == 0) {
-    out.inconsistent = MaxAbs(b) > tolerance;
+    out.inconsistent = MaxAbs(b) > consistency_tolerance;
     return out;
   }
   Matrix augmented(a.rows(), a.cols() + 1);
@@ -159,20 +321,24 @@ RectangularSolve SolveRectangularRref(const Matrix& a, const Vector& b,
     for (std::size_t j = 0; j < a.cols(); ++j) augmented(i, j) = a(i, j);
     augmented(i, a.cols()) = b[i];
   }
-  RrefResult rref = Rref(augmented, a.cols(), tolerance);
-  out.rank = rref.pivot_columns.size();
-  for (std::size_t i = 0; i < rref.pivot_columns.size(); ++i) {
-    out.x[rref.pivot_columns[i]] = rref.matrix(rref.pivot_rows[i], a.cols());
+  OrthogonalEchelonResult echelon =
+      OrthogonalEchelon(std::move(augmented), a.cols(), a.cols(),
+                        rank_tolerance);
+  out.rank = echelon.pivot_columns.size();
+  for (std::size_t i = 0; i < echelon.pivot_columns.size(); ++i) {
+    out.x[echelon.pivot_columns[i]] =
+        echelon.matrix(i, a.cols());
   }
-  for (std::size_t row = 0; row < rref.matrix.rows(); ++row) {
+  for (std::size_t row = out.rank; row < echelon.matrix.rows(); ++row) {
     bool zero_lhs = true;
     for (std::size_t col = 0; col < a.cols(); ++col) {
-      if (!IsNearlyZero(rref.matrix(row, col), tolerance)) {
+      if (!IsNearlyZero(echelon.matrix(row, col), rank_tolerance)) {
         zero_lhs = false;
         break;
       }
     }
-    if (zero_lhs && !IsNearlyZero(rref.matrix(row, a.cols()), tolerance)) {
+    if (zero_lhs &&
+        !IsNearlyZero(echelon.matrix(row, a.cols()), consistency_tolerance)) {
       out.inconsistent = true;
       break;
     }
@@ -180,10 +346,9 @@ RectangularSolve SolveRectangularRref(const Matrix& a, const Vector& b,
   return out;
 }
 
-RectangularSolve SolveMixedMultiplierRref(const Stage& stage, const Vector& x,
-                                          const Vector& u, const Vector& y,
-                                          Scalar rank_tolerance,
-                                          Scalar consistency_tolerance) {
+RectangularSolve SolveMixedMultiplierOrthogonally(
+    const Stage& stage, const Vector& x, const Vector& u, const Vector& y,
+    Scalar rank_tolerance, Scalar consistency_tolerance) {
   const std::size_t constraints = stage.C.rows();
   const std::size_t controls = stage.B.cols();
   RectangularSolve out;
@@ -211,21 +376,24 @@ RectangularSolve SolveMixedMultiplierRref(const Stage& stage, const Vector& x,
     }
   }
 
-  RrefResult rref = Rref(std::move(augmented), constraints, rank_tolerance);
-  out.rank = rref.pivot_columns.size();
-  for (std::size_t i = 0; i < rref.pivot_columns.size(); ++i) {
-    out.x[rref.pivot_columns[i]] = rref.matrix(rref.pivot_rows[i], constraints);
+  OrthogonalEchelonResult echelon =
+      OrthogonalEchelon(std::move(augmented), constraints, constraints,
+                        rank_tolerance);
+  out.rank = echelon.pivot_columns.size();
+  for (std::size_t i = 0; i < echelon.pivot_columns.size(); ++i) {
+    out.x[echelon.pivot_columns[i]] =
+        echelon.matrix(i, constraints);
   }
-  for (std::size_t row = 0; row < rref.matrix.rows(); ++row) {
+  for (std::size_t row = out.rank; row < echelon.matrix.rows(); ++row) {
     bool zero_lhs = true;
     for (std::size_t col = 0; col < constraints; ++col) {
-      if (!IsNearlyZero(rref.matrix(row, col), rank_tolerance)) {
+      if (!IsNearlyZero(echelon.matrix(row, col), rank_tolerance)) {
         zero_lhs = false;
         break;
       }
     }
-    if (zero_lhs &&
-        !IsNearlyZero(rref.matrix(row, constraints), consistency_tolerance)) {
+    if (zero_lhs && !IsNearlyZero(echelon.matrix(row, constraints),
+                                  consistency_tolerance)) {
       out.inconsistent = true;
       break;
     }
@@ -263,71 +431,6 @@ bool Contains(const WorkspaceVector<std::size_t>& values, std::size_t needle) {
   return false;
 }
 
-struct TracedRref {
-  RrefResult rref;
-  RrefOperations operations;
-};
-
-TracedRref RrefWithRowTransform(Matrix matrix,
-                                std::size_t pivot_column_limit,
-                                Scalar tolerance) {
-  TracedRref result;
-  const std::size_t maximum_operations =
-      std::min(matrix.rows(), pivot_column_limit);
-  result.operations.pivot_rows.reserve(maximum_operations);
-  result.operations.best_rows.reserve(maximum_operations);
-  result.operations.pivot_values = Vector(maximum_operations);
-  result.operations.factors = Matrix(maximum_operations, matrix.rows());
-  result.rref.pivot_columns.reserve(
-      std::min(matrix.rows(), pivot_column_limit));
-  result.rref.pivot_rows.reserve(
-      std::min(matrix.rows(), pivot_column_limit));
-  std::size_t pivot_row = 0;
-  const std::size_t limit = std::min(pivot_column_limit, matrix.cols());
-  for (std::size_t col = 0; col < limit && pivot_row < matrix.rows(); ++col) {
-    std::size_t best_row = pivot_row;
-    Scalar best = std::abs(matrix(best_row, col));
-    for (std::size_t row = pivot_row + 1; row < matrix.rows(); ++row) {
-      const Scalar candidate = std::abs(matrix(row, col));
-      if (candidate > best) {
-        best = candidate;
-        best_row = row;
-      }
-    }
-    if (best <= tolerance) continue;
-    const std::size_t operation = result.operations.count++;
-    result.operations.pivot_rows.push_back(pivot_row);
-    result.operations.best_rows.push_back(best_row);
-    if (best_row != pivot_row) {
-      for (std::size_t j = 0; j < matrix.cols(); ++j) {
-        std::swap(matrix(pivot_row, j), matrix(best_row, j));
-      }
-    }
-    const Scalar pivot_value = matrix(pivot_row, col);
-    result.operations.pivot_values[operation] = pivot_value;
-    for (std::size_t j = col; j < matrix.cols(); ++j) {
-      matrix(pivot_row, j) /= pivot_value;
-    }
-    for (std::size_t row = 0; row < matrix.rows(); ++row) {
-      if (row == pivot_row) continue;
-      const Scalar factor = matrix(row, col);
-      if (IsNearlyZero(factor, tolerance)) continue;
-      result.operations.factors(operation, row) = factor;
-      for (std::size_t j = col; j < matrix.cols(); ++j) {
-        matrix(row, j) -= factor * matrix(pivot_row, j);
-      }
-    }
-    result.rref.pivot_columns.push_back(col);
-    result.rref.pivot_rows.push_back(pivot_row);
-    ++pivot_row;
-  }
-  for (Scalar& value : matrix.data()) {
-    if (IsNearlyZero(value, tolerance)) value = Scalar{0};
-  }
-  result.rref.matrix = std::move(matrix);
-  return result;
-}
-
 LinearParametrization ParametrizeLinearSystem(const Matrix& a, const Vector& b,
                                               Scalar rank_tolerance,
                                               Scalar consistency_tolerance) {
@@ -344,37 +447,40 @@ LinearParametrization ParametrizeLinearSystem(const Matrix& a, const Vector& b,
     for (std::size_t j = 0; j < a.cols(); ++j) augmented(i, j) = a(i, j);
     augmented(i, a.cols()) = b[i];
   }
-  RrefResult rref = Rref(augmented, a.cols(), rank_tolerance);
+  OrthogonalEchelonResult echelon =
+      OrthogonalEchelon(std::move(augmented), a.cols(), a.cols(),
+                        rank_tolerance);
   WorkspaceVector<std::size_t> free_cols;
   free_cols.reserve(a.cols());
   for (std::size_t col = 0; col < a.cols(); ++col) {
-    if (!Contains(rref.pivot_columns, col)) free_cols.push_back(col);
+    if (!Contains(echelon.pivot_columns, col)) free_cols.push_back(col);
   }
   out.offset = Vector(a.cols());
   out.basis = Matrix(a.cols(), free_cols.size());
   for (std::size_t j = 0; j < free_cols.size(); ++j)
     out.basis(free_cols[j], j) = Scalar{1};
-  for (std::size_t pivot_index = 0; pivot_index < rref.pivot_columns.size();
+  for (std::size_t pivot_index = 0; pivot_index < echelon.pivot_columns.size();
        ++pivot_index) {
-    const std::size_t pivot_col = rref.pivot_columns[pivot_index];
-    const std::size_t row = rref.pivot_rows[pivot_index];
-    out.offset[pivot_col] = rref.matrix(row, a.cols());
+    const std::size_t pivot_col = echelon.pivot_columns[pivot_index];
+    const std::size_t row = pivot_index;
+    out.offset[pivot_col] = echelon.matrix(row, a.cols());
     for (std::size_t free_index = 0; free_index < free_cols.size();
          ++free_index) {
       out.basis(pivot_col, free_index) =
-          -rref.matrix(row, free_cols[free_index]);
+          -echelon.matrix(row, free_cols[free_index]);
     }
   }
-  for (std::size_t row = 0; row < rref.matrix.rows(); ++row) {
+  for (std::size_t row = echelon.pivot_columns.size();
+       row < echelon.matrix.rows(); ++row) {
     bool zero_lhs = true;
     for (std::size_t col = 0; col < a.cols(); ++col) {
-      if (!IsNearlyZero(rref.matrix(row, col), rank_tolerance)) {
+      if (!IsNearlyZero(echelon.matrix(row, col), rank_tolerance)) {
         zero_lhs = false;
         break;
       }
     }
     if (zero_lhs &&
-        !IsNearlyZero(rref.matrix(row, a.cols()), consistency_tolerance)) {
+        !IsNearlyZero(echelon.matrix(row, a.cols()), consistency_tolerance)) {
       out.inconsistent = true;
       break;
     }
@@ -447,7 +553,8 @@ void AnalyzeReducedControlHessian(const Matrix& Huu, bool positive_definite,
                                   std::size_t stage, Scalar tolerance,
                                   NewtonKktDiagnostics* diagnostics) {
   if (positive_definite) return;
-  RrefResult rank = Rref(Huu, Huu.cols(), tolerance);
+  OrthogonalEchelonResult rank =
+      OrthogonalEchelon(Huu, Huu.cols(), Huu.cols(), tolerance);
   if (rank.pivot_columns.size() < Huu.cols()) {
     diagnostics->singular = true;
     AddIndexedDiagnostic(diagnostics,
@@ -620,46 +727,47 @@ AffineStateBasis StateBasis(const Matrix& E, const Vector& e, std::size_t n,
     for (std::size_t col = 0; col < n; ++col) augmented(row, col) = E(row, col);
     augmented(row, n) = e[row];
   }
-  TracedRref traced = RrefWithRowTransform(std::move(augmented), n, tolerance);
-  const RrefResult& rref = traced.rref;
-  for (std::size_t row = 0; row < rref.matrix.rows(); ++row) {
+  OrthogonalEchelonResult echelon =
+      OrthogonalEchelon(std::move(augmented), n, n, tolerance);
+  for (std::size_t row = echelon.pivot_columns.size();
+       row < echelon.matrix.rows(); ++row) {
     bool zero_e = true;
     for (std::size_t col = 0; col < n; ++col) {
-      if (!IsNearlyZero(rref.matrix(row, col), tolerance)) {
+      if (!IsNearlyZero(echelon.matrix(row, col), tolerance)) {
         zero_e = false;
         break;
       }
     }
-    if (zero_e && !IsNearlyZero(rref.matrix(row, n),
+    if (zero_e && !IsNearlyZero(echelon.matrix(row, n),
                                 FeasibilityConsistencyTolerance(tolerance))) {
       out.infeasible = true;
       out.message = "inconsistent state equality constraints";
       return out;
     }
   }
-  out.redundant = rref.pivot_columns.size() < E.rows();
+  out.redundant = echelon.pivot_columns.size() < E.rows();
 
   out.free_rows.reserve(n);
   for (std::size_t col = 0; col < n; ++col) {
-    if (!Contains(rref.pivot_columns, col)) out.free_rows.push_back(col);
+    if (!Contains(echelon.pivot_columns, col)) out.free_rows.push_back(col);
   }
-  out.pivot_rows = rref.pivot_columns;
+  out.pivot_rows = echelon.pivot_columns;
   out.T = Matrix(n, out.free_rows.size());
   out.offset = Vector(n);
   for (std::size_t j = 0; j < out.free_rows.size(); ++j)
     out.T(out.free_rows[j], j) = Scalar{1};
-  for (std::size_t pivot_index = 0; pivot_index < rref.pivot_columns.size();
+  for (std::size_t pivot_index = 0; pivot_index < echelon.pivot_columns.size();
        ++pivot_index) {
-    const std::size_t pivot_col = rref.pivot_columns[pivot_index];
-    const std::size_t row = rref.pivot_rows[pivot_index];
-    out.offset[pivot_col] = -rref.matrix(row, n);
+    const std::size_t pivot_col = echelon.pivot_columns[pivot_index];
+    const std::size_t row = pivot_index;
+    out.offset[pivot_col] = -echelon.matrix(row, n);
     for (std::size_t free_index = 0; free_index < out.free_rows.size();
          ++free_index) {
       out.T(pivot_col, free_index) =
-          -rref.matrix(row, out.free_rows[free_index]);
+          -echelon.matrix(row, out.free_rows[free_index]);
     }
   }
-  out.rhs_operations = std::move(traced.operations);
+  out.rhs_operations = std::move(echelon.operations);
   return out;
 }
 
@@ -685,55 +793,47 @@ MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
       augmented(row, m + col) = C(row, col);
     augmented(row, m + n) = d[row];
   }
-  TracedRref traced =
-      RrefWithRowTransform(std::move(augmented), m, tolerance);
-  const RrefResult& rref = traced.rref;
+  OrthogonalEchelonResult echelon =
+      OrthogonalEchelon(std::move(augmented), m, m + n, tolerance);
   WorkspaceVector<std::size_t> free_cols;
   free_cols.reserve(m);
   for (std::size_t col = 0; col < m; ++col) {
-    if (!Contains(rref.pivot_columns, col)) free_cols.push_back(col);
+    if (!Contains(echelon.pivot_columns, col)) free_cols.push_back(col);
   }
   out.Y = Matrix(m, n);
   out.Z = Matrix(m, free_cols.size());
   out.y = Vector(m);
-  out.pivot_columns = rref.pivot_columns;
+  out.pivot_columns = echelon.pivot_columns;
   for (std::size_t j = 0; j < free_cols.size(); ++j)
     out.Z(free_cols[j], j) = Scalar{1};
-  for (std::size_t pivot_index = 0; pivot_index < rref.pivot_columns.size();
+  for (std::size_t pivot_index = 0; pivot_index < echelon.pivot_columns.size();
        ++pivot_index) {
-    const std::size_t pivot_col = rref.pivot_columns[pivot_index];
-    const std::size_t row = rref.pivot_rows[pivot_index];
-    out.y[pivot_col] = -rref.matrix(row, m + n);
+    const std::size_t pivot_col = echelon.pivot_columns[pivot_index];
+    const std::size_t row = pivot_index;
+    out.y[pivot_col] = -echelon.matrix(row, m + n);
     for (std::size_t x_col = 0; x_col < n; ++x_col) {
-      out.Y(pivot_col, x_col) = -rref.matrix(row, m + x_col);
+      out.Y(pivot_col, x_col) = -echelon.matrix(row, m + x_col);
     }
     for (std::size_t free_index = 0; free_index < free_cols.size();
          ++free_index) {
-      out.Z(pivot_col, free_index) = -rref.matrix(row, free_cols[free_index]);
+      out.Z(pivot_col, free_index) =
+          -echelon.matrix(row, free_cols[free_index]);
     }
   }
 
   WorkspaceVector<std::size_t> residual_rows;
   residual_rows.reserve(constraints);
-  for (std::size_t row = 0; row < constraints; ++row) {
-    if (Contains(rref.pivot_rows, row)) continue;
-    bool zero_d = true;
-    for (std::size_t col = 0; col < m; ++col) {
-      if (!IsNearlyZero(rref.matrix(row, col), tolerance)) {
-        zero_d = false;
-        break;
-      }
-    }
-    if (!zero_d) continue;
+  for (std::size_t row = echelon.pivot_columns.size(); row < constraints;
+       ++row) {
     bool any_state = false;
     for (std::size_t col = 0; col < n; ++col) {
-      if (!IsNearlyZero(rref.matrix(row, m + col), tolerance)) {
+      if (!IsNearlyZero(echelon.matrix(row, m + col), tolerance)) {
         any_state = true;
         break;
       }
     }
     const bool any_const = !IsNearlyZero(
-        rref.matrix(row, m + n), FeasibilityConsistencyTolerance(tolerance));
+        echelon.matrix(row, m + n), FeasibilityConsistencyTolerance(tolerance));
     if (!any_state && any_const) {
       out.infeasible = true;
       out.message = "inconsistent mixed equality constraints";
@@ -744,14 +844,14 @@ MixedElimination ControlBasis(const Matrix& C, const Matrix& D, const Vector& d,
   }
   out.state_C = Matrix(residual_rows.size(), n);
   out.state_d = Vector(residual_rows.size());
-  out.state_rref_rows = residual_rows;
+  out.state_transformed_rows = residual_rows;
   for (std::size_t i = 0; i < residual_rows.size(); ++i) {
     const std::size_t row = residual_rows[i];
     for (std::size_t col = 0; col < n; ++col)
-      out.state_C(i, col) = rref.matrix(row, m + col);
-    out.state_d[i] = rref.matrix(row, m + n);
+      out.state_C(i, col) = echelon.matrix(row, m + col);
+    out.state_d[i] = echelon.matrix(row, m + n);
   }
-  out.rhs_operations = std::move(traced.operations);
+  out.rhs_operations = std::move(echelon.operations);
   return out;
 }
 
@@ -1585,8 +1685,8 @@ std::size_t MixedEliminationStageScalars(const WorkspaceDimensionSummary& dims,
   const std::size_t p = std::max<std::size_t>(1, mixed_rows_bound);
   const std::size_t f = m;
   std::size_t scalars = 0;
-  scalars += 2 * p * (m + n + 1 + p);  // augmented RREF and by-value copy
-  scalars += m * n + m * f + m;  // Y, Z, y
+  scalars += 2 * p * (m + n + 1 + p);    // orthogonal echelon form and trace
+  scalars += m * n + m * f + m;          // Y, Z, y
   scalars += m * p + p * n + p + p * p;  // RHS pullback and residual relation
   scalars += n * n + m * m + n * m + next_n * m + n + m + next_n;  // old copies
   scalars += 8 * n * n + 4 * m * m + 6 * n * m + 2 * next_n * n +
@@ -1650,9 +1750,9 @@ void AddRecoveryStorageBound(const Problem& problem,
   AddObjects<Vector>(offset, 2 * N + 1);
   AddScalars(offset, dims.total_dynamics + dims.total_state);
   const std::size_t local_vector_bound =
-      40 * (dims.max_state + dims.max_next_state + dims.max_control +
-            dims.max_mixed_rows + dims.max_state_rows +
-            dims.max_terminal_rows + 1);
+      40 *
+      (dims.max_state + dims.max_next_state + dims.max_control +
+       dims.max_mixed_rows + dims.max_state_rows + dims.max_terminal_rows + 1);
   AddScalars(offset, N * local_vector_bound);
   AddScalars(offset,
              4 * dims.terminal_state *
@@ -2224,9 +2324,10 @@ bool RecoverZeroHorizonMultipliers(const Problem& original, Solution* out,
       system(row, n + col) = original.terminal_E(col, row);
     }
   }
-  Vector rhs = Scale(
-      original.terminal_Q * out->states[0] + original.terminal_q, -Scalar{1});
-  RectangularSolve solve = SolveRectangularRref(system, rhs, tolerance);
+  Vector rhs = Scale(original.terminal_Q * out->states[0] + original.terminal_q,
+                     -Scalar{1});
+  RectangularSolve solve = SolveRectangularOrthogonally(
+      system, rhs, tolerance, MultiplierConsistencyTolerance(tolerance));
   if (solve.inconsistent) {
     *error = "inconsistent terminal multiplier recovery";
     return false;
@@ -2332,7 +2433,7 @@ bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out,
     const Stage& stage = original.stages[i];
     const Vector& y = out->dynamics_multipliers[i];
     if (stage.C.rows() > 0) {
-      RectangularSolve solve = SolveMixedMultiplierRref(
+      RectangularSolve solve = SolveMixedMultiplierOrthogonally(
           stage, out->states[i], out->controls[i], y, tolerance,
           MultiplierConsistencyTolerance(tolerance));
       if (solve.inconsistent) {
@@ -2405,23 +2506,41 @@ Vector TransposeSelectedRowsMultiply(const Matrix& matrix,
   return result;
 }
 
-Vector ApplyRrefTranspose(const RrefOperations& operations, Vector cotangent) {
-  Check(cotangent.size() == operations.factors.cols(),
-        "RREF transpose shape mismatch");
-  for (std::size_t reverse = 0; reverse < operations.count; ++reverse) {
-    const std::size_t operation = operations.count - 1 - reverse;
-    const std::size_t pivot_row = operations.pivot_rows[operation];
-    const std::size_t best_row = operations.best_rows[operation];
-    Scalar off_pivot = Scalar{0};
-    for (std::size_t row = 0; row < cotangent.size(); ++row) {
-      if (row == pivot_row) continue;
-      off_pivot += operations.factors(operation, row) * cotangent[row];
+Vector ApplyOrthogonalTranspose(const OrthogonalOperations& operations,
+                                Vector cotangent) {
+  Check(cotangent.size() == operations.row_scales.size(),
+        "orthogonal transpose shape mismatch");
+  const std::size_t rank = operations.rank;
+
+  // The normalized pivot equations apply R^{-1} after Q^T. Their transpose
+  // therefore first solves R^T z = bar_z.
+  for (std::size_t row = 0; row < rank; ++row) {
+    Scalar value = cotangent[row];
+    for (std::size_t col = 0; col < row; ++col)
+      value -= operations.reflectors(row, col) * cotangent[col];
+    cotangent[row] = value / operations.diagonal[row];
+  }
+
+  // Q^T was accumulated by applying Householder reflectors in increasing
+  // order. Apply Q to the cotangent by replaying them in reverse order.
+  for (std::size_t reverse = 0; reverse < rank; ++reverse) {
+    const std::size_t reflector = rank - 1 - reverse;
+    Scalar projection = Scalar{0};
+    for (std::size_t row = reflector; row < cotangent.size(); ++row) {
+      projection +=
+          operations.reflectors(reflector, row) * cotangent[row];
     }
-    cotangent[pivot_row] =
-        (cotangent[pivot_row] - off_pivot) /
-        operations.pivot_values[operation];
-    if (best_row != pivot_row) {
-      std::swap(cotangent[pivot_row], cotangent[best_row]);
+    projection *= operations.betas[reflector];
+    for (std::size_t row = reflector; row < cotangent.size(); ++row) {
+      cotangent[row] -=
+          operations.reflectors(reflector, row) * projection;
+    }
+  }
+  for (std::size_t row = 0; row < cotangent.size(); ++row) {
+    cotangent[row] /= operations.row_scales[row];
+    if (!std::isfinite(cotangent[row])) {
+      throw NumericalFailureError(
+          "constraint multiplier is not representable");
     }
   }
   return cotangent;
@@ -2434,14 +2553,12 @@ WorkspaceVector<Vector> ReducedDynamicsMultipliers(
   if (N == 0) return dynamics;
 
   dynamics[N - 1] =
-      Scale(problem.terminal_Q * reduced.x[N] + problem.terminal_q,
-            -Scalar{1});
+      Scale(problem.terminal_Q * reduced.x[N] + problem.terminal_q, -Scalar{1});
   for (std::size_t rev = 1; rev < N; ++rev) {
     const std::size_t i = N - 1 - rev;
     const Stage& stage = problem.stages[i + 1];
     dynamics[i] =
-        Scale(stage.Q * reduced.x[i + 1] +
-                  stage.M * reduced.u[i + 1] + stage.q,
+        Scale(stage.Q * reduced.x[i + 1] + stage.M * reduced.u[i + 1] + stage.q,
               -Scalar{1}) +
         TransposeMultiply(stage.A, dynamics[i + 1]);
   }
@@ -2450,9 +2567,8 @@ WorkspaceVector<Vector> ReducedDynamicsMultipliers(
 
 bool RecoverEliminatedMultipliers(const Problem& original,
                                   const WorkingState& working,
-                                  const ReducedSolution& reduced,
-                                  Solution* out, Scalar tolerance,
-                                  std::string* error) {
+                                  const ReducedSolution& reduced, Solution* out,
+                                  Scalar tolerance, std::string* error) {
   const std::size_t N = original.stages.size();
   if (N == 0)
     return RecoverZeroHorizonMultipliers(original, out, tolerance, error);
@@ -2462,8 +2578,8 @@ bool RecoverEliminatedMultipliers(const Problem& original,
   out->state_multipliers.assign(N, Vector());
   WorkspaceVector<Vector> offset_cotangent(N + 1);
   for (std::size_t node = 0; node <= N; ++node) {
-    const std::size_t n = node == N ? original.terminal_Q.rows()
-                                    : original.stages[node].A.cols();
+    const std::size_t n =
+        node == N ? original.terminal_Q.rows() : original.stages[node].A.cols();
     offset_cotangent[node] = Vector(n);
   }
 
@@ -2500,13 +2616,14 @@ bool RecoverEliminatedMultipliers(const Problem& original,
         AddInPlace(&bar_offset, TransposeMultiply(trace.mixed.Y, bar_y));
       }
       AddInPlace(&offset_cotangent[i], bar_offset);
-      Vector reduced_rhs_cotangent(current.rhs_operations.factors.cols());
+      Vector reduced_rhs_cotangent(
+          current.rhs_operations.row_scales.size());
       for (std::size_t pivot = 0; pivot < current.pivot_rows.size(); ++pivot) {
-        reduced_rhs_cotangent[current.rhs_operations.pivot_rows[pivot]] -=
+        reduced_rhs_cotangent[pivot] -=
             offset_cotangent[i][current.pivot_rows[pivot]];
       }
-      bar_e = ApplyRrefTranspose(current.rhs_operations,
-                                 std::move(reduced_rhs_cotangent));
+      bar_e = ApplyOrthogonalTranspose(current.rhs_operations,
+                                       std::move(reduced_rhs_cotangent));
     } else {
       bar_e = Vector(0);
     }
@@ -2514,26 +2631,25 @@ bool RecoverEliminatedMultipliers(const Problem& original,
     Vector bar_d;
     if (trace.mixed.active) {
       const MixedElimination& mixed = trace.mixed;
-      Vector reduced_rhs_cotangent(mixed.rhs_operations.factors.cols());
+      Vector reduced_rhs_cotangent(
+          mixed.rhs_operations.row_scales.size());
       for (std::size_t pivot = 0; pivot < mixed.pivot_columns.size(); ++pivot) {
-        reduced_rhs_cotangent[mixed.rhs_operations.pivot_rows[pivot]] -=
-            bar_y[mixed.pivot_columns[pivot]];
+        reduced_rhs_cotangent[pivot] -= bar_y[mixed.pivot_columns[pivot]];
       }
       const std::size_t original_state_rows = original_stage.E.rows();
-      const std::size_t residual_rows = mixed.state_rref_rows.size();
+      const std::size_t residual_rows = mixed.state_transformed_rows.size();
       if (residual_rows > 0) {
         const Vector residual_cotangent =
             Slice(bar_e, original_state_rows, residual_rows);
         for (std::size_t row = 0; row < residual_rows; ++row) {
-          reduced_rhs_cotangent[mixed.state_rref_rows[row]] +=
+          reduced_rhs_cotangent[mixed.state_transformed_rows[row]] +=
               residual_cotangent[row];
         }
       }
-      bar_d = ApplyRrefTranspose(mixed.rhs_operations,
-                                 std::move(reduced_rhs_cotangent));
+      bar_d = ApplyOrthogonalTranspose(mixed.rhs_operations,
+                                       std::move(reduced_rhs_cotangent));
       out->state_multipliers[i] = Slice(bar_e, 0, original_state_rows);
-      out->mixed_multipliers[i] =
-          Slice(bar_d, 0, original_stage.C.rows());
+      out->mixed_multipliers[i] = Slice(bar_d, 0, original_stage.C.rows());
     } else {
       out->state_multipliers[i] = bar_e;
       out->mixed_multipliers[i] = Vector(0);
@@ -2541,26 +2657,25 @@ bool RecoverEliminatedMultipliers(const Problem& original,
     }
 
     const std::size_t original_mixed_rows = original_stage.C.rows();
-    const std::size_t extra_rows =
-        bar_d.size() >= original_mixed_rows
-            ? bar_d.size() - original_mixed_rows
-            : std::size_t{0};
+    const std::size_t extra_rows = bar_d.size() >= original_mixed_rows
+                                       ? bar_d.size() - original_mixed_rows
+                                       : std::size_t{0};
     Vector original_c(original_stage.A.rows());
     if (extra_rows > 0) {
       Check(next.active && extra_rows == next.pivot_rows.size(),
             "invalid propagated multiplier pullback trace");
       Check(bar_c.size() == next.free_rows.size(),
             "propagated multiplier state shape mismatch");
-      for (std::size_t free_index = 0;
-           free_index < next.free_rows.size(); ++free_index) {
+      for (std::size_t free_index = 0; free_index < next.free_rows.size();
+           ++free_index) {
         original_c[next.free_rows[free_index]] += bar_c[free_index];
       }
       for (std::size_t row = 0; row < extra_rows; ++row) {
         const Scalar value = bar_d[original_mixed_rows + row];
         const std::size_t pivot = next.pivot_rows[row];
         original_c[pivot] += value;
-        for (std::size_t free_index = 0;
-             free_index < next.free_rows.size(); ++free_index) {
+        for (std::size_t free_index = 0; free_index < next.free_rows.size();
+             ++free_index) {
           original_c[next.free_rows[free_index]] -=
               next.T(pivot, free_index) * value;
         }
@@ -2579,12 +2694,13 @@ bool RecoverEliminatedMultipliers(const Problem& original,
     Vector bar_offset =
         original.terminal_Q * out->states[N] + original.terminal_q;
     AddInPlace(&offset_cotangent[N], bar_offset);
-    Vector reduced_rhs_cotangent(terminal.rhs_operations.factors.cols());
+    Vector reduced_rhs_cotangent(
+        terminal.rhs_operations.row_scales.size());
     for (std::size_t pivot = 0; pivot < terminal.pivot_rows.size(); ++pivot) {
-      reduced_rhs_cotangent[terminal.rhs_operations.pivot_rows[pivot]] -=
+      reduced_rhs_cotangent[pivot] -=
           offset_cotangent[N][terminal.pivot_rows[pivot]];
     }
-    out->terminal_state_multiplier = ApplyRrefTranspose(
+    out->terminal_state_multiplier = ApplyOrthogonalTranspose(
         terminal.rhs_operations, std::move(reduced_rhs_cotangent));
   } else {
     out->terminal_state_multiplier = Vector(0);

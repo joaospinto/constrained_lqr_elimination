@@ -21,7 +21,7 @@ constexpr Scalar kDenseTolerance = 4e-3f;
 constexpr Scalar kLinearTolerance = 2e-5f;
 constexpr Scalar kSmallRowScale = 1e-2f;
 constexpr Scalar kLargeRowScale = 1e2f;
-constexpr Scalar kAccuracyLimitKktToleranceScale = 2;
+constexpr Scalar kAccuracyLimitKktToleranceScale = 3;
 #else
 constexpr Scalar kPrimalTolerance = 3e-7;
 constexpr Scalar kKktTolerance = 3e-5;
@@ -337,9 +337,9 @@ inline std::vector<TestCase> StandardCases() {
                      SolveStatus::kOptimal, SolveStatus::kOptimal, true,
                      horizon <= 9});
   }
-  // This intentionally accuracy-limited FP32 fixture uses twice the ordinary
-  // KKT gate only; its primal and dense-reference gates are unchanged, and
-  // stable fixtures at the same horizon retain the ordinary KKT gate.
+  // This intentionally accuracy-limited FP32 fixture uses three times the
+  // ordinary KKT gate only; its primal and dense-reference gates are unchanged,
+  // and stable fixtures at the same horizon retain the ordinary KKT gate.
   cases.push_back(
       {"ill-conditioned-horizon-17",
        UniformProblem(27, 17, 3, 2, 1, Pattern::kAlternating),

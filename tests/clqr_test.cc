@@ -30,10 +30,18 @@ constexpr Scalar kTol = 2e-4f;
 constexpr Scalar kKktTol =
     1e4f * std::numeric_limits<Scalar>::epsilon();
 constexpr Scalar kLinearSolveTolerance = 1e-7f;
+constexpr Scalar kSmallConstraintScale = 1e-4f;
+constexpr Scalar kLargeConstraintScale = 1e4f;
+constexpr Scalar kScalingInvariantTolerance = 8e-4f;
+constexpr Scalar kEssentialConstraintScale = 1e-6f;
 #else
 constexpr Scalar kTol = 1e-7;
 constexpr Scalar kKktTol = kTol;
 constexpr Scalar kLinearSolveTolerance = 1e-10;
+constexpr Scalar kSmallConstraintScale = 1e-10;
+constexpr Scalar kLargeConstraintScale = 1e10;
+constexpr Scalar kScalingInvariantTolerance = 2e-8;
+constexpr Scalar kEssentialConstraintScale = 1e-12;
 #endif
 
 struct Solution {
@@ -752,6 +760,270 @@ void InfeasibleConstraintDetected() {
   Expect(sol.status == SolveStatus::kInfeasible, "infeasible status");
 }
 
+void ScaleConstraintRow(Matrix* matrix, Vector* vector, std::size_t row,
+                        Scalar scale) {
+  for (std::size_t col = 0; col < matrix->cols(); ++col)
+    (*matrix)(row, col) *= scale;
+  (*vector)[row] *= scale;
+}
+
+void IndependentlyRescaledConstraintsAreInvariant() {
+  Problem original =
+      GeneratedFeasibleProblem(1701, 5, 4, 3, 2,
+                               ConstraintMode::kMixed);
+  original.terminal_E = GeneratedMatrix(2, 4, 1711, Scalar{0.5});
+  const Vector terminal_nominal = GeneratedVector(4, 1806, Scalar{0.8});
+  SetStateConstraintFromNominal(&original.terminal_E, &original.terminal_e,
+                                terminal_nominal);
+
+  Problem scaled = original;
+  for (std::size_t stage_index = 0; stage_index < scaled.stages.size();
+       ++stage_index) {
+    Stage& stage = scaled.stages[stage_index];
+    if (stage.C.rows() > 0) {
+      const Scalar scales[2] = {kSmallConstraintScale,
+                                kLargeConstraintScale};
+      for (std::size_t row = 0; row < stage.C.rows(); ++row) {
+        const Scalar scale = scales[(row + stage_index) % 2];
+        ScaleConstraintRow(&stage.C, &stage.d, row, scale);
+        for (std::size_t col = 0; col < stage.D.cols(); ++col)
+          stage.D(row, col) *= scale;
+      }
+    }
+    if (stage.E.rows() > 0) {
+      const Scalar scales[2] = {kLargeConstraintScale,
+                                kSmallConstraintScale};
+      for (std::size_t row = 0; row < stage.E.rows(); ++row) {
+        ScaleConstraintRow(&stage.E, &stage.e, row,
+                           scales[(row + stage_index) % 2]);
+      }
+    }
+  }
+  for (std::size_t row = 0; row < scaled.terminal_E.rows(); ++row) {
+    const Scalar scale =
+        row % 2 == 0 ? kSmallConstraintScale : kLargeConstraintScale;
+    ScaleConstraintRow(&scaled.terminal_E, &scaled.terminal_e, row, scale);
+  }
+
+  const Solution reference = SolveWithWorkspace(original);
+  const Solution candidate = SolveWithWorkspace(scaled);
+  Expect(reference.status == SolveStatus::kOptimal,
+         "row-scaling reference status: " + reference.message);
+  Expect(candidate.status == SolveStatus::kOptimal,
+         "row-scaling candidate status: " + candidate.message);
+  Expect(reference.states.size() == candidate.states.size(),
+         "row-scaling state count");
+  Expect(reference.controls.size() == candidate.controls.size(),
+         "row-scaling control count");
+  for (std::size_t i = 0; i < reference.states.size(); ++i) {
+    ExpectVectorNear(candidate.states[i], reference.states[i],
+                     kScalingInvariantTolerance,
+                     "row-scaling state " + std::to_string(i));
+  }
+  for (std::size_t i = 0; i < reference.controls.size(); ++i) {
+    ExpectVectorNear(candidate.controls[i], reference.controls[i],
+                     kScalingInvariantTolerance,
+                     "row-scaling control " + std::to_string(i));
+  }
+  for (std::size_t stage_index = 0;
+       stage_index < reference.mixed_multipliers.size(); ++stage_index) {
+    const Scalar scales[2] = {kSmallConstraintScale,
+                              kLargeConstraintScale};
+    for (std::size_t row = 0;
+         row < reference.mixed_multipliers[stage_index].size(); ++row) {
+      const Scalar recovered =
+          scales[(row + stage_index) % 2] *
+          candidate.mixed_multipliers[stage_index][row];
+      ExpectNear(recovered,
+                 reference.mixed_multipliers[stage_index][row],
+                 Scalar{16} * kScalingInvariantTolerance,
+                 "row-scaling mixed multiplier " +
+                     std::to_string(stage_index) + ":" +
+                     std::to_string(row));
+    }
+  }
+  for (std::size_t stage_index = 0;
+       stage_index < reference.state_multipliers.size(); ++stage_index) {
+    const Scalar scales[2] = {kLargeConstraintScale,
+                              kSmallConstraintScale};
+    for (std::size_t row = 0;
+         row < reference.state_multipliers[stage_index].size(); ++row) {
+      const Scalar recovered =
+          scales[(row + stage_index) % 2] *
+          candidate.state_multipliers[stage_index][row];
+      ExpectNear(recovered, reference.state_multipliers[stage_index][row],
+                 Scalar{16} * kScalingInvariantTolerance,
+                 "row-scaling state multiplier " +
+                     std::to_string(stage_index) + ":" +
+                     std::to_string(row));
+    }
+  }
+  for (std::size_t row = 0;
+       row < reference.terminal_state_multiplier.size(); ++row) {
+    const Scalar scale =
+        row % 2 == 0 ? kSmallConstraintScale : kLargeConstraintScale;
+    ExpectNear(scale * candidate.terminal_state_multiplier[row],
+               reference.terminal_state_multiplier[row],
+               Scalar{16} * kScalingInvariantTolerance,
+               "row-scaling terminal multiplier " + std::to_string(row));
+  }
+}
+
+Problem EssentialSingleRowProblem(bool terminal_constraint, Scalar scale) {
+  Problem problem;
+  problem.initial_state = Vector{Scalar{1}};
+  problem.stages.resize(1);
+  Stage& stage = problem.stages[0];
+  stage.A = Matrix(1, 1, {Scalar{1}});
+  stage.B = Matrix(1, 1, {Scalar{1}});
+  stage.c = Vector{Scalar{0}};
+  stage.Q = Matrix(1, 1, {Scalar{1}});
+  stage.R = Matrix(1, 1, {Scalar{1}});
+  stage.M = Matrix(1, 1, {Scalar{0}});
+  stage.q = Vector{Scalar{0}};
+  stage.r = Vector{Scalar{0}};
+  stage.C = Matrix(0, 1);
+  stage.D = Matrix(0, 1);
+  stage.d = Vector(0);
+  stage.E = Matrix(0, 1);
+  stage.e = Vector(0);
+  problem.terminal_Q = Matrix(1, 1, {Scalar{1}});
+  problem.terminal_q = Vector{Scalar{0}};
+  problem.terminal_E = Matrix(0, 1);
+  problem.terminal_e = Vector(0);
+  if (terminal_constraint) {
+    // x_1 = 1.7, equivalently u_0 = 0.7.
+    problem.terminal_E = Matrix(1, 1, {scale});
+    problem.terminal_e = Vector{Scalar{-1.7} * scale};
+  } else {
+    // u_0 = 0.7.
+    stage.C = Matrix(1, 1, {Scalar{0}});
+    stage.D = Matrix(1, 1, {scale});
+    stage.d = Vector{Scalar{-0.7} * scale};
+  }
+  return problem;
+}
+
+Problem ExtremeFiniteRowProblem(bool terminal_constraint, Scalar scale,
+                                bool nonzero_multiplier) {
+  Problem problem;
+  problem.initial_state = Vector{Scalar{0}};
+  problem.stages.resize(1);
+  Stage& stage = problem.stages[0];
+  stage.A = Matrix(1, 1, {Scalar{1}});
+  stage.B = Matrix(1, 1, {Scalar{1}});
+  stage.c = Vector{Scalar{0}};
+  stage.Q = Matrix(1, 1, {Scalar{1}});
+  stage.R = Matrix(1, 1, {Scalar{1}});
+  stage.M = Matrix(1, 1, {Scalar{0}});
+  stage.q = Vector{Scalar{0}};
+  stage.r =
+      Vector{nonzero_multiplier ? Scalar{0} : Scalar{-1}};
+  stage.C = Matrix(0, 1);
+  stage.D = Matrix(0, 1);
+  stage.d = Vector(0);
+  stage.E = Matrix(0, 1);
+  stage.e = Vector(0);
+  problem.terminal_Q = Matrix(1, 1, {Scalar{0}});
+  problem.terminal_q = Vector{Scalar{0}};
+  problem.terminal_E = Matrix(0, 1);
+  problem.terminal_e = Vector(0);
+  if (terminal_constraint) {
+    problem.terminal_E = Matrix(1, 1, {scale});
+    problem.terminal_e = Vector{-scale};
+  } else {
+    stage.C = Matrix(1, 1, {Scalar{0}});
+    stage.D = Matrix(1, 1, {scale});
+    stage.d = Vector{-scale};
+  }
+  return problem;
+}
+
+void ExtremeFiniteConstraintRowsAreSafe() {
+  const Scalar scales[2] = {std::numeric_limits<Scalar>::denorm_min(),
+                            std::numeric_limits<Scalar>::max()};
+  for (bool terminal_constraint : {false, true}) {
+    const std::string kind =
+        terminal_constraint ? "terminal" : "mixed";
+    for (Scalar scale : scales) {
+      const Problem problem =
+          ExtremeFiniteRowProblem(terminal_constraint, scale, false);
+      const Solution solution = SolveWithWorkspace(problem);
+      Expect(solution.status == SolveStatus::kOptimal,
+             "extreme " + kind + " row status: " + solution.message);
+      ExpectNear(solution.controls[0][0], Scalar{1},
+                 kScalingInvariantTolerance,
+                 "extreme " + kind + " row control");
+      ExpectNear(solution.states[1][0], Scalar{1},
+                 kScalingInvariantTolerance,
+                 "extreme " + kind + " row terminal state");
+      ExpectNear(MaxKktResidual(problem, solution), Scalar{0}, kKktTol,
+                 "extreme " + kind + " row KKT residual");
+    }
+
+    const Problem unrepresentable = ExtremeFiniteRowProblem(
+        terminal_constraint, std::numeric_limits<Scalar>::denorm_min(), true);
+    const Solution unrepresentable_solution =
+        SolveWithWorkspace(unrepresentable);
+    Expect(unrepresentable_solution.status == SolveStatus::kNumericalFailure,
+           "unrepresentable " + kind + " multiplier status");
+    Expect(unrepresentable_solution.message.find("not representable") !=
+               std::string::npos,
+           "unrepresentable " + kind + " multiplier diagnostic: " +
+               unrepresentable_solution.message);
+
+    Problem huge_rhs = ExtremeFiniteRowProblem(
+        terminal_constraint, std::numeric_limits<Scalar>::denorm_min(), false);
+    if (terminal_constraint) {
+      huge_rhs.terminal_e[0] = std::numeric_limits<Scalar>::max();
+    } else {
+      huge_rhs.stages[0].d[0] = std::numeric_limits<Scalar>::max();
+    }
+    const Solution huge_rhs_solution = SolveWithWorkspace(huge_rhs);
+    Expect(huge_rhs_solution.status == SolveStatus::kNumericalFailure,
+           "unrepresentable " + kind + " normalized row status");
+    Expect(huge_rhs_solution.message.find("not representable") !=
+               std::string::npos,
+           "unrepresentable " + kind + " normalized row diagnostic: " +
+               huge_rhs_solution.message);
+  }
+}
+
+void EssentialSingleRowsRemainActiveWhenScaled() {
+  for (bool terminal_constraint : {false, true}) {
+    const std::string name =
+        terminal_constraint ? "essential terminal row" : "essential mixed row";
+    const Solution reference =
+        SolveWithWorkspace(EssentialSingleRowProblem(terminal_constraint,
+                                                     Scalar{1}));
+    const Problem scaled_problem = EssentialSingleRowProblem(
+        terminal_constraint, kEssentialConstraintScale);
+    const Solution scaled = SolveWithWorkspace(scaled_problem);
+    Expect(reference.status == SolveStatus::kOptimal,
+           name + " reference status: " + reference.message);
+    Expect(scaled.status == SolveStatus::kOptimal,
+           name + " scaled status: " + scaled.message);
+    ExpectVectorNear(scaled.controls[0], reference.controls[0],
+                     kScalingInvariantTolerance, name + " control");
+    ExpectVectorNear(scaled.states[1], reference.states[1],
+                     kScalingInvariantTolerance, name + " terminal state");
+    if (terminal_constraint) {
+      ExpectNear(kEssentialConstraintScale *
+                     scaled.terminal_state_multiplier[0],
+                 reference.terminal_state_multiplier[0],
+                 Scalar{16} * kScalingInvariantTolerance,
+                 name + " multiplier pullback");
+    } else {
+      ExpectNear(kEssentialConstraintScale * scaled.mixed_multipliers[0][0],
+                 reference.mixed_multipliers[0][0],
+                 Scalar{16} * kScalingInvariantTolerance,
+                 name + " multiplier pullback");
+    }
+    ExpectNear(MaxKktResidual(scaled_problem, scaled), Scalar{0}, kKktTol,
+               name + " full KKT residual");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -765,6 +1037,9 @@ int main() {
   WrongInertiaReportedWithCandidate();
   SingularReducedHessianReported();
   InfeasibleConstraintDetected();
+  IndependentlyRescaledConstraintsAreInvariant();
+  EssentialSingleRowsRemainActiveWhenScaled();
+  ExtremeFiniteConstraintRowsAreSafe();
   std::cout << "all C++ tests passed\n";
   return 0;
 }
