@@ -51,7 +51,6 @@ struct Solution {
   Vector terminal_state_multiplier;
   std::vector<int> reduced_state_dimensions;
   std::vector<int> reduced_control_dimensions;
-  bool used_parallel_riccati = false;
   Scalar objective = Scalar{0};
   Timings timings;
 };

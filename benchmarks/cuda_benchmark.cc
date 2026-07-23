@@ -186,7 +186,7 @@ int main(int argc, char **argv) {
                "wall_speedup,kernel_speedup,other_wall_ms,upload_ms,"
                "feasibility_ms,reduction_ms,riccati_ms,reconstruction_ms,"
                "multiplier_ms,download_ms,min_reduced_n,"
-               "min_reduced_m,parallel_riccati,cuda_kkt_residual\n";
+               "min_reduced_m,cuda_kkt_residual\n";
   clqr::cuda::Workspace cuda_workspace;
   int completed_horizons = 0;
   for (std::size_t horizon : horizons) {
@@ -282,9 +282,8 @@ int main(int argc, char **argv) {
               << Median(feasibility) << ',' << Median(reduction) << ','
               << Median(riccati) << ',' << Median(reconstruction) << ','
               << Median(multiplier) << ',' << Median(download) << ','
-              << min_reduced_n << ',' << min_reduced_m << ','
-              << (gpu.used_parallel_riccati ? "yes" : "no") << ','
-              << std::scientific << kkt_residual << '\n';
+              << min_reduced_n << ',' << min_reduced_m << ',' << std::scientific
+              << kkt_residual << '\n';
     ++completed_horizons;
   }
   return completed_horizons == 0 ? 1 : 0;

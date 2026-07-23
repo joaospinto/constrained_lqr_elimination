@@ -21,12 +21,10 @@ using clqr::Vector;
 constexpr Scalar kTolerance = 2e-2f;
 constexpr Scalar kKktTolerance = 1e-2f;
 constexpr Scalar kLongHorizonKktTolerance = 1e-1f;
-constexpr bool kRedundantUsesParallelRiccati = false;
 #else
 constexpr Scalar kTolerance = 3e-6;
 constexpr Scalar kKktTolerance = 2e-5;
 constexpr Scalar kLongHorizonKktTolerance = 2e-4;
-constexpr bool kRedundantUsesParallelRiccati = true;
 #endif
 
 void Expect(bool condition, const std::string &message) {
@@ -313,7 +311,6 @@ Scalar MaxKktResidual(const Problem &problem,
 }
 
 void CompareWithCpu(const Problem &problem, const std::string &name,
-                    bool expect_parallel = true,
                     const Problem *cpu_reference_problem = nullptr,
                     clqr::cuda::Workspace *cuda_workspace = nullptr,
                     clqr::cuda::Solution *reusable_solution = nullptr) {
@@ -336,7 +333,6 @@ void CompareWithCpu(const Problem &problem, const std::string &name,
          name + " CPU status: " + cpu.message);
   Expect(gpu.status == SolveStatus::kOptimal,
          name + " CUDA status: " + gpu.message);
-  Expect(gpu.used_parallel_riccati == expect_parallel, name + " Riccati path");
   Expect(gpu.states.size() == cpu.state_count, name + " state count");
   Expect(gpu.controls.size() == cpu.control_count, name + " control count");
   for (std::size_t i = 0; i < cpu.state_count; ++i) {
@@ -378,7 +374,7 @@ void CompareWithCpu(const Problem &problem, const std::string &name,
   }
 }
 
-Problem FutureRegularizedRiccatiProblem() {
+void NonPositiveDefiniteReducedControlCostCase() {
   Problem problem;
   problem.initial_state = Vector{0.4};
   problem.stages.resize(1);
@@ -400,7 +396,13 @@ Problem FutureRegularizedRiccatiProblem() {
   problem.terminal_q = Vector{-0.2};
   problem.terminal_E = Matrix(0, 1);
   problem.terminal_e = Vector(0);
-  return problem;
+
+  std::cout << "case: non-positive-definite reduced control cost" << std::endl;
+  const clqr::cuda::Solution solution = clqr::cuda::Solve(problem);
+  Expect(solution.status == SolveStatus::kNumericalFailure,
+         "non-positive-definite reduced control cost status");
+  Expect(solution.message.find("positive-definite") != std::string::npos,
+         "non-positive-definite reduced control cost diagnostic");
 }
 
 Problem ZeroHorizonProblem() {
@@ -462,7 +464,6 @@ void LongHorizonCase() {
   const clqr::cuda::Solution solution = clqr::cuda::Solve(problem);
   Expect(solution.status == SolveStatus::kOptimal,
          name + " CUDA status: " + solution.message);
-  Expect(solution.used_parallel_riccati, name + " Riccati path");
   Expect(MaxKktResidual(problem, solution) <= kLongHorizonKktTolerance,
          name + " full primal-dual KKT residual");
 }
@@ -508,12 +509,11 @@ int main() {
                  "alternating");
   CompareWithCpu(
       GeneratedProblem(5, 5, 4, 2, 2, ConstraintMode::kRedundantMixed),
-      "rank-deficient redundant", kRedundantUsesParallelRiccati);
+      "rank-deficient redundant");
   CompareWithCpu(GeneratedProblem(6, 4, 4, 2, 2, ConstraintMode::kTerminal),
                  "terminal constraints");
   CompareWithCpu(NonuniformProblem(), "nonuniform dimensions");
-  CompareWithCpu(FutureRegularizedRiccatiProblem(),
-                 "future-regularized Riccati", false);
+  NonPositiveDefiniteReducedControlCostCase();
   CompareWithCpu(ZeroHorizonProblem(), "zero horizon");
   CompareWithCpu(GeneratedProblem(100, 3, clqr::cuda::kMaxStateDimension,
                                   clqr::cuda::kMaxControlDimension, 0,
@@ -531,20 +531,19 @@ int main() {
   // Keep the CPU reference well scaled so this case specifically tests
   // whether CUDA rank decisions are invariant to independent row scaling.
   CompareWithCpu(RescaledMixedRowsProblem(unscaled_rows),
-                 "independently rescaled rows", true, &unscaled_rows);
+                 "independently rescaled rows", &unscaled_rows);
   CompareWithCpu(MaximumConstraintProblem(), "maximum constraint dimensions");
   CompareWithCpu(GeneratedProblem(111, 3, 3, 1, 1, ConstraintMode::kState),
                  "small state-only standalone");
   clqr::cuda::Workspace reusable_cuda_workspace;
   clqr::cuda::Solution reusable_cuda_solution;
   CompareWithCpu(MaximumConstraintProblem(), "reusable workspace large case",
-                 true, nullptr, &reusable_cuda_workspace,
-                 &reusable_cuda_solution);
+                 nullptr, &reusable_cuda_workspace, &reusable_cuda_solution);
   CompareWithCpu(GeneratedProblem(111, 3, 3, 1, 1, ConstraintMode::kState),
-                 "reusable workspace smaller case", true, nullptr,
+                 "reusable workspace smaller case", nullptr,
                  &reusable_cuda_workspace, &reusable_cuda_solution);
   CompareWithCpu(GeneratedProblem(111, 3, 3, 1, 1, ConstraintMode::kState),
-                 "reusable workspace cached layout", true, nullptr,
+                 "reusable workspace cached layout", nullptr,
                  &reusable_cuda_workspace, &reusable_cuda_solution);
   LongHorizonCase();
   InfeasibleCase();

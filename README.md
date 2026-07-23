@@ -64,12 +64,20 @@ workspace. Kernels nevertheless loop over and factor only the active state,
 control, constraint, and reduced dimensions; no padded dense algebra is
 performed.
 
-The conditional-value scan uses the standard positive-definite reduced stage
-control-cost assumption. If a stage violates that local assumption but a
-sequential Riccati recursion still has positive-definite effective control
-Hessians after incorporating future cost, the current CUDA implementation
-uses its device-side sequential Riccati path. `Solution::used_parallel_riccati`
-reports which path was used. The benchmark problems use the parallel path.
+Every horizon-dependent device dependency is a balanced-tree reduction or
+expansion. Feasibility propagation, the conditional-value solve, primal
+reconstruction, and multiplier recovery each use at most a constant multiple
+of `ceil(log2(N + 1))` kernel rounds plus a constant number of independent
+per-stage kernels. No device kernel iterates over the horizon. Consequently,
+for fixed local dimensions, the device algorithm has `O(log N)` parallel time,
+`O(N)` work, and `O(N)` storage. End-to-end API wall time additionally includes
+serial host packing, compact-storage planning, transfers, and result
+construction; these costs are reported separately from pure kernel time.
+
+The conditional-value scan requires every reduced stage control Hessian to be
+positive definite, as in the standard convex LQR setting. A problem violating
+this regularity condition is reported as a numerical failure; the CUDA backend
+does not contain a horizon-sequential Riccati compatibility path.
 
 The public CUDA API is in `clqr/cuda.h`. Reserve a workspace once when solving
 the same shape repeatedly:

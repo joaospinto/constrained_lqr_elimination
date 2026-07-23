@@ -168,14 +168,8 @@ __device__ void SetFailure(DeviceStatus *status, int code, int stage,
 __device__ bool BlockEnabled(const DeviceStatus *status) {
   int enabled = 0;
   if (threadIdx.x == 0)
-    enabled = status->code == kDeviceOk;
-  return WarpBroadcastLaneZero(enabled) != 0;
-}
-
-__device__ bool BlockEnabled(const int *flag) {
-  int enabled = 0;
-  if (threadIdx.x == 0)
-    enabled = *flag != 0;
+    enabled = atomicCAS(const_cast<int *>(&status->code), kDeviceOk,
+                        kDeviceOk) == kDeviceOk;
   return WarpBroadcastLaneZero(enabled) != 0;
 }
 
@@ -1197,22 +1191,19 @@ __global__ void InitialReducedStateKernel(const StateParam *, const Scalar *,
                                           Scalar *, Scalar, DeviceStatus *);
 __global__ void BuildValueElementsKernel(const ReducedStage *,
                                          const ReducedTerminal *, int, Scalar,
-                                         ValueElement *, int *, DeviceStatus *);
+                                         ValueElement *, DeviceStatus *);
 __global__ void ReduceValueLeavesKernel(const ValueElement *, int, int, Scalar,
-                                        int *, ValueElement *);
+                                        DeviceStatus *, ValueElement *);
 __global__ void ReduceValueTreeLevelKernel(ValueElement *, int, int, int, int,
-                                           Scalar, int *);
+                                           Scalar, DeviceStatus *);
 __global__ void InitializeValueContextRootKernel(ValueElement *, int);
 __global__ void ExpandValueContextLevelKernel(ValueElement *, int, int, int,
-                                              int, Scalar, int *);
+                                              int, Scalar, DeviceStatus *);
 __global__ void FinalizeValueSuffixFromParentsKernel(ValueElement *, int,
                                                      const ValueElement *, int,
-                                                     Scalar, int *);
+                                                     Scalar, DeviceStatus *);
 __global__ void FeedbackKernel(const ReducedStage *, const ValueElement *, int,
-                               Scalar, Feedback *, const int *, DeviceStatus *);
-__global__ void SequentialRiccatiKernel(const ReducedStage *, int, Scalar,
-                                        ValueElement *, Feedback *,
-                                        DeviceStatus *);
+                               Scalar, Feedback *, DeviceStatus *);
 __global__ void InitializeAffineMapsKernel(const Feedback *, int, AffineMap *);
 __global__ void ReduceAffineLeavesKernel(const AffineMap *, int, int,
                                          AffineMap *, DeviceStatus *);
@@ -1374,7 +1365,6 @@ struct WorkspaceStorage {
   DeviceBuffer<ValueElement> value_scan;
   DeviceBuffer<Scalar> value_data;
   DeviceBuffer<Feedback> feedback;
-  DeviceBuffer<int> parallel_ok;
   DeviceBuffer<AffineMap> map_leaves;
   DeviceBuffer<AffineMap> map_scan;
   DeviceBuffer<Scalar> map_data;
@@ -1428,7 +1418,6 @@ struct WorkspaceStorage {
   PinnedBuffer<ValueElement> host_value_scan;
   PinnedBuffer<AffineMap> host_map_leaves;
   PinnedBuffer<AffineMap> host_map_scan;
-  PinnedBuffer<int> host_parallel_ok;
   PinnedBuffer<int> host_dual_scan_needed;
   PinnedBuffer<int> host_dual_dimensions;
   PinnedBuffer<DualRelation> host_dual_tree;
@@ -1494,7 +1483,6 @@ struct WorkspaceStorage {
     value_leaves.Reserve(node_count);
     value_scan.Reserve(total_tree_nodes - node_count);
     feedback.Reserve(stage_count);
-    parallel_ok.Reserve(1);
     map_leaves.Reserve(stage_count);
     map_scan.Reserve(total_stage_tree_nodes - std::max(stage_count, 1));
     states.Reserve(state_entries);
@@ -1542,7 +1530,6 @@ struct WorkspaceStorage {
     host_value_scan.Resize(total_tree_nodes - node_count);
     host_map_leaves.Resize(stage_count);
     host_map_scan.Resize(total_stage_tree_nodes - std::max(stage_count, 1));
-    host_parallel_ok.Resize(1);
     host_dual_scan_needed.Resize(1);
     host_dual_dimensions.Resize(stage_count);
     host_status.Resize(1);
@@ -1759,6 +1746,12 @@ std::string DeviceFailureMessage(const DeviceStatus &status) {
   std::ostringstream out;
   if (status.code == kDeviceInfeasible) {
     out << "CUDA feasibility elimination found an inconsistent relation";
+  } else if (status.detail == 19) {
+    out << "CUDA conditional-value scan requires a positive-definite reduced "
+           "control Hessian";
+  } else if (status.detail == 20) {
+    out << "CUDA conditional-value scan encountered a singular or "
+           "incompatible interval composition";
   } else {
     out << "CUDA backend encountered a rank or consistency failure";
   }
@@ -2382,7 +2375,6 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   const auto total_start = std::chrono::steady_clock::now();
   solution.status = SolveStatus::kInvalidInput;
   solution.message.clear();
-  solution.used_parallel_riccati = false;
   solution.objective = Scalar{0};
   solution.timings = Timings{};
   const int stage_count = static_cast<int>(problem.stages.size());
@@ -2523,7 +2515,16 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       options.tolerance, kMinimumFeasibilityConsistencyTolerance *
                              static_cast<Scalar>(feasibility_scan_levels + 2));
   solution.timings.feasibility_ms = TimeGpuKernels(
-      workspace, [] {},
+      workspace,
+      [&] {
+        // A failing block may cause other blocks to stop before publishing
+        // their dimensions. The host downloads status and dimensions in one
+        // synchronization, so keep the ignored-on-failure entries initialized.
+        CudaCheck(cudaMemsetAsync(state_dimensions.get(), 0,
+                                  workspace.host_state_dimensions.size() *
+                                      sizeof(int)),
+                  "initialize reduced state dimensions");
+      },
       [&] {
         BuildPrimalLeavesKernel<<<node_count, kThreads>>>(
             device_stages.get(), stage_count, device_terminal.get(),
@@ -2606,6 +2607,12 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                           sizeof(int),
                       cudaMemcpyHostToDevice),
                   "upload reduced-state offsets");
+        if (stage_count > 0) {
+          CudaCheck(cudaMemsetAsync(control_dimensions.get(), 0,
+                                    workspace.host_control_dimensions.size() *
+                                        sizeof(int)),
+                    "initialize reduced control dimensions");
+        }
       },
       [&] {
         if (stage_count > 0) {
@@ -2652,10 +2659,7 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &value_a = workspace.value_leaves;
   auto &value_b = workspace.value_scan;
   auto &feedback = workspace.feedback;
-  auto &parallel_ok = workspace.parallel_ok;
-  ValueElement *value_suffix = value_a.get();
-  int &host_parallel_ok = workspace.host_parallel_ok[0];
-  host_parallel_ok = 1;
+  const ValueElement *value_suffix = value_a.get();
   solution.timings.riccati_ms = TimeGpuKernels(
       workspace,
       [&] {
@@ -2677,27 +2681,23 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                 "upload compact value tree");
           }
         }
-        CudaCheck(cudaMemcpyAsync(parallel_ok.get(), &host_parallel_ok,
-                                  sizeof(int), cudaMemcpyHostToDevice),
-                  "initialize parallel Riccati flag");
       },
       [&] {
         BuildValueElementsKernel<<<node_count, kThreads>>>(
             reduced_stages.get(), reduced_terminal.get(), stage_count,
-            options.tolerance, value_a.get(), parallel_ok.get(),
-            device_status.get());
+            options.tolerance, value_a.get(), device_status.get());
         if (node_count > 1) {
           const int first_parent_count = level_counts[1];
           ReduceValueLeavesKernel<<<first_parent_count, kThreads>>>(
-              value_a.get(), node_count, first_parent_count,
-              options.tolerance, parallel_ok.get(), value_b.get());
+              value_a.get(), node_count, first_parent_count, options.tolerance,
+              device_status.get(), value_b.get());
           for (std::size_t level = 1; level + 1 < level_counts.size();
                ++level) {
             ReduceValueTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
                 value_b.get(), level_offsets[level] - node_count,
                 level_offsets[level + 1] - node_count, level_counts[level],
                 level_counts[level + 1], options.tolerance,
-                parallel_ok.get());
+                device_status.get());
           }
           InitializeValueContextRootKernel<<<1, kThreads>>>(
               value_b.get(), level_offsets.back() - node_count);
@@ -2708,61 +2708,26 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                 value_b.get(), level_offsets[level] - node_count,
                 level_offsets[level + 1] - node_count, level_counts[level],
                 level_counts[level + 1], options.tolerance,
-                parallel_ok.get());
+                device_status.get());
           }
           FinalizeValueSuffixFromParentsKernel<<<first_parent_count,
                                                  kThreads>>>(
               value_a.get(), node_count, value_b.get(), first_parent_count,
-              options.tolerance, parallel_ok.get());
+              options.tolerance, device_status.get());
         }
         if (stage_count > 0) {
           FeedbackKernel<<<stage_count, kThreads>>>(
               reduced_stages.get(), value_suffix, stage_count,
-              options.tolerance, feedback.get(), parallel_ok.get(),
-              device_status.get());
+              options.tolerance, feedback.get(), device_status.get());
         }
       },
       [&] {
-        CudaCheck(cudaMemcpyAsync(&host_parallel_ok, parallel_ok.get(),
-                                  sizeof(int), cudaMemcpyDeviceToHost),
-                  "read value scan status");
         CudaCheck(
             cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
                             sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
             "read Riccati status");
       });
 
-  if (host_parallel_ok != 0) {
-    solution.used_parallel_riccati = true;
-  } else {
-    solution.used_parallel_riccati = false;
-    host_parallel_ok = 1;
-    solution.timings.riccati_ms += TimeGpuKernels(
-        workspace,
-        [&] {
-          CudaCheck(cudaMemcpyAsync(parallel_ok.get(), &host_parallel_ok,
-                                    sizeof(int), cudaMemcpyHostToDevice),
-                    "reset Riccati flag");
-        },
-        [&] {
-          BuildValueElementsKernel<<<node_count, kThreads>>>(
-              reduced_stages.get(), reduced_terminal.get(), stage_count,
-              options.tolerance, value_a.get(), parallel_ok.get(),
-              device_status.get());
-          if (stage_count > 0) {
-            SequentialRiccatiKernel<<<1, kThreads>>>(
-                reduced_stages.get(), stage_count, options.tolerance,
-                value_a.get(), feedback.get(), device_status.get());
-          }
-          value_suffix = value_a.get();
-        },
-        [&] {
-          CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
-                                    device_status.get(), sizeof(DeviceStatus),
-                                    cudaMemcpyDeviceToHost),
-                    "read Riccati status");
-        });
-  }
   status = workspace.host_status[0];
   if (ApplyDeviceFailure(status, &solution)) {
     solution.timings.total_ms =
@@ -2889,6 +2854,10 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         [&] {
           CudaCheck(cudaMemsetAsync(dual_scan_needed.get(), 0, sizeof(int)),
                     "initialize dual scan flag");
+          CudaCheck(cudaMemsetAsync(dual_dimensions.get(), 0,
+                                    workspace.host_dual_dimensions.size() *
+                                        sizeof(int)),
+                    "initialize dual dimensions");
         },
         [&] {
           BuildDualParametersKernel<<<stage_count, kThreads>>>(
@@ -3130,10 +3099,7 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                            workspace.host_control_offsets.data(),
                            host_states.data(), host_controls.data());
   solution.status = SolveStatus::kOptimal;
-  solution.message =
-      solution.used_parallel_riccati
-          ? "optimal (parallel CUDA Riccati scan)"
-          : "optimal (sequential CUDA Riccati compatibility path)";
+  solution.message = "optimal (parallel CUDA conditional-value scan)";
   if (!options.enforce_multiplier_consistency)
     solution.message += "; multiplier consistency unchecked";
   solution.timings.total_ms =
@@ -4093,7 +4059,6 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
                                          const ReducedTerminal *terminal_ptr,
                                          int stage_count, Scalar tolerance,
                                          ValueElement *elements,
-                                         int *parallel_ok,
                                          DeviceStatus *status) {
   const int index = blockIdx.x;
   if (index > stage_count)
@@ -4194,7 +4159,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
       }
     }
     if (!positive_definite)
-      atomicExch(parallel_ok, 0);
+      SetFailure(status, kDeviceNumericalFailure, index, 19);
   }
   WarpSynchronize();
   if (!positive_definite)
@@ -4204,7 +4169,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
             &rank, &best_row, factors);
   if (rank != s.m) {
     if (threadIdx.x == 0)
-      atomicExch(parallel_ok, 0);
+      SetFailure(status, kDeviceNumericalFailure, index, 19);
     return;
   }
 
@@ -4267,14 +4232,16 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
   }
 }
 
-__device__ void ComposeValueElementsBlock(
-    const ValueElement &first, const ValueElement &second, Scalar tolerance,
-    ValueElement *output, int *parallel_ok, Scalar *augmented, Scalar *factors,
-    int *pivot_columns, int *pivot_rows, int *rank, int *best_row) {
+__device__ void
+ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
+                          Scalar tolerance, ValueElement *output,
+                          DeviceStatus *status, int node, Scalar *augmented,
+                          Scalar *factors, int *pivot_columns, int *pivot_rows,
+                          int *rank, int *best_row) {
   const int shared = first.right_dim;
   if (shared != second.left_dim) {
     if (threadIdx.x == 0)
-      atomicExch(parallel_ok, 0);
+      SetFailure(status, kDeviceNumericalFailure, node, 20);
     return;
   }
   const int left = first.left_dim;
@@ -4332,7 +4299,7 @@ __device__ void ComposeValueElementsBlock(
             pivot_rows, rank, best_row, factors);
   if (*rank != shared) {
     if (threadIdx.x == 0)
-      atomicExch(parallel_ok, 0);
+      SetFailure(status, kDeviceNumericalFailure, node, 20);
     return;
   }
 
@@ -4462,11 +4429,13 @@ __device__ void CopyValueElementBlock(const ValueElement &input,
   }
 }
 
-__device__ void
-ComposeScanValueBlock(const ValueElement &first, const ValueElement &second,
-                      Scalar tolerance, ValueElement *output, int *parallel_ok,
-                      Scalar *augmented, Scalar *factors, int *pivot_columns,
-                      int *pivot_rows, int *rank, int *best_row) {
+__device__ void ComposeScanValueBlock(const ValueElement &first,
+                                      const ValueElement &second,
+                                      Scalar tolerance, ValueElement *output,
+                                      DeviceStatus *status, int node,
+                                      Scalar *augmented, Scalar *factors,
+                                      int *pivot_columns, int *pivot_rows,
+                                      int *rank, int *best_row) {
   if (InvalidScanValueElement(first)) {
     if (InvalidScanValueElement(second)) {
       SetInvalidScanValueElement(output);
@@ -4479,19 +4448,19 @@ ComposeScanValueBlock(const ValueElement &first, const ValueElement &second,
     CopyValueElementBlock(first, output);
     return;
   }
-  ComposeValueElementsBlock(first, second, tolerance, output, parallel_ok,
+  ComposeValueElementsBlock(first, second, tolerance, output, status, node,
                             augmented, factors, pivot_columns, pivot_rows, rank,
                             best_row);
 }
 
 __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
                                         int parent_count, Scalar tolerance,
-                                        int *parallel_ok,
+                                        DeviceStatus *status,
                                         ValueElement *parents) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  if (!BlockEnabled(parallel_ok))
+  if (!BlockEnabled(status))
     return;
   const int left = 2 * index;
   if (left + 1 >= count) {
@@ -4506,18 +4475,18 @@ __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
   __shared__ int rank;
   __shared__ int best_row;
   ComposeValueElementsBlock(leaves[left], leaves[left + 1], tolerance,
-                            &parents[index], parallel_ok, augmented, factors,
+                            &parents[index], status, index, augmented, factors,
                             pivot_columns, pivot_rows, &rank, &best_row);
 }
 
 __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
                                            int parent_offset, int child_count,
                                            int parent_count, Scalar tolerance,
-                                           int *parallel_ok) {
+                                           DeviceStatus *status) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  if (!BlockEnabled(parallel_ok))
+  if (!BlockEnabled(status))
     return;
   const int left = child_offset + 2 * index;
   if (2 * index + 1 >= child_count) {
@@ -4533,9 +4502,9 @@ __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
   __shared__ int rank;
   __shared__ int best_row;
   ComposeValueElementsBlock(tree[left], tree[right], tolerance,
-                            &tree[parent_offset + index], parallel_ok,
-                            augmented, factors, pivot_columns, pivot_rows,
-                            &rank, &best_row);
+                            &tree[parent_offset + index], status,
+                            parent_offset + index, augmented, factors,
+                            pivot_columns, pivot_rows, &rank, &best_row);
 }
 
 __global__ void InitializeValueContextRootKernel(ValueElement *tree,
@@ -4546,11 +4515,11 @@ __global__ void InitializeValueContextRootKernel(ValueElement *tree,
 
 __global__ void ExpandValueContextLevelKernel(
     ValueElement *tree, int child_offset, int parent_offset, int child_count,
-    int parent_count, Scalar tolerance, int *parallel_ok) {
+    int parent_count, Scalar tolerance, DeviceStatus *status) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  if (!BlockEnabled(parallel_ok))
+  if (!BlockEnabled(status))
     return;
   const int left = child_offset + 2 * index;
   const ValueElement &parent_context = tree[parent_offset + index];
@@ -4567,7 +4536,7 @@ __global__ void ExpandValueContextLevelKernel(
   __shared__ int rank;
   __shared__ int best_row;
   ComposeScanValueBlock(tree[right], parent_context, tolerance, &tree[left],
-                        parallel_ok, augmented, factors, pivot_columns,
+                        status, left, augmented, factors, pivot_columns,
                         pivot_rows, &rank, &best_row);
   WarpSynchronize();
   CopyValueElementBlock(parent_context, &tree[right]);
@@ -4575,11 +4544,11 @@ __global__ void ExpandValueContextLevelKernel(
 
 __global__ void FinalizeValueSuffixFromParentsKernel(
     ValueElement *leaves, int count, const ValueElement *parent_contexts,
-    int parent_count, Scalar tolerance, int *parallel_ok) {
+    int parent_count, Scalar tolerance, DeviceStatus *status) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  if (!BlockEnabled(parallel_ok))
+  if (!BlockEnabled(status))
     return;
   const int left = 2 * index;
   const ValueElement &parent = parent_contexts[index];
@@ -4597,9 +4566,9 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   WarpSynchronize();
   if (left + 1 >= count) {
     if (!InvalidScanValueElement(parent)) {
-      ComposeScanValueBlock(leaves[left], parent, tolerance, &composed,
-                            parallel_ok, augmented, factors, pivot_columns,
-                            pivot_rows, &rank, &best_row);
+      ComposeScanValueBlock(leaves[left], parent, tolerance, &composed, status,
+                            left, augmented, factors, pivot_columns, pivot_rows,
+                            &rank, &best_row);
       WarpSynchronize();
       CopyValueElementBlock(composed, &leaves[left]);
     }
@@ -4607,15 +4576,15 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   }
   const int right = left + 1;
   if (!InvalidScanValueElement(parent)) {
-    ComposeScanValueBlock(leaves[right], parent, tolerance, &composed,
-                          parallel_ok, augmented, factors, pivot_columns,
-                          pivot_rows, &rank, &best_row);
+    ComposeScanValueBlock(leaves[right], parent, tolerance, &composed, status,
+                          right, augmented, factors, pivot_columns, pivot_rows,
+                          &rank, &best_row);
     WarpSynchronize();
     CopyValueElementBlock(composed, &leaves[right]);
     WarpSynchronize();
   }
   ComposeValueElementsBlock(leaves[left], leaves[right], tolerance, &composed,
-                            parallel_ok, augmented, factors, pivot_columns,
+                            status, left, augmented, factors, pivot_columns,
                             pivot_rows, &rank, &best_row);
   WarpSynchronize();
   CopyValueElementBlock(composed, &leaves[left]);
@@ -4734,13 +4703,11 @@ __device__ bool SolveFeedbackBlock(
 __global__ void FeedbackKernel(const ReducedStage *stages,
                                const ValueElement *suffix, int stage_count,
                                Scalar tolerance, Feedback *feedback,
-                               const int *parallel_ok, DeviceStatus *status) {
+                               DeviceStatus *status) {
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
   if (!BlockEnabled(status))
-    return;
-  if (!BlockEnabled(parallel_ok))
     return;
   const ReducedStage &s = stages[index];
   const ValueElement &next = suffix[index + 1];
@@ -4755,97 +4722,6 @@ __global__ void FeedbackKernel(const ReducedStage *stages,
   SolveFeedbackBlock(s, next, tolerance, &out, augmented, factors,
                      pivot_columns, pivot_rows, &rank, &best_row, status,
                      index, 9);
-}
-
-__global__ void SequentialRiccatiKernel(const ReducedStage *stages,
-                                        int stage_count, Scalar tolerance,
-                                        ValueElement *suffix,
-                                        Feedback *feedback,
-                                        DeviceStatus *status) {
-  if (blockIdx.x != 0)
-    return;
-  if (!BlockEnabled(status))
-    return;
-  __shared__ Scalar augmented[kMaxControlDimension *
-                              (kMaxControlDimension + kMaxStateDimension + 1)];
-  __shared__ Scalar factors[kMaxRrefRows];
-  __shared__ int pivot_columns[kMaxRrefRows];
-  __shared__ int pivot_rows[kMaxRrefRows];
-  __shared__ int rank;
-  __shared__ int best_row;
-
-  for (int index = stage_count - 1; index >= 0; --index) {
-    const ReducedStage &s = stages[index];
-    const ValueElement &next = suffix[index + 1];
-    Feedback &fb = feedback[index];
-    if (!SolveFeedbackBlock(s, next, tolerance, &fb, augmented, factors,
-                            pivot_columns, pivot_rows, &rank, &best_row,
-                            status, index, 10))
-      return;
-    WarpSynchronize();
-
-    ValueElement &current = suffix[index];
-    if (threadIdx.x == 0) {
-      current.left_dim = s.n;
-      current.right_dim = 0;
-    }
-    for (int linear = threadIdx.x; linear < s.n * s.n; linear += blockDim.x) {
-      const int row = linear / s.n;
-      const int col = linear % s.n;
-      Scalar value = s.Q[row * s.n + col];
-      for (int a = 0; a < s.next_n; ++a) {
-        for (int b = 0; b < s.next_n; ++b) {
-          value += s.A[a * s.n + row] * next.J[a * next.left_dim + b] *
-                   s.A[b * s.n + col];
-        }
-      }
-      for (int u = 0; u < s.m; ++u) {
-        Scalar cross = s.M[row * s.m + u];
-        for (int a = 0; a < s.next_n; ++a) {
-          for (int b = 0; b < s.next_n; ++b) {
-            cross += s.A[a * s.n + row] * next.J[a * next.left_dim + b] *
-                     s.B[b * s.m + u];
-          }
-        }
-        value += cross * fb.K[u * s.n + col];
-      }
-      current.J[row * current.left_dim + col] = value;
-    }
-    for (int row = threadIdx.x; row < s.n; row += blockDim.x) {
-      Scalar value = s.q[row];
-      for (int a = 0; a < s.next_n; ++a) {
-        Scalar future = next.eta[a];
-        for (int b = 0; b < s.next_n; ++b) {
-          future += next.J[a * next.left_dim + b] * s.c[b];
-        }
-        value += s.A[a * s.n + row] * future;
-      }
-      for (int u = 0; u < s.m; ++u) {
-        Scalar cross = s.M[row * s.m + u];
-        for (int a = 0; a < s.next_n; ++a) {
-          for (int b = 0; b < s.next_n; ++b) {
-            cross += s.A[a * s.n + row] * next.J[a * next.left_dim + b] *
-                     s.B[b * s.m + u];
-          }
-        }
-        value += cross * fb.k[u];
-      }
-      current.eta[row] = value;
-    }
-    WarpSynchronize();
-    for (int linear = threadIdx.x; linear < s.n * s.n; linear += blockDim.x) {
-      const int row = linear / s.n;
-      const int col = linear % s.n;
-      if (row < col) {
-        const Scalar value =
-            Scalar{0.5} * (current.J[row * current.left_dim + col] +
-                           current.J[col * current.left_dim + row]);
-        current.J[row * current.left_dim + col] = value;
-        current.J[col * current.left_dim + row] = value;
-      }
-    }
-    WarpSynchronize();
-  }
 }
 
 } // namespace

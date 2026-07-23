@@ -25,7 +25,6 @@ using namespace clqr::cuda::detail;
 constexpr Scalar kTolerance = 1e-5f;
 #else
 constexpr Scalar kTolerance = 1e-9;
-constexpr Scalar kRiccatiComparisonTolerance = 2e-8;
 constexpr Scalar kPrimalComparisonTolerance = 2e-7;
 constexpr Scalar kKktComparisonTolerance = 2e-7;
 constexpr Scalar kLongHorizonKktComparisonTolerance = 2e-5;
@@ -365,6 +364,32 @@ template <typename Function> void Launch(int blocks, Function function) {
   }
 }
 
+void NonPositiveDefiniteReducedControlCostCase() {
+  ReducedStage stage{};
+  stage.n = 1;
+  stage.next_n = 1;
+  stage.m = 1;
+  ReducedTerminal terminal{};
+  terminal.n = 1;
+  terminal.Q[0] = Scalar{1};
+  std::vector<ValueElement> elements(2);
+  std::vector<Scalar> storage(2 * kMaxValueElementEntries);
+  for (int node = 0; node < 2; ++node) {
+    BindValueElementScratch(&elements[node],
+                            storage.data() + static_cast<std::size_t>(node) *
+                                                 kMaxValueElementEntries);
+  }
+  DeviceStatus status{kDeviceOk, -1, 0};
+  Launch(2, [&] {
+    BuildValueElementsKernel(&stage, &terminal, 1, kTolerance, elements.data(),
+                             &status);
+  });
+  Expect(status.code == kDeviceNumericalFailure,
+         "non-positive-definite reduced control cost status");
+  Expect(status.stage == 0 && status.detail == 19,
+         "non-positive-definite reduced control cost diagnostic");
+}
+
 Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
                    const std::vector<Scalar> &controls,
                    const std::vector<Scalar> &initial_multiplier,
@@ -613,25 +638,24 @@ void RunEmulation(const Problem &problem, const std::string &name,
                                                 node * kMaxValueElementEntries);
   }
   std::vector<Feedback> feedback(horizon);
-  int parallel_ok = 1;
   Launch(nodes, [&] {
     BuildValueElementsKernel(reduced.data(), &reduced_terminal, horizon,
-                             kTolerance, value_a.data(), &parallel_ok, &status);
+                             kTolerance, value_a.data(), &status);
   });
-  Expect(parallel_ok == 1, "parallel value base applicability");
+  Expect(status.code == kDeviceOk, "parallel value base applicability");
   ValueElement *value_suffix = value_a.data();
   if (nodes > 1) {
     const int first_parent_count = node_level_counts[1];
     Launch(first_parent_count, [&] {
       ReduceValueLeavesKernel(value_a.data(), nodes, first_parent_count,
-                              kTolerance, &parallel_ok, value_b.data());
+                              kTolerance, &status, value_b.data());
     });
     for (std::size_t level = 1; level + 1 < node_level_counts.size(); ++level) {
       Launch(node_level_counts[level + 1], [&] {
         ReduceValueTreeLevelKernel(
             value_b.data(), node_level_offsets[level] - nodes,
             node_level_offsets[level + 1] - nodes, node_level_counts[level],
-            node_level_counts[level + 1], kTolerance, &parallel_ok);
+            node_level_counts[level + 1], kTolerance, &status);
       });
     }
     Launch(1, [&] {
@@ -644,72 +668,22 @@ void RunEmulation(const Problem &problem, const std::string &name,
         ExpandValueContextLevelKernel(
             value_b.data(), node_level_offsets[level] - nodes,
             node_level_offsets[level + 1] - nodes, node_level_counts[level],
-            node_level_counts[level + 1], kTolerance, &parallel_ok);
+            node_level_counts[level + 1], kTolerance, &status);
       });
     }
     Launch(first_parent_count, [&] {
       FinalizeValueSuffixFromParentsKernel(value_a.data(), nodes,
                                            value_b.data(), first_parent_count,
-                                           kTolerance, &parallel_ok);
+                                           kTolerance, &status);
     });
   }
-  Expect(parallel_ok == 1, "parallel value scan");
+  Expect(status.code == kDeviceOk, "parallel value scan");
   Launch(horizon, [&] {
     FeedbackKernel(reduced.data(), value_suffix, horizon, kTolerance,
-                   feedback.data(), &parallel_ok, &status);
+                   feedback.data(), &status);
   });
   Expect(status.code == kDeviceOk, "emulated feedback solve");
 
-  std::vector<ValueElement> sequential_values(nodes);
-  std::vector<Scalar> sequential_value_storage(static_cast<std::size_t>(nodes) *
-                                               kMaxValueElementEntries);
-  std::fill(sequential_value_storage.begin(), sequential_value_storage.end(),
-            Scalar{23});
-  for (int node = 0; node < nodes; ++node) {
-    BindValueElementScratch(&sequential_values[node],
-                            sequential_value_storage.data() +
-                                static_cast<std::size_t>(node) *
-                                    kMaxValueElementEntries);
-  }
-  std::vector<Feedback> sequential_feedback(horizon);
-  int sequential_base_ok = 1;
-  Launch(nodes, [&] {
-    BuildValueElementsKernel(reduced.data(), &reduced_terminal, horizon,
-                             kTolerance, sequential_values.data(),
-                             &sequential_base_ok, &status);
-  });
-  Launch(1, [&] {
-    SequentialRiccatiKernel(reduced.data(), horizon, kTolerance,
-                            sequential_values.data(),
-                            sequential_feedback.data(), &status);
-  });
-  Expect(status.code == kDeviceOk, "emulated sequential Riccati reference");
-#ifndef CLQR_USE_FLOAT
-  for (int i = 0; i < horizon; ++i) {
-    for (int row = 0; row < feedback[i].control_dim; ++row) {
-      Expect(
-          std::abs(feedback[i].k[row] - sequential_feedback[i].k[row]) <
-              kRiccatiComparisonTolerance,
-          name + " parallel and sequential feedforward terms agree: parallel=" +
-              std::to_string(feedback[i].k[row]) +
-              ", sequential=" + std::to_string(sequential_feedback[i].k[row]));
-      for (int col = 0; col < feedback[i].state_dim; ++col) {
-        Expect(std::abs(feedback[i].K[row * feedback[i].state_dim + col] -
-                        sequential_feedback[i]
-                            .K[row * sequential_feedback[i].state_dim + col]) <
-                   kRiccatiComparisonTolerance,
-               name +
-                   " parallel and sequential feedback terms agree: parallel=" +
-                   std::to_string(
-                       feedback[i].K[row * feedback[i].state_dim + col]) +
-                   ", sequential=" +
-                   std::to_string(
-                       sequential_feedback[i]
-                           .K[row * sequential_feedback[i].state_dim + col]));
-      }
-    }
-  }
-#endif
   std::vector<int> stage_level_offsets{0};
   std::vector<int> stage_level_counts{std::max(horizon, 1)};
   int stage_tree_size = stage_level_counts.front();
@@ -962,6 +936,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
 int main() {
   TinyCoefficientRrefCase();
   InvalidValueElementCopyCase();
+  NonPositiveDefiniteReducedControlCostCase();
   RunEmulation(MakeProblem(), "rank-deficient constrained", true, true);
   RunEmulation(ZeroHorizonProblem(), "zero-horizon", false, false);
   RunEmulation(
