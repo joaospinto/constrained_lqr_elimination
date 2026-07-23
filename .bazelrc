@@ -5,6 +5,8 @@ build:linux --cxxopt=-Wpedantic
 build:linux --cxxopt=-Werror
 # Keep project warnings fatal without imposing that policy on dependencies.
 build:linux --per_file_copt=external/.*@-Wno-error
+# Nanobind intentionally uses a zero-length-array compiler extension.
+build:linux --per_file_copt=external/nanobind_bazel.*@-Wno-pedantic
 build:linux --cxxopt=-O3
 build:linux --sandbox_add_mount_pair=/tmp
 

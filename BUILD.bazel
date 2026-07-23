@@ -94,6 +94,10 @@ cuda_library(
         "-Wno-deprecated-gpu-targets",
     ],
     defines = CUDA_CAPACITY_DEFINES,
+    # rules_cuda keeps CUDA and host compilation definitions separate.
+    # Export the capacities through CcInfo as well so every C++ client sees
+    # the same public constants as cuda_solver.cu.
+    host_defines = CUDA_CAPACITY_DEFINES,
     host_copts = ["-std=c++17"],
     includes = ["include"],
     target_compatible_with = requires_cuda(),
@@ -178,9 +182,9 @@ nanobind_extension(
     name = "_clqr",
     srcs = ["python/clqr_module.cc"],
     # Nanobind deliberately uses a zero-length-array extension. Keep all
-    # other warnings fatal in this translation unit.
+    # other warnings enabled and fatal in this translation unit.
     copts = select({
-        ":linux": ["-Wno-error=pedantic"],
+        ":linux": ["-Wno-pedantic"],
         "//conditions:default": [],
     }),
     deps = [":clqr"],
