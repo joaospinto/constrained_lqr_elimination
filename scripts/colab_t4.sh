@@ -92,7 +92,17 @@ for precision in "${precisions[@]}"; do
     -DCLQR_CUDA_MAX_STATE_CONSTRAINTS="${max_state_constraints}" \
     -DCMAKE_CUDA_ARCHITECTURES="${cuda_arch}"
   cmake --build "${build_dir}" --parallel 2
-  ctest --test-dir "${build_dir}" --output-on-failure
+  if ! ctest --test-dir "${build_dir}" --output-on-failure; then
+    if command -v compute-sanitizer >/dev/null 2>&1 &&
+       [[ "${CLQR_SKIP_SANITIZER:-0}" != "1" ]]; then
+      for sanitizer_tool in memcheck initcheck racecheck synccheck; do
+        echo "=== ${precision} CUDA ${sanitizer_tool} failure diagnostic ==="
+        compute-sanitizer --tool "${sanitizer_tool}" --error-exitcode 99 \
+          "${build_dir}/clqr_cuda_test" || true
+      done
+    fi
+    exit 8
+  fi
 
   if command -v compute-sanitizer >/dev/null 2>&1 && \
      [[ "${CLQR_SKIP_SANITIZER:-0}" != "1" ]]; then

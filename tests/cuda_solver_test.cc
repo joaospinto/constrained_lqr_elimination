@@ -253,22 +253,30 @@ void AddTransposeProduct(const Matrix &matrix, const Vector &multiplier,
 }
 
 Scalar MaxKktResidual(const Problem &problem,
-                      const clqr::cuda::Solution &solution) {
+                      const clqr::cuda::Solution &solution,
+                      std::string *worst_equation = nullptr) {
   Scalar residual = 0.0;
+  const auto update = [&](Scalar candidate, const std::string &equation) {
+    if (candidate > residual) {
+      residual = candidate;
+      if (worst_equation != nullptr)
+        *worst_equation = equation;
+    }
+  };
   const std::size_t horizon = problem.stages.size();
   for (std::size_t i = 0; i < horizon; ++i) {
     const Stage &stage = problem.stages[i];
-    residual = std::max(residual,
-                        TestMaxAbs(solution.states[i + 1] -
-                                   stage.A * solution.states[i] -
-                                   stage.B * solution.controls[i] - stage.c));
+    update(TestMaxAbs(solution.states[i + 1] -
+                      stage.A * solution.states[i] -
+                      stage.B * solution.controls[i] - stage.c),
+           "dynamics at stage " + std::to_string(i));
     if (stage.C.rows() > 0)
-      residual =
-          std::max(residual, MaxScaledMixedResidual(stage, solution.states[i],
-                                                    solution.controls[i]));
+      update(MaxScaledMixedResidual(stage, solution.states[i],
+                                    solution.controls[i]),
+             "mixed feasibility at stage " + std::to_string(i));
     if (stage.E.rows() > 0)
-      residual = std::max(residual, MaxScaledStateResidual(stage.E, stage.e,
-                                                           solution.states[i]));
+      update(MaxScaledStateResidual(stage.E, stage.e, solution.states[i]),
+             "state feasibility at stage " + std::to_string(i));
 
     Vector gx = stage.Q * solution.states[i] + stage.M * solution.controls[i] +
                 stage.q -
@@ -277,20 +285,22 @@ Scalar MaxKktResidual(const Problem &problem,
                       : solution.dynamics_multipliers[i - 1]);
     AddTransposeProduct(stage.C, solution.mixed_multipliers[i], &gx);
     AddTransposeProduct(stage.E, solution.state_multipliers[i], &gx);
-    residual = std::max(residual, TestMaxAbs(gx));
+    update(TestMaxAbs(gx),
+           "state stationarity at stage " + std::to_string(i));
 
     Vector gu = clqr::Transpose(stage.M) * solution.states[i] +
                 stage.R * solution.controls[i] + stage.r -
                 clqr::Transpose(stage.B) * solution.dynamics_multipliers[i];
     AddTransposeProduct(stage.D, solution.mixed_multipliers[i], &gu);
-    residual = std::max(residual, TestMaxAbs(gu));
+    update(TestMaxAbs(gu),
+           "control stationarity at stage " + std::to_string(i));
   }
   Vector initial_error = solution.states.front() - problem.initial_state;
-  residual = std::max(residual, TestMaxAbs(initial_error));
+  update(TestMaxAbs(initial_error), "initial-state feasibility");
   if (problem.terminal_E.rows() > 0)
-    residual = std::max(
-        residual, MaxScaledStateResidual(problem.terminal_E, problem.terminal_e,
-                                         solution.states.back()));
+    update(MaxScaledStateResidual(problem.terminal_E, problem.terminal_e,
+                                  solution.states.back()),
+           "terminal-state feasibility");
   Vector terminal_gradient =
       problem.terminal_Q * solution.states.back() + problem.terminal_q;
   terminal_gradient =
@@ -298,7 +308,8 @@ Scalar MaxKktResidual(const Problem &problem,
                                         : solution.dynamics_multipliers.back());
   AddTransposeProduct(problem.terminal_E, solution.terminal_state_multiplier,
                       &terminal_gradient);
-  return std::max(residual, TestMaxAbs(terminal_gradient));
+  update(TestMaxAbs(terminal_gradient), "terminal stationarity");
+  return residual;
 }
 
 void CompareWithCpu(const Problem &problem, const std::string &name,
@@ -349,10 +360,12 @@ void CompareWithCpu(const Problem &problem, const std::string &name,
   Expect(std::abs(gpu.objective - cpu.objective) <=
              kTolerance * (1.0 + std::abs(cpu.objective)),
          name + " objective mismatch");
-  const Scalar kkt_residual = MaxKktResidual(problem, gpu);
+  std::string worst_equation;
+  const Scalar kkt_residual =
+      MaxKktResidual(problem, gpu, &worst_equation);
   Expect(kkt_residual <= kKktTolerance,
          name + " full primal-dual KKT residual=" +
-             std::to_string(kkt_residual));
+             std::to_string(kkt_residual) + " in " + worst_equation);
   for (std::size_t i = 0; i < gpu.reduced_state_dimensions.size(); ++i) {
     Expect(gpu.reduced_state_dimensions[i] <=
                static_cast<int>(gpu.states[i].size()),
