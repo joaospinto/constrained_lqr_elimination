@@ -85,23 +85,25 @@ CUDA support is optional. A CUDA-free build provides the same symbols through
 a stub library: `clqr::cuda::Available()` returns false and `Solve` reports an
 invalid-input result without loading the CUDA runtime.
 
-Until the native CUDA targets are migrated to Bazel, build them with CMake:
+Build and test the native backend with Bazel. For example, target a P100
+(`sm_60`) in FP64 with the benchmark capacities:
 
 ```sh
-cmake -S . -B build-cuda \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCLQR_ENABLE_CUDA=ON \
-  -DCLQR_PRECISION=FP64 \
-  -DCMAKE_CUDA_ARCHITECTURES=60
-cmake --build build-cuda --parallel
-ctest --test-dir build-cuda --output-on-failure
+bazel test //:cuda_solver_test \
+  --config=fp64 \
+  --config=cuda-benchmark \
+  --cuda_archs=sm_60 \
+  --test_output=errors
 ```
 
-`CLQR_PRECISION=FP32` builds both the CPU reference and CUDA backend entirely
-in FP32. The four `CLQR_CUDA_MAX_*` CMake cache variables select compile-time
-state, control, mixed-constraint, and state-constraint capacities (each from 1
-through 16). Problems exceeding a configured capacity are rejected before any
-kernel launch.
+`--config=fp32` builds both the CPU reference and CUDA backend entirely in
+FP32. The `--cuda_max_state_dimension`, `--cuda_max_control_dimension`,
+`--cuda_max_mixed_constraints`, and `--cuda_max_state_constraints` flags select
+compile-time capacities from 1 through 16. `--config=cuda-benchmark` sets these
+to 8, 4, 2, and 2, respectively. Problems exceeding a configured capacity are
+rejected before any kernel launch. The combined capacities must also fit the
+portable 48 KiB per-block shared-memory budget; an oversized combination is
+rejected at compile time.
 
 The CUDA benchmark reuses reserved storage and reports both end-to-end wall
 time and pure kernel time. Wall time includes host packing, all transfers,
@@ -118,7 +120,8 @@ For a reproducible native-CUDA validation and benchmark run, open
 in a fresh Kaggle GPU notebook. It records the machine specification, builds
 the CPU and CUDA implementations in the same precision, runs the CPU,
 kernel-emulation, native-CUDA, and Compute Sanitizer tests, and benchmarks all
-configured horizons. The canonical shell driver is
+configured horizons. It bootstraps the Bazel version pinned in `.bazelversion`
+when needed. The canonical shell driver is
 [`scripts/notebook_cuda.sh`](scripts/notebook_cuda.sh); the former
 `scripts/colab_t4.sh` name remains as a compatibility wrapper.
 

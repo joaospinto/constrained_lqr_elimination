@@ -1,12 +1,26 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load(
+    "@rules_cuda//cuda:defs.bzl",
+    "cuda_library",
+    "requires_cuda",
+)
 load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
+load(
+    "//:cuda_config.bzl",
+    "cuda_capacity_defines",
+    "declare_cuda_capacity_flags",
+)
+
+declare_cuda_capacity_flags()
 
 config_setting(
     name = "fp32",
     define_values = {"clqr_precision": "fp32"},
 )
+
+CUDA_CAPACITY_DEFINES = cuda_capacity_defines()
 
 cc_library(
     name = "clqr",
@@ -42,6 +56,7 @@ cc_library(
     name = "clqr_cuda_stub",
     srcs = ["src/cuda_stub.cc"],
     hdrs = ["include/clqr/cuda.h"],
+    defines = CUDA_CAPACITY_DEFINES,
     includes = ["include"],
     visibility = ["//visibility:public"],
     deps = [":clqr"],
@@ -51,6 +66,63 @@ cc_test(
     name = "cuda_stub_test",
     srcs = ["tests/cuda_stub_test.cc"],
     deps = [":clqr_cuda_stub"],
+)
+
+cuda_library(
+    name = "clqr_cuda",
+    srcs = ["src/cuda_solver.cu"],
+    hdrs = [
+        "include/clqr/cuda.h",
+        "src/cuda_internal.h",
+    ],
+    alwayslink = True,
+    copts = [
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-Wno-deprecated-gpu-targets",
+    ],
+    defines = CUDA_CAPACITY_DEFINES,
+    host_copts = ["-std=c++17"],
+    includes = ["include"],
+    target_compatible_with = requires_cuda(),
+    visibility = ["//visibility:public"],
+    deps = [":clqr"],
+)
+
+cc_test(
+    name = "cuda_solver_test",
+    srcs = [
+        "benchmarks/cuda_benchmark_problem.h",
+        "tests/cuda_solver_test.cc",
+    ],
+    tags = [
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = requires_cuda(),
+    deps = [":clqr_cuda"],
+)
+
+cc_binary(
+    name = "clqr_cuda_jax_fixture",
+    srcs = [
+        "tests/cuda_jax_fixture.cc",
+        "tests/cuda_jax_problem.h",
+    ],
+    tags = ["manual"],
+    target_compatible_with = requires_cuda(),
+    deps = [":clqr_cuda"],
+)
+
+cc_binary(
+    name = "clqr_cuda_benchmark",
+    srcs = [
+        "benchmarks/cuda_benchmark.cc",
+        "benchmarks/cuda_benchmark_problem.h",
+    ],
+    tags = ["manual"],
+    target_compatible_with = requires_cuda(),
+    deps = [":clqr_cuda"],
 )
 
 cc_library(
@@ -64,6 +136,7 @@ cc_library(
         "include",
         "tests/emulated_cuda",
     ],
+    defines = CUDA_CAPACITY_DEFINES,
     textual_hdrs = ["src/cuda_solver.cu"],
     deps = [":clqr"],
 )

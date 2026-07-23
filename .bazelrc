@@ -1,6 +1,3 @@
-startup --output_base=/private/tmp/constrained_lqr_elimination_bazel
-startup --install_base=/private/tmp/constrained_lqr_elimination_bazel_install
-
 build:linux --cxxopt=-std=c++20
 build:linux --cxxopt=-Wall
 build:linux --cxxopt=-Wextra
@@ -30,6 +27,27 @@ build -c opt
 build:fp64 --define=clqr_precision=fp64
 build:fp32 --define=clqr_precision=fp32
 
+# Keep CUDA optional for ordinary CPU builds. Native CUDA targets become
+# compatible only when --config=cuda is selected.
+build --@rules_cuda//cuda:enable=false
+build:cuda --@rules_cuda//cuda:enable=true
+build:cuda --@rules_cuda//cuda:compiler=nvcc
+
+# Friendly aliases for the rules_cuda architecture flag and the four validated
+# (1--16) dense-workspace capacities.
+common --flag_alias=cuda_archs=@rules_cuda//cuda:archs
+common --flag_alias=cuda_max_state_dimension=//:cuda_max_state_dimension
+common --flag_alias=cuda_max_control_dimension=//:cuda_max_control_dimension
+common --flag_alias=cuda_max_mixed_constraints=//:cuda_max_mixed_constraints
+common --flag_alias=cuda_max_state_constraints=//:cuda_max_state_constraints
+
+# Benchmark capacities match n=8, m=4, and two constraints of each kind.
+build:cuda-benchmark --config=cuda
+build:cuda-benchmark --cuda_max_state_dimension=8
+build:cuda-benchmark --cuda_max_control_dimension=4
+build:cuda-benchmark --cuda_max_mixed_constraints=2
+build:cuda-benchmark --cuda_max_state_constraints=2
+
 common --enable_platform_specific_config
 
 # Set minimum supported MacOS version to 11.0.
@@ -41,25 +59,25 @@ build:debug --cxxopt=-O0
 build:debug --spawn_strategy=local
 
 build:asan -c dbg
-build:asan --copt -fsanitize=address
-build:asan --copt -gfull
-build:asan --copt -O0
+build:asan --copt=-fsanitize=address
+build:asan --copt=-g
+build:asan --copt=-O0
 build:asan --spawn_strategy=local
-build:asan --copt -fno-omit-frame-pointer
-build:asan --linkopt -fsanitize=address
+build:asan --copt=-fno-omit-frame-pointer
+build:asan --linkopt=-fsanitize=address
 
 build:msan -c dbg
-build:msan --copt -fsanitize=memory
-build:msan --copt -gfull
-build:msan --copt -O0
+build:msan --copt=-fsanitize=memory
+build:msan --copt=-g
+build:msan --copt=-O0
 build:msan --spawn_strategy=local
-build:msan --copt -fno-omit-frame-pointer
-build:msan --linkopt -fsanitize=memory
+build:msan --copt=-fno-omit-frame-pointer
+build:msan --linkopt=-fsanitize=memory
 
 build:ubsan -c dbg
-build:ubsan --copt -fsanitize=undefined
-build:ubsan --copt -gfull
-build:ubsan --copt -O0
+build:ubsan --copt=-fsanitize=undefined
+build:ubsan --copt=-g
+build:ubsan --copt=-O0
 build:ubsan --spawn_strategy=local
-build:ubsan --copt -fno-omit-frame-pointer
-build:ubsan --linkopt -fsanitize=undefined
+build:ubsan --copt=-fno-omit-frame-pointer
+build:ubsan --linkopt=-fsanitize=undefined

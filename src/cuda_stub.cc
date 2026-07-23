@@ -23,7 +23,7 @@ Solution &Solve(const Problem &, Workspace &, Solution &result,
                 const Options &) {
   result.status = SolveStatus::kInvalidInput;
   result.message =
-      "CUDA backend not built; configure CMake with CLQR_ENABLE_CUDA=ON";
+      "CUDA backend not built; use Bazel --config=cuda and link clqr_cuda";
   return result;
 }
 

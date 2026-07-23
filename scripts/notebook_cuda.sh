@@ -7,7 +7,6 @@ if [[ -d /kaggle/working ]]; then
 else
   notebook_work_dir=/content
 fi
-build_root="${CLQR_CUDA_BUILD_DIR:-${notebook_work_dir}/clqr_cuda_build}"
 jax_dir="${CLQR_JAX_DIR:-${notebook_work_dir}/constrained_lqr_jax}"
 jax_revision="${CLQR_JAX_REVISION:-f867e0adf4ff165782a9b9bb3ebf1be6b66c856c}"
 cuda_arch="${CLQR_CUDA_ARCH:-75}"
@@ -16,6 +15,43 @@ max_control_dimension="${CLQR_CUDA_MAX_CONTROL_DIMENSION:-4}"
 max_mixed_constraints="${CLQR_CUDA_MAX_MIXED_CONSTRAINTS:-2}"
 max_state_constraints="${CLQR_CUDA_MAX_STATE_CONSTRAINTS:-2}"
 read -r -a precisions <<< "${CLQR_PRECISIONS:-FP64}"
+
+bazelisk_version=1.29.0
+bazelisk_sha256=5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992
+bazel_command="${CLQR_BAZEL:-}"
+required_bazel_version="$(<"${repo_dir}/.bazelversion")"
+
+if [[ -z "${bazel_command}" ]] && command -v bazelisk >/dev/null 2>&1; then
+  bazel_command="$(command -v bazelisk)"
+fi
+if [[ -z "${bazel_command}" ]] && command -v bazel >/dev/null 2>&1 &&
+   [[ "$(bazel --version 2>/dev/null)" == "bazel ${required_bazel_version}" ]]; then
+  bazel_command="$(command -v bazel)"
+fi
+if [[ -z "${bazel_command}" ]]; then
+  case "$(uname -m)" in
+    x86_64|amd64) bazelisk_asset=bazelisk-linux-amd64 ;;
+    *)
+      echo "automatic Bazelisk bootstrap supports x86-64 Linux only; set CLQR_BAZEL" >&2
+      exit 2
+      ;;
+  esac
+  tool_dir="${notebook_work_dir}/clqr_tools"
+  bazel_command="${tool_dir}/bazelisk-${bazelisk_version}"
+  if [[ ! -x "${bazel_command}" ]] ||
+     ! printf '%s  %s\n' "${bazelisk_sha256}" "${bazel_command}" |
+       sha256sum --check --status; then
+    mkdir -p "${tool_dir}"
+    bazelisk_tmp="${bazel_command}.tmp"
+    curl --fail --location --silent --show-error \
+      "https://github.com/bazelbuild/bazelisk/releases/download/v${bazelisk_version}/${bazelisk_asset}" \
+      --output "${bazelisk_tmp}"
+    printf '%s  %s\n' "${bazelisk_sha256}" "${bazelisk_tmp}" |
+      sha256sum --check
+    chmod +x "${bazelisk_tmp}"
+    mv "${bazelisk_tmp}" "${bazel_command}"
+  fi
+fi
 
 if ! command -v nvcc >/dev/null 2>&1; then
   echo "nvcc is unavailable; select a CUDA GPU runtime first." >&2
@@ -47,9 +83,9 @@ fi
 free -h
 
 echo "=== Build toolchain ==="
-cmake --version
 c++ --version
 nvcc --version
+(cd "${repo_dir}" && "${bazel_command}" --version)
 
 echo "=== NVIDIA runtime summary ==="
 nvidia-smi
@@ -81,32 +117,45 @@ for precision in "${precisions[@]}"; do
       ;;
   esac
   precision_suffix="$(printf '%s' "${precision}" | tr '[:upper:]' '[:lower:]')"
-  build_dir="${build_root}_${precision_suffix}"
   echo "=== ${precision} build and tests ==="
   echo "CUDA capacities: state=${max_state_dimension}, control=${max_control_dimension}, mixed=${max_mixed_constraints}, state constraints=${max_state_constraints}"
-  cmake -S "${repo_dir}" -B "${build_dir}" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCLQR_ENABLE_CUDA=ON \
-    -DCLQR_BUILD_TESTS=ON \
-    -DCLQR_BUILD_BENCHMARKS=ON \
-    -DCLQR_PRECISION="${precision}" \
-    -DCLQR_CUDA_MAX_STATE_DIMENSION="${max_state_dimension}" \
-    -DCLQR_CUDA_MAX_CONTROL_DIMENSION="${max_control_dimension}" \
-    -DCLQR_CUDA_MAX_MIXED_CONSTRAINTS="${max_mixed_constraints}" \
-    -DCLQR_CUDA_MAX_STATE_CONSTRAINTS="${max_state_constraints}" \
-    -DCMAKE_CUDA_ARCHITECTURES="${cuda_arch}"
-  cmake --build "${build_dir}" --parallel "$(nproc)"
-  if ! ctest --test-dir "${build_dir}" --output-on-failure; then
+  bazel_args=(
+    "--config=${precision_suffix}"
+    --config=cuda
+    "--cuda_archs=sm_${cuda_arch}"
+    "--cuda_max_state_dimension=${max_state_dimension}"
+    "--cuda_max_control_dimension=${max_control_dimension}"
+    "--cuda_max_mixed_constraints=${max_mixed_constraints}"
+    "--cuda_max_state_constraints=${max_state_constraints}"
+    "--jobs=$(nproc)"
+  )
+  test_targets=(
+    //:clqr_test
+    //:workspace_allocation_test
+    //:python_binding_test
+    //:cuda_stub_test
+    //:cuda_kernel_emulation_test
+    //:cuda_solver_test
+  )
+  build_targets=(
+    //:clqr_cuda_jax_fixture
+    //:clqr_cuda_benchmark
+  )
+  cd "${repo_dir}"
+  if ! "${bazel_command}" test "${bazel_args[@]}" \
+       --test_output=errors "${test_targets[@]}"; then
     if command -v compute-sanitizer >/dev/null 2>&1 &&
-       [[ "${CLQR_SKIP_SANITIZER:-0}" != "1" ]]; then
+       [[ "${CLQR_SKIP_SANITIZER:-0}" != "1" ]] &&
+       [[ -x "${repo_dir}/bazel-bin/cuda_solver_test" ]]; then
       for sanitizer_tool in memcheck initcheck racecheck synccheck; do
         echo "=== ${precision} CUDA ${sanitizer_tool} failure diagnostic ==="
         compute-sanitizer --tool "${sanitizer_tool}" --error-exitcode 99 \
-          "${build_dir}/clqr_cuda_test" || true
+          "${repo_dir}/bazel-bin/cuda_solver_test" || true
       done
     fi
     exit 8
   fi
+  "${bazel_command}" build "${bazel_args[@]}" "${build_targets[@]}"
 
   if command -v compute-sanitizer >/dev/null 2>&1 && \
      [[ "${CLQR_SKIP_SANITIZER:-0}" != "1" ]]; then
@@ -115,15 +164,15 @@ for precision in "${precisions[@]}"; do
     for sanitizer_tool in "${sanitizer_tools[@]}"; do
       echo "=== ${precision} CUDA ${sanitizer_tool} check ==="
       compute-sanitizer --tool "${sanitizer_tool}" --error-exitcode 99 \
-        "${build_dir}/clqr_cuda_test"
+        "${repo_dir}/bazel-bin/cuda_solver_test"
     done
   fi
 
   if [[ "${CLQR_RUN_JAX_CROSS_VALIDATION:-0}" == "1" ]]; then
     python3 "${repo_dir}/tests/cross_validate_jax.py" \
-      "${build_dir}/clqr_cuda_jax_fixture"
+      "${repo_dir}/bazel-bin/clqr_cuda_jax_fixture"
   fi
 
-  "${build_dir}/clqr_cuda_benchmark" \
+  "${repo_dir}/bazel-bin/clqr_cuda_benchmark" \
     --repeats "${CLQR_BENCHMARK_REPEATS:-5}"
 done
