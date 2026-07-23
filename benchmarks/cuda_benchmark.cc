@@ -26,9 +26,8 @@ double Median(std::vector<double> values) {
 }
 
 double KernelTotal(const clqr::cuda::Timings &timings) {
-  return timings.feasibility_ms + timings.reduction_ms +
-         timings.riccati_ms + timings.reconstruction_ms +
-         timings.multiplier_ms;
+  return timings.feasibility_ms + timings.reduction_ms + timings.riccati_ms +
+         timings.reconstruction_ms + timings.multiplier_ms;
 }
 
 double EventTotal(const clqr::cuda::Timings &timings) {
@@ -159,11 +158,10 @@ int main(int argc, char **argv) {
   constexpr std::size_t p = 2;
   std::cout << "# device=" << clqr::cuda::DeviceDescription() << "\n";
   std::cout << "# precision=" << clqr::kPrecisionName << "\n";
-  std::cout << "# CUDA capacities: state=" << clqr::cuda::kMaxStateDimension
-            << ", control=" << clqr::cuda::kMaxControlDimension
-            << ", mixed=" << clqr::cuda::kMaxMixedConstraints
-            << ", state constraints=" << clqr::cuda::kMaxStateConstraints
-            << "\n";
+  std::cout << "# dimensions are runtime-sized; benchmark problem: n=" << n
+            << ", m=" << m << ", mixed/state constraints=" << p << "\n";
+  std::cout << "# per-stage records are compact runtime slices; dense kernel "
+               "workspaces use active-dimension dynamic shared memory.\n";
   std::cout << "# cpp_cpu_ms and CUDA timings use the same scalar precision.\n";
   std::cout
       << "# CUDA wall time reuses reserved storage and includes packing, "
@@ -172,8 +170,12 @@ int main(int argc, char **argv) {
          "host-device transfers; upload_ms and download_ms cover the bulk "
          "packed inputs and outputs.\n"
          "# other_wall_ms is wall time minus bulk upload, kernels, and bulk "
-         "download; it includes host packing/result construction, phase-control "
-         "transfers, and synchronization.\n";
+         "download; it includes host packing/result construction, "
+         "phase-control "
+         "transfers, synchronization, and API setup/validation.\n"
+         "# api_overhead_ms is time outside the backend's internal timer "
+         "(validation and device/workspace setup); internal_other_ms is "
+         "internal wall time not covered by bulk-transfer or kernel events.\n";
   if (cpu_max_horizon == std::numeric_limits<std::size_t>::max()) {
     std::cout << "# The sequential C++ solver is timed at every horizon.\n";
   } else {
@@ -182,8 +184,9 @@ int main(int argc, char **argv) {
   std::cout << "# Multiplier consistency rejection is disabled while timing; "
                "kkt_residual reports the final repeated solution's "
                "accuracy.\n";
-  std::cout << "N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_kernel_ms,"
-               "wall_speedup,kernel_speedup,other_wall_ms,upload_ms,"
+  std::cout << "N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_internal_ms,"
+               "cuda_kernel_ms,wall_speedup,kernel_speedup,other_wall_ms,"
+               "api_overhead_ms,internal_other_ms,upload_ms,"
                "feasibility_ms,reduction_ms,riccati_ms,reconstruction_ms,"
                "multiplier_ms,download_ms,min_reduced_n,"
                "min_reduced_m,cuda_kkt_residual\n";
@@ -215,8 +218,11 @@ int main(int argc, char **argv) {
 
     std::vector<double> cpu_times;
     std::vector<double> gpu_wall_times;
+    std::vector<double> gpu_internal_times;
     std::vector<double> gpu_kernel_times;
     std::vector<double> other_wall_times;
+    std::vector<double> api_overhead_times;
+    std::vector<double> internal_other_times;
     std::vector<double> feasibility;
     std::vector<double> upload;
     std::vector<double> reduction;
@@ -251,8 +257,12 @@ int main(int argc, char **argv) {
               .count();
       const double gpu_kernel_time = KernelTotal(gpu.timings);
       gpu_wall_times.push_back(gpu_wall_time);
+      gpu_internal_times.push_back(gpu.timings.total_ms);
       gpu_kernel_times.push_back(gpu_kernel_time);
       other_wall_times.push_back(gpu_wall_time - EventTotal(gpu.timings));
+      api_overhead_times.push_back(gpu_wall_time - gpu.timings.total_ms);
+      internal_other_times.push_back(gpu.timings.total_ms -
+                                     EventTotal(gpu.timings));
       upload.push_back(gpu.timings.upload_ms);
       feasibility.push_back(gpu.timings.feasibility_ms);
       reduction.push_back(gpu.timings.reduction_ms);
@@ -266,6 +276,7 @@ int main(int argc, char **argv) {
     const double cpu_ms =
         run_cpu ? Median(cpu_times) : std::numeric_limits<double>::quiet_NaN();
     const double gpu_wall_ms = Median(gpu_wall_times);
+    const double gpu_internal_ms = Median(gpu_internal_times);
     const double gpu_kernel_ms = Median(gpu_kernel_times);
     int min_reduced_n = std::numeric_limits<int>::max();
     int min_reduced_m = std::numeric_limits<int>::max();
@@ -276,9 +287,12 @@ int main(int argc, char **argv) {
     const Scalar kkt_residual = MaxKktResidual(problem, gpu);
     std::cout << horizon << ',' << n << ',' << m << ',' << p << ',' << repeats
               << ',' << std::fixed << std::setprecision(6) << cpu_ms << ','
-              << gpu_wall_ms << ',' << gpu_kernel_ms << ','
+              << gpu_wall_ms << ',' << gpu_internal_ms << ','
+              << gpu_kernel_ms << ','
               << cpu_ms / gpu_wall_ms << ',' << cpu_ms / gpu_kernel_ms << ','
-              << Median(other_wall_times) << ',' << Median(upload) << ','
+              << Median(other_wall_times) << ',' << Median(api_overhead_times)
+              << ',' << Median(internal_other_times) << ',' << Median(upload)
+              << ','
               << Median(feasibility) << ',' << Median(reduction) << ','
               << Median(riccati) << ',' << Median(reconstruction) << ','
               << Median(multiplier) << ',' << Median(download) << ','

@@ -7,30 +7,6 @@ namespace clqr {
 namespace cuda {
 namespace detail {
 
-constexpr int ConstexprMax(int first, int second) {
-  return first > second ? first : second;
-}
-
-constexpr int kMaxRelationRows = 2 * kMaxStateDimension;
-constexpr int kMaxRelationColumns =
-    3 * kMaxStateDimension +
-    1; // eliminated boundary, two outer boundaries, rhs
-constexpr int kMaxDualParameterDimension =
-    kMaxStateDimension + kMaxMixedConstraints;
-constexpr int kMaxDualColumns = ConstexprMax(
-    kMaxRelationColumns,
-    ConstexprMax(
-        kMaxControlDimension + 2 * kMaxStateDimension + 1,
-        ConstexprMax(kMaxMixedConstraints + kMaxStateConstraints +
-                         2 * kMaxStateDimension + 1,
-                     ConstexprMax(kMaxStateConstraints +
-                                      2 * kMaxDualParameterDimension + 1,
-                                  3 * kMaxDualParameterDimension + 1))));
-constexpr int kMaxStageConstraintRows =
-    kMaxMixedConstraints + kMaxStateDimension;
-constexpr int kMaxStageReductionColumns =
-    kMaxControlDimension + kMaxStateDimension + 1;
-
 struct PackedStage {
   int n;
   int next_n;
@@ -63,7 +39,6 @@ struct PackedTerminal {
 
 // A relation L*x + R*y = h. Only rows, left_dim, and right_dim are active.
 struct Relation {
-  static constexpr int kMaxDimension = kMaxStateDimension;
   int left_dim;
   int right_dim;
   int rows;
@@ -77,7 +52,6 @@ struct Relation {
 // can include mixed-multiplier directions, so it has its own endpoint capacity
 // rather than padding or truncating them to the physical state dimension.
 struct DualRelation {
-  static constexpr int kMaxDimension = kMaxDualParameterDimension;
   int left_dim;
   int right_dim;
   int rows;
@@ -90,9 +64,9 @@ struct DualRelation {
 struct StateParam {
   int physical_dim;
   int reduced_dim;
-  int free_columns[kMaxStateDimension];
-  Scalar T[kMaxStateDimension * kMaxStateDimension];
-  Scalar t[kMaxStateDimension];
+  int *free_columns;
+  Scalar *T;
+  Scalar *t;
 };
 
 // u = Y*z + Z*v + y.
@@ -100,30 +74,30 @@ struct ControlParam {
   int physical_dim;
   int state_dim;
   int reduced_dim;
-  int free_columns[kMaxControlDimension];
-  Scalar Y[kMaxControlDimension * kMaxStateDimension];
-  Scalar Z[kMaxControlDimension * kMaxControlDimension];
-  Scalar y[kMaxControlDimension];
+  int *free_columns;
+  Scalar *Y;
+  Scalar *Z;
+  Scalar *y;
 };
 
 struct ReducedStage {
   int n;
   int next_n;
   int m;
-  Scalar A[kMaxStateDimension * kMaxStateDimension];
-  Scalar B[kMaxStateDimension * kMaxControlDimension];
-  Scalar c[kMaxStateDimension];
-  Scalar Q[kMaxStateDimension * kMaxStateDimension];
-  Scalar R[kMaxControlDimension * kMaxControlDimension];
-  Scalar M[kMaxStateDimension * kMaxControlDimension];
-  Scalar q[kMaxStateDimension];
-  Scalar r[kMaxControlDimension];
+  Scalar *A;
+  Scalar *B;
+  Scalar *c;
+  Scalar *Q;
+  Scalar *R;
+  Scalar *M;
+  Scalar *q;
+  Scalar *r;
 };
 
 struct ReducedTerminal {
   int n;
-  Scalar Q[kMaxStateDimension * kMaxStateDimension];
-  Scalar q[kMaxStateDimension];
+  Scalar *Q;
+  Scalar *q;
 };
 
 // Associative conditional-value element for an interval. J and eta live at
@@ -142,10 +116,10 @@ struct Feedback {
   int state_dim;
   int next_state_dim;
   int control_dim;
-  Scalar K[kMaxControlDimension * kMaxStateDimension];
-  Scalar k[kMaxControlDimension];
-  Scalar transition[kMaxStateDimension * kMaxStateDimension];
-  Scalar offset[kMaxStateDimension];
+  Scalar *K;
+  Scalar *k;
+  Scalar *transition;
+  Scalar *offset;
 };
 
 struct AffineMap {
@@ -170,9 +144,9 @@ struct DualParam {
   int mixed_dim;
   int physical_dim;
   int free_dim;
-  int free_columns[kMaxDualParameterDimension];
-  Scalar basis[kMaxDualParameterDimension * kMaxDualParameterDimension];
-  Scalar offset[kMaxDualParameterDimension];
+  int *free_columns;
+  Scalar *basis;
+  Scalar *offset;
 };
 
 // State-only multiplier at node i as an affine function of the free dual
@@ -182,9 +156,9 @@ struct StateDualParam {
   int constraint_dim;
   int left_dim;
   int right_dim;
-  Scalar offset[kMaxStateConstraints];
-  Scalar left[kMaxStateConstraints * kMaxDualParameterDimension];
-  Scalar right[kMaxStateConstraints * kMaxDualParameterDimension];
+  Scalar *offset;
+  Scalar *left;
+  Scalar *right;
 };
 
 enum DeviceCode : int {

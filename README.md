@@ -55,14 +55,12 @@ horizon of `N` stages, it:
 4. recovers the original equality multipliers with a balanced dual-relation
    scan, reusing the parameterizations produced by the primal solve.
 
-With fixed per-stage dimension limits, every horizon-dependent device buffer
-has `O(N)` storage. Problem data, trajectories, reduced trajectories, and scan
-coefficient buffers are packed according to their active dimensions. Some
-per-stage parameterization and factor records reserve fixed-capacity inline
-arrays, and the compile-time capacity constants also bound each kernel's dense
-workspace. Kernels nevertheless loop over and factor only the active state,
-control, constraint, and reduced dimensions; no padded dense algebra is
-performed.
+Every horizon-dependent device buffer has `O(N)` storage. Problem data,
+trajectories, parameterizations, reduced stages, feedback records, multiplier
+records, and scan coefficients are packed from the runtime dimensions of the
+individual stages. Kernels loop over and factor only active state, control,
+constraint, and reduced dimensions; no padded dense algebra is performed and
+there are no build-time dimension capacities.
 
 Every horizon-dependent device dependency is a balanced-tree reduction or
 expansion. Feasibility propagation, the conditional-value solve, primal
@@ -94,7 +92,7 @@ A CPU-only build provides the same symbols through a stub library:
 result without loading the CUDA runtime.
 
 Build and test the native backend with Bazel. For example, target a P100
-(`sm_60`) in FP64 with the benchmark capacities:
+(`sm_60`) in FP64:
 
 ```sh
 bazel test //:cuda_solver_test \
@@ -105,13 +103,13 @@ bazel test //:cuda_solver_test \
 ```
 
 `--config=fp32` builds both the CPU reference and CUDA backend entirely in
-FP32. The `--cuda_max_state_dimension`, `--cuda_max_control_dimension`,
-`--cuda_max_mixed_constraints`, and `--cuda_max_state_constraints` flags select
-compile-time capacities from 1 through 16. `--config=cuda-benchmark` sets these
-to 8, 4, 2, and 2, respectively. Problems exceeding a configured capacity are
-rejected before any kernel launch. The combined capacities must also fit the
-portable 48 KiB per-block shared-memory budget; an oversized combination is
-rejected at compile time.
+FP32. Local dense workspaces are sized at runtime. A solve is accepted whenever
+its packed allocations and the largest active per-block factorization fit the
+selected device's portable, non-opt-in per-block shared-memory limit. Staying
+within that default limit avoids architecture-specific launch attributes and
+excessive per-block storage that would sharply reduce occupancy. If a
+factorization does not fit, `Solve` returns a deterministic diagnostic
+describing the required resource; there is no capacity flag to rebuild.
 
 The CUDA benchmark reuses reserved storage and reports both end-to-end wall
 time and pure kernel time. Wall time includes host packing, all transfers,

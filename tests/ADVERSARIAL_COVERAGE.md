@@ -14,9 +14,9 @@ shares the library's low-level RREF and linear-system primitives.
 | Horizons 31/32/33, 63/65, 127, 257, and 1025 | extended | through 257 | extended |
 | Nonuniform state/control dimensions | yes | yes | yes |
 | Zero controls | yes | yes | yes |
-| Mixed rows exceeding control dimension | yes | capacity permitting | capacity permitting |
+| Mixed rows exceeding control dimension | yes | yes | yes |
 | Redundant/rank-deficient equalities | yes | yes | yes |
-| Independently scaled rows | yes | capacity permitting | capacity permitting |
+| Independently scaled rows | yes | yes | yes |
 | Subnormal/largest-finite row scaling and unrepresentable pullbacks | yes | no | no |
 | Initial, stagewise, and terminal state equalities | yes | yes | yes |
 | Initial/terminal infeasibility | yes | no (public solver path only) | yes |
@@ -84,11 +84,7 @@ On a CUDA machine, run the extended native target explicitly:
 ```sh
 bazel build //:adversarial_cuda_extended_test \
   --config=fp64 --config=cuda \
-  --cuda_archs=sm_60 \
-  --cuda_max_state_dimension=8 \
-  --cuda_max_control_dimension=4 \
-  --cuda_max_mixed_constraints=4 \
-  --cuda_max_state_constraints=4
+  --cuda_archs=sm_60
 ./bazel-bin/adversarial_cuda_extended_test --extended
 ```
 

@@ -23,6 +23,24 @@ using clqr::Vector;
 using namespace clqr::cuda;
 using namespace clqr::cuda::detail;
 
+// Test-only backing strides deliberately exceed the former production
+// capacities (8/8/8/8). They are not solver limits.
+constexpr int kTestStateCapacity = 24;
+constexpr int kTestControlCapacity = 12;
+constexpr int kTestMixedCapacity = 10;
+constexpr int kTestStateConstraintCapacity = 10;
+constexpr int kTestDualCapacity = kTestStateCapacity + kTestMixedCapacity;
+constexpr int kTestRelationRows = 2 * kTestStateCapacity;
+constexpr int kTestRelationEntries =
+    kTestRelationRows * (2 * kTestStateCapacity) + kTestRelationRows;
+constexpr int kTestValueEntries =
+    3 * kTestStateCapacity * kTestStateCapacity + 2 * kTestStateCapacity;
+constexpr int kTestMapEntries =
+    kTestStateCapacity * kTestStateCapacity + kTestStateCapacity;
+constexpr int kTestDualRelationEntries =
+    2 * kTestDualCapacity * (2 * kTestDualCapacity) + 2 * kTestDualCapacity;
+constexpr int kTestDualValueEntries = 2 * kTestDualCapacity;
+
 #ifdef CLQR_USE_FLOAT
 constexpr Scalar kTolerance = 1e-5f;
 // The scan and sequential CPU paths can choose different FP32 pivots on the
@@ -111,8 +129,8 @@ void TinyCoefficientRrefCase() {
   int rank = -1;
   int best_row = -1;
   Scalar factors[1]{};
-  RrefBlock(matrix, 1, 2, 1, rank_tolerance, pivot_columns, pivot_rows,
-            &rank, &best_row, factors, rank_tolerance);
+  RrefBlock(matrix, 1, 2, 1, rank_tolerance, pivot_columns, pivot_rows, &rank,
+            &best_row, factors, rank_tolerance);
   Expect(rank == 0, "RREF does not amplify a roundoff-level coefficient");
   Expect(matrix[0] == Scalar{0},
          "RREF removes a coefficient below its rank tolerance");
@@ -265,6 +283,133 @@ void FreeFixedFreeValueCompositionCase() {
   for (std::size_t i = 0; i < std::size(second_b); ++i)
     Expect(output_b[i] == second_b[i],
            "free-fixed-free value composition preserves the right offset");
+}
+
+void DualRelationLeafScratchSizeCase() {
+  ScratchSize without_constraint_scales;
+  without_constraint_scales.Add<Scalar>(4);
+  without_constraint_scales.Add<Scalar>(1);
+  without_constraint_scales.Add<int>(1);
+  without_constraint_scales.Add<int>(1);
+  Expect(DualRelationLeafScratchBytes(4, 1, 1) ==
+             without_constraint_scales.bytes + sizeof(Scalar),
+         "dual-relation leaf scratch includes state-constraint scales");
+}
+
+Problem PathologicalScratchProblem() {
+  constexpr std::size_t n = 45;
+  Problem problem;
+  problem.initial_state = Vector(n);
+  problem.stages.resize(1);
+  Stage &stage = problem.stages[0];
+  stage.A = Matrix(0, n);
+  stage.B = Matrix(0, 0);
+  stage.c = Vector(0);
+  stage.Q = Matrix(n, n);
+  for (std::size_t row = 0; row < n; ++row)
+    stage.Q(row, row) = Scalar{1};
+  stage.R = Matrix(0, 0);
+  stage.M = Matrix(n, 0);
+  stage.q = Vector(n);
+  stage.r = Vector(0);
+  stage.C = Matrix(0, n);
+  stage.D = Matrix(0, 0);
+  stage.d = Vector(0);
+  stage.E = Matrix(0, n);
+  stage.e = Vector(0);
+  problem.terminal_Q = Matrix(0, 0);
+  problem.terminal_q = Vector(0);
+  problem.terminal_E = Matrix(0, 0);
+  problem.terminal_e = Vector(0);
+  return problem;
+}
+
+void ScratchPlannerTopologyCase() {
+  constexpr std::size_t kUsableP100SharedBytes = 48 * 1024 - 256;
+  const ScratchRequirements pathological =
+      PlanScratch(PathologicalScratchProblem());
+  Expect(pathological.Maximum() <= kUsableP100SharedBytes,
+         "topology-aware scratch accepts a 45-to-0 state transition");
+  Expect(DenseEliminationScratchBytes(4 * 45, 3 * 45 + 1,
+                                      "legacy synthetic workspace") >
+             kUsableP100SharedBytes,
+         "the former synthetic cross-maximum would reject the 45-to-0 case");
+
+  constexpr std::size_t n = 8;
+  const Problem uniform_problem = clqr::benchmark::StateOnlyProblem(8, n, 4, 2);
+  const ScratchRequirements uniform = PlanScratch(uniform_problem);
+  const ScanShape uniform_relation = MakeScanShape(n, n);
+  const ScanShape terminal_relation = MakeScanShape(n, 0);
+  ScratchSize value_leaf;
+  value_leaf.Add<Scalar>(4 * 4);
+  value_leaf.Add<Scalar>(4 * (2 * n + 1));
+  ScratchSize feedback;
+  feedback.Add<Scalar>(4 * (4 + n + 1));
+  feedback.Add<Scalar>(4 * 4);
+  ScratchSize dual_parameter;
+  dual_parameter.Add<Scalar>(12 * 9);
+  dual_parameter.Add<Scalar>(0);
+  dual_parameter.Add<Scalar>(12);
+  dual_parameter.Add<Scalar>(n * n);
+  dual_parameter.Add<Scalar>(n);
+  dual_parameter.Add<Scalar>(n);
+  dual_parameter.Add<int>(n);
+  Expect(uniform.primal_relation ==
+             DenseEliminationScratchBytes(4 * n, 3 * n + 1,
+                                          "uniform primal workspace"),
+         "uniform n=8 primal-relation launch scratch is unchanged");
+  Expect(uniform.primal_leaf == DenseEliminationScratchBytes(
+                                    10, 21, "uniform primal-leaf workspace") &&
+             uniform.primal_relation_final ==
+                 RelationFinalizeScratchBytes(
+                     uniform_relation, &uniform_relation, terminal_relation) &&
+             uniform.state_parameter == n * sizeof(int) &&
+             uniform.stage_reduction ==
+                 DenseEliminationScratchBytes(
+                     8, 13, "uniform stage-reduction workspace"),
+         "uniform n=8 feasibility launch scratch is unchanged");
+  Expect(uniform.value_compose == DenseEliminationScratchBytes(
+                                      n, 3 * n + 1, "uniform value workspace"),
+         "uniform n=8 value-composition launch scratch is unchanged");
+  Expect(uniform.value_leaf == value_leaf.bytes &&
+             uniform.value_finalize ==
+                 ValueFinalizeScratchBytes(uniform_relation, &uniform_relation,
+                                           terminal_relation) &&
+             uniform.feedback == feedback.bytes &&
+             uniform.affine_finalize ==
+                 AffineFinalizeScratchBytes(uniform_relation, &uniform_relation,
+                                            uniform_relation),
+         "uniform n=8 Riccati/reconstruction launch scratch matches active "
+         "dimensions");
+  Expect(uniform.dual_relation ==
+             DenseEliminationScratchBytes(4 * n, 3 * n + 1,
+                                          "uniform dual workspace"),
+         "uniform n=8 dual-relation launch scratch is unchanged");
+  Expect(uniform.dual_parameter == dual_parameter.bytes &&
+             uniform.dual_relation_leaf ==
+                 DualRelationLeafScratchBytes(8 * 19, 8, 2) &&
+             uniform.dual_root == DualRootScratchBytes(terminal_relation) &&
+             uniform.dual_expand ==
+                 DualExpandScratchBytes(uniform_relation, uniform_relation),
+         "uniform n=8 dual-expansion launch scratch is unchanged");
+
+  std::vector<int> cached_key;
+  ScratchRequirements cached_scratch;
+  int plan_builds =
+      RefreshScratchPlan(uniform_problem, &cached_key, &cached_scratch);
+  for (int repeat = 0; repeat < 100; ++repeat) {
+    plan_builds +=
+        RefreshScratchPlan(uniform_problem, &cached_key, &cached_scratch);
+  }
+  Expect(plan_builds == 1 && cached_scratch.Maximum() == uniform.Maximum(),
+         "same-shape workspace reuse builds the scratch plan only once");
+  const Problem changed_problem =
+      clqr::benchmark::StateOnlyProblem(8, n + 1, 4, 2);
+  plan_builds +=
+      RefreshScratchPlan(changed_problem, &cached_key, &cached_scratch);
+  Expect(plan_builds == 2 &&
+             cached_scratch.Maximum() == PlanScratch(changed_problem).Maximum(),
+         "a dimension change rebuilds the cached scratch plan");
 }
 
 Scalar Value(int seed, std::size_t row, std::size_t col = 0) {
@@ -421,12 +566,77 @@ Problem ZeroControlStateConstraintProblem() {
   return problem;
 }
 
+Problem ExactDualRelationScratchProblem() {
+  constexpr int seed = 1950;
+  constexpr std::size_t horizon = 4;
+  Problem problem = UniformProblem(seed, horizon, 1, 0);
+  for (std::size_t i = 1; i < horizon; ++i) {
+    problem.stages[i].E = Matrix(1, 1, {Scalar{1}});
+    problem.stages[i].e =
+        Vector{-GeneratedVector(1, seed + 100 + static_cast<int>(i), 0.5)[0]};
+  }
+  problem.terminal_E = Matrix(1, 1, {Scalar{1}});
+  problem.terminal_e = Vector{
+      -GeneratedVector(1, seed + 100 + static_cast<int>(horizon), 0.5)[0]};
+  return problem;
+}
+
+Problem HeterogeneousDimensionProblem() {
+  constexpr int seed = 1975;
+  const std::vector<std::size_t> dimensions{24, 1, 23, 0};
+  const std::vector<std::size_t> controls{2, 1, 0};
+  const std::size_t horizon = controls.size();
+  Problem problem;
+  std::vector<Vector> x(horizon + 1);
+  std::vector<Vector> u(horizon);
+  for (std::size_t i = 0; i <= horizon; ++i)
+    x[i] = GeneratedVector(dimensions[i], seed + 100 + static_cast<int>(i),
+                           Scalar{0.25});
+  for (std::size_t i = 0; i < horizon; ++i)
+    u[i] = GeneratedVector(controls[i], seed + 200 + static_cast<int>(i),
+                           Scalar{0.2});
+  problem.initial_state = x.front();
+  problem.stages.resize(horizon);
+  for (std::size_t i = 0; i < horizon; ++i) {
+    Stage &stage = problem.stages[i];
+    const std::size_t n = dimensions[i];
+    const std::size_t next = dimensions[i + 1];
+    const std::size_t m = controls[i];
+    stage.A = GeneratedMatrix(next, n, seed + 300 + static_cast<int>(i),
+                              Scalar{0.05});
+    stage.B = GeneratedMatrix(next, m, seed + 400 + static_cast<int>(i),
+                              Scalar{0.08});
+    stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
+    stage.Q = PositiveDefinite(n, seed + 500 + static_cast<int>(i), Scalar{1});
+    stage.R =
+        PositiveDefinite(m, seed + 600 + static_cast<int>(i), Scalar{1.5});
+    stage.M =
+        GeneratedMatrix(n, m, seed + 700 + static_cast<int>(i), Scalar{0.01});
+    stage.q =
+        GeneratedVector(n, seed + 800 + static_cast<int>(i), Scalar{0.05});
+    stage.r =
+        GeneratedVector(m, seed + 900 + static_cast<int>(i), Scalar{0.05});
+    stage.C = Matrix(0, n);
+    stage.D = Matrix(0, m);
+    stage.d = Vector(0);
+    stage.E = Matrix(0, n);
+    stage.e = Vector(0);
+  }
+  problem.terminal_Q =
+      PositiveDefinite(dimensions.back(), seed + 1000, Scalar{1.5});
+  problem.terminal_q =
+      GeneratedVector(dimensions.back(), seed + 1100, Scalar{0.05});
+  problem.terminal_E = Matrix(0, dimensions.back());
+  problem.terminal_e = Vector(0);
+  return problem;
+}
+
 Problem MaximumConstraintProblem() {
   constexpr int seed = 1700;
-  constexpr std::size_t n = kMaxStateDimension;
-  constexpr std::size_t m = kMaxControlDimension;
+  constexpr std::size_t n = kTestStateCapacity;
+  constexpr std::size_t m = kTestControlCapacity;
   constexpr std::size_t constraints =
-      std::min(kMaxMixedConstraints, kMaxStateConstraints);
+      std::min(kTestMixedCapacity, kTestStateConstraintCapacity);
   Problem problem = UniformProblem(seed, 1, n, m);
   Stage &stage = problem.stages[0];
   const Vector nominal_u = GeneratedVector(m, seed + 200, 0.4);
@@ -449,7 +659,7 @@ Problem MoreMixedRowsThanControlsProblem() {
   constexpr std::size_t horizon = 4;
   constexpr std::size_t n = 4;
   constexpr std::size_t m = 1;
-  constexpr std::size_t rows = std::min<std::size_t>(3, kMaxMixedConstraints);
+  constexpr std::size_t rows = std::min<std::size_t>(3, kTestMixedCapacity);
   Problem problem = UniformProblem(seed, horizon, n, m);
   for (std::size_t i = 0; i < horizon; ++i) {
     Stage &stage = problem.stages[i];
@@ -476,9 +686,9 @@ Problem MoreMixedRowsThanControlsProblem() {
 
 Problem LongHorizonStateConstraintProblem() {
   return clqr::benchmark::StateOnlyProblem(
-      16384, std::min<std::size_t>(8, kMaxStateDimension),
-      std::min<std::size_t>(4, kMaxControlDimension),
-      std::min<std::size_t>(2, kMaxStateConstraints));
+      16384, std::min<std::size_t>(8, kTestStateCapacity),
+      std::min<std::size_t>(4, kTestControlCapacity),
+      std::min<std::size_t>(2, kTestStateConstraintCapacity));
 }
 
 void PackMatrix(const Matrix &source, Scalar **cursor, const Scalar **target) {
@@ -563,18 +773,38 @@ template <typename Function> void Launch(int blocks, Function function) {
 
 void NonPositiveDefiniteReducedControlCostCase() {
   ReducedStage stage{};
+  Scalar stage_a[1]{};
+  Scalar stage_b[1]{};
+  Scalar stage_c[1]{};
+  Scalar stage_q_matrix[1]{Scalar{1}};
+  Scalar stage_r_matrix[1]{Scalar{-1}};
+  Scalar stage_m[1]{};
+  Scalar stage_q[1]{};
+  Scalar stage_r[1]{};
+  stage.A = stage_a;
+  stage.B = stage_b;
+  stage.c = stage_c;
+  stage.Q = stage_q_matrix;
+  stage.R = stage_r_matrix;
+  stage.M = stage_m;
+  stage.q = stage_q;
+  stage.r = stage_r;
   stage.n = 1;
   stage.next_n = 1;
   stage.m = 1;
   ReducedTerminal terminal{};
+  Scalar terminal_q_matrix[1]{Scalar{1}};
+  Scalar terminal_q[1]{};
+  terminal.Q = terminal_q_matrix;
+  terminal.q = terminal_q;
   terminal.n = 1;
-  terminal.Q[0] = Scalar{1};
   std::vector<ValueElement> elements(2);
-  std::vector<Scalar> storage(2 * kMaxValueElementEntries);
+  std::vector<Scalar> storage(2 * kTestValueEntries);
   for (int node = 0; node < 2; ++node) {
     BindValueElementScratch(&elements[node],
                             storage.data() + static_cast<std::size_t>(node) *
-                                                 kMaxValueElementEntries);
+                                                 kTestValueEntries,
+                            kTestStateCapacity, kTestStateCapacity);
   }
   DeviceStatus status{kDeviceOk, -1, 0};
   Launch(2, [&] {
@@ -605,13 +835,13 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
   const int horizon = static_cast<int>(problem.stages.size());
   for (int i = 0; i < horizon; ++i) {
     const Stage &s = problem.stages[i];
-    const Scalar *x = states.data() + i * kMaxStateDimension;
-    const Scalar *xp = states.data() + (i + 1) * kMaxStateDimension;
-    const Scalar *u = controls.data() + i * kMaxControlDimension;
-    const Scalar *right = dynamics.data() + i * kMaxStateDimension;
+    const Scalar *x = states.data() + i * kTestStateCapacity;
+    const Scalar *xp = states.data() + (i + 1) * kTestStateCapacity;
+    const Scalar *u = controls.data() + i * kTestControlCapacity;
+    const Scalar *right = dynamics.data() + i * kTestStateCapacity;
     const Scalar *left = i == 0
                              ? initial_multiplier.data()
-                             : dynamics.data() + (i - 1) * kMaxStateDimension;
+                             : dynamics.data() + (i - 1) * kTestStateCapacity;
     for (std::size_t row = 0; row < s.A.rows(); ++row) {
       Scalar value = xp[row] - s.c[row];
       for (std::size_t col = 0; col < s.A.cols(); ++col)
@@ -652,10 +882,11 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
         value -= s.A(next, row) * right[next];
       for (std::size_t constraint = 0; constraint < s.C.rows(); ++constraint)
         value +=
-            s.C(constraint, row) * mixed[i * kMaxMixedConstraints + constraint];
+            s.C(constraint, row) * mixed[i * kTestMixedCapacity + constraint];
       for (std::size_t constraint = 0; constraint < s.E.rows(); ++constraint)
-        value += s.E(constraint, row) *
-                 state_multipliers[i * kMaxStateConstraints + constraint];
+        value +=
+            s.E(constraint, row) *
+            state_multipliers[i * kTestStateConstraintCapacity + constraint];
       update(value);
     }
     for (std::size_t row = 0; row < s.B.cols(); ++row) {
@@ -668,14 +899,14 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
         value -= s.B(next, row) * right[next];
       for (std::size_t constraint = 0; constraint < s.D.rows(); ++constraint)
         value +=
-            s.D(constraint, row) * mixed[i * kMaxMixedConstraints + constraint];
+            s.D(constraint, row) * mixed[i * kTestMixedCapacity + constraint];
       update(value);
     }
   }
-  const Scalar *terminal = states.data() + horizon * kMaxStateDimension;
+  const Scalar *terminal = states.data() + horizon * kTestStateCapacity;
   const Scalar *left =
       horizon == 0 ? initial_multiplier.data()
-                   : dynamics.data() + (horizon - 1) * kMaxStateDimension;
+                   : dynamics.data() + (horizon - 1) * kTestStateCapacity;
   for (std::size_t row = 0; row < problem.terminal_Q.rows(); ++row) {
     Scalar value = problem.terminal_q[row] + left[row];
     for (std::size_t col = 0; col < problem.terminal_Q.cols(); ++col)
@@ -704,7 +935,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
   const PackedTerminal terminal = Pack(problem, &packed_cursor);
   Expect(packed_cursor == packed_data.data() + packed_data.size(),
          "compact problem packing uses the exact allocation");
-  std::vector<Scalar> initial(kMaxStateDimension);
+  std::vector<Scalar> initial(kTestStateCapacity);
   for (std::size_t row = 0; row < problem.initial_state.size(); ++row)
     initial[row] = problem.initial_state[row];
   DeviceStatus status{};
@@ -727,18 +958,20 @@ void RunEmulation(const Problem &problem, const std::string &name,
   std::vector<Relation> relation_a(nodes),
       relation_b(std::max(node_tree_size - nodes, 1));
   std::vector<Scalar> relation_a_storage(static_cast<std::size_t>(nodes) *
-                                         kMaxRelationScratchEntries);
+                                         kTestRelationEntries);
   std::vector<Scalar> relation_b_storage(relation_b.size() *
-                                         kMaxRelationScratchEntries);
+                                         kTestRelationEntries);
   for (int node = 0; node < nodes; ++node) {
-    BindRelationScratch(&relation_a[node], relation_a_storage.data() +
-                                               static_cast<std::size_t>(node) *
-                                                   kMaxRelationScratchEntries);
+    BindRelationScratch(&relation_a[node],
+                        relation_a_storage.data() +
+                            static_cast<std::size_t>(node) *
+                                kTestRelationEntries,
+                        kTestStateCapacity, kTestStateCapacity);
   }
   for (std::size_t node = 0; node < relation_b.size(); ++node) {
     BindRelationScratch(&relation_b[node],
-                        relation_b_storage.data() +
-                            node * kMaxRelationScratchEntries);
+                        relation_b_storage.data() + node * kTestRelationEntries,
+                        kTestStateCapacity, kTestStateCapacity);
   }
   Launch(nodes, [&] {
     BuildPrimalLeavesKernel(stages.data(), horizon, &terminal, kTolerance,
@@ -783,6 +1016,22 @@ void RunEmulation(const Problem &problem, const std::string &name,
   }
   Relation *suffix = relation_a.data();
   std::vector<StateParam> state_params(nodes);
+  std::vector<int> state_free_columns(static_cast<std::size_t>(nodes) *
+                                      kTestStateCapacity);
+  std::vector<Scalar> state_t(static_cast<std::size_t>(nodes) *
+                              kTestStateCapacity);
+  std::vector<Scalar> state_T(static_cast<std::size_t>(nodes) *
+                              kTestStateCapacity * kTestStateCapacity);
+  for (int node = 0; node < nodes; ++node) {
+    state_params[node].free_columns =
+        state_free_columns.data() +
+        static_cast<std::size_t>(node) * kTestStateCapacity;
+    state_params[node].T = state_T.data() + static_cast<std::size_t>(node) *
+                                                kTestStateCapacity *
+                                                kTestStateCapacity;
+    state_params[node].t =
+        state_t.data() + static_cast<std::size_t>(node) * kTestStateCapacity;
+  }
   Launch(nodes, [&] {
     StateParamKernel(suffix, nodes, state_params.data(), nullptr, &status,
                      kTolerance);
@@ -793,8 +1042,60 @@ void RunEmulation(const Problem &problem, const std::string &name,
 
   std::vector<ControlParam> control_params(horizon);
   std::vector<ReducedStage> reduced(horizon);
-  ReducedTerminal reduced_terminal;
-  std::vector<Scalar> reduced_initial(kMaxStateDimension);
+  std::vector<int> control_free_columns(static_cast<std::size_t>(horizon) *
+                                        kTestControlCapacity);
+  std::vector<Scalar> control_Y(static_cast<std::size_t>(horizon) *
+                                kTestControlCapacity * kTestStateCapacity);
+  std::vector<Scalar> control_Z(static_cast<std::size_t>(horizon) *
+                                kTestControlCapacity * kTestControlCapacity);
+  std::vector<Scalar> control_y(static_cast<std::size_t>(horizon) *
+                                kTestControlCapacity);
+  std::vector<Scalar> reduced_A(static_cast<std::size_t>(horizon) *
+                                kTestStateCapacity * kTestStateCapacity);
+  std::vector<Scalar> reduced_B(static_cast<std::size_t>(horizon) *
+                                kTestStateCapacity * kTestControlCapacity);
+  std::vector<Scalar> reduced_c(static_cast<std::size_t>(horizon) *
+                                kTestStateCapacity);
+  std::vector<Scalar> reduced_Q(static_cast<std::size_t>(horizon) *
+                                kTestStateCapacity * kTestStateCapacity);
+  std::vector<Scalar> reduced_R(static_cast<std::size_t>(horizon) *
+                                kTestControlCapacity * kTestControlCapacity);
+  std::vector<Scalar> reduced_M(static_cast<std::size_t>(horizon) *
+                                kTestStateCapacity * kTestControlCapacity);
+  std::vector<Scalar> reduced_q(static_cast<std::size_t>(horizon) *
+                                kTestStateCapacity);
+  std::vector<Scalar> reduced_r(static_cast<std::size_t>(horizon) *
+                                kTestControlCapacity);
+  for (int stage = 0; stage < horizon; ++stage) {
+    const std::size_t index = static_cast<std::size_t>(stage);
+    control_params[stage].free_columns =
+        control_free_columns.data() + index * kTestControlCapacity;
+    control_params[stage].Y =
+        control_Y.data() + index * kTestControlCapacity * kTestStateCapacity;
+    control_params[stage].Z =
+        control_Z.data() + index * kTestControlCapacity * kTestControlCapacity;
+    control_params[stage].y = control_y.data() + index * kTestControlCapacity;
+    reduced[stage].A =
+        reduced_A.data() + index * kTestStateCapacity * kTestStateCapacity;
+    reduced[stage].B =
+        reduced_B.data() + index * kTestStateCapacity * kTestControlCapacity;
+    reduced[stage].c = reduced_c.data() + index * kTestStateCapacity;
+    reduced[stage].Q =
+        reduced_Q.data() + index * kTestStateCapacity * kTestStateCapacity;
+    reduced[stage].R =
+        reduced_R.data() + index * kTestControlCapacity * kTestControlCapacity;
+    reduced[stage].M =
+        reduced_M.data() + index * kTestStateCapacity * kTestControlCapacity;
+    reduced[stage].q = reduced_q.data() + index * kTestStateCapacity;
+    reduced[stage].r = reduced_r.data() + index * kTestControlCapacity;
+  }
+  ReducedTerminal reduced_terminal{};
+  std::vector<Scalar> reduced_terminal_Q(
+      static_cast<std::size_t>(kTestStateCapacity) * kTestStateCapacity);
+  std::vector<Scalar> reduced_terminal_q(kTestStateCapacity);
+  reduced_terminal.Q = reduced_terminal_Q.data();
+  reduced_terminal.q = reduced_terminal_q.data();
+  std::vector<Scalar> reduced_initial(kTestStateCapacity);
   Launch(horizon, [&] {
     ReduceStagesKernel(stages.data(), suffix, state_params.data(), horizon,
                        kTolerance, feasibility_consistency_tolerance,
@@ -825,20 +1126,43 @@ void RunEmulation(const Problem &problem, const std::string &name,
   std::vector<ValueElement> value_a(nodes),
       value_b(std::max(node_tree_size - nodes, 1));
   std::vector<Scalar> value_a_storage(static_cast<std::size_t>(nodes) *
-                                      kMaxValueElementEntries);
-  std::vector<Scalar> value_b_storage(value_b.size() * kMaxValueElementEntries);
+                                      kTestValueEntries);
+  std::vector<Scalar> value_b_storage(value_b.size() * kTestValueEntries);
   std::fill(value_a_storage.begin(), value_a_storage.end(), Scalar{17});
   std::fill(value_b_storage.begin(), value_b_storage.end(), Scalar{19});
   for (int node = 0; node < nodes; ++node) {
-    BindValueElementScratch(&value_a[node], value_a_storage.data() +
-                                                static_cast<std::size_t>(node) *
-                                                    kMaxValueElementEntries);
+    BindValueElementScratch(&value_a[node],
+                            value_a_storage.data() +
+                                static_cast<std::size_t>(node) *
+                                    kTestValueEntries,
+                            kTestStateCapacity, kTestStateCapacity);
   }
   for (std::size_t node = 0; node < value_b.size(); ++node) {
-    BindValueElementScratch(&value_b[node], value_b_storage.data() +
-                                                node * kMaxValueElementEntries);
+    BindValueElementScratch(&value_b[node],
+                            value_b_storage.data() + node * kTestValueEntries,
+                            kTestStateCapacity, kTestStateCapacity);
   }
   std::vector<Feedback> feedback(horizon);
+  std::vector<Scalar> feedback_K(static_cast<std::size_t>(horizon) *
+                                 kTestControlCapacity * kTestStateCapacity);
+  std::vector<Scalar> feedback_k(static_cast<std::size_t>(horizon) *
+                                 kTestControlCapacity);
+  std::vector<Scalar> feedback_transition(static_cast<std::size_t>(horizon) *
+                                          kTestStateCapacity *
+                                          kTestStateCapacity);
+  std::vector<Scalar> feedback_offset(static_cast<std::size_t>(horizon) *
+                                      kTestStateCapacity);
+  for (int stage = 0; stage < horizon; ++stage) {
+    const std::size_t index = static_cast<std::size_t>(stage);
+    feedback[stage].K =
+        feedback_K.data() + index * kTestControlCapacity * kTestStateCapacity;
+    feedback[stage].k = feedback_k.data() + index * kTestControlCapacity;
+    feedback[stage].transition =
+        feedback_transition.data() +
+        index * kTestStateCapacity * kTestStateCapacity;
+    feedback[stage].offset =
+        feedback_offset.data() + index * kTestStateCapacity;
+  }
   Launch(nodes, [&] {
     BuildValueElementsKernel(reduced.data(), &reduced_terminal, horizon,
                              kTolerance, value_a.data(), &status);
@@ -902,16 +1226,18 @@ void RunEmulation(const Problem &problem, const std::string &name,
   std::vector<AffineMap> map_a(horizon),
       map_b(std::max(stage_tree_size - std::max(horizon, 1), 1));
   std::vector<Scalar> map_a_storage(static_cast<std::size_t>(horizon) *
-                                    kMaxAffineMapEntries);
-  std::vector<Scalar> map_b_storage(map_b.size() * kMaxAffineMapEntries);
+                                    kTestMapEntries);
+  std::vector<Scalar> map_b_storage(map_b.size() * kTestMapEntries);
   for (int stage = 0; stage < horizon; ++stage) {
-    BindAffineMapScratch(&map_a[stage], map_a_storage.data() +
-                                            static_cast<std::size_t>(stage) *
-                                                kMaxAffineMapEntries);
+    BindAffineMapScratch(&map_a[stage],
+                         map_a_storage.data() +
+                             static_cast<std::size_t>(stage) * kTestMapEntries,
+                         kTestStateCapacity, kTestStateCapacity);
   }
   for (std::size_t node = 0; node < map_b.size(); ++node) {
     BindAffineMapScratch(&map_b[node],
-                         map_b_storage.data() + node * kMaxAffineMapEntries);
+                         map_b_storage.data() + node * kTestMapEntries,
+                         kTestStateCapacity, kTestStateCapacity);
   }
   Launch(horizon, [&] {
     InitializeAffineMapsKernel(feedback.data(), horizon, map_a.data());
@@ -956,20 +1282,23 @@ void RunEmulation(const Problem &problem, const std::string &name,
   for (int index = 0; index < nodes; ++index) {
     reduced_state_offsets[index + 1] =
         reduced_state_offsets[index] + state_params[index].reduced_dim;
-    state_offsets[index] = index * kMaxStateDimension;
+    state_offsets[index] = index * kTestStateCapacity;
   }
-  state_offsets[nodes] = nodes * kMaxStateDimension;
+  state_offsets[nodes] = nodes * kTestStateCapacity;
   for (int index = 0; index <= horizon; ++index)
-    control_offsets[index] = index * kMaxControlDimension;
+    control_offsets[index] = index * kTestControlCapacity;
   std::vector<Scalar> reduced_states(reduced_state_offsets.back());
-  std::vector<Scalar> states(nodes * kMaxStateDimension);
-  std::vector<Scalar> controls(horizon * kMaxControlDimension);
+  std::vector<Scalar> reduced_controls(static_cast<std::size_t>(horizon) *
+                                       kTestControlCapacity);
+  std::vector<Scalar> states(nodes * kTestStateCapacity);
+  std::vector<Scalar> controls(horizon * kTestControlCapacity);
   Launch(nodes, [&] {
-    ReconstructPrimalKernel(
-        prefix, state_params.data(), control_params.data(), feedback.data(),
-        reduced_initial.data(), reduced_state_offsets.data(),
-        state_offsets.data(), control_offsets.data(), horizon,
-        reduced_states.data(), states.data(), controls.data());
+    ReconstructPrimalKernel(prefix, state_params.data(), control_params.data(),
+                            feedback.data(), reduced_initial.data(),
+                            reduced_state_offsets.data(), state_offsets.data(),
+                            control_offsets.data(), horizon,
+                            reduced_states.data(), reduced_controls.data(),
+                            states.data(), controls.data());
   });
   if (FinishAllowedDeviceFailure(status, name, "affine rollout",
                                  allowed_failure))
@@ -985,40 +1314,40 @@ void RunEmulation(const Problem &problem, const std::string &name,
                ", message=" + cpu.message);
     for (int i = 0; i < nodes; ++i) {
       for (std::size_t row = 0; row < cpu.states[i].size; ++row) {
-        Expect(std::abs(states[i * kMaxStateDimension + row] -
+        Expect(std::abs(states[i * kTestStateCapacity + row] -
                         cpu.states[i][row]) < kPrimalComparisonTolerance,
                "emulated state matches CPU before dual recovery at " +
                    std::to_string(i) + "," + std::to_string(row) +
                    ": emulated=" +
-                   std::to_string(states[i * kMaxStateDimension + row]) +
+                   std::to_string(states[i * kTestStateCapacity + row]) +
                    ", CPU=" + std::to_string(cpu.states[i][row]));
       }
     }
     for (int i = 0; i < horizon; ++i) {
       for (std::size_t row = 0; row < cpu.controls[i].size; ++row) {
-        Expect(std::abs(controls[i * kMaxControlDimension + row] -
+        Expect(std::abs(controls[i * kTestControlCapacity + row] -
                         cpu.controls[i][row]) < kPrimalComparisonTolerance,
                "emulated control matches CPU before dual recovery at " +
                    std::to_string(i) + "," + std::to_string(row) +
                    ": emulated=" +
-                   std::to_string(controls[i * kMaxControlDimension + row]) +
+                   std::to_string(controls[i * kTestControlCapacity + row]) +
                    ", CPU=" + std::to_string(cpu.controls[i][row]));
       }
     }
   }
 
-  std::vector<Scalar> initial_multiplier(kMaxStateDimension);
-  std::vector<Scalar> dynamics(horizon * kMaxStateDimension);
-  std::vector<Scalar> mixed(horizon * kMaxMixedConstraints);
-  std::vector<Scalar> state_multipliers(horizon * kMaxStateConstraints);
-  std::vector<Scalar> terminal_multiplier(kMaxStateConstraints);
+  std::vector<Scalar> initial_multiplier(kTestStateCapacity);
+  std::vector<Scalar> dynamics(horizon * kTestStateCapacity);
+  std::vector<Scalar> mixed(horizon * kTestMixedCapacity);
+  std::vector<Scalar> state_multipliers(horizon * kTestStateConstraintCapacity);
+  std::vector<Scalar> terminal_multiplier(kTestStateConstraintCapacity);
   std::vector<int> dynamics_offsets(horizon + 1);
   std::vector<int> mixed_offsets(horizon + 1);
   std::vector<int> state_constraint_offsets(horizon + 1);
   for (int index = 0; index <= horizon; ++index) {
-    dynamics_offsets[index] = index * kMaxStateDimension;
-    mixed_offsets[index] = index * kMaxMixedConstraints;
-    state_constraint_offsets[index] = index * kMaxStateConstraints;
+    dynamics_offsets[index] = index * kTestStateCapacity;
+    mixed_offsets[index] = index * kTestMixedCapacity;
+    state_constraint_offsets[index] = index * kTestStateConstraintCapacity;
   }
   const Scalar multiplier_rank_tolerance = kMinimumMultiplierRankTolerance;
   const Scalar multiplier_consistency_tolerance =
@@ -1027,22 +1356,53 @@ void RunEmulation(const Problem &problem, const std::string &name,
                    static_cast<Scalar>(stage_level_counts.size()));
   std::vector<DualParam> dual_params(horizon);
   std::vector<StateDualParam> state_dual_params(horizon);
+  std::vector<int> dual_free_columns(static_cast<std::size_t>(horizon) *
+                                     kTestDualCapacity);
+  std::vector<Scalar> dual_basis(static_cast<std::size_t>(horizon) *
+                                 kTestDualCapacity * kTestDualCapacity);
+  std::vector<Scalar> dual_offset(static_cast<std::size_t>(horizon) *
+                                  kTestDualCapacity);
+  std::vector<Scalar> state_dual_offset(static_cast<std::size_t>(horizon) *
+                                        kTestStateConstraintCapacity);
+  std::vector<Scalar> state_dual_left(static_cast<std::size_t>(horizon) *
+                                      kTestStateConstraintCapacity *
+                                      kTestDualCapacity);
+  std::vector<Scalar> state_dual_right(static_cast<std::size_t>(horizon) *
+                                       kTestStateConstraintCapacity *
+                                       kTestDualCapacity);
+  for (int stage = 0; stage < horizon; ++stage) {
+    const std::size_t index = static_cast<std::size_t>(stage);
+    dual_params[stage].free_columns =
+        dual_free_columns.data() + index * kTestDualCapacity;
+    dual_params[stage].basis =
+        dual_basis.data() + index * kTestDualCapacity * kTestDualCapacity;
+    dual_params[stage].offset = dual_offset.data() + index * kTestDualCapacity;
+    state_dual_params[stage].offset =
+        state_dual_offset.data() + index * kTestStateConstraintCapacity;
+    state_dual_params[stage].left =
+        state_dual_left.data() +
+        index * kTestStateConstraintCapacity * kTestDualCapacity;
+    state_dual_params[stage].right =
+        state_dual_right.data() +
+        index * kTestStateConstraintCapacity * kTestDualCapacity;
+  }
   std::vector<DualRelation> dual_tree(stage_tree_size);
   std::vector<DualNodeValue> dual_values(stage_tree_size);
   std::vector<Scalar> dual_tree_storage(
-      static_cast<std::size_t>(stage_tree_size) *
-      kMaxDualRelationScratchEntries);
+      static_cast<std::size_t>(stage_tree_size) * kTestDualRelationEntries);
   std::vector<Scalar> dual_value_storage(
-      static_cast<std::size_t>(stage_tree_size) * kMaxDualValueScratchEntries);
+      static_cast<std::size_t>(stage_tree_size) * kTestDualValueEntries);
   for (int node = 0; node < stage_tree_size; ++node) {
     BindDualRelationScratch(&dual_tree[node],
                             dual_tree_storage.data() +
                                 static_cast<std::size_t>(node) *
-                                    kMaxDualRelationScratchEntries);
+                                    kTestDualRelationEntries,
+                            kTestDualCapacity, kTestDualCapacity);
     BindDualValueScratch(&dual_values[node],
                          dual_value_storage.data() +
                              static_cast<std::size_t>(node) *
-                                 kMaxDualValueScratchEntries);
+                                 kTestDualValueEntries,
+                         kTestDualCapacity);
   }
   int dual_scan_needed = 0;
   if (horizon > 0) {
@@ -1126,18 +1486,19 @@ void RunEmulation(const Problem &problem, const std::string &name,
             << validation << "; KKT residual=" << residual << '\n';
 }
 
-bool FitsAdversarialEmulationCapacities(const Problem &problem) {
-  if (problem.terminal_Q.rows() > static_cast<std::size_t>(kMaxStateDimension) ||
+bool FitsAdversarialEmulationStorage(const Problem &problem) {
+  if (problem.terminal_Q.rows() > static_cast<std::size_t>(kTestStateCapacity) ||
       problem.terminal_E.rows() >
-          static_cast<std::size_t>(kMaxStateConstraints)) {
+          static_cast<std::size_t>(kTestStateConstraintCapacity)) {
     return false;
   }
   for (const Stage &stage : problem.stages) {
-    if (stage.A.cols() > static_cast<std::size_t>(kMaxStateDimension) ||
-        stage.A.rows() > static_cast<std::size_t>(kMaxStateDimension) ||
-        stage.B.cols() > static_cast<std::size_t>(kMaxControlDimension) ||
-        stage.C.rows() > static_cast<std::size_t>(kMaxMixedConstraints) ||
-        stage.E.rows() > static_cast<std::size_t>(kMaxStateConstraints)) {
+    if (stage.A.cols() > static_cast<std::size_t>(kTestStateCapacity) ||
+        stage.A.rows() > static_cast<std::size_t>(kTestStateCapacity) ||
+        stage.B.cols() > static_cast<std::size_t>(kTestControlCapacity) ||
+        stage.C.rows() > static_cast<std::size_t>(kTestMixedCapacity) ||
+        stage.E.rows() >
+            static_cast<std::size_t>(kTestStateConstraintCapacity)) {
       return false;
     }
   }
@@ -1160,14 +1521,20 @@ int main(int argc, char **argv) {
   IllConditionedPositiveDefiniteMultiRhsCase();
   InvalidValueElementCopyCase();
   FreeFixedFreeValueCompositionCase();
+  DualRelationLeafScratchSizeCase();
+  ScratchPlannerTopologyCase();
   NonPositiveDefiniteReducedControlCostCase();
   RunEmulation(MakeProblem(), "rank-deficient constrained", true, true);
   RunEmulation(ZeroHorizonProblem(), "zero-horizon", false, false);
   RunEmulation(
-      UniformProblem(1800, 3, kMaxStateDimension, kMaxControlDimension),
+      UniformProblem(1800, 3, kTestStateCapacity, kTestControlCapacity),
       "maximum-active-dimension", false, false);
   RunEmulation(ZeroControlStateConstraintProblem(), "zero-control", true,
                false);
+  RunEmulation(ExactDualRelationScratchProblem(), "exact-dual-relation-scratch",
+               true, false);
+  RunEmulation(HeterogeneousDimensionProblem(), "heterogeneous-dimensions",
+               false, false);
   RunEmulation(MaximumConstraintProblem(), "maximum-constraint", true, true);
   RunEmulation(MoreMixedRowsThanControlsProblem(), "more-mixed-than-controls",
                true, true);
@@ -1196,7 +1563,7 @@ int main(int argc, char **argv) {
         (test_case.cuda_status != clqr::SolveStatus::kOptimal &&
          test_case.cuda_status != clqr::SolveStatus::kNumericalFailure &&
          test_case.cuda_status != clqr::SolveStatus::kInfeasible) ||
-        !FitsAdversarialEmulationCapacities(test_case.problem)) {
+        !FitsAdversarialEmulationStorage(test_case.problem)) {
       continue;
     }
     RunEmulation(test_case.problem, "shared-" + test_case.name, false, false,

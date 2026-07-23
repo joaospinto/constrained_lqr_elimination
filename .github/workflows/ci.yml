@@ -33,17 +33,6 @@ jobs:
           bazel test //...
           --config=${{ matrix.precision }}
           --test_output=errors
-      - name: Test nondefault CUDA capacities
-        if: matrix.os == 'ubuntu-latest' && matrix.precision == 'fp64'
-        run: >-
-          bazel test //:cuda_kernel_emulation_test //:cuda_stub_test
-          --config=fp64
-          --cuda_max_state_dimension=8
-          --cuda_max_control_dimension=4
-          --cuda_max_mixed_constraints=2
-          --cuda_max_state_constraints=2
-          --test_output=errors
-
   sanitizers:
     name: ubuntu / ${{ matrix.sanitizer }}
     runs-on: ubuntu-latest

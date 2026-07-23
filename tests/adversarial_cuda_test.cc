@@ -35,37 +35,8 @@ KktPoint CopyCudaSolution(const clqr::cuda::Solution &source) {
   return result;
 }
 
-bool FitsConfiguredCapacities(const Problem &problem) {
-  if (problem.terminal_Q.rows() >
-          static_cast<std::size_t>(clqr::cuda::kMaxStateDimension) ||
-      problem.terminal_E.rows() >
-          static_cast<std::size_t>(clqr::cuda::kMaxStateConstraints)) {
-    return false;
-  }
-  for (const clqr::Stage &stage : problem.stages) {
-    if (stage.A.cols() >
-            static_cast<std::size_t>(clqr::cuda::kMaxStateDimension) ||
-        stage.A.rows() >
-            static_cast<std::size_t>(clqr::cuda::kMaxStateDimension) ||
-        stage.B.cols() >
-            static_cast<std::size_t>(clqr::cuda::kMaxControlDimension) ||
-        stage.C.rows() >
-            static_cast<std::size_t>(clqr::cuda::kMaxMixedConstraints) ||
-        stage.E.rows() >
-            static_cast<std::size_t>(clqr::cuda::kMaxStateConstraints)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool RunCase(const TestCase &test_case, clqr::cuda::Workspace *workspace,
+void RunCase(const TestCase &test_case, clqr::cuda::Workspace *workspace,
              clqr::cuda::Solution *solution) {
-  if (!FitsConfiguredCapacities(test_case.problem)) {
-    std::cout << "case: " << test_case.name
-              << " skipped (configured capacity)\n";
-    return false;
-  }
   if (test_case.cuda_status == SolveStatus::kInvalidInput) {
     *solution = clqr::cuda::Solve(test_case.problem);
   } else {
@@ -80,7 +51,7 @@ bool RunCase(const TestCase &test_case, clqr::cuda::Workspace *workspace,
   if (solution->status != SolveStatus::kOptimal) {
     std::cout << "case: " << test_case.name << " passed ("
               << clqr::StatusName(solution->status) << ")\n";
-    return true;
+    return;
   }
 
   if (test_case.name == "free-fixed-free-state") {
@@ -115,7 +86,6 @@ bool RunCase(const TestCase &test_case, clqr::cuda::Workspace *workspace,
                " dense-KKT primal difference=" + std::to_string(difference));
   }
   std::cout << "case: " << test_case.name << " passed\n";
-  return true;
 }
 
 } // namespace
@@ -142,11 +112,9 @@ int main(int argc, char **argv) {
   }
   clqr::cuda::Workspace workspace;
   clqr::cuda::Solution solution;
-  std::size_t executed = 0;
   for (const TestCase &test_case : cases)
-    executed += RunCase(test_case, &workspace, &solution) ? 1 : 0;
-  std::cout << "all " << executed << " executed adversarial CUDA cases passed"
-            << " (" << cases.size() - executed
-            << " skipped by configured capacities)\n";
+    RunCase(test_case, &workspace, &solution);
+  std::cout << "all " << cases.size()
+            << " executed adversarial CUDA cases passed\n";
   return 0;
 }

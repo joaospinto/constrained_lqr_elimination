@@ -3,6 +3,7 @@
 
 #define __device__
 #define __global__
+#define __host__
 #define __shared__
 
 struct EmulatedCudaIndex {
@@ -17,15 +18,16 @@ inline EmulatedCudaIndex blockDim{1, 1, 1};
 inline EmulatedCudaIndex gridDim{1, 1, 1};
 
 inline void __syncthreads() {}
-inline int atomicCAS(int* address, int compare, int value) {
+inline int atomicCAS(int *address, int compare, int value) {
   const int old = *address;
-  if (old == compare) *address = value;
+  if (old == compare)
+    *address = value;
   return old;
 }
-inline int atomicExch(int* address, int value) {
+inline int atomicExch(int *address, int value) {
   const int old = *address;
   *address = value;
   return old;
 }
 
-#endif  // CLQR_TESTS_EMULATED_CUDA_RUNTIME_H_
+#endif // CLQR_TESTS_EMULATED_CUDA_RUNTIME_H_

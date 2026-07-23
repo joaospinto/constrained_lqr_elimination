@@ -201,6 +201,50 @@ Problem NonuniformProblem() {
   return problem;
 }
 
+Problem ExactDualRelationScratchProblem() {
+  constexpr int seed = 2150;
+  constexpr std::size_t horizon = 4;
+  Problem problem =
+      GeneratedProblem(seed, horizon, 1, 0, 0, ConstraintMode::kNone);
+  for (std::size_t i = 1; i < horizon; ++i) {
+    problem.stages[i].E = Matrix(1, 1, {Scalar{1}});
+    problem.stages[i].e =
+        Vector{-GeneratedVector(1, seed + 100 + static_cast<int>(i), 0.6)[0]};
+  }
+  problem.terminal_E = Matrix(1, 1, {Scalar{1}});
+  problem.terminal_e = Vector{
+      -GeneratedVector(1, seed + 100 + static_cast<int>(horizon), 0.6)[0]};
+  return problem;
+}
+
+Problem PathologicalScratchProblem() {
+  constexpr std::size_t n = 45;
+  Problem problem;
+  problem.initial_state = Vector(n);
+  problem.stages.resize(1);
+  Stage &stage = problem.stages[0];
+  stage.A = Matrix(0, n);
+  stage.B = Matrix(0, 0);
+  stage.c = Vector(0);
+  stage.Q = Matrix(n, n);
+  for (std::size_t row = 0; row < n; ++row)
+    stage.Q(row, row) = Scalar{1};
+  stage.R = Matrix(0, 0);
+  stage.M = Matrix(n, 0);
+  stage.q = Vector(n);
+  stage.r = Vector(0);
+  stage.C = Matrix(0, n);
+  stage.D = Matrix(0, 0);
+  stage.d = Vector(0);
+  stage.E = Matrix(0, n);
+  stage.e = Vector(0);
+  problem.terminal_Q = Matrix(0, 0);
+  problem.terminal_q = Vector(0);
+  problem.terminal_E = Matrix(0, 0);
+  problem.terminal_e = Vector(0);
+  return problem;
+}
+
 Scalar TestMaxAbs(const Vector &vector) {
   Scalar value = 0.0;
   for (std::size_t i = 0; i < vector.size(); ++i)
@@ -264,8 +308,7 @@ Scalar MaxKktResidual(const Problem &problem,
   const std::size_t horizon = problem.stages.size();
   for (std::size_t i = 0; i < horizon; ++i) {
     const Stage &stage = problem.stages[i];
-    update(TestMaxAbs(solution.states[i + 1] -
-                      stage.A * solution.states[i] -
+    update(TestMaxAbs(solution.states[i + 1] - stage.A * solution.states[i] -
                       stage.B * solution.controls[i] - stage.c),
            "dynamics at stage " + std::to_string(i));
     if (stage.C.rows() > 0)
@@ -283,8 +326,7 @@ Scalar MaxKktResidual(const Problem &problem,
                       : solution.dynamics_multipliers[i - 1]);
     AddTransposeProduct(stage.C, solution.mixed_multipliers[i], &gx);
     AddTransposeProduct(stage.E, solution.state_multipliers[i], &gx);
-    update(TestMaxAbs(gx),
-           "state stationarity at stage " + std::to_string(i));
+    update(TestMaxAbs(gx), "state stationarity at stage " + std::to_string(i));
 
     Vector gu = clqr::Transpose(stage.M) * solution.states[i] +
                 stage.R * solution.controls[i] + stage.r -
@@ -357,8 +399,7 @@ void CompareWithCpu(const Problem &problem, const std::string &name,
              kTolerance * (1.0 + std::abs(cpu.objective)),
          name + " objective mismatch");
   std::string worst_equation;
-  const Scalar kkt_residual =
-      MaxKktResidual(problem, gpu, &worst_equation);
+  const Scalar kkt_residual = MaxKktResidual(problem, gpu, &worst_equation);
   Expect(kkt_residual <= kKktTolerance,
          name + " full primal-dual KKT residual=" +
              std::to_string(kkt_residual) + " in " + worst_equation);
@@ -417,10 +458,11 @@ Problem ZeroHorizonProblem() {
 
 Problem MaximumConstraintProblem() {
   constexpr int seed = 110;
-  constexpr std::size_t n = clqr::cuda::kMaxStateDimension;
-  constexpr std::size_t m = clqr::cuda::kMaxControlDimension;
-  constexpr std::size_t constraints = std::min(
-      clqr::cuda::kMaxMixedConstraints, clqr::cuda::kMaxStateConstraints);
+  // Every dimension exceeds at least one former compile-time benchmark
+  // capacity (state=8, control=4, mixed=2, state constraints=2).
+  constexpr std::size_t n = 10;
+  constexpr std::size_t m = 9;
+  constexpr std::size_t constraints = 9;
   Problem problem = GeneratedProblem(seed, 1, n, m, 0, ConstraintMode::kNone);
   Stage &stage = problem.stages[0];
   const Vector nominal_u = GeneratedVector(m, seed + 200, 0.5);
@@ -457,10 +499,7 @@ Problem RescaledMixedRowsProblem(const Problem &unscaled) {
 void LongHorizonCase() {
   const std::string name = "long-horizon state constraints";
   std::cout << "case: " << name << std::endl;
-  const Problem problem = clqr::benchmark::StateOnlyProblem(
-      2048, std::min<std::size_t>(8, clqr::cuda::kMaxStateDimension),
-      std::min<std::size_t>(4, clqr::cuda::kMaxControlDimension),
-      std::min<std::size_t>(2, clqr::cuda::kMaxStateConstraints));
+  const Problem problem = clqr::benchmark::StateOnlyProblem(2048, 8, 4, 2);
   const clqr::cuda::Solution solution = clqr::cuda::Solve(problem);
   Expect(solution.status == SolveStatus::kOptimal,
          name + " CUDA status: " + solution.message);
@@ -515,14 +554,15 @@ int main() {
   CompareWithCpu(NonuniformProblem(), "nonuniform dimensions");
   NonPositiveDefiniteReducedControlCostCase();
   CompareWithCpu(ZeroHorizonProblem(), "zero horizon");
-  CompareWithCpu(GeneratedProblem(100, 3, clqr::cuda::kMaxStateDimension,
-                                  clqr::cuda::kMaxControlDimension, 0,
-                                  ConstraintMode::kNone),
-                 "maximum active dimensions");
+  CompareWithCpu(GeneratedProblem(100, 3, 10, 9, 0, ConstraintMode::kNone),
+                 "runtime dimensions beyond former capacities");
   CompareWithCpu(GeneratedProblem(101, 4, 3, 0, 1, ConstraintMode::kState),
                  "zero control dimension");
-  const std::size_t many_mixed_rows =
-      std::min<std::size_t>(3, clqr::cuda::kMaxMixedConstraints);
+  CompareWithCpu(ExactDualRelationScratchProblem(),
+                 "exact dual-relation scratch layout");
+  CompareWithCpu(PathologicalScratchProblem(),
+                 "topology-tight 45-to-0 scratch planning");
+  const std::size_t many_mixed_rows = 3;
   CompareWithCpu(
       GeneratedProblem(102, 5, 4, 1, many_mixed_rows, ConstraintMode::kMixed),
       "more mixed rows than controls");

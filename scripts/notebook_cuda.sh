@@ -10,10 +10,6 @@ fi
 jax_dir="${CLQR_JAX_DIR:-${notebook_work_dir}/constrained_lqr_jax}"
 jax_revision="${CLQR_JAX_REVISION:-f867e0adf4ff165782a9b9bb3ebf1be6b66c856c}"
 cuda_arch="${CLQR_CUDA_ARCH:-75}"
-max_state_dimension="${CLQR_CUDA_MAX_STATE_DIMENSION:-8}"
-max_control_dimension="${CLQR_CUDA_MAX_CONTROL_DIMENSION:-4}"
-max_mixed_constraints="${CLQR_CUDA_MAX_MIXED_CONSTRAINTS:-2}"
-max_state_constraints="${CLQR_CUDA_MAX_STATE_CONSTRAINTS:-2}"
 read -r -a precisions <<< "${CLQR_PRECISIONS:-FP64}"
 native_test_timeout_seconds="${CLQR_NATIVE_TEST_TIMEOUT_SECONDS:-900}"
 
@@ -149,15 +145,11 @@ for precision in "${precisions[@]}"; do
   esac
   precision_suffix="$(printf '%s' "${precision}" | tr '[:upper:]' '[:lower:]')"
   echo "=== ${precision} build and tests ==="
-  echo "CUDA capacities: state=${max_state_dimension}, control=${max_control_dimension}, mixed=${max_mixed_constraints}, state constraints=${max_state_constraints}"
+  echo "The native CUDA suite includes dimensions beyond the former compile-time capacities, zero controls, and a zero horizon."
   bazel_args=(
     "--config=${precision_suffix}"
     --config=cuda
     "--cuda_archs=sm_${cuda_arch}"
-    "--cuda_max_state_dimension=${max_state_dimension}"
-    "--cuda_max_control_dimension=${max_control_dimension}"
-    "--cuda_max_mixed_constraints=${max_mixed_constraints}"
-    "--cuda_max_state_constraints=${max_state_constraints}"
     "--jobs=$(nproc)"
   )
   host_test_targets=(
@@ -244,3 +236,38 @@ for precision in "${precisions[@]}"; do
       --repeats "${CLQR_BENCHMARK_REPEATS:-5}"
   fi
 done
+
+if [[ "${CLQR_COMPARE_DIMENSION_BASELINE:-0}" == "1" ]]; then
+  baseline_revision="${CLQR_DIMENSION_BASELINE_REVISION:-b3b66cc4f71c72464c5c15a1ac38edd8068f3b71}"
+  baseline_dir="${CLQR_DIMENSION_BASELINE_DIR:-${notebook_work_dir}/constrained_lqr_elimination_dimension_baseline}"
+  if [[ ! -d "${baseline_dir}/.git" ]]; then
+    git clone --filter=blob:none --no-checkout \
+      https://github.com/joaospinto/constrained_lqr_elimination.git \
+      "${baseline_dir}"
+  fi
+  git -C "${baseline_dir}" fetch --depth 1 origin "${baseline_revision}"
+  git -C "${baseline_dir}" checkout --detach FETCH_HEAD
+  echo "=== Compile-time-capacity baseline ==="
+  echo "baseline revision: $(git -C "${baseline_dir}" rev-parse HEAD)"
+  echo "capacities: state=8, control=4, mixed=2, state constraints=2"
+  for precision in "${precisions[@]}"; do
+    precision_suffix="$(printf '%s' "${precision}" | tr '[:upper:]' '[:lower:]')"
+    baseline_args=(
+      "--config=${precision_suffix}"
+      --config=cuda
+      "--cuda_archs=sm_${cuda_arch}"
+      --cuda_max_state_dimension=8
+      --cuda_max_control_dimension=4
+      --cuda_max_mixed_constraints=2
+      --cuda_max_state_constraints=2
+      "--jobs=$(nproc)"
+    )
+    echo "=== ${precision} compile-time-capacity baseline benchmark ==="
+    (
+      cd "${baseline_dir}"
+      "${bazel_command}" build "${baseline_args[@]}" //:clqr_cuda_benchmark
+      "${baseline_dir}/bazel-bin/clqr_cuda_benchmark" \
+        --repeats "${CLQR_BENCHMARK_REPEATS:-5}"
+    )
+  done
+fi

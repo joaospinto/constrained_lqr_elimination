@@ -9,14 +9,6 @@ load(
     "requires_cuda",
 )
 load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
-load(
-    "//:cuda_config.bzl",
-    "cuda_capacity_defines",
-    "declare_cuda_capacity_flags",
-)
-
-declare_cuda_capacity_flags()
-
 config_setting(
     name = "fp32",
     define_values = {"clqr_precision": "fp32"},
@@ -31,8 +23,6 @@ config_setting(
     name = "macos",
     constraint_values = ["@platforms//os:osx"],
 )
-
-CUDA_CAPACITY_DEFINES = cuda_capacity_defines()
 
 cc_library(
     name = "clqr",
@@ -97,7 +87,6 @@ cc_library(
     name = "clqr_cuda_stub",
     srcs = ["src/cuda_stub.cc"],
     hdrs = ["include/clqr/cuda.h"],
-    defines = CUDA_CAPACITY_DEFINES,
     includes = ["include"],
     visibility = ["//visibility:public"],
     deps = [":clqr"],
@@ -122,11 +111,6 @@ cuda_library(
         "-lineinfo",
         "-Wno-deprecated-gpu-targets",
     ],
-    defines = CUDA_CAPACITY_DEFINES,
-    # rules_cuda keeps CUDA and host compilation definitions separate.
-    # Export the capacities through CcInfo as well so every C++ client sees
-    # the same public constants as cuda_solver.cu.
-    host_defines = CUDA_CAPACITY_DEFINES,
     host_copts = ["-std=c++17"],
     includes = ["include"],
     target_compatible_with = requires_cuda(),
@@ -211,7 +195,6 @@ cc_library(
         "include",
         "tests/emulated_cuda",
     ],
-    defines = CUDA_CAPACITY_DEFINES,
     textual_hdrs = ["src/cuda_solver.cu"],
     deps = [":clqr"],
 )
