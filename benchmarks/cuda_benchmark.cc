@@ -167,8 +167,13 @@ int main(int argc, char **argv) {
   std::cout << "# cpp_cpu_ms and CUDA timings use the same scalar precision.\n";
   std::cout
       << "# CUDA wall time reuses reserved storage and includes packing, "
-         "transfers, kernels, and result construction; cuda_kernel_ms excludes "
-         "host-device transfers.\n";
+         "transfers, kernels, synchronization, and result construction.\n"
+         "# cuda_kernel_ms sums pure kernel event times and excludes all "
+         "host-device transfers; upload_ms and download_ms cover the bulk "
+         "packed inputs and outputs.\n"
+         "# other_wall_ms is wall time minus bulk upload, kernels, and bulk "
+         "download; it includes host packing/result construction, phase-control "
+         "transfers, and synchronization.\n";
   if (cpu_max_horizon == std::numeric_limits<std::size_t>::max()) {
     std::cout << "# The sequential C++ solver is timed at every horizon.\n";
   } else {
@@ -178,7 +183,7 @@ int main(int argc, char **argv) {
                "kkt_residual reports the final repeated solution's "
                "accuracy.\n";
   std::cout << "N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_kernel_ms,"
-               "wall_speedup,kernel_speedup,host_overhead_ms,upload_ms,"
+               "wall_speedup,kernel_speedup,other_wall_ms,upload_ms,"
                "feasibility_ms,reduction_ms,riccati_ms,reconstruction_ms,"
                "multiplier_ms,download_ms,min_reduced_n,"
                "min_reduced_m,parallel_riccati,cuda_kkt_residual\n";
@@ -211,7 +216,7 @@ int main(int argc, char **argv) {
     std::vector<double> cpu_times;
     std::vector<double> gpu_wall_times;
     std::vector<double> gpu_kernel_times;
-    std::vector<double> host_overheads;
+    std::vector<double> other_wall_times;
     std::vector<double> feasibility;
     std::vector<double> upload;
     std::vector<double> reduction;
@@ -247,7 +252,7 @@ int main(int argc, char **argv) {
       const double gpu_kernel_time = KernelTotal(gpu.timings);
       gpu_wall_times.push_back(gpu_wall_time);
       gpu_kernel_times.push_back(gpu_kernel_time);
-      host_overheads.push_back(gpu_wall_time - EventTotal(gpu.timings));
+      other_wall_times.push_back(gpu_wall_time - EventTotal(gpu.timings));
       upload.push_back(gpu.timings.upload_ms);
       feasibility.push_back(gpu.timings.feasibility_ms);
       reduction.push_back(gpu.timings.reduction_ms);
@@ -273,7 +278,7 @@ int main(int argc, char **argv) {
               << ',' << std::fixed << std::setprecision(6) << cpu_ms << ','
               << gpu_wall_ms << ',' << gpu_kernel_ms << ','
               << cpu_ms / gpu_wall_ms << ',' << cpu_ms / gpu_kernel_ms << ','
-              << Median(host_overheads) << ',' << Median(upload) << ','
+              << Median(other_wall_times) << ',' << Median(upload) << ','
               << Median(feasibility) << ',' << Median(reduction) << ','
               << Median(riccati) << ',' << Median(reconstruction) << ','
               << Median(multiplier) << ',' << Median(download) << ','

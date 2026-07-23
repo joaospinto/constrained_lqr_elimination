@@ -1563,6 +1563,30 @@ double TimeGpu(WorkspaceStorage &workspace, Function &&function) {
   return milliseconds;
 }
 
+// Queue setup transfers before the start event and result/control transfers
+// after the stop event, then synchronize the whole default stream once.  The
+// returned duration therefore measures only the kernels in `function`, while
+// preserving the same single synchronization needed before the host consumes
+// `after`'s results.
+template <typename Before, typename Function, typename After>
+double TimeGpuKernels(WorkspaceStorage &workspace, Before &&before,
+                      Function &&function, After &&after) {
+  before();
+  CudaCheck(cudaGetLastError(), "CUDA phase setup");
+  CudaCheck(cudaEventRecord(workspace.event_start), "cudaEventRecord(start)");
+  function();
+  CudaCheck(cudaGetLastError(), "CUDA kernel launch");
+  CudaCheck(cudaEventRecord(workspace.event_stop), "cudaEventRecord(stop)");
+  after();
+  CudaCheck(cudaGetLastError(), "CUDA phase result transfer");
+  CudaCheck(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize");
+  float milliseconds = 0.0f;
+  CudaCheck(cudaEventElapsedTime(&milliseconds, workspace.event_start,
+                                 workspace.event_stop),
+            "cudaEventElapsedTime");
+  return milliseconds;
+}
+
 bool Finite(const Matrix &matrix) {
   for (Scalar value : matrix.data()) {
     if (!std::isfinite(value))
@@ -2482,53 +2506,62 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   Scalar feasibility_consistency_tolerance = std::max(
       options.tolerance, kMinimumFeasibilityConsistencyTolerance *
                              static_cast<Scalar>(feasibility_scan_levels + 2));
-  solution.timings.feasibility_ms = TimeGpu(workspace, [&] {
-    BuildPrimalLeavesKernel<<<node_count, kThreads>>>(
-        device_stages.get(), stage_count, device_terminal.get(),
-        options.tolerance, feasibility_consistency_tolerance, relation_a.get(),
-        device_status.get());
-    if (node_count > 1) {
-      const int first_parent_count = level_counts[1];
-      ReduceRelationLeavesKernel<<<first_parent_count, kThreads>>>(
-          relation_a.get(), node_count, first_parent_count, options.tolerance,
-          feasibility_consistency_tolerance, relation_b.get(),
-          device_status.get());
-      for (std::size_t level = 1; level + 1 < level_counts.size(); ++level) {
-        ReduceRelationTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
-            relation_b.get(), level_offsets[level] - node_count,
-            level_offsets[level + 1] - node_count, level_counts[level],
-            level_counts[level + 1], options.tolerance,
-            feasibility_consistency_tolerance, device_status.get());
-      }
-      InitializeRelationContextRootKernel<<<1, kThreads>>>(
-          relation_b.get(), level_offsets.back() - node_count);
-      for (int level = static_cast<int>(level_counts.size()) - 2; level >= 1;
-           --level) {
-        ExpandRelationContextLevelKernel<<<level_counts[level + 1], kThreads>>>(
-            relation_b.get(), level_offsets[level] - node_count,
-            level_offsets[level + 1] - node_count, level_counts[level],
-            level_counts[level + 1], options.tolerance,
-            feasibility_consistency_tolerance, device_status.get());
-      }
-      FinalizeRelationSuffixFromParentsKernel<<<first_parent_count, kThreads>>>(
-          relation_a.get(), node_count, relation_b.get(), first_parent_count,
-          options.tolerance, feasibility_consistency_tolerance,
-          device_status.get());
-    }
-    const int blocks = (node_count + kThreads - 1) / kThreads;
-    StateParamKernel<<<blocks, kThreads>>>(
-        relation_a.get(), node_count, state_params.get(),
-        state_dimensions.get(), device_status.get(), options.tolerance);
-    CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
-                              sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
-              "read feasibility status");
-    CudaCheck(
-        cudaMemcpyAsync(workspace.host_state_dimensions.data(),
-                        state_dimensions.get(),
-                        workspace.host_state_dimensions.size() * sizeof(int),
-                        cudaMemcpyDeviceToHost),
-        "download reduced state dimensions");
-  });
+  solution.timings.feasibility_ms = TimeGpuKernels(
+      workspace, [] {},
+      [&] {
+        BuildPrimalLeavesKernel<<<node_count, kThreads>>>(
+            device_stages.get(), stage_count, device_terminal.get(),
+            options.tolerance, feasibility_consistency_tolerance,
+            relation_a.get(), device_status.get());
+        if (node_count > 1) {
+          const int first_parent_count = level_counts[1];
+          ReduceRelationLeavesKernel<<<first_parent_count, kThreads>>>(
+              relation_a.get(), node_count, first_parent_count,
+              options.tolerance, feasibility_consistency_tolerance,
+              relation_b.get(), device_status.get());
+          for (std::size_t level = 1; level + 1 < level_counts.size();
+               ++level) {
+            ReduceRelationTreeLevelKernel<<<level_counts[level + 1],
+                                            kThreads>>>(
+                relation_b.get(), level_offsets[level] - node_count,
+                level_offsets[level + 1] - node_count, level_counts[level],
+                level_counts[level + 1], options.tolerance,
+                feasibility_consistency_tolerance, device_status.get());
+          }
+          InitializeRelationContextRootKernel<<<1, kThreads>>>(
+              relation_b.get(), level_offsets.back() - node_count);
+          for (int level = static_cast<int>(level_counts.size()) - 2;
+               level >= 1; --level) {
+            ExpandRelationContextLevelKernel<<<level_counts[level + 1],
+                                               kThreads>>>(
+                relation_b.get(), level_offsets[level] - node_count,
+                level_offsets[level + 1] - node_count, level_counts[level],
+                level_counts[level + 1], options.tolerance,
+                feasibility_consistency_tolerance, device_status.get());
+          }
+          FinalizeRelationSuffixFromParentsKernel<<<first_parent_count,
+                                                    kThreads>>>(
+              relation_a.get(), node_count, relation_b.get(),
+              first_parent_count, options.tolerance,
+              feasibility_consistency_tolerance, device_status.get());
+        }
+        const int blocks = (node_count + kThreads - 1) / kThreads;
+        StateParamKernel<<<blocks, kThreads>>>(
+            relation_a.get(), node_count, state_params.get(),
+            state_dimensions.get(), device_status.get(), options.tolerance);
+      },
+      [&] {
+        CudaCheck(
+            cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
+                            sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
+            "read feasibility status");
+        CudaCheck(cudaMemcpyAsync(
+                      workspace.host_state_dimensions.data(),
+                      state_dimensions.get(),
+                      workspace.host_state_dimensions.size() * sizeof(int),
+                      cudaMemcpyDeviceToHost),
+                  "download reduced state dimensions");
+      });
   Relation *suffix = relation_a.get();
   DeviceStatus status = workspace.host_status[0];
   if (ApplyDeviceFailure(status, &solution)) {
@@ -2547,38 +2580,46 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   workspace.reduced_states.Reserve(
       workspace.host_reduced_state_offsets[node_count]);
 
-  solution.timings.reduction_ms = TimeGpu(workspace, [&] {
-    CudaCheck(cudaMemcpyAsync(reduced_state_offsets.get(),
-                              workspace.host_reduced_state_offsets.data(),
-                              workspace.host_reduced_state_offsets.size() *
-                                  sizeof(int),
-                              cudaMemcpyHostToDevice),
-              "upload reduced-state offsets");
-    if (stage_count > 0) {
-      ReduceStagesKernel<<<stage_count, kThreads>>>(
-          device_stages.get(), suffix, state_params.get(), stage_count,
-          options.tolerance, feasibility_consistency_tolerance,
-          control_params.get(), reduced_stages.get(), control_dimensions.get(),
-          device_status.get());
-    }
-    ReduceTerminalKernel<<<1, kThreads>>>(device_terminal.get(),
-                                          state_params.get(), stage_count,
-                                          reduced_terminal.get());
-    InitialReducedStateKernel<<<1, kThreads>>>(
-        state_params.get(), device_initial.get(), reduced_initial.get(),
-        options.tolerance, device_status.get());
-    if (stage_count > 0) {
-      CudaCheck(cudaMemcpyAsync(workspace.host_control_dimensions.data(),
-                                control_dimensions.get(),
-                                workspace.host_control_dimensions.size() *
-                                    sizeof(int),
-                                cudaMemcpyDeviceToHost),
-                "download reduced control dimensions");
-    }
-    CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
-                              sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
-              "read reduction status");
-  });
+  solution.timings.reduction_ms = TimeGpuKernels(
+      workspace,
+      [&] {
+        CudaCheck(cudaMemcpyAsync(
+                      reduced_state_offsets.get(),
+                      workspace.host_reduced_state_offsets.data(),
+                      workspace.host_reduced_state_offsets.size() *
+                          sizeof(int),
+                      cudaMemcpyHostToDevice),
+                  "upload reduced-state offsets");
+      },
+      [&] {
+        if (stage_count > 0) {
+          ReduceStagesKernel<<<stage_count, kThreads>>>(
+              device_stages.get(), suffix, state_params.get(), stage_count,
+              options.tolerance, feasibility_consistency_tolerance,
+              control_params.get(), reduced_stages.get(),
+              control_dimensions.get(), device_status.get());
+        }
+        ReduceTerminalKernel<<<1, kThreads>>>(
+            device_terminal.get(), state_params.get(), stage_count,
+            reduced_terminal.get());
+        InitialReducedStateKernel<<<1, kThreads>>>(
+            state_params.get(), device_initial.get(), reduced_initial.get(),
+            options.tolerance, device_status.get());
+      },
+      [&] {
+        if (stage_count > 0) {
+          CudaCheck(cudaMemcpyAsync(
+                        workspace.host_control_dimensions.data(),
+                        control_dimensions.get(),
+                        workspace.host_control_dimensions.size() * sizeof(int),
+                        cudaMemcpyDeviceToHost),
+                    "download reduced control dimensions");
+        }
+        CudaCheck(
+            cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
+                            sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
+            "read reduction status");
+      });
   status = workspace.host_status[0];
   if (ApplyDeviceFailure(status, &solution)) {
     solution.timings.total_ms =
@@ -2599,89 +2640,112 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   ValueElement *value_suffix = value_a.get();
   int &host_parallel_ok = workspace.host_parallel_ok[0];
   host_parallel_ok = 1;
-  solution.timings.riccati_ms = TimeGpu(workspace, [&] {
-    if (value_layout_changed) {
-      CudaCheck(cudaMemcpyAsync(
-                    value_a.get(), workspace.host_value_leaves.data(),
-                    workspace.host_value_leaves.size() * sizeof(ValueElement),
-                    cudaMemcpyHostToDevice),
-                "upload compact value leaves");
-      if (workspace.host_value_scan.size() > 0) {
-        CudaCheck(cudaMemcpyAsync(
-                      value_b.get(), workspace.host_value_scan.data(),
-                      workspace.host_value_scan.size() * sizeof(ValueElement),
-                      cudaMemcpyHostToDevice),
-                  "upload compact value tree");
-      }
-    }
-    CudaCheck(cudaMemcpyAsync(parallel_ok.get(), &host_parallel_ok, sizeof(int),
+  solution.timings.riccati_ms = TimeGpuKernels(
+      workspace,
+      [&] {
+        if (value_layout_changed) {
+          CudaCheck(
+              cudaMemcpyAsync(value_a.get(),
+                              workspace.host_value_leaves.data(),
+                              workspace.host_value_leaves.size() *
+                                  sizeof(ValueElement),
                               cudaMemcpyHostToDevice),
-              "initialize parallel Riccati flag");
-    BuildValueElementsKernel<<<node_count, kThreads>>>(
-        reduced_stages.get(), reduced_terminal.get(), stage_count,
-        options.tolerance, value_a.get(), parallel_ok.get(),
-        device_status.get());
-    if (node_count > 1) {
-      const int first_parent_count = level_counts[1];
-      ReduceValueLeavesKernel<<<first_parent_count, kThreads>>>(
-          value_a.get(), node_count, first_parent_count, options.tolerance,
-          parallel_ok.get(), value_b.get());
-      for (std::size_t level = 1; level + 1 < level_counts.size(); ++level) {
-        ReduceValueTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
-            value_b.get(), level_offsets[level] - node_count,
-            level_offsets[level + 1] - node_count, level_counts[level],
-            level_counts[level + 1], options.tolerance, parallel_ok.get());
-      }
-      InitializeValueContextRootKernel<<<1, kThreads>>>(
-          value_b.get(), level_offsets.back() - node_count);
-      for (int level = static_cast<int>(level_counts.size()) - 2; level >= 1;
-           --level) {
-        ExpandValueContextLevelKernel<<<level_counts[level + 1], kThreads>>>(
-            value_b.get(), level_offsets[level] - node_count,
-            level_offsets[level + 1] - node_count, level_counts[level],
-            level_counts[level + 1], options.tolerance, parallel_ok.get());
-      }
-      FinalizeValueSuffixFromParentsKernel<<<first_parent_count, kThreads>>>(
-          value_a.get(), node_count, value_b.get(), first_parent_count,
-          options.tolerance, parallel_ok.get());
-    }
-    if (stage_count > 0) {
-      FeedbackKernel<<<stage_count, kThreads>>>(
-          reduced_stages.get(), value_suffix, stage_count, options.tolerance,
-          feedback.get(), parallel_ok.get(), device_status.get());
-    }
-    CudaCheck(cudaMemcpyAsync(&host_parallel_ok, parallel_ok.get(), sizeof(int),
-                              cudaMemcpyDeviceToHost),
-              "read value scan status");
-    CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
-                              sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
-              "read Riccati status");
-  });
+              "upload compact value leaves");
+          if (workspace.host_value_scan.size() > 0) {
+            CudaCheck(
+                cudaMemcpyAsync(value_b.get(),
+                                workspace.host_value_scan.data(),
+                                workspace.host_value_scan.size() *
+                                    sizeof(ValueElement),
+                                cudaMemcpyHostToDevice),
+                "upload compact value tree");
+          }
+        }
+        CudaCheck(cudaMemcpyAsync(parallel_ok.get(), &host_parallel_ok,
+                                  sizeof(int), cudaMemcpyHostToDevice),
+                  "initialize parallel Riccati flag");
+      },
+      [&] {
+        BuildValueElementsKernel<<<node_count, kThreads>>>(
+            reduced_stages.get(), reduced_terminal.get(), stage_count,
+            options.tolerance, value_a.get(), parallel_ok.get(),
+            device_status.get());
+        if (node_count > 1) {
+          const int first_parent_count = level_counts[1];
+          ReduceValueLeavesKernel<<<first_parent_count, kThreads>>>(
+              value_a.get(), node_count, first_parent_count,
+              options.tolerance, parallel_ok.get(), value_b.get());
+          for (std::size_t level = 1; level + 1 < level_counts.size();
+               ++level) {
+            ReduceValueTreeLevelKernel<<<level_counts[level + 1], kThreads>>>(
+                value_b.get(), level_offsets[level] - node_count,
+                level_offsets[level + 1] - node_count, level_counts[level],
+                level_counts[level + 1], options.tolerance,
+                parallel_ok.get());
+          }
+          InitializeValueContextRootKernel<<<1, kThreads>>>(
+              value_b.get(), level_offsets.back() - node_count);
+          for (int level = static_cast<int>(level_counts.size()) - 2;
+               level >= 1; --level) {
+            ExpandValueContextLevelKernel<<<level_counts[level + 1],
+                                            kThreads>>>(
+                value_b.get(), level_offsets[level] - node_count,
+                level_offsets[level + 1] - node_count, level_counts[level],
+                level_counts[level + 1], options.tolerance,
+                parallel_ok.get());
+          }
+          FinalizeValueSuffixFromParentsKernel<<<first_parent_count,
+                                                 kThreads>>>(
+              value_a.get(), node_count, value_b.get(), first_parent_count,
+              options.tolerance, parallel_ok.get());
+        }
+        if (stage_count > 0) {
+          FeedbackKernel<<<stage_count, kThreads>>>(
+              reduced_stages.get(), value_suffix, stage_count,
+              options.tolerance, feedback.get(), parallel_ok.get(),
+              device_status.get());
+        }
+      },
+      [&] {
+        CudaCheck(cudaMemcpyAsync(&host_parallel_ok, parallel_ok.get(),
+                                  sizeof(int), cudaMemcpyDeviceToHost),
+                  "read value scan status");
+        CudaCheck(
+            cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
+                            sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
+            "read Riccati status");
+      });
 
   if (host_parallel_ok != 0) {
     solution.used_parallel_riccati = true;
   } else {
     solution.used_parallel_riccati = false;
-    solution.timings.riccati_ms += TimeGpu(workspace, [&] {
-      host_parallel_ok = 1;
-      CudaCheck(cudaMemcpyAsync(parallel_ok.get(), &host_parallel_ok,
-                                sizeof(int), cudaMemcpyHostToDevice),
-                "reset Riccati flag");
-      BuildValueElementsKernel<<<node_count, kThreads>>>(
-          reduced_stages.get(), reduced_terminal.get(), stage_count,
-          options.tolerance, value_a.get(), parallel_ok.get(),
-          device_status.get());
-      if (stage_count > 0) {
-        SequentialRiccatiKernel<<<1, kThreads>>>(
-            reduced_stages.get(), stage_count, options.tolerance, value_a.get(),
-            feedback.get(), device_status.get());
-      }
-      value_suffix = value_a.get();
-      CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
-                                device_status.get(), sizeof(DeviceStatus),
-                                cudaMemcpyDeviceToHost),
-                "read Riccati status");
-    });
+    host_parallel_ok = 1;
+    solution.timings.riccati_ms += TimeGpuKernels(
+        workspace,
+        [&] {
+          CudaCheck(cudaMemcpyAsync(parallel_ok.get(), &host_parallel_ok,
+                                    sizeof(int), cudaMemcpyHostToDevice),
+                    "reset Riccati flag");
+        },
+        [&] {
+          BuildValueElementsKernel<<<node_count, kThreads>>>(
+              reduced_stages.get(), reduced_terminal.get(), stage_count,
+              options.tolerance, value_a.get(), parallel_ok.get(),
+              device_status.get());
+          if (stage_count > 0) {
+            SequentialRiccatiKernel<<<1, kThreads>>>(
+                reduced_stages.get(), stage_count, options.tolerance,
+                value_a.get(), feedback.get(), device_status.get());
+          }
+          value_suffix = value_a.get();
+        },
+        [&] {
+          CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
+                                    device_status.get(), sizeof(DeviceStatus),
+                                    cudaMemcpyDeviceToHost),
+                    "read Riccati status");
+        });
   }
   status = workspace.host_status[0];
   if (ApplyDeviceFailure(status, &solution)) {
@@ -2698,65 +2762,75 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &states = workspace.states;
   auto &controls = workspace.controls;
   AffineMap *prefix = map_a.get();
-  solution.timings.reconstruction_ms = TimeGpu(workspace, [&] {
-    if (stage_count > 0) {
-      if (map_layout_changed) {
-        CudaCheck(cudaMemcpyAsync(map_a.get(), workspace.host_map_leaves.data(),
-                                  workspace.host_map_leaves.size() *
-                                      sizeof(AffineMap),
-                                  cudaMemcpyHostToDevice),
-                  "upload compact affine leaves");
-        if (workspace.host_map_scan.size() > 0) {
-          CudaCheck(cudaMemcpyAsync(map_b.get(), workspace.host_map_scan.data(),
-                                    workspace.host_map_scan.size() *
-                                        sizeof(AffineMap),
-                                    cudaMemcpyHostToDevice),
-                    "upload compact affine tree");
+  solution.timings.reconstruction_ms = TimeGpuKernels(
+      workspace,
+      [&] {
+        if (stage_count > 0 && map_layout_changed) {
+          CudaCheck(
+              cudaMemcpyAsync(map_a.get(), workspace.host_map_leaves.data(),
+                              workspace.host_map_leaves.size() *
+                                  sizeof(AffineMap),
+                              cudaMemcpyHostToDevice),
+              "upload compact affine leaves");
+          if (workspace.host_map_scan.size() > 0) {
+            CudaCheck(
+                cudaMemcpyAsync(map_b.get(), workspace.host_map_scan.data(),
+                                workspace.host_map_scan.size() *
+                                    sizeof(AffineMap),
+                                cudaMemcpyHostToDevice),
+                "upload compact affine tree");
+          }
         }
-      }
-      InitializeAffineMapsKernel<<<stage_count, kThreads>>>(
-          feedback.get(), stage_count, map_a.get());
-      if (stage_count > 1) {
-        const int first_parent_count = stage_level_counts[1];
-        ReduceAffineLeavesKernel<<<first_parent_count, kThreads>>>(
-            map_a.get(), stage_count, first_parent_count, map_b.get(),
-            device_status.get());
-        for (std::size_t level = 1; level + 1 < stage_level_counts.size();
-             ++level) {
-          ReduceAffineTreeLevelKernel<<<stage_level_counts[level + 1],
-                                        kThreads>>>(
-              map_b.get(), stage_level_offsets[level] - stage_count,
-              stage_level_offsets[level + 1] - stage_count,
-              stage_level_counts[level], stage_level_counts[level + 1],
-              device_status.get());
+      },
+      [&] {
+        if (stage_count > 0) {
+          InitializeAffineMapsKernel<<<stage_count, kThreads>>>(
+              feedback.get(), stage_count, map_a.get());
+          if (stage_count > 1) {
+            const int first_parent_count = stage_level_counts[1];
+            ReduceAffineLeavesKernel<<<first_parent_count, kThreads>>>(
+                map_a.get(), stage_count, first_parent_count, map_b.get(),
+                device_status.get());
+            for (std::size_t level = 1;
+                 level + 1 < stage_level_counts.size(); ++level) {
+              ReduceAffineTreeLevelKernel<<<stage_level_counts[level + 1],
+                                            kThreads>>>(
+                  map_b.get(), stage_level_offsets[level] - stage_count,
+                  stage_level_offsets[level + 1] - stage_count,
+                  stage_level_counts[level], stage_level_counts[level + 1],
+                  device_status.get());
+            }
+            InitializeAffineContextRootKernel<<<1, kThreads>>>(
+                map_b.get(), stage_level_offsets.back() - stage_count);
+            for (int level = static_cast<int>(stage_level_counts.size()) - 2;
+                 level >= 1; --level) {
+              ExpandAffineContextLevelKernel<<<stage_level_counts[level + 1],
+                                               kThreads>>>(
+                  map_b.get(), stage_level_offsets[level] - stage_count,
+                  stage_level_offsets[level + 1] - stage_count,
+                  stage_level_counts[level], stage_level_counts[level + 1],
+                  device_status.get());
+            }
+            FinalizeAffinePrefixFromParentsKernel<<<first_parent_count,
+                                                    kThreads>>>(
+                map_a.get(), stage_count, map_b.get(), first_parent_count,
+                device_status.get());
+          }
+          prefix = map_a.get();
         }
-        InitializeAffineContextRootKernel<<<1, kThreads>>>(
-            map_b.get(), stage_level_offsets.back() - stage_count);
-        for (int level = static_cast<int>(stage_level_counts.size()) - 2;
-             level >= 1; --level) {
-          ExpandAffineContextLevelKernel<<<stage_level_counts[level + 1],
-                                           kThreads>>>(
-              map_b.get(), stage_level_offsets[level] - stage_count,
-              stage_level_offsets[level + 1] - stage_count,
-              stage_level_counts[level], stage_level_counts[level + 1],
-              device_status.get());
-        }
-        FinalizeAffinePrefixFromParentsKernel<<<first_parent_count, kThreads>>>(
-            map_a.get(), stage_count, map_b.get(), first_parent_count,
-            device_status.get());
-      }
-      prefix = map_a.get();
-    }
-    const int state_blocks = (node_count + kThreads - 1) / kThreads;
-    ReconstructPrimalKernel<<<state_blocks, kThreads>>>(
-        prefix, state_params.get(), control_params.get(), feedback.get(),
-        reduced_initial.get(), reduced_state_offsets.get(), state_offsets.get(),
-        control_offsets.get(), stage_count, reduced_states.get(), states.get(),
-        controls.get());
-    CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
-                              sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
-              "read reconstruction status");
-  });
+        const int state_blocks = (node_count + kThreads - 1) / kThreads;
+        ReconstructPrimalKernel<<<state_blocks, kThreads>>>(
+            prefix, state_params.get(), control_params.get(), feedback.get(),
+            reduced_initial.get(), reduced_state_offsets.get(),
+            state_offsets.get(), control_offsets.get(), stage_count,
+            reduced_states.get(), states.get(), controls.get());
+      },
+      [&] {
+        CudaCheck(
+            cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
+                            sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
+            "read reconstruction status");
+      });
   status = workspace.host_status[0];
   if (ApplyDeviceFailure(status, &solution)) {
     solution.timings.total_ms =
@@ -2794,30 +2868,38 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   host_dual_scan_needed = 0;
   solution.timings.multiplier_ms = 0.0;
   if (stage_count > 0) {
-    solution.timings.multiplier_ms += TimeGpu(workspace, [&] {
-      CudaCheck(cudaMemsetAsync(dual_scan_needed.get(), 0, sizeof(int)),
-                "initialize dual scan flag");
-      BuildDualParametersKernel<<<stage_count, kThreads>>>(
-          device_stages.get(), state_params.get(), value_suffix,
-          reduced_states.get(), states.get(), controls.get(),
-          reduced_state_offsets.get(), state_offsets.get(),
-          control_offsets.get(), stage_count, multiplier_rank_tolerance,
-          multiplier_consistency_tolerance, dual_params.get(),
-          dual_scan_needed.get(), dual_dimensions.get(), device_status.get());
-      CudaCheck(cudaMemcpyAsync(&host_dual_scan_needed, dual_scan_needed.get(),
-                                sizeof(int), cudaMemcpyDeviceToHost),
-                "read dual scan flag");
-      CudaCheck(
-          cudaMemcpyAsync(workspace.host_dual_dimensions.data(),
-                          dual_dimensions.get(),
-                          workspace.host_dual_dimensions.size() * sizeof(int),
-                          cudaMemcpyDeviceToHost),
-          "read dual dimensions");
-      CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
-                                device_status.get(), sizeof(DeviceStatus),
-                                cudaMemcpyDeviceToHost),
-                "read dual parameter status");
-    });
+    solution.timings.multiplier_ms += TimeGpuKernels(
+        workspace,
+        [&] {
+          CudaCheck(cudaMemsetAsync(dual_scan_needed.get(), 0, sizeof(int)),
+                    "initialize dual scan flag");
+        },
+        [&] {
+          BuildDualParametersKernel<<<stage_count, kThreads>>>(
+              device_stages.get(), state_params.get(), value_suffix,
+              reduced_states.get(), states.get(), controls.get(),
+              reduced_state_offsets.get(), state_offsets.get(),
+              control_offsets.get(), stage_count, multiplier_rank_tolerance,
+              multiplier_consistency_tolerance, dual_params.get(),
+              dual_scan_needed.get(), dual_dimensions.get(),
+              device_status.get());
+        },
+        [&] {
+          CudaCheck(cudaMemcpyAsync(&host_dual_scan_needed,
+                                    dual_scan_needed.get(), sizeof(int),
+                                    cudaMemcpyDeviceToHost),
+                    "read dual scan flag");
+          CudaCheck(cudaMemcpyAsync(
+                        workspace.host_dual_dimensions.data(),
+                        dual_dimensions.get(),
+                        workspace.host_dual_dimensions.size() * sizeof(int),
+                        cudaMemcpyDeviceToHost),
+                    "read dual dimensions");
+          CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
+                                    device_status.get(), sizeof(DeviceStatus),
+                                    cudaMemcpyDeviceToHost),
+                    "read dual parameter status");
+        });
     status = workspace.host_status[0];
     if (ApplyDeviceFailure(status, &solution)) {
       solution.timings.total_ms =
@@ -2833,86 +2915,105 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         host_dual_scan_needed != 0 ? dual_tree.get() : nullptr;
     DualNodeValue *dual_leaf_values =
         host_dual_scan_needed != 0 ? dual_values.get() : nullptr;
-    solution.timings.multiplier_ms += TimeGpu(workspace, [&] {
-      if (dual_layout_changed) {
-        CudaCheck(cudaMemcpyAsync(
-                      dual_tree.get(), workspace.host_dual_tree.data(),
-                      workspace.host_dual_tree.size() * sizeof(DualRelation),
-                      cudaMemcpyHostToDevice),
-                  "upload compact dual relation tree");
-        CudaCheck(cudaMemcpyAsync(
-                      dual_values.get(), workspace.host_dual_values.data(),
-                      workspace.host_dual_values.size() * sizeof(DualNodeValue),
-                      cudaMemcpyHostToDevice),
-                  "upload compact dual value tree");
-      }
-      BuildDualParameterRelationsKernel<<<stage_count, kThreads>>>(
-          device_stages.get(), device_terminal.get(), dual_params.get(),
-          stage_count, states.get(), controls.get(), state_offsets.get(),
-          control_offsets.get(), multiplier_rank_tolerance,
-          multiplier_consistency_tolerance, dual_relations,
-          dual_scan_needed.get(), state_dual_params.get(), device_status.get());
-      if (host_dual_scan_needed != 0) {
-        for (std::size_t level = 0; level + 1 < stage_level_counts.size();
-             ++level) {
-          ReduceDualTreeLevelKernel<<<stage_level_counts[level + 1],
-                                      kThreads>>>(
-              dual_tree.get(), stage_level_offsets[level],
-              stage_level_offsets[level + 1], stage_level_counts[level],
-              stage_level_counts[level + 1], multiplier_rank_tolerance,
-              multiplier_consistency_tolerance, dual_tree.get(),
-              dual_scan_needed.get(), device_status.get());
-        }
-        const int root_offset = stage_level_offsets.back();
-        SolveDualRootKernel<<<1, kThreads>>>(
-            dual_tree.get() + root_offset, dual_values.get() + root_offset,
-            dual_scan_needed.get(), device_status.get(),
-            multiplier_rank_tolerance);
-        for (int level = static_cast<int>(stage_level_counts.size()) - 2;
-             level >= 0; --level) {
-          ExpandDualTreeLevelKernel<<<stage_level_counts[level + 1],
-                                      kThreads>>>(
-              dual_tree.get(), stage_level_offsets[level],
-              stage_level_offsets[level + 1], stage_level_counts[level],
-              stage_level_counts[level + 1], multiplier_rank_tolerance,
-              multiplier_consistency_tolerance, dual_values.get(),
-              dual_values.get(), dual_scan_needed.get(), device_status.get());
-        }
-      }
-      const int recovery_blocks = (stage_count + kThreads - 1) / kThreads;
-      RecoverParameterizedMultipliersKernel<<<recovery_blocks, kThreads>>>(
-          dual_params.get(), state_dual_params.get(), dual_leaf_values,
-          dynamics_offsets.get(), mixed_offsets.get(),
-          state_constraint_offsets.get(), stage_count,
-          dynamics_multipliers.get(), mixed_multipliers.get(),
-          state_multipliers.get(), terminal_multiplier.get());
-      RecoverInitialMultiplierKernel<<<1, kThreads>>>(
-          device_stages.get(), device_terminal.get(), stage_count, states.get(),
-          controls.get(), dynamics_multipliers.get(), mixed_multipliers.get(),
-          state_offsets.get(), control_offsets.get(), dynamics_offsets.get(),
-          mixed_offsets.get(), state_constraint_offsets.get(),
-          initial_multiplier.get(), state_multipliers.get(),
-          terminal_multiplier.get());
-      CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
-                                device_status.get(), sizeof(DeviceStatus),
-                                cudaMemcpyDeviceToHost),
-                "read multiplier status");
-    });
+    solution.timings.multiplier_ms += TimeGpuKernels(
+        workspace,
+        [&] {
+          if (dual_layout_changed) {
+            CudaCheck(
+                cudaMemcpyAsync(dual_tree.get(),
+                                workspace.host_dual_tree.data(),
+                                workspace.host_dual_tree.size() *
+                                    sizeof(DualRelation),
+                                cudaMemcpyHostToDevice),
+                "upload compact dual relation tree");
+            CudaCheck(
+                cudaMemcpyAsync(dual_values.get(),
+                                workspace.host_dual_values.data(),
+                                workspace.host_dual_values.size() *
+                                    sizeof(DualNodeValue),
+                                cudaMemcpyHostToDevice),
+                "upload compact dual value tree");
+          }
+        },
+        [&] {
+          BuildDualParameterRelationsKernel<<<stage_count, kThreads>>>(
+              device_stages.get(), device_terminal.get(), dual_params.get(),
+              stage_count, states.get(), controls.get(), state_offsets.get(),
+              control_offsets.get(), multiplier_rank_tolerance,
+              multiplier_consistency_tolerance, dual_relations,
+              dual_scan_needed.get(), state_dual_params.get(),
+              device_status.get());
+          if (host_dual_scan_needed != 0) {
+            for (std::size_t level = 0;
+                 level + 1 < stage_level_counts.size(); ++level) {
+              ReduceDualTreeLevelKernel<<<stage_level_counts[level + 1],
+                                          kThreads>>>(
+                  dual_tree.get(), stage_level_offsets[level],
+                  stage_level_offsets[level + 1], stage_level_counts[level],
+                  stage_level_counts[level + 1], multiplier_rank_tolerance,
+                  multiplier_consistency_tolerance, dual_tree.get(),
+                  dual_scan_needed.get(), device_status.get());
+            }
+            const int root_offset = stage_level_offsets.back();
+            SolveDualRootKernel<<<1, kThreads>>>(
+                dual_tree.get() + root_offset,
+                dual_values.get() + root_offset, dual_scan_needed.get(),
+                device_status.get(), multiplier_rank_tolerance);
+            for (int level = static_cast<int>(stage_level_counts.size()) - 2;
+                 level >= 0; --level) {
+              ExpandDualTreeLevelKernel<<<stage_level_counts[level + 1],
+                                          kThreads>>>(
+                  dual_tree.get(), stage_level_offsets[level],
+                  stage_level_offsets[level + 1], stage_level_counts[level],
+                  stage_level_counts[level + 1], multiplier_rank_tolerance,
+                  multiplier_consistency_tolerance, dual_values.get(),
+                  dual_values.get(), dual_scan_needed.get(),
+                  device_status.get());
+            }
+          }
+          const int recovery_blocks =
+              (stage_count + kThreads - 1) / kThreads;
+          RecoverParameterizedMultipliersKernel<<<recovery_blocks, kThreads>>>(
+              dual_params.get(), state_dual_params.get(), dual_leaf_values,
+              dynamics_offsets.get(), mixed_offsets.get(),
+              state_constraint_offsets.get(), stage_count,
+              dynamics_multipliers.get(), mixed_multipliers.get(),
+              state_multipliers.get(), terminal_multiplier.get());
+          RecoverInitialMultiplierKernel<<<1, kThreads>>>(
+              device_stages.get(), device_terminal.get(), stage_count,
+              states.get(), controls.get(), dynamics_multipliers.get(),
+              mixed_multipliers.get(), state_offsets.get(),
+              control_offsets.get(), dynamics_offsets.get(),
+              mixed_offsets.get(), state_constraint_offsets.get(),
+              initial_multiplier.get(), state_multipliers.get(),
+              terminal_multiplier.get());
+        },
+        [&] {
+          CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
+                                    device_status.get(), sizeof(DeviceStatus),
+                                    cudaMemcpyDeviceToHost),
+                    "read multiplier status");
+        });
   }
   if (stage_count == 0) {
-    solution.timings.multiplier_ms += TimeGpu(workspace, [&] {
-      RecoverInitialMultiplierKernel<<<1, kThreads>>>(
-          device_stages.get(), device_terminal.get(), stage_count, states.get(),
-          controls.get(), dynamics_multipliers.get(), mixed_multipliers.get(),
-          state_offsets.get(), control_offsets.get(), dynamics_offsets.get(),
-          mixed_offsets.get(), state_constraint_offsets.get(),
-          initial_multiplier.get(), state_multipliers.get(),
-          terminal_multiplier.get());
-      CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
-                                device_status.get(), sizeof(DeviceStatus),
-                                cudaMemcpyDeviceToHost),
-                "read multiplier status");
-    });
+    solution.timings.multiplier_ms += TimeGpuKernels(
+        workspace, [] {},
+        [&] {
+          RecoverInitialMultiplierKernel<<<1, kThreads>>>(
+              device_stages.get(), device_terminal.get(), stage_count,
+              states.get(), controls.get(), dynamics_multipliers.get(),
+              mixed_multipliers.get(), state_offsets.get(),
+              control_offsets.get(), dynamics_offsets.get(),
+              mixed_offsets.get(), state_constraint_offsets.get(),
+              initial_multiplier.get(), state_multipliers.get(),
+              terminal_multiplier.get());
+        },
+        [&] {
+          CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
+                                    device_status.get(), sizeof(DeviceStatus),
+                                    cudaMemcpyDeviceToHost),
+                    "read multiplier status");
+        });
   }
   status = workspace.host_status[0];
   if (ApplyDeviceFailure(status, &solution)) {
