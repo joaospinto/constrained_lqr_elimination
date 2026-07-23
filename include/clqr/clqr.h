@@ -304,7 +304,7 @@ class Workspace {
     if (stages == 0) {
       // Match the runtime constrained-workspace bound for the terminal-only
       // recovery path.  With no stage-proportional scratch, its dense affine
-      // products and rectangular multiplier RREF coexist in the arena.
+      // products and rectangular multiplier QR coexist in the arena.
       const std::size_t local_dimension =
           state_dim + terminal_constraints + 1;
       bytes = AddAligned(

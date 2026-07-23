@@ -1759,7 +1759,7 @@ void AddRecoveryStorageBound(const Problem& problem,
                  (dims.terminal_state + dims.max_terminal_rows + 1));
   if (N == 0) {
     // With no stages the terminal-state parametrization, dense affine
-    // products, rectangular multiplier solve, and their RREF traces all
+    // products, rectangular multiplier solve, and its orthogonal trace all
     // coexist in the monotonic arena. The stage-proportional scratch terms
     // above vanish, so retain a local quadratic bound explicitly.
     const std::size_t local_dimension =
