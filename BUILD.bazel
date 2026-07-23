@@ -185,6 +185,10 @@ nanobind_extension(
     # other warnings enabled and fatal in this translation unit.
     copts = select({
         ":linux": ["-Wno-pedantic"],
+        ":macos": [
+            "-Wno-nested-anon-types",
+            "-Wno-zero-length-array",
+        ],
         "//conditions:default": [],
     }),
     deps = [":clqr"],
