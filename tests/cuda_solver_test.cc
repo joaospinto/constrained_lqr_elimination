@@ -378,7 +378,7 @@ void CompareWithCpu(const Problem &problem, const std::string &name,
   }
 }
 
-Problem RiccatiFallbackProblem() {
+Problem FutureRegularizedRiccatiProblem() {
   Problem problem;
   problem.initial_state = Vector{0.4};
   problem.stages.resize(1);
@@ -512,7 +512,8 @@ int main() {
   CompareWithCpu(GeneratedProblem(6, 4, 4, 2, 2, ConstraintMode::kTerminal),
                  "terminal constraints");
   CompareWithCpu(NonuniformProblem(), "nonuniform dimensions");
-  CompareWithCpu(RiccatiFallbackProblem(), "Riccati fallback", false);
+  CompareWithCpu(FutureRegularizedRiccatiProblem(),
+                 "future-regularized Riccati", false);
   CompareWithCpu(ZeroHorizonProblem(), "zero horizon");
   CompareWithCpu(GeneratedProblem(100, 3, clqr::cuda::kMaxStateDimension,
                                   clqr::cuda::kMaxControlDimension, 0,

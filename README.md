@@ -56,12 +56,13 @@ horizon of `N` stages, it:
    scan, reusing the parameterizations produced by the primal solve.
 
 With fixed per-stage dimension limits, every horizon-dependent device buffer
-has `O(N)` storage and the contraction/expansion trees have fewer than `2N`
-nodes. Problem data, trajectories, reduced states, reduced controls, and dual
-parameters are packed according to each stage's active dimensions. The
-compile-time capacity constants bound only the small dense workspaces used by
-individual kernels; the solver does not pad every stage to those capacities or
-perform arithmetic on padded state and control dimensions.
+has `O(N)` storage. Problem data, trajectories, reduced trajectories, and scan
+coefficient buffers are packed according to their active dimensions. Some
+per-stage parameterization and factor records reserve fixed-capacity inline
+arrays, and the compile-time capacity constants also bound each kernel's dense
+workspace. Kernels nevertheless loop over and factor only the active state,
+control, constraint, and reduced dimensions; no padded dense algebra is
+performed.
 
 The conditional-value scan uses the standard positive-definite reduced stage
 control-cost assumption. If a stage violates that local assumption but a
@@ -116,10 +117,15 @@ For a reproducible native-CUDA validation and benchmark run, open
 [`notebooks/kaggle_cuda_benchmark.ipynb`](notebooks/kaggle_cuda_benchmark.ipynb)
 in a fresh Kaggle GPU notebook. It records the machine specification, builds
 the CPU and CUDA implementations in the same precision, runs the CPU,
-kernel-emulation, native-CUDA, Compute Sanitizer, and JAX cross-validation
-tests, and benchmarks all configured horizons. The canonical shell driver is
+kernel-emulation, native-CUDA, and Compute Sanitizer tests, and benchmarks all
+configured horizons. The canonical shell driver is
 [`scripts/notebook_cuda.sh`](scripts/notebook_cuda.sh); the former
 `scripts/colab_t4.sh` name remains as a compatibility wrapper.
+
+The benchmark does not install or time the JAX implementation. To run the
+additional solution-level JAX cross-validation diagnostic, set
+`CLQR_RUN_JAX_CROSS_VALIDATION=1`; `CLQR_JAX_REVISION` can override its pinned
+reference revision.
 
 Build and test either precision:
 

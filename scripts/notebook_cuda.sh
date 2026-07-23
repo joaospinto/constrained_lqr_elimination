@@ -62,7 +62,7 @@ if ! nvidia-smi --query-gpu="${gpu_query}" --format=csv; then
     --format=csv
 fi
 
-if [[ "${CLQR_SKIP_JAX:-0}" != "1" ]]; then
+if [[ "${CLQR_RUN_JAX_CROSS_VALIDATION:-0}" == "1" ]]; then
   if [[ ! -d "${jax_dir}/.git" ]]; then
     git clone --filter=blob:none --no-checkout \
       https://github.com/joaospinto/constrained_lqr_jax.git "${jax_dir}"
@@ -119,7 +119,7 @@ for precision in "${precisions[@]}"; do
     done
   fi
 
-  if [[ "${CLQR_SKIP_JAX:-0}" != "1" ]]; then
+  if [[ "${CLQR_RUN_JAX_CROSS_VALIDATION:-0}" == "1" ]]; then
     python3 "${repo_dir}/tests/cross_validate_jax.py" \
       "${build_dir}/clqr_cuda_jax_fixture"
   fi

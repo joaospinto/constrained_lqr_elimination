@@ -23,13 +23,19 @@ struct Options {
 };
 
 struct Timings {
+  // Bulk packed-input transfer, measured with CUDA events.
   double upload_ms = 0.0;
+  // Computational phases below contain kernel event time only; phase-control
+  // transfers and synchronization are intentionally excluded.
   double feasibility_ms = 0.0;
   double reduction_ms = 0.0;
   double riccati_ms = 0.0;
   double reconstruction_ms = 0.0;
   double multiplier_ms = 0.0;
+  // Bulk packed-output transfer, measured with CUDA events.
   double download_ms = 0.0;
+  // End-to-end host wall time, including packing, all transfers,
+  // synchronization, kernels, and construction of the owning result.
   double total_ms = 0.0;
 };
 

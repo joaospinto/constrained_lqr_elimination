@@ -682,7 +682,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
                             sequential_values.data(),
                             sequential_feedback.data(), &status);
   });
-  Expect(status.code == kDeviceOk, "emulated sequential Riccati fallback");
+  Expect(status.code == kDeviceOk, "emulated sequential Riccati reference");
   for (int i = 0; i < horizon; ++i) {
     for (int row = 0; row < feedback[i].control_dim; ++row) {
       Expect(

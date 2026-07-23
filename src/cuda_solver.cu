@@ -1608,16 +1608,32 @@ void Require(bool condition, const std::string &message) {
     throw std::invalid_argument(message);
 }
 
+std::size_t BalancedTreeNodeCount(std::size_t leaf_count) {
+  Require(leaf_count > 0, "CUDA tree must contain at least one leaf");
+  std::size_t total = 0;
+  for (std::size_t level_count = leaf_count;;
+       level_count = level_count / 2 + level_count % 2) {
+    Require(level_count <= std::numeric_limits<std::size_t>::max() - total,
+            "CUDA tree size overflows size_t");
+    total += level_count;
+    if (level_count == 1)
+      return total;
+  }
+}
+
 void ValidateCudaProblem(const Problem &problem, const Options &options) {
   Require(std::isfinite(options.tolerance) && options.tolerance > Scalar{0},
           "CUDA tolerance must be finite and positive");
   Require(options.device >= 0, "CUDA device index must be nonnegative");
-  // Node counts, scan padding, and compact-tree offsets are stored in signed
-  // ints.
-  Require(problem.stages.size() <=
-              static_cast<std::size_t>(std::numeric_limits<int>::max() / 2),
-          "too many stages for CUDA tree indices");
   const std::size_t count = problem.stages.size();
+  Require(count < static_cast<std::size_t>(std::numeric_limits<int>::max()),
+          "too many stages for CUDA indices");
+  constexpr std::size_t kMaxTreeIndex =
+      static_cast<std::size_t>(std::numeric_limits<int>::max());
+  Require(BalancedTreeNodeCount(count + 1) <= kMaxTreeIndex &&
+              BalancedTreeNodeCount(std::max<std::size_t>(count, 1)) <=
+                  kMaxTreeIndex,
+          "too many stages for CUDA tree indices");
   Require(problem.terminal_Q.rows() == problem.terminal_Q.cols(),
           "terminal_Q must be square");
   Require(problem.terminal_Q.rows() <= kMaxStateDimension,
@@ -3114,9 +3130,10 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                            workspace.host_control_offsets.data(),
                            host_states.data(), host_controls.data());
   solution.status = SolveStatus::kOptimal;
-  solution.message = solution.used_parallel_riccati
-                         ? "optimal (parallel CUDA Riccati scan)"
-                         : "optimal (CUDA sequential Riccati fallback)";
+  solution.message =
+      solution.used_parallel_riccati
+          ? "optimal (parallel CUDA Riccati scan)"
+          : "optimal (sequential CUDA Riccati compatibility path)";
   if (!options.enforce_multiplier_consistency)
     solution.message += "; multiplier consistency unchecked";
   solution.timings.total_ms =
@@ -4677,6 +4694,43 @@ __device__ void ExtractFeedback(const ReducedStage &s, const Scalar *augmented,
   }
 }
 
+__device__ bool SolveFeedbackBlock(
+    const ReducedStage &stage, const ValueElement &next, Scalar tolerance,
+    Feedback *feedback, Scalar *augmented, Scalar *factors,
+    int *pivot_columns, int *pivot_rows, int *rank, int *best_row,
+    DeviceStatus *status, int stage_index, int diagnostic) {
+  if (stage.m == 0) {
+    if (threadIdx.x == 0) {
+      feedback->state_dim = stage.n;
+      feedback->next_state_dim = stage.next_n;
+      feedback->control_dim = 0;
+    }
+    for (int linear = threadIdx.x; linear < stage.next_n * stage.n;
+         linear += blockDim.x) {
+      const int row = linear / stage.n;
+      const int col = linear % stage.n;
+      feedback->transition[row * stage.n + col] =
+          stage.A[row * stage.n + col];
+    }
+    for (int row = threadIdx.x; row < stage.next_n; row += blockDim.x)
+      feedback->offset[row] = stage.c[row];
+    return true;
+  }
+
+  const int columns = stage.m + stage.n + 1;
+  BuildFeedbackSystem(stage, next, augmented, columns);
+  WarpSynchronize();
+  RrefBlock(augmented, stage.m, columns, stage.m, tolerance, pivot_columns,
+            pivot_rows, rank, best_row, factors);
+  if (*rank != stage.m) {
+    if (threadIdx.x == 0)
+      SetFailure(status, kDeviceNumericalFailure, stage_index, diagnostic);
+    return false;
+  }
+  ExtractFeedback(stage, augmented, columns, feedback);
+  return true;
+}
+
 __global__ void FeedbackKernel(const ReducedStage *stages,
                                const ValueElement *suffix, int stage_count,
                                Scalar tolerance, Feedback *feedback,
@@ -4691,22 +4745,6 @@ __global__ void FeedbackKernel(const ReducedStage *stages,
   const ReducedStage &s = stages[index];
   const ValueElement &next = suffix[index + 1];
   Feedback &out = feedback[index];
-  if (s.m == 0) {
-    if (threadIdx.x == 0) {
-      out.state_dim = s.n;
-      out.next_state_dim = s.next_n;
-      out.control_dim = 0;
-    }
-    for (int linear = threadIdx.x; linear < s.next_n * s.n;
-         linear += blockDim.x) {
-      const int row = linear / s.n;
-      const int col = linear % s.n;
-      out.transition[row * s.n + col] = s.A[row * s.n + col];
-    }
-    for (int row = threadIdx.x; row < s.next_n; row += blockDim.x)
-      out.offset[row] = s.c[row];
-    return;
-  }
   __shared__ Scalar augmented[kMaxControlDimension *
                               (kMaxControlDimension + kMaxStateDimension + 1)];
   __shared__ Scalar factors[kMaxRrefRows];
@@ -4714,17 +4752,9 @@ __global__ void FeedbackKernel(const ReducedStage *stages,
   __shared__ int pivot_rows[kMaxRrefRows];
   __shared__ int rank;
   __shared__ int best_row;
-  const int columns = s.m + s.n + 1;
-  BuildFeedbackSystem(s, next, augmented, columns);
-  WarpSynchronize();
-  RrefBlock(augmented, s.m, columns, s.m, tolerance, pivot_columns, pivot_rows,
-            &rank, &best_row, factors);
-  if (rank != s.m) {
-    if (threadIdx.x == 0)
-      SetFailure(status, kDeviceNumericalFailure, index, 9);
-    return;
-  }
-  ExtractFeedback(s, augmented, columns, &out);
+  SolveFeedbackBlock(s, next, tolerance, &out, augmented, factors,
+                     pivot_columns, pivot_rows, &rank, &best_row, status,
+                     index, 9);
 }
 
 __global__ void SequentialRiccatiKernel(const ReducedStage *stages,
@@ -4748,33 +4778,10 @@ __global__ void SequentialRiccatiKernel(const ReducedStage *stages,
     const ReducedStage &s = stages[index];
     const ValueElement &next = suffix[index + 1];
     Feedback &fb = feedback[index];
-    if (s.m == 0) {
-      if (threadIdx.x == 0) {
-        fb.state_dim = s.n;
-        fb.next_state_dim = s.next_n;
-        fb.control_dim = 0;
-      }
-      for (int linear = threadIdx.x; linear < s.next_n * s.n;
-           linear += blockDim.x) {
-        const int row = linear / s.n;
-        const int col = linear % s.n;
-        fb.transition[row * s.n + col] = s.A[row * s.n + col];
-      }
-      for (int row = threadIdx.x; row < s.next_n; row += blockDim.x)
-        fb.offset[row] = s.c[row];
-    } else {
-      const int columns = s.m + s.n + 1;
-      BuildFeedbackSystem(s, next, augmented, columns);
-      WarpSynchronize();
-      RrefBlock(augmented, s.m, columns, s.m, tolerance, pivot_columns,
-                pivot_rows, &rank, &best_row, factors);
-      if (rank != s.m) {
-        if (threadIdx.x == 0)
-          SetFailure(status, kDeviceNumericalFailure, index, 10);
-        return;
-      }
-      ExtractFeedback(s, augmented, columns, &fb);
-    }
+    if (!SolveFeedbackBlock(s, next, tolerance, &fb, augmented, factors,
+                            pivot_columns, pivot_rows, &rank, &best_row,
+                            status, index, 10))
+      return;
     WarpSynchronize();
 
     ValueElement &current = suffix[index];
