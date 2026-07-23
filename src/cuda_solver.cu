@@ -1671,6 +1671,13 @@ void Require(bool condition, const std::string &message) {
     throw std::invalid_argument(message);
 }
 
+void RequireAtStage(bool condition, const char *message, std::size_t stage) {
+  if (!condition) {
+    throw std::invalid_argument(std::string(message) + " at stage " +
+                                std::to_string(stage));
+  }
+}
+
 std::size_t BalancedTreeNodeCount(std::size_t leaf_count) {
   Require(leaf_count > 0, "CUDA tree must contain at least one leaf");
   std::size_t total = 0;
@@ -1684,7 +1691,8 @@ std::size_t BalancedTreeNodeCount(std::size_t leaf_count) {
   }
 }
 
-void ValidateCudaProblem(const Problem &problem, const Options &options) {
+void ValidateCudaProblem(const Problem &problem, const Options &options,
+                         bool validate_values) {
   Require(std::isfinite(options.tolerance) && options.tolerance > Scalar{0},
           "CUDA tolerance must be finite and positive");
   Require(options.device >= 0, "CUDA device index must be nonnegative");
@@ -1709,10 +1717,12 @@ void ValidateCudaProblem(const Problem &problem, const Options &options) {
           "terminal constraint count exceeds CUDA limit");
   Require(problem.terminal_e.size() == problem.terminal_E.rows(),
           "terminal_e shape mismatch");
-  Require(Finite(problem.terminal_Q) && Finite(problem.terminal_q) &&
-              Finite(problem.terminal_E) && Finite(problem.terminal_e) &&
-              Finite(problem.initial_state),
-          "problem contains a non-finite terminal or initial value");
+  if (validate_values) {
+    Require(Finite(problem.terminal_Q) && Finite(problem.terminal_q) &&
+                Finite(problem.terminal_E) && Finite(problem.terminal_e) &&
+                Finite(problem.initial_state),
+            "problem contains a non-finite terminal or initial value");
+  }
   if (count == 0) {
     Require(problem.initial_state.size() == problem.terminal_Q.rows(),
             "initial_state and terminal state dimensions differ");
@@ -1725,97 +1735,108 @@ void ValidateCudaProblem(const Problem &problem, const Options &options) {
     const std::size_t n = s.A.cols();
     const std::size_t next = s.A.rows();
     const std::size_t m = s.B.cols();
-    Require(n <= kMaxStateDimension && next <= kMaxStateDimension,
-            "state dimension exceeds CUDA limit at stage " + std::to_string(i));
-    Require(m <= kMaxControlDimension,
-            "control dimension exceeds CUDA limit at stage " +
-                std::to_string(i));
-    Require(s.C.rows() <= kMaxMixedConstraints,
-            "mixed constraint count exceeds CUDA limit at stage " +
-                std::to_string(i));
-    Require(s.E.rows() <= kMaxStateConstraints,
-            "state constraint count exceeds CUDA limit at stage " +
-                std::to_string(i));
-    Require(s.B.rows() == next && s.c.size() == next,
-            "dynamics shape mismatch at stage " + std::to_string(i));
-    Require(s.Q.rows() == n && s.Q.cols() == n && s.q.size() == n,
-            "state-cost shape mismatch at stage " + std::to_string(i));
-    Require(s.R.rows() == m && s.R.cols() == m && s.r.size() == m,
-            "control-cost shape mismatch at stage " + std::to_string(i));
-    Require(s.M.rows() == n && s.M.cols() == m,
-            "cross-cost shape mismatch at stage " + std::to_string(i));
-    Require(s.C.cols() == n && s.D.rows() == s.C.rows() && s.D.cols() == m &&
-                s.d.size() == s.C.rows(),
-            "mixed-constraint shape mismatch at stage " + std::to_string(i));
-    Require(s.E.cols() == n && s.e.size() == s.E.rows(),
-            "state-constraint shape mismatch at stage " + std::to_string(i));
+    RequireAtStage(n <= kMaxStateDimension && next <= kMaxStateDimension,
+                   "state dimension exceeds CUDA limit", i);
+    RequireAtStage(m <= kMaxControlDimension,
+                   "control dimension exceeds CUDA limit", i);
+    RequireAtStage(s.C.rows() <= kMaxMixedConstraints,
+                   "mixed constraint count exceeds CUDA limit", i);
+    RequireAtStage(s.E.rows() <= kMaxStateConstraints,
+                   "state constraint count exceeds CUDA limit", i);
+    RequireAtStage(s.B.rows() == next && s.c.size() == next,
+                   "dynamics shape mismatch", i);
+    RequireAtStage(s.Q.rows() == n && s.Q.cols() == n && s.q.size() == n,
+                   "state-cost shape mismatch", i);
+    RequireAtStage(s.R.rows() == m && s.R.cols() == m && s.r.size() == m,
+                   "control-cost shape mismatch", i);
+    RequireAtStage(s.M.rows() == n && s.M.cols() == m,
+                   "cross-cost shape mismatch", i);
+    RequireAtStage(s.C.cols() == n && s.D.rows() == s.C.rows() &&
+                       s.D.cols() == m && s.d.size() == s.C.rows(),
+                   "mixed-constraint shape mismatch", i);
+    RequireAtStage(s.E.cols() == n && s.e.size() == s.E.rows(),
+                   "state-constraint shape mismatch", i);
     const std::size_t expected_next = i + 1 == count
                                           ? problem.terminal_Q.rows()
                                           : problem.stages[i + 1].A.cols();
-    Require(next == expected_next,
-            "neighboring state dimensions differ at stage " +
-                std::to_string(i));
-    Require(Finite(s.A) && Finite(s.B) && Finite(s.c) && Finite(s.Q) &&
-                Finite(s.R) && Finite(s.M) && Finite(s.q) && Finite(s.r) &&
-                Finite(s.C) && Finite(s.D) && Finite(s.d) && Finite(s.E) &&
-                Finite(s.e),
-            "problem contains a non-finite value at stage " +
-                std::to_string(i));
-  }
-}
-
-void PackMatrix(const Matrix &source, Scalar **host_cursor,
-                Scalar **device_cursor, const Scalar **target) {
-  *target = *device_cursor;
-  for (std::size_t row = 0; row < source.rows(); ++row) {
-    for (std::size_t col = 0; col < source.cols(); ++col) {
-      (*host_cursor)[row * source.cols() + col] = source(row, col);
+    RequireAtStage(next == expected_next,
+                   "neighboring state dimensions differ", i);
+    if (validate_values) {
+      RequireAtStage(Finite(s.A) && Finite(s.B) && Finite(s.c) &&
+                         Finite(s.Q) && Finite(s.R) && Finite(s.M) &&
+                         Finite(s.q) && Finite(s.r) && Finite(s.C) &&
+                         Finite(s.D) && Finite(s.d) && Finite(s.E) &&
+                         Finite(s.e),
+                     "problem contains a non-finite value", i);
     }
   }
-  const std::size_t entries = source.rows() * source.cols();
+}
+
+bool PackScalars(const Scalar *source, std::size_t entries,
+                 Scalar **host_cursor, Scalar **device_cursor,
+                 const Scalar **target) {
+  *target = *device_cursor;
+  bool finite = true;
+  for (std::size_t index = 0; index < entries; ++index) {
+    const Scalar value = source[index];
+    (*host_cursor)[index] = value;
+    finite &= std::isfinite(value);
+  }
   *host_cursor += entries;
   *device_cursor += entries;
+  return finite;
 }
 
-void PackVector(const Vector &source, Scalar **host_cursor,
+bool PackMatrix(const Matrix &source, Scalar **host_cursor,
                 Scalar **device_cursor, const Scalar **target) {
-  *target = *device_cursor;
-  for (std::size_t i = 0; i < source.size(); ++i)
-    (*host_cursor)[i] = source[i];
-  *host_cursor += source.size();
-  *device_cursor += source.size();
+  return PackScalars(source.data().data(), source.rows() * source.cols(),
+                     host_cursor, device_cursor, target);
 }
 
-void PackStage(const Stage &source, Scalar **host_cursor,
+bool PackVector(const Vector &source, Scalar **host_cursor,
+                Scalar **device_cursor, const Scalar **target) {
+  return PackScalars(source.data().data(), source.size(), host_cursor,
+                     device_cursor, target);
+}
+
+bool PackStage(const Stage &source, Scalar **host_cursor,
                Scalar **device_cursor, PackedStage *out) {
   out->n = static_cast<int>(source.A.cols());
   out->next_n = static_cast<int>(source.A.rows());
   out->m = static_cast<int>(source.B.cols());
   out->mixed = static_cast<int>(source.C.rows());
   out->state = static_cast<int>(source.E.rows());
-  PackMatrix(source.A, host_cursor, device_cursor, &out->A);
-  PackMatrix(source.B, host_cursor, device_cursor, &out->B);
-  PackVector(source.c, host_cursor, device_cursor, &out->c);
-  PackMatrix(source.Q, host_cursor, device_cursor, &out->Q);
-  PackMatrix(source.R, host_cursor, device_cursor, &out->R);
-  PackMatrix(source.M, host_cursor, device_cursor, &out->M);
-  PackVector(source.q, host_cursor, device_cursor, &out->q);
-  PackVector(source.r, host_cursor, device_cursor, &out->r);
-  PackMatrix(source.C, host_cursor, device_cursor, &out->C);
-  PackMatrix(source.D, host_cursor, device_cursor, &out->D);
-  PackVector(source.d, host_cursor, device_cursor, &out->d);
-  PackMatrix(source.E, host_cursor, device_cursor, &out->E);
-  PackVector(source.e, host_cursor, device_cursor, &out->e);
+  bool finite = true;
+  finite &= PackMatrix(source.A, host_cursor, device_cursor, &out->A);
+  finite &= PackMatrix(source.B, host_cursor, device_cursor, &out->B);
+  finite &= PackVector(source.c, host_cursor, device_cursor, &out->c);
+  finite &= PackMatrix(source.Q, host_cursor, device_cursor, &out->Q);
+  finite &= PackMatrix(source.R, host_cursor, device_cursor, &out->R);
+  finite &= PackMatrix(source.M, host_cursor, device_cursor, &out->M);
+  finite &= PackVector(source.q, host_cursor, device_cursor, &out->q);
+  finite &= PackVector(source.r, host_cursor, device_cursor, &out->r);
+  finite &= PackMatrix(source.C, host_cursor, device_cursor, &out->C);
+  finite &= PackMatrix(source.D, host_cursor, device_cursor, &out->D);
+  finite &= PackVector(source.d, host_cursor, device_cursor, &out->d);
+  finite &= PackMatrix(source.E, host_cursor, device_cursor, &out->E);
+  finite &= PackVector(source.e, host_cursor, device_cursor, &out->e);
+  return finite;
 }
 
-void PackTerminal(const Problem &problem, Scalar **host_cursor,
+bool PackTerminal(const Problem &problem, Scalar **host_cursor,
                   Scalar **device_cursor, PackedTerminal *out) {
   out->n = static_cast<int>(problem.terminal_Q.rows());
   out->state = static_cast<int>(problem.terminal_E.rows());
-  PackMatrix(problem.terminal_Q, host_cursor, device_cursor, &out->Q);
-  PackVector(problem.terminal_q, host_cursor, device_cursor, &out->q);
-  PackMatrix(problem.terminal_E, host_cursor, device_cursor, &out->E);
-  PackVector(problem.terminal_e, host_cursor, device_cursor, &out->e);
+  bool finite = true;
+  finite &=
+      PackMatrix(problem.terminal_Q, host_cursor, device_cursor, &out->Q);
+  finite &=
+      PackVector(problem.terminal_q, host_cursor, device_cursor, &out->q);
+  finite &=
+      PackMatrix(problem.terminal_E, host_cursor, device_cursor, &out->E);
+  finite &=
+      PackVector(problem.terminal_e, host_cursor, device_cursor, &out->e);
+  return finite;
 }
 
 std::string DeviceFailureMessage(const DeviceStatus &status) {
@@ -2443,7 +2464,7 @@ Scalar ObjectiveFromCompact(const Problem &problem, const int *state_offsets,
 
 Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                     Solution &solution, const Options &options) {
-  ValidateCudaProblem(problem, options);
+  ValidateCudaProblem(problem, options, false);
   int device_count = 0;
   CudaCheck(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
   Require(options.device < device_count, "CUDA device index is out of range");
@@ -2488,19 +2509,24 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &host_stages = workspace.host_stages;
   Scalar *host_problem_cursor = workspace.host_problem_data.data();
   Scalar *device_problem_cursor = workspace.device_problem_data.get();
-  for (std::size_t index = 0; index < problem.stages.size(); ++index)
-    PackStage(problem.stages[index], &host_problem_cursor,
-              &device_problem_cursor, &host_stages[index]);
+  bool finite = true;
+  for (std::size_t index = 0; index < problem.stages.size(); ++index) {
+    finite &= PackStage(problem.stages[index], &host_problem_cursor,
+                        &device_problem_cursor, &host_stages[index]);
+  }
   PackedTerminal &terminal = workspace.host_terminal[0];
-  PackTerminal(problem, &host_problem_cursor, &device_problem_cursor,
-               &terminal);
+  finite &= PackTerminal(problem, &host_problem_cursor, &device_problem_cursor,
+                         &terminal);
   Require(host_problem_cursor == workspace.host_problem_data.data() +
                                      workspace.host_problem_data.size(),
           "internal CUDA problem-packing size mismatch");
   auto &host_initial = workspace.host_initial;
-  std::fill(host_initial.begin(), host_initial.end(), Scalar{0});
-  for (std::size_t i = 0; i < problem.initial_state.size(); ++i)
-    host_initial[i] = problem.initial_state[i];
+  for (std::size_t i = 0; i < problem.initial_state.size(); ++i) {
+    const Scalar value = problem.initial_state[i];
+    host_initial[i] = value;
+    finite &= std::isfinite(value);
+  }
+  Require(finite, "problem contains a non-finite value");
 
   auto &device_stages = workspace.device_stages;
   auto &device_terminal = workspace.device_terminal;
@@ -3210,7 +3236,7 @@ Workspace &Workspace::operator=(Workspace &&other) noexcept {
 void Workspace::Reserve(const Problem &problem, const Options &options) {
   if (!impl_)
     impl_ = std::make_unique<Impl>();
-  detail::ValidateCudaProblem(problem, options);
+  detail::ValidateCudaProblem(problem, options, true);
   int device_count = 0;
   detail::CudaCheck(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
   detail::Require(options.device < device_count,
