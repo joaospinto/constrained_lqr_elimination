@@ -3,6 +3,8 @@ build:linux --cxxopt=-Wall
 build:linux --cxxopt=-Wextra
 build:linux --cxxopt=-Wpedantic
 build:linux --cxxopt=-Werror
+# Keep project warnings fatal without imposing that policy on dependencies.
+build:linux --per_file_copt=external/.*@-Wno-error
 build:linux --cxxopt=-O3
 build:linux --sandbox_add_mount_pair=/tmp
 
@@ -11,6 +13,8 @@ build:macos --cxxopt=-Wall
 build:macos --cxxopt=-Wextra
 build:macos --cxxopt=-Wpedantic
 build:macos --cxxopt=-Werror
+# Keep project warnings fatal without imposing that policy on dependencies.
+build:macos --per_file_copt=external/.*@-Wno-error
 build:macos --cxxopt=-Wno-error=nested-anon-types
 build:macos --cxxopt=-Wno-error=zero-length-array
 build:macos --cxxopt=-O3

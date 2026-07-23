@@ -21,7 +21,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         precision: [fp64, fp32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
@@ -52,7 +52,7 @@ jobs:
       matrix:
         sanitizer: [asan, ubsan]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
