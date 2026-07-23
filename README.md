@@ -1,7 +1,8 @@
 # Constrained LQR Elimination
 
-Sequential CPU implementation of equality-constrained finite-horizon LQR via stagewise affine
-constraint elimination, followed by a standard Riccati solve on the reduced unconstrained problem.
+CPU and optional CUDA implementations of equality-constrained finite-horizon
+LQR via affine constraint elimination, followed by an unconstrained LQR solve
+in reduced coordinates.
 
 The implemented problem form is:
 
@@ -40,6 +41,85 @@ The C++ API uses `clqr::Scalar` throughout. FP64 is the default; FP32 is a
 separate, pure-precision build selected at compile time. Because the scalar
 type is part of the C++ ABI, libraries and clients must use the same precision
 configuration.
+
+## Optional CUDA backend
+
+The CUDA backend implements the parallel form of the same reduction. For a
+horizon of `N` stages, it:
+
+1. contracts and expands a balanced tree of affine feasibility relations to
+   compute every state parameterization `x_i = T_i z_i + t_i`;
+2. eliminates each stage's controls independently in those coordinates;
+3. solves the reduced unconstrained LQR with a balanced conditional-value
+   scan and reconstructs the primal trajectory with an affine-map scan; and
+4. recovers the original equality multipliers with a balanced dual-relation
+   scan, reusing the parameterizations produced by the primal solve.
+
+With fixed per-stage dimension limits, every horizon-dependent device buffer
+has `O(N)` storage and the contraction/expansion trees have fewer than `2N`
+nodes. Problem data, trajectories, reduced states, reduced controls, and dual
+parameters are packed according to each stage's active dimensions. The
+compile-time capacity constants bound only the small dense workspaces used by
+individual kernels; the solver does not pad every stage to those capacities or
+perform arithmetic on padded state and control dimensions.
+
+The conditional-value scan uses the standard positive-definite reduced stage
+control-cost assumption. If a stage violates that local assumption but a
+sequential Riccati recursion still has positive-definite effective control
+Hessians after incorporating future cost, the current CUDA implementation
+uses its device-side sequential Riccati path. `Solution::used_parallel_riccati`
+reports which path was used. The benchmark problems use the parallel path.
+
+The public CUDA API is in `clqr/cuda.h`. Reserve a workspace once when solving
+the same shape repeatedly:
+
+```cpp
+clqr::cuda::Workspace workspace;
+workspace.Reserve(problem);
+clqr::cuda::Solution result;
+clqr::cuda::Solve(problem, workspace, result);
+```
+
+CUDA support is optional. A CUDA-free build provides the same symbols through
+a stub library: `clqr::cuda::Available()` returns false and `Solve` reports an
+invalid-input result without loading the CUDA runtime.
+
+Until the native CUDA targets are migrated to Bazel, build them with CMake:
+
+```sh
+cmake -S . -B build-cuda \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCLQR_ENABLE_CUDA=ON \
+  -DCLQR_PRECISION=FP64 \
+  -DCMAKE_CUDA_ARCHITECTURES=60
+cmake --build build-cuda --parallel
+ctest --test-dir build-cuda --output-on-failure
+```
+
+`CLQR_PRECISION=FP32` builds both the CPU reference and CUDA backend entirely
+in FP32. The four `CLQR_CUDA_MAX_*` CMake cache variables select compile-time
+state, control, mixed-constraint, and state-constraint capacities (each from 1
+through 16). Problems exceeding a configured capacity are rejected before any
+kernel launch.
+
+The CUDA benchmark reuses reserved storage and reports both end-to-end wall
+time and pure kernel time. Wall time includes host packing, all transfers,
+synchronization, kernels, and result construction. `cuda_kernel_ms` sums CUDA
+event intervals containing only kernels; `upload_ms` and `download_ms` cover
+the bulk packed inputs and outputs, while `other_wall_ms` also contains the
+small phase-control transfers and synchronization overhead. Multiplier
+consistency rejection is disabled only while timing so the final KKT residual
+can be reported rather than turning a numerical threshold crossing into a
+missing row.
+
+For a reproducible native-CUDA validation and benchmark run, open
+[`notebooks/kaggle_cuda_benchmark.ipynb`](notebooks/kaggle_cuda_benchmark.ipynb)
+in a fresh Kaggle GPU notebook. It records the machine specification, builds
+the CPU and CUDA implementations in the same precision, runs the CPU,
+kernel-emulation, native-CUDA, Compute Sanitizer, and JAX cross-validation
+tests, and benchmarks all configured horizons. The canonical shell driver is
+[`scripts/notebook_cuda.sh`](scripts/notebook_cuda.sh); the former
+`scripts/colab_t4.sh` name remains as a compatibility wrapper.
 
 Build and test either precision:
 
