@@ -150,6 +150,19 @@ when needed. The canonical shell driver is
 [`scripts/notebook_cuda.sh`](scripts/notebook_cuda.sh); the former
 `scripts/colab_t4.sh` name remains as a compatibility wrapper.
 
+After validating a candidate, compare it against `main` with alternating
+benchmark order:
+
+```sh
+CLQR_CANDIDATE_REVISION=feature/my-candidate \
+CLQR_CUDA_ARCH=60 bash scripts/compare_cuda_revisions.sh
+```
+
+The comparison defaults to three rounds of eleven warmed FP64 solves and
+reports wall, kernel, phase, and CPU/CUDA KKT-residual comparisons. Temporary
+build trees are removed automatically; set `CLQR_KEEP_COMPARE_OUTPUT=1` to
+retain them.
+
 The benchmark does not install or time the JAX implementation. To run the
 additional solution-level JAX cross-validation diagnostic, set
 `CLQR_RUN_JAX_CROSS_VALIDATION=1`; `CLQR_JAX_REVISION` can override its pinned

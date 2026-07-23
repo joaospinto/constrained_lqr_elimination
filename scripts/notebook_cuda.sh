@@ -36,42 +36,10 @@ run_native_test() {
   timeout --signal=TERM "${native_test_timeout_seconds}s" "${command[@]}"
 }
 
-bazelisk_version=1.29.0
-bazelisk_sha256=5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992
-bazel_command="${CLQR_BAZEL:-}"
-required_bazel_version="$(<"${repo_dir}/.bazelversion")"
-
-if [[ -z "${bazel_command}" ]] && command -v bazelisk >/dev/null 2>&1; then
-  bazel_command="$(command -v bazelisk)"
-fi
-if [[ -z "${bazel_command}" ]] && command -v bazel >/dev/null 2>&1 &&
-   [[ "$(bazel --version 2>/dev/null)" == "bazel ${required_bazel_version}" ]]; then
-  bazel_command="$(command -v bazel)"
-fi
-if [[ -z "${bazel_command}" ]]; then
-  case "$(uname -m)" in
-    x86_64|amd64) bazelisk_asset=bazelisk-linux-amd64 ;;
-    *)
-      echo "automatic Bazelisk bootstrap supports x86-64 Linux only; set CLQR_BAZEL" >&2
-      exit 2
-      ;;
-  esac
-  tool_dir="${notebook_work_dir}/clqr_tools"
-  bazel_command="${tool_dir}/bazelisk-${bazelisk_version}"
-  if [[ ! -x "${bazel_command}" ]] ||
-     ! printf '%s  %s\n' "${bazelisk_sha256}" "${bazel_command}" |
-       sha256sum --check --status; then
-    mkdir -p "${tool_dir}"
-    bazelisk_tmp="${bazel_command}.tmp"
-    curl --fail --location --silent --show-error \
-      "https://github.com/bazelbuild/bazelisk/releases/download/v${bazelisk_version}/${bazelisk_asset}" \
-      --output "${bazelisk_tmp}"
-    printf '%s  %s\n' "${bazelisk_sha256}" "${bazelisk_tmp}" |
-      sha256sum --check
-    chmod +x "${bazelisk_tmp}"
-    mv "${bazelisk_tmp}" "${bazel_command}"
-  fi
-fi
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/notebook_bazel.sh
+source "${script_dir}/notebook_bazel.sh"
+bazel_command="$(clqr_notebook_bazel "${repo_dir}" "${notebook_work_dir}")"
 
 if ! command -v nvcc >/dev/null 2>&1; then
   echo "nvcc is unavailable; select a CUDA GPU runtime first." >&2
