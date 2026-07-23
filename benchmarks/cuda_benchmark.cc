@@ -130,6 +130,38 @@ Scalar MaxKktResidual(const Problem &problem,
   return std::max(residual, BenchmarkMaxAbs(terminal_gradient));
 }
 
+Vector CopyVectorView(const clqr::VectorView &view) {
+  Vector copy(view.size);
+  for (std::size_t index = 0; index < view.size; ++index)
+    copy[index] = view[index];
+  return copy;
+}
+
+std::vector<Vector> CopyVectorViews(const clqr::VectorView *views,
+                                    std::size_t count) {
+  std::vector<Vector> copies;
+  copies.reserve(count);
+  for (std::size_t index = 0; index < count; ++index)
+    copies.push_back(CopyVectorView(views[index]));
+  return copies;
+}
+
+clqr::cuda::Solution CopyCpuSolution(const clqr::SolutionView &view) {
+  clqr::cuda::Solution copy;
+  copy.states = CopyVectorViews(view.states, view.state_count);
+  copy.controls = CopyVectorViews(view.controls, view.control_count);
+  copy.initial_multiplier = CopyVectorView(view.initial_multiplier);
+  copy.dynamics_multipliers = CopyVectorViews(
+      view.dynamics_multipliers, view.dynamics_multiplier_count);
+  copy.mixed_multipliers =
+      CopyVectorViews(view.mixed_multipliers, view.mixed_multiplier_count);
+  copy.state_multipliers =
+      CopyVectorViews(view.state_multipliers, view.state_multiplier_count);
+  copy.terminal_state_multiplier =
+      CopyVectorView(view.terminal_state_multiplier);
+  return copy;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -188,7 +220,7 @@ int main(int argc, char **argv) {
     std::cout << "# CPU columns are nan above N=" << cpu_max_horizon << ".\n";
   }
   std::cout << "# Multiplier consistency rejection is disabled while timing; "
-               "kkt_residual reports the final repeated solution's "
+               "the KKT residuals report the final repeated solutions' "
                "accuracy.\n";
   std::cout << "N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_internal_ms,"
                "cuda_kernel_ms,wall_speedup,kernel_speedup,other_wall_ms,"
@@ -197,19 +229,20 @@ int main(int argc, char **argv) {
                "unattributed_internal_ms,upload_ms,"
                "feasibility_ms,reduction_ms,riccati_ms,reconstruction_ms,"
                "multiplier_ms,download_ms,min_reduced_n,"
-               "min_reduced_m,cuda_kkt_residual\n";
+               "min_reduced_m,cpp_kkt_residual,cuda_kkt_residual\n";
   clqr::cuda::Workspace cuda_workspace;
   int completed_horizons = 0;
   for (std::size_t horizon : horizons) {
     Problem problem = clqr::benchmark::StateOnlyProblem(horizon, n, m, p);
     clqr::Workspace workspace;
+    clqr::SolutionView cpu_view;
     const bool run_cpu = horizon <= cpu_max_horizon;
     if (run_cpu) {
       workspace.Reserve(problem);
-      const clqr::SolutionView cpu = clqr::Solve(problem, workspace);
-      if (cpu.status != clqr::SolveStatus::kOptimal) {
-        std::cerr << "CPU warmup failed at N=" << horizon << ": " << cpu.message
-                  << "\n";
+      cpu_view = clqr::Solve(problem, workspace);
+      if (cpu_view.status != clqr::SolveStatus::kOptimal) {
+        std::cerr << "CPU warmup failed at N=" << horizon << ": "
+                  << cpu_view.message << "\n";
         return 1;
       }
     }
@@ -248,9 +281,9 @@ int main(int argc, char **argv) {
     for (int repeat = 0; repeat < repeats; ++repeat) {
       if (run_cpu) {
         const auto cpu_start = Clock::now();
-        const clqr::SolutionView cpu = clqr::Solve(problem, workspace);
+        cpu_view = clqr::Solve(problem, workspace);
         const auto cpu_stop = Clock::now();
-        if (cpu.status != clqr::SolveStatus::kOptimal)
+        if (cpu_view.status != clqr::SolveStatus::kOptimal)
           return 1;
         cpu_times.push_back(
             std::chrono::duration<double, std::milli>(cpu_stop - cpu_start)
@@ -312,7 +345,10 @@ int main(int argc, char **argv) {
       min_reduced_m =
           std::min(min_reduced_m, gpu_view.reduced_control_dimensions[index]);
     clqr::cuda::Materialize(gpu_view, gpu);
-    const Scalar kkt_residual = MaxKktResidual(problem, gpu);
+    const Scalar cpu_kkt_residual =
+        run_cpu ? MaxKktResidual(problem, CopyCpuSolution(cpu_view))
+                : std::numeric_limits<Scalar>::quiet_NaN();
+    const Scalar cuda_kkt_residual = MaxKktResidual(problem, gpu);
     std::cout << horizon << ',' << n << ',' << m << ',' << p << ',' << repeats
               << ',' << std::fixed << std::setprecision(6) << cpu_ms << ','
               << gpu_wall_ms << ',' << gpu_internal_ms << ',' << gpu_kernel_ms
@@ -327,8 +363,9 @@ int main(int argc, char **argv) {
               << Median(feasibility) << ',' << Median(reduction) << ','
               << Median(riccati) << ',' << Median(reconstruction) << ','
               << Median(multiplier) << ',' << Median(download) << ','
-              << min_reduced_n << ',' << min_reduced_m << ',' << std::scientific
-              << kkt_residual << '\n';
+              << min_reduced_n << ',' << min_reduced_m << ','
+              << std::scientific << cpu_kkt_residual << ','
+              << cuda_kkt_residual << '\n';
     ++completed_horizons;
   }
   return completed_horizons == 0 ? 1 : 0;
