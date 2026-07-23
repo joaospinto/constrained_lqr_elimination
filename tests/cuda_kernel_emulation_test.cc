@@ -463,6 +463,9 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
 void RunEmulation(const Problem &problem, const std::string &name,
                   bool expect_reduced_state, bool expect_reduced_control,
                   bool compare_cpu = true) {
+#ifdef CLQR_USE_FLOAT
+  (void)compare_cpu;
+#endif
   const int horizon = static_cast<int>(problem.stages.size());
   const int nodes = horizon + 1;
   std::vector<Scalar> packed_data(PackedEntries(problem));
