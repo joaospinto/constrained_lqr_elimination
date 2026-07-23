@@ -33,6 +33,27 @@ build -c opt
 build:fp64 --define=clqr_precision=fp64
 build:fp32 --define=clqr_precision=fp32
 
+# Keep native CUDA targets out of ordinary CPU builds. They become compatible
+# when --config=cuda is selected.
+build --@rules_cuda//cuda:enable=false
+build:cuda --@rules_cuda//cuda:enable=true
+build:cuda --@rules_cuda//cuda:compiler=nvcc
+
+# Friendly aliases for the rules_cuda architecture flag and the four validated
+# (1--16) dense-workspace capacities.
+common --flag_alias=cuda_archs=@rules_cuda//cuda:archs
+common --flag_alias=cuda_max_state_dimension=//:cuda_max_state_dimension
+common --flag_alias=cuda_max_control_dimension=//:cuda_max_control_dimension
+common --flag_alias=cuda_max_mixed_constraints=//:cuda_max_mixed_constraints
+common --flag_alias=cuda_max_state_constraints=//:cuda_max_state_constraints
+
+# Benchmark capacities match n=8, m=4, and two constraints of each kind.
+build:cuda-benchmark --config=cuda
+build:cuda-benchmark --cuda_max_state_dimension=8
+build:cuda-benchmark --cuda_max_control_dimension=4
+build:cuda-benchmark --cuda_max_mixed_constraints=2
+build:cuda-benchmark --cuda_max_state_constraints=2
+
 common --enable_platform_specific_config
 
 # Set minimum supported MacOS version to 11.0.

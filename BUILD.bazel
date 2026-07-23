@@ -3,7 +3,19 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_test")
 load("@clqr_pip//:requirements.bzl", "requirement")
+load(
+    "@rules_cuda//cuda:defs.bzl",
+    "cuda_library",
+    "requires_cuda",
+)
 load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
+load(
+    "//:cuda_config.bzl",
+    "cuda_capacity_defines",
+    "declare_cuda_capacity_flags",
+)
+
+declare_cuda_capacity_flags()
 
 config_setting(
     name = "fp32",
@@ -19,6 +31,8 @@ config_setting(
     name = "macos",
     constraint_values = ["@platforms//os:osx"],
 )
+
+CUDA_CAPACITY_DEFINES = cuda_capacity_defines()
 
 cc_library(
     name = "clqr",
@@ -48,6 +62,120 @@ cc_test(
     name = "workspace_allocation_test",
     srcs = ["tests/workspace_allocation_test.cc"],
     deps = [":clqr"],
+)
+
+cc_library(
+    name = "clqr_cuda_stub",
+    srcs = ["src/cuda_stub.cc"],
+    hdrs = ["include/clqr/cuda.h"],
+    defines = CUDA_CAPACITY_DEFINES,
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [":clqr"],
+)
+
+cc_test(
+    name = "cuda_stub_test",
+    srcs = ["tests/cuda_stub_test.cc"],
+    deps = [":clqr_cuda_stub"],
+)
+
+cuda_library(
+    name = "clqr_cuda",
+    srcs = ["src/cuda_solver.cu"],
+    hdrs = [
+        "include/clqr/cuda.h",
+        "src/cuda_internal.h",
+    ],
+    alwayslink = True,
+    copts = [
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-Wno-deprecated-gpu-targets",
+    ],
+    defines = CUDA_CAPACITY_DEFINES,
+    # rules_cuda keeps CUDA and host compilation definitions separate.
+    # Export the capacities through CcInfo as well so every C++ client sees
+    # the same public constants as cuda_solver.cu.
+    host_defines = CUDA_CAPACITY_DEFINES,
+    host_copts = ["-std=c++17"],
+    includes = ["include"],
+    target_compatible_with = requires_cuda(),
+    visibility = ["//visibility:public"],
+    deps = [":clqr"],
+)
+
+cc_test(
+    name = "cuda_solver_test",
+    srcs = [
+        "benchmarks/cuda_benchmark_problem.h",
+        "tests/cuda_solver_test.cc",
+    ],
+    tags = [
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = requires_cuda(),
+    deps = [":clqr_cuda"],
+)
+
+cc_binary(
+    name = "clqr_cuda_jax_fixture",
+    srcs = [
+        "tests/cuda_jax_fixture.cc",
+        "tests/cuda_jax_problem.h",
+    ],
+    tags = ["manual"],
+    target_compatible_with = requires_cuda(),
+    deps = [":clqr_cuda"],
+)
+
+cc_binary(
+    name = "clqr_cuda_benchmark",
+    srcs = [
+        "benchmarks/cuda_benchmark.cc",
+        "benchmarks/cuda_benchmark_problem.h",
+    ],
+    tags = ["manual"],
+    target_compatible_with = requires_cuda(),
+    deps = [":clqr_cuda"],
+)
+
+cc_library(
+    name = "cuda_kernel_emulation_sources",
+    hdrs = [
+        "include/clqr/cuda.h",
+        "src/cuda_internal.h",
+        "tests/emulated_cuda/cuda_runtime.h",
+    ],
+    includes = [
+        "include",
+        "tests/emulated_cuda",
+    ],
+    defines = CUDA_CAPACITY_DEFINES,
+    textual_hdrs = ["src/cuda_solver.cu"],
+    deps = [":clqr"],
+)
+
+cc_test(
+    name = "cuda_kernel_emulation_test",
+    srcs = [
+        "benchmarks/cuda_benchmark_problem.h",
+        "tests/cuda_jax_problem.h",
+        "tests/cuda_kernel_emulation_test.cc",
+    ],
+    # The emulator executes every CUDA block with one host thread. GCC and
+    # Clang cannot infer that thread zero initializes each emulated __shared__
+    # scalar before the no-op synchronization barrier.
+    copts = select({
+        ":linux": ["-Wno-maybe-uninitialized"],
+        ":macos": ["-Wno-sometimes-uninitialized"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":clqr",
+        ":cuda_kernel_emulation_sources",
+    ],
 )
 
 nanobind_extension(

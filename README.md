@@ -1,7 +1,8 @@
 # Constrained LQR Elimination
 
-Sequential CPU implementation of equality-constrained finite-horizon LQR via stagewise affine
-constraint elimination, followed by a standard Riccati solve on the reduced unconstrained problem.
+CPU and CUDA implementations of equality-constrained finite-horizon
+LQR via affine constraint elimination, followed by an unconstrained LQR solve
+in reduced coordinates.
 
 The implemented problem form is:
 
@@ -40,6 +41,102 @@ The C++ API uses `clqr::Scalar` throughout. FP64 is the default; FP32 is a
 separate, pure-precision build selected at compile time. Because the scalar
 type is part of the C++ ABI, libraries and clients must use the same precision
 configuration.
+
+## CUDA backend
+
+The CUDA backend implements the parallel form of the same reduction. For a
+horizon of `N` stages, it:
+
+1. contracts and expands a balanced tree of affine feasibility relations to
+   compute every state parameterization `x_i = T_i z_i + t_i`;
+2. eliminates each stage's controls independently in those coordinates;
+3. solves the reduced unconstrained LQR with a balanced conditional-value
+   scan and reconstructs the primal trajectory with an affine-map scan; and
+4. recovers the original equality multipliers with a balanced dual-relation
+   scan, reusing the parameterizations produced by the primal solve.
+
+With fixed per-stage dimension limits, every horizon-dependent device buffer
+has `O(N)` storage. Problem data, trajectories, reduced trajectories, and scan
+coefficient buffers are packed according to their active dimensions. Some
+per-stage parameterization and factor records reserve fixed-capacity inline
+arrays, and the compile-time capacity constants also bound each kernel's dense
+workspace. Kernels nevertheless loop over and factor only the active state,
+control, constraint, and reduced dimensions; no padded dense algebra is
+performed.
+
+Every horizon-dependent device dependency is a balanced-tree reduction or
+expansion. Feasibility propagation, the conditional-value solve, primal
+reconstruction, and multiplier recovery each use at most a constant multiple
+of `ceil(log2(N + 1))` kernel rounds plus a constant number of independent
+per-stage kernels. No device kernel iterates over the horizon. Consequently,
+for fixed local dimensions, the device algorithm has `O(log N)` parallel time,
+`O(N)` work, and `O(N)` storage. End-to-end API wall time additionally includes
+serial host packing, compact-storage planning, transfers, and result
+construction; these costs are reported separately from pure kernel time.
+
+The conditional-value scan requires every reduced stage control Hessian to be
+positive definite, as in the standard convex LQR setting. A problem violating
+this regularity condition is reported as a numerical failure; the CUDA backend
+does not contain a horizon-sequential Riccati compatibility path.
+
+The public CUDA API is in `clqr/cuda.h`. Reserve a workspace once when solving
+the same shape repeatedly:
+
+```cpp
+clqr::cuda::Workspace workspace;
+workspace.Reserve(problem);
+clqr::cuda::Solution result;
+clqr::cuda::Solve(problem, workspace, result);
+```
+
+A CPU-only build provides the same symbols through a stub library:
+`clqr::cuda::Available()` returns false and `Solve` reports an invalid-input
+result without loading the CUDA runtime.
+
+Build and test the native backend with Bazel. For example, target a P100
+(`sm_60`) in FP64 with the benchmark capacities:
+
+```sh
+bazel test //:cuda_solver_test \
+  --config=fp64 \
+  --config=cuda-benchmark \
+  --cuda_archs=sm_60 \
+  --test_output=errors
+```
+
+`--config=fp32` builds both the CPU reference and CUDA backend entirely in
+FP32. The `--cuda_max_state_dimension`, `--cuda_max_control_dimension`,
+`--cuda_max_mixed_constraints`, and `--cuda_max_state_constraints` flags select
+compile-time capacities from 1 through 16. `--config=cuda-benchmark` sets these
+to 8, 4, 2, and 2, respectively. Problems exceeding a configured capacity are
+rejected before any kernel launch. The combined capacities must also fit the
+portable 48 KiB per-block shared-memory budget; an oversized combination is
+rejected at compile time.
+
+The CUDA benchmark reuses reserved storage and reports both end-to-end wall
+time and pure kernel time. Wall time includes host packing, all transfers,
+synchronization, kernels, and result construction. `cuda_kernel_ms` sums CUDA
+event intervals containing only kernels; `upload_ms` and `download_ms` cover
+the bulk packed inputs and outputs, while `other_wall_ms` also contains the
+small phase-control transfers and synchronization overhead. Multiplier
+consistency rejection is disabled only while timing so the final KKT residual
+can be reported rather than turning a numerical threshold crossing into a
+missing row.
+
+For a reproducible native-CUDA validation and benchmark run, open
+[`notebooks/kaggle_cuda_benchmark.ipynb`](notebooks/kaggle_cuda_benchmark.ipynb)
+in a fresh Kaggle GPU notebook. It records the machine specification, builds
+the CPU and CUDA implementations in the same precision, runs the CPU,
+kernel-emulation, native-CUDA, and Compute Sanitizer tests, and benchmarks all
+configured horizons. It bootstraps the Bazel version pinned in `.bazelversion`
+when needed. The canonical shell driver is
+[`scripts/notebook_cuda.sh`](scripts/notebook_cuda.sh); the former
+`scripts/colab_t4.sh` name remains as a compatibility wrapper.
+
+The benchmark does not install or time the JAX implementation. To run the
+additional solution-level JAX cross-validation diagnostic, set
+`CLQR_RUN_JAX_CROSS_VALIDATION=1`; `CLQR_JAX_REVISION` can override its pinned
+reference revision.
 
 Build and test either precision:
 
