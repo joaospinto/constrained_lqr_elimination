@@ -27,6 +27,9 @@ build:windows --sandbox_add_mount_pair=C:\Temp
 
 build -c opt
 
+build:fp64 --define=clqr_precision=fp64
+build:fp32 --define=clqr_precision=fp32
+
 common --enable_platform_specific_config
 
 # Set minimum supported MacOS version to 11.0.

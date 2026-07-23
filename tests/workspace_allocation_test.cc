@@ -1,10 +1,10 @@
-#include "clqr/clqr.h"
-
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
 #include <new>
 #include <vector>
+
+#include "clqr/clqr.h"
 
 namespace {
 
@@ -41,6 +41,7 @@ void StopCounting() {
 
 using clqr::Matrix;
 using clqr::Problem;
+using clqr::Scalar;
 using clqr::SolutionView;
 using clqr::Solve;
 using clqr::SolveStatus;
@@ -48,11 +49,12 @@ using clqr::Stage;
 using clqr::Vector;
 using clqr::Workspace;
 
-Problem MakeProblem(std::size_t stages, std::size_t state_dim, std::size_t control_dim) {
+Problem MakeProblem(std::size_t stages, std::size_t state_dim,
+                    std::size_t control_dim) {
   Problem problem;
   problem.initial_state = Vector(state_dim);
   for (std::size_t i = 0; i < state_dim; ++i) {
-    problem.initial_state[i] = 0.1 * static_cast<double>(i + 1);
+    problem.initial_state[i] = 0.1 * static_cast<Scalar>(i + 1);
   }
   problem.stages.resize(stages);
   for (std::size_t i = 0; i < stages; ++i) {
@@ -60,13 +62,14 @@ Problem MakeProblem(std::size_t stages, std::size_t state_dim, std::size_t contr
     stage.A = Matrix(state_dim, state_dim);
     for (std::size_t row = 0; row < state_dim; ++row) {
       for (std::size_t col = 0; col < state_dim; ++col) {
-        stage.A(row, col) = row == col ? 0.9 : 0.02 * static_cast<double>(row + col + 1);
+        stage.A(row, col) =
+            row == col ? 0.9 : 0.02 * static_cast<Scalar>(row + col + 1);
       }
     }
     stage.B = Matrix(state_dim, control_dim);
     for (std::size_t row = 0; row < state_dim; ++row) {
       for (std::size_t col = 0; col < control_dim; ++col) {
-        stage.B(row, col) = 0.03 * static_cast<double>((row + 1) * (col + 1));
+        stage.B(row, col) = 0.03 * static_cast<Scalar>((row + 1) * (col + 1));
       }
     }
     stage.c = Vector(state_dim);
@@ -84,7 +87,8 @@ Problem MakeProblem(std::size_t stages, std::size_t state_dim, std::size_t contr
     stage.e = Vector(0);
   }
   problem.terminal_Q = Matrix(state_dim, state_dim);
-  for (std::size_t row = 0; row < state_dim; ++row) problem.terminal_Q(row, row) = 1.5;
+  for (std::size_t row = 0; row < state_dim; ++row)
+    problem.terminal_Q(row, row) = 1.5;
   problem.terminal_q = Vector(state_dim);
   problem.terminal_E = Matrix(0, state_dim);
   problem.terminal_e = Vector(0);
@@ -128,47 +132,61 @@ int main() {
   owned.Reserve(problem);
   SolutionView owned_solution = Solve(problem, owned);
   StopCounting();
-  const std::size_t owned_allocations = g_allocations.load(std::memory_order_relaxed);
+  const std::size_t owned_allocations =
+      g_allocations.load(std::memory_order_relaxed);
   const std::size_t owned_bytes = g_bytes.load(std::memory_order_relaxed);
-  Expect(owned_solution.status == SolveStatus::kOptimal, "owned workspace solve status");
-  Expect(owned_allocations == 1, "owned workspace should allocate exactly once");
+  Expect(owned_solution.status == SolveStatus::kOptimal,
+         "owned workspace solve status");
+  Expect(owned_allocations == 1,
+         "owned workspace should allocate exactly once");
 
   std::vector<unsigned char> memory(Workspace::RequiredBytes(problem));
   Workspace external(memory.data(), memory.size());
   StartCounting();
   SolutionView external_solution = Solve(problem, external);
   StopCounting();
-  const std::size_t external_allocations = g_allocations.load(std::memory_order_relaxed);
+  const std::size_t external_allocations =
+      g_allocations.load(std::memory_order_relaxed);
   const std::size_t external_bytes = g_bytes.load(std::memory_order_relaxed);
-  Expect(external_solution.status == SolveStatus::kOptimal, "external workspace solve status");
-  Expect(external_allocations == 0, "external workspace solve should not allocate");
+  Expect(external_solution.status == SolveStatus::kOptimal,
+         "external workspace solve status");
+  Expect(external_allocations == 0,
+         "external workspace solve should not allocate");
 
   Problem constrained = MakeConstrainedProblem(16, 4, 2);
   constexpr std::size_t kConstrainedBytes =
       Workspace::RequiredBytesUniformConstrained(16, 4, 2, 1);
-  static_assert(kConstrainedBytes > 0, "constrained workspace size must be positive");
-  const std::size_t constrained_required = Workspace::RequiredBytes(constrained);
+  static_assert(kConstrainedBytes > 0,
+                "constrained workspace size must be positive");
+  const std::size_t constrained_required =
+      Workspace::RequiredBytes(constrained);
   Expect(Workspace::RequiredBytes(constrained) <= kConstrainedBytes,
          "constrained constexpr workspace byte count");
   Workspace constrained_owned;
   StartCounting();
   constrained_owned.Reserve(constrained);
-  SolutionView constrained_owned_solution = Solve(constrained, constrained_owned);
+  SolutionView constrained_owned_solution =
+      Solve(constrained, constrained_owned);
   StopCounting();
   const std::size_t constrained_owned_allocations =
       g_allocations.load(std::memory_order_relaxed);
-  const std::size_t constrained_owned_bytes = g_bytes.load(std::memory_order_relaxed);
+  const std::size_t constrained_owned_bytes =
+      g_bytes.load(std::memory_order_relaxed);
   Expect(constrained_owned_solution.status == SolveStatus::kOptimal,
          "constrained owned workspace solve status");
 
-  std::vector<unsigned char> constrained_memory(Workspace::RequiredBytes(constrained));
-  Workspace constrained_external(constrained_memory.data(), constrained_memory.size());
+  std::vector<unsigned char> constrained_memory(
+      Workspace::RequiredBytes(constrained));
+  Workspace constrained_external(constrained_memory.data(),
+                                 constrained_memory.size());
   StartCounting();
-  SolutionView constrained_external_solution = Solve(constrained, constrained_external);
+  SolutionView constrained_external_solution =
+      Solve(constrained, constrained_external);
   StopCounting();
   const std::size_t constrained_external_allocations =
       g_allocations.load(std::memory_order_relaxed);
-  const std::size_t constrained_external_bytes = g_bytes.load(std::memory_order_relaxed);
+  const std::size_t constrained_external_bytes =
+      g_bytes.load(std::memory_order_relaxed);
   Expect(constrained_external_solution.status == SolveStatus::kOptimal,
          "constrained external workspace solve status");
 
@@ -185,29 +203,36 @@ int main() {
   terminal_constrained.terminal_E = Matrix(1, 3);
   terminal_constrained.terminal_E(0, 0) = 1.0;
   terminal_constrained.terminal_e = Vector(1);
-  const std::size_t terminal_required = Workspace::RequiredBytes(terminal_constrained);
+  const std::size_t terminal_required =
+      Workspace::RequiredBytes(terminal_constrained);
   std::vector<unsigned char> terminal_memory(terminal_required);
   Workspace terminal_external(terminal_memory.data(), terminal_memory.size());
   StartCounting();
-  SolutionView terminal_solution = Solve(terminal_constrained, terminal_external);
+  SolutionView terminal_solution =
+      Solve(terminal_constrained, terminal_external);
   StopCounting();
   const std::size_t terminal_external_allocations =
       g_allocations.load(std::memory_order_relaxed);
-  const std::size_t terminal_external_bytes = g_bytes.load(std::memory_order_relaxed);
+  const std::size_t terminal_external_bytes =
+      g_bytes.load(std::memory_order_relaxed);
   Expect(terminal_solution.status == SolveStatus::kOptimal,
          "terminal constrained workspace solve status");
 
-  std::cout << "owned_allocations=" << owned_allocations << " owned_bytes=" << owned_bytes
+  std::cout << "owned_allocations=" << owned_allocations
+            << " owned_bytes=" << owned_bytes
             << " external_allocations=" << external_allocations
             << " external_bytes=" << external_bytes
             << " constrained_required=" << constrained_required
             << " constrained_constexpr=" << kConstrainedBytes
-            << " constrained_owned_allocations=" << constrained_owned_allocations
+            << " constrained_owned_allocations="
+            << constrained_owned_allocations
             << " constrained_owned_bytes=" << constrained_owned_bytes
-            << " constrained_external_allocations=" << constrained_external_allocations
+            << " constrained_external_allocations="
+            << constrained_external_allocations
             << " constrained_external_bytes=" << constrained_external_bytes
             << " terminal_required=" << terminal_required
-            << " terminal_external_allocations=" << terminal_external_allocations
+            << " terminal_external_allocations="
+            << terminal_external_allocations
             << " terminal_external_bytes=" << terminal_external_bytes << "\n";
   Expect(constrained_owned_allocations == 1,
          "constrained owned workspace should allocate exactly once");

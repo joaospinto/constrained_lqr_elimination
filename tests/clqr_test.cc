@@ -13,6 +13,7 @@ namespace {
 
 using clqr::Matrix;
 using clqr::Problem;
+using clqr::Scalar;
 using clqr::SolutionView;
 using clqr::Solve;
 using clqr::SolveStatus;
@@ -21,7 +22,17 @@ using clqr::Vector;
 using clqr::VectorView;
 using clqr::Workspace;
 
-constexpr double kTol = 1e-7;
+#ifdef CLQR_USE_FLOAT
+constexpr Scalar kTol = 2e-4f;
+// The elimination pullback accumulates more rounding error in the dual
+// variables than in the primal trajectory when every operation is FP32.
+constexpr Scalar kKktTol = 6e-4f;
+constexpr Scalar kLinearSolveTolerance = 1e-7f;
+#else
+constexpr Scalar kTol = 1e-7;
+constexpr Scalar kKktTol = kTol;
+constexpr Scalar kLinearSolveTolerance = 1e-10;
+#endif
 
 struct Solution {
   SolveStatus status = SolveStatus::kInvalidInput;
@@ -36,7 +47,7 @@ struct Solution {
   bool newton_kkt_singular = false;
   bool newton_kkt_wrong_inertia = false;
   std::string newton_kkt_diagnostic;
-  double objective = 0.0;
+  Scalar objective = 0.0;
 };
 
 void Expect(bool condition, const std::string& message) {
@@ -46,27 +57,30 @@ void Expect(bool condition, const std::string& message) {
   }
 }
 
-void ExpectNear(double actual, double expected, double tol, const std::string& message) {
+void ExpectNear(Scalar actual, Scalar expected, Scalar tol,
+                const std::string& message) {
   if (std::abs(actual - expected) > tol) {
-    std::cerr << "FAIL: " << message << ": actual=" << actual << " expected=" << expected
-              << "\n";
+    std::cerr << "FAIL: " << message << ": actual=" << actual
+              << " expected=" << expected << "\n";
     std::exit(1);
   }
 }
 
-void ExpectVectorNear(const Vector& actual, const Vector& expected, double tol,
+void ExpectVectorNear(const Vector& actual, const Vector& expected, Scalar tol,
                       const std::string& message) {
   Expect(actual.size() == expected.size(), message + " size mismatch");
   for (std::size_t i = 0; i < actual.size(); ++i) {
-    ExpectNear(actual[i], expected[i], tol, message + "[" + std::to_string(i) + "]");
+    ExpectNear(actual[i], expected[i], tol,
+               message + "[" + std::to_string(i) + "]");
   }
 }
 
-void ExpectVectorViewNear(const VectorView& actual, const Vector& expected, double tol,
-                          const std::string& message) {
+void ExpectVectorViewNear(const VectorView& actual, const Vector& expected,
+                          Scalar tol, const std::string& message) {
   Expect(actual.size == expected.size(), message + " size mismatch");
   for (std::size_t i = 0; i < actual.size; ++i) {
-    ExpectNear(actual[i], expected[i], tol, message + "[" + std::to_string(i) + "]");
+    ExpectNear(actual[i], expected[i], tol,
+               message + "[" + std::to_string(i) + "]");
   }
 }
 
@@ -81,7 +95,8 @@ Solution CopySolutionView(const SolutionView& view) {
   out.status = view.status;
   out.message = view.message;
   out.states.resize(view.state_count);
-  for (std::size_t i = 0; i < view.state_count; ++i) out.states[i] = CopyVectorView(view.states[i]);
+  for (std::size_t i = 0; i < view.state_count; ++i)
+    out.states[i] = CopyVectorView(view.states[i]);
   out.controls.resize(view.control_count);
   for (std::size_t i = 0; i < view.control_count; ++i) {
     out.controls[i] = CopyVectorView(view.controls[i]);
@@ -99,7 +114,8 @@ Solution CopySolutionView(const SolutionView& view) {
   for (std::size_t i = 0; i < view.state_multiplier_count; ++i) {
     out.state_multipliers[i] = CopyVectorView(view.state_multipliers[i]);
   }
-  out.terminal_state_multiplier = CopyVectorView(view.terminal_state_multiplier);
+  out.terminal_state_multiplier =
+      CopyVectorView(view.terminal_state_multiplier);
   out.objective = view.objective;
   out.newton_kkt_singular = view.newton_kkt_singular;
   out.newton_kkt_wrong_inertia = view.newton_kkt_wrong_inertia;
@@ -107,8 +123,9 @@ Solution CopySolutionView(const SolutionView& view) {
   return out;
 }
 
-Solution SolveWithWorkspace(const Problem& p,
-                            const clqr::SolveOptions& options = clqr::SolveOptions{}) {
+Solution SolveWithWorkspace(
+    const Problem& p,
+    const clqr::SolveOptions& options = clqr::SolveOptions{}) {
   Workspace workspace;
   workspace.Reserve(p, options);
   return CopySolutionView(Solve(p, workspace, options));
@@ -117,34 +134,39 @@ Solution SolveWithWorkspace(const Problem& p,
 void ExpectDiagnostics(const Solution& sol, bool singular, bool wrong_inertia,
                        const std::string& message) {
   Expect(sol.newton_kkt_singular == singular, message + " singular diagnostic");
-  Expect(sol.newton_kkt_wrong_inertia == wrong_inertia, message + " inertia diagnostic");
+  Expect(sol.newton_kkt_wrong_inertia == wrong_inertia,
+         message + " inertia diagnostic");
 }
 
-double MaxAbsVector(const Vector& x) {
-  double out = 0.0;
-  for (std::size_t i = 0; i < x.size(); ++i) out = std::max(out, std::abs(x[i]));
+Scalar MaxAbsVector(const Vector& x) {
+  Scalar out = 0.0;
+  for (std::size_t i = 0; i < x.size(); ++i)
+    out = std::max(out, std::abs(x[i]));
   return out;
 }
 
-double MaxAbsDifference(const Vector& a, const Vector& b) {
+Scalar MaxAbsDifference(const Vector& a, const Vector& b) {
   Expect(a.size() == b.size(), "difference size mismatch");
-  double out = 0.0;
-  for (std::size_t i = 0; i < a.size(); ++i) out = std::max(out, std::abs(a[i] - b[i]));
+  Scalar out = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    out = std::max(out, std::abs(a[i] - b[i]));
   return out;
 }
 
 void Accumulate(Matrix matrix, Vector multiplier, Vector* into) {
-  Expect(matrix.rows() == multiplier.size(), "accumulate multiplier size mismatch");
+  Expect(matrix.rows() == multiplier.size(),
+         "accumulate multiplier size mismatch");
   Expect(matrix.cols() == into->size(), "accumulate target size mismatch");
   Vector term = Transpose(matrix) * multiplier;
   for (std::size_t i = 0; i < into->size(); ++i) (*into)[i] += term[i];
 }
 
-double MaxKktStationarityResidual(const Problem& p, const Solution& sol) {
+Scalar MaxKktStationarityResidual(const Problem& p, const Solution& sol) {
   const std::size_t N = p.stages.size();
-  double residual = 0.0;
+  Scalar residual = 0.0;
   if (N == 0) {
-    Vector grad = p.terminal_Q * sol.states[0] + p.terminal_q + sol.initial_multiplier;
+    Vector grad =
+        p.terminal_Q * sol.states[0] + p.terminal_q + sol.initial_multiplier;
     Accumulate(p.terminal_E, sol.terminal_state_multiplier, &grad);
     return MaxAbsVector(grad);
   }
@@ -161,42 +183,44 @@ double MaxKktStationarityResidual(const Problem& p, const Solution& sol) {
     Accumulate(s.E, sol.state_multipliers[i], &x_grad);
     residual = std::max(residual, MaxAbsVector(x_grad));
 
-    Vector u_grad = Transpose(s.M) * sol.states[i] + s.R * sol.controls[i] + s.r -
-                    Transpose(s.B) * sol.dynamics_multipliers[i];
+    Vector u_grad = Transpose(s.M) * sol.states[i] + s.R * sol.controls[i] +
+                    s.r - Transpose(s.B) * sol.dynamics_multipliers[i];
     Accumulate(s.D, sol.mixed_multipliers[i], &u_grad);
     residual = std::max(residual, MaxAbsVector(u_grad));
   }
-  Vector terminal_grad =
-      p.terminal_Q * sol.states[N] + p.terminal_q + sol.dynamics_multipliers[N - 1];
+  Vector terminal_grad = p.terminal_Q * sol.states[N] + p.terminal_q +
+                         sol.dynamics_multipliers[N - 1];
   Accumulate(p.terminal_E, sol.terminal_state_multiplier, &terminal_grad);
   residual = std::max(residual, MaxAbsVector(terminal_grad));
   return residual;
 }
 
-double MaxKktPrimalResidual(const Problem& p, const Solution& sol) {
+Scalar MaxKktPrimalResidual(const Problem& p, const Solution& sol) {
   const std::size_t N = p.stages.size();
-  double residual = MaxAbsDifference(sol.states[0], p.initial_state);
+  Scalar residual = MaxAbsDifference(sol.states[0], p.initial_state);
   for (std::size_t i = 0; i < N; ++i) {
     const Stage& s = p.stages[i];
-    residual = std::max(
-        residual,
-        MaxAbsVector(sol.states[i + 1] - s.A * sol.states[i] - s.B * sol.controls[i] - s.c));
+    residual = std::max(residual,
+                        MaxAbsVector(sol.states[i + 1] - s.A * sol.states[i] -
+                                     s.B * sol.controls[i] - s.c));
     if (s.C.rows() > 0) {
-      residual =
-          std::max(residual, MaxAbsVector(s.C * sol.states[i] + s.D * sol.controls[i] + s.d));
+      residual = std::max(residual, MaxAbsVector(s.C * sol.states[i] +
+                                                 s.D * sol.controls[i] + s.d));
     }
     if (s.E.rows() > 0) {
       residual = std::max(residual, MaxAbsVector(s.E * sol.states[i] + s.e));
     }
   }
   if (p.terminal_E.rows() > 0) {
-    residual = std::max(residual, MaxAbsVector(p.terminal_E * sol.states[N] + p.terminal_e));
+    residual = std::max(
+        residual, MaxAbsVector(p.terminal_E * sol.states[N] + p.terminal_e));
   }
   return residual;
 }
 
-double MaxKktResidual(const Problem& p, const Solution& sol) {
-  return std::max(MaxKktStationarityResidual(p, sol), MaxKktPrimalResidual(p, sol));
+Scalar MaxKktResidual(const Problem& p, const Solution& sol) {
+  return std::max(MaxKktStationarityResidual(p, sol),
+                  MaxKktPrimalResidual(p, sol));
 }
 
 std::vector<std::size_t> StateOffsets(const Problem& p) {
@@ -210,7 +234,8 @@ std::vector<std::size_t> StateOffsets(const Problem& p) {
   return out;
 }
 
-std::vector<std::size_t> ControlOffsets(const Problem& p, std::size_t state_vars) {
+std::vector<std::size_t> ControlOffsets(const Problem& p,
+                                        std::size_t state_vars) {
   std::vector<std::size_t> out(p.stages.size());
   std::size_t offset = state_vars;
   for (std::size_t i = 0; i < p.stages.size(); ++i) {
@@ -234,8 +259,8 @@ enum class ConstraintMode {
   kTerminalState,
 };
 
-void AddConstraintRow(std::vector<Vector>* rows, std::vector<double>* rhs, Vector row,
-                      double constant) {
+void AddConstraintRow(std::vector<Vector>* rows, std::vector<Scalar>* rhs,
+                      Vector row, Scalar constant) {
   rows->push_back(row);
   rhs->push_back(-constant);
 }
@@ -254,11 +279,13 @@ DenseKktSolution SolveKkt(const Problem& p) {
     const Stage& s = p.stages[i];
     for (std::size_t r = 0; r < s.Q.rows(); ++r) {
       h[xoff[i] + r] += s.q[r];
-      for (std::size_t c = 0; c < s.Q.cols(); ++c) H(xoff[i] + r, xoff[i] + c) += s.Q(r, c);
+      for (std::size_t c = 0; c < s.Q.cols(); ++c)
+        H(xoff[i] + r, xoff[i] + c) += s.Q(r, c);
     }
     for (std::size_t r = 0; r < s.R.rows(); ++r) {
       h[uoff[i] + r] += s.r[r];
-      for (std::size_t c = 0; c < s.R.cols(); ++c) H(uoff[i] + r, uoff[i] + c) += s.R(r, c);
+      for (std::size_t c = 0; c < s.R.cols(); ++c)
+        H(uoff[i] + r, uoff[i] + c) += s.R(r, c);
     }
     for (std::size_t r = 0; r < s.M.rows(); ++r) {
       for (std::size_t c = 0; c < s.M.cols(); ++c) {
@@ -275,7 +302,7 @@ DenseKktSolution SolveKkt(const Problem& p) {
   }
 
   std::vector<Vector> rows;
-  std::vector<double> rhs;
+  std::vector<Scalar> rhs;
   for (std::size_t r = 0; r < p.initial_state.size(); ++r) {
     Vector row(vars);
     row[xoff[0] + r] = 1.0;
@@ -286,25 +313,31 @@ DenseKktSolution SolveKkt(const Problem& p) {
     for (std::size_t r = 0; r < s.A.rows(); ++r) {
       Vector row(vars);
       row[xoff[i + 1] + r] = 1.0;
-      for (std::size_t c = 0; c < s.A.cols(); ++c) row[xoff[i] + c] -= s.A(r, c);
-      for (std::size_t c = 0; c < s.B.cols(); ++c) row[uoff[i] + c] -= s.B(r, c);
+      for (std::size_t c = 0; c < s.A.cols(); ++c)
+        row[xoff[i] + c] -= s.A(r, c);
+      for (std::size_t c = 0; c < s.B.cols(); ++c)
+        row[uoff[i] + c] -= s.B(r, c);
       AddConstraintRow(&rows, &rhs, row, -s.c[r]);
     }
     for (std::size_t r = 0; r < s.C.rows(); ++r) {
       Vector row(vars);
-      for (std::size_t c = 0; c < s.C.cols(); ++c) row[xoff[i] + c] += s.C(r, c);
-      for (std::size_t c = 0; c < s.D.cols(); ++c) row[uoff[i] + c] += s.D(r, c);
+      for (std::size_t c = 0; c < s.C.cols(); ++c)
+        row[xoff[i] + c] += s.C(r, c);
+      for (std::size_t c = 0; c < s.D.cols(); ++c)
+        row[uoff[i] + c] += s.D(r, c);
       AddConstraintRow(&rows, &rhs, row, s.d[r]);
     }
     for (std::size_t r = 0; r < s.E.rows(); ++r) {
       Vector row(vars);
-      for (std::size_t c = 0; c < s.E.cols(); ++c) row[xoff[i] + c] += s.E(r, c);
+      for (std::size_t c = 0; c < s.E.cols(); ++c)
+        row[xoff[i] + c] += s.E(r, c);
       AddConstraintRow(&rows, &rhs, row, s.e[r]);
     }
   }
   for (std::size_t r = 0; r < p.terminal_E.rows(); ++r) {
     Vector row(vars);
-    for (std::size_t c = 0; c < p.terminal_E.cols(); ++c) row[xoff[N] + c] += p.terminal_E(r, c);
+    for (std::size_t c = 0; c < p.terminal_E.cols(); ++c)
+      row[xoff[N] + c] += p.terminal_E(r, c);
     AddConstraintRow(&rows, &rhs, row, p.terminal_e[r]);
   }
 
@@ -313,12 +346,14 @@ DenseKktSolution SolveKkt(const Problem& p) {
     for (std::size_t c = 0; c < vars; ++c) constraints_aug(r, c) = rows[r][c];
     constraints_aug(r, vars) = rhs[r];
   }
-  clqr::RrefResult independent = clqr::Rref(constraints_aug, vars, 1e-10);
+  clqr::RrefResult independent =
+      clqr::Rref(constraints_aug, vars, kLinearSolveTolerance);
   rows.clear();
   rhs.clear();
   for (std::size_t row : independent.pivot_rows) {
     Vector constraint(vars);
-    for (std::size_t c = 0; c < vars; ++c) constraint[c] = independent.matrix(row, c);
+    for (std::size_t c = 0; c < vars; ++c)
+      constraint[c] = independent.matrix(row, c);
     rows.push_back(constraint);
     rhs.push_back(independent.matrix(row, vars));
   }
@@ -337,56 +372,63 @@ DenseKktSolution SolveKkt(const Problem& p) {
       kkt(c, vars + r) = rows[r][c];
     }
   }
-  Vector z = clqr::SolveLinearSystem(kkt, b, 1e-10);
+  Vector z = clqr::SolveLinearSystem(kkt, b, kLinearSolveTolerance);
 
   DenseKktSolution out;
   out.x.resize(N + 1);
   out.u.resize(N);
   for (std::size_t i = 0; i < N; ++i) {
     out.x[i] = Vector(p.stages[i].A.cols());
-    for (std::size_t r = 0; r < out.x[i].size(); ++r) out.x[i][r] = z[xoff[i] + r];
+    for (std::size_t r = 0; r < out.x[i].size(); ++r)
+      out.x[i][r] = z[xoff[i] + r];
     out.u[i] = Vector(p.stages[i].B.cols());
-    for (std::size_t r = 0; r < out.u[i].size(); ++r) out.u[i][r] = z[uoff[i] + r];
+    for (std::size_t r = 0; r < out.u[i].size(); ++r)
+      out.u[i][r] = z[uoff[i] + r];
   }
   out.x[N] = Vector(p.terminal_Q.rows());
-  for (std::size_t r = 0; r < out.x[N].size(); ++r) out.x[N][r] = z[xoff[N] + r];
+  for (std::size_t r = 0; r < out.x[N].size(); ++r)
+    out.x[N][r] = z[xoff[N] + r];
   return out;
 }
 
-double DeterministicValue(int seed, std::size_t i, std::size_t j = 0) {
-  const double x = static_cast<double>(seed + 17 * static_cast<int>(i) +
-                                      31 * static_cast<int>(j));
+Scalar DeterministicValue(int seed, std::size_t i, std::size_t j = 0) {
+  const Scalar x = static_cast<Scalar>(seed + 17 * static_cast<int>(i) +
+                                       31 * static_cast<int>(j));
   return 0.5 * std::sin(0.37 * x) + 0.25 * std::cos(0.19 * x);
 }
 
-Vector GeneratedVector(std::size_t size, int seed, double scale = 1.0) {
+Vector GeneratedVector(std::size_t size, int seed, Scalar scale = 1.0) {
   Vector out(size);
-  for (std::size_t i = 0; i < size; ++i) out[i] = scale * DeterministicValue(seed, i);
+  for (std::size_t i = 0; i < size; ++i)
+    out[i] = scale * DeterministicValue(seed, i);
   return out;
 }
 
-Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed, double scale = 1.0) {
+Matrix GeneratedMatrix(std::size_t rows, std::size_t cols, int seed,
+                       Scalar scale = 1.0) {
   Matrix out(rows, cols);
   for (std::size_t i = 0; i < rows; ++i) {
-    for (std::size_t j = 0; j < cols; ++j) out(i, j) = scale * DeterministicValue(seed, i, j);
+    for (std::size_t j = 0; j < cols; ++j)
+      out(i, j) = scale * DeterministicValue(seed, i, j);
   }
   return out;
 }
 
-Matrix PositiveDefinite(std::size_t size, int seed, double diagonal) {
+Matrix PositiveDefinite(std::size_t size, int seed, Scalar diagonal) {
   Matrix g = GeneratedMatrix(size, size, seed, 0.25);
   Matrix out = Transpose(g) * g;
   for (std::size_t i = 0; i < size; ++i) out(i, i) += diagonal;
   return out;
 }
 
-double RowDot(const Matrix& a, std::size_t row, const Vector& x) {
-  double out = 0.0;
+Scalar RowDot(const Matrix& a, std::size_t row, const Vector& x) {
+  Scalar out = 0.0;
   for (std::size_t col = 0; col < x.size(); ++col) out += a(row, col) * x[col];
   return out;
 }
 
-void SetMixedConstraintFromNominal(Stage* stage, const Vector& x, const Vector& u) {
+void SetMixedConstraintFromNominal(Stage* stage, const Vector& x,
+                                   const Vector& u) {
   stage->d = Vector(stage->C.rows());
   for (std::size_t row = 0; row < stage->C.rows(); ++row) {
     stage->d[row] = -(RowDot(stage->C, row, x) + RowDot(stage->D, row, u));
@@ -395,16 +437,20 @@ void SetMixedConstraintFromNominal(Stage* stage, const Vector& x, const Vector& 
 
 void SetStateConstraintFromNominal(Matrix* E, Vector* e, const Vector& x) {
   *e = Vector(E->rows());
-  for (std::size_t row = 0; row < E->rows(); ++row) (*e)[row] = -RowDot(*E, row, x);
+  for (std::size_t row = 0; row < E->rows(); ++row)
+    (*e)[row] = -RowDot(*E, row, x);
 }
 
-Problem GeneratedFeasibleProblem(int seed, std::size_t N, std::size_t n, std::size_t m,
-                                 std::size_t p, ConstraintMode mode) {
+Problem GeneratedFeasibleProblem(int seed, std::size_t N, std::size_t n,
+                                 std::size_t m, std::size_t p,
+                                 ConstraintMode mode) {
   Problem problem;
   std::vector<Vector> x(N + 1);
   std::vector<Vector> u(N);
-  for (std::size_t i = 0; i <= N; ++i) x[i] = GeneratedVector(n, seed + 100 + static_cast<int>(i), 0.8);
-  for (std::size_t i = 0; i < N; ++i) u[i] = GeneratedVector(m, seed + 200 + static_cast<int>(i), 0.7);
+  for (std::size_t i = 0; i <= N; ++i)
+    x[i] = GeneratedVector(n, seed + 100 + static_cast<int>(i), 0.8);
+  for (std::size_t i = 0; i < N; ++i)
+    u[i] = GeneratedVector(m, seed + 200 + static_cast<int>(i), 0.7);
   problem.initial_state = x[0];
   problem.stages.resize(N);
   for (std::size_t i = 0; i < N; ++i) {
@@ -430,11 +476,14 @@ Problem GeneratedFeasibleProblem(int seed, std::size_t N, std::size_t n, std::si
       stage.C = GeneratedMatrix(p, n, seed + 900 + static_cast<int>(i), 0.5);
       stage.D = GeneratedMatrix(p, m, seed + 1000 + static_cast<int>(i), 0.5);
       if (mode == ConstraintMode::kRankDeficientMixed && p >= 2) {
-        for (std::size_t col = 0; col < n; ++col) stage.C(1, col) = 2.0 * stage.C(0, col);
-        for (std::size_t col = 0; col < m; ++col) stage.D(1, col) = 2.0 * stage.D(0, col);
+        for (std::size_t col = 0; col < n; ++col)
+          stage.C(1, col) = 2.0 * stage.C(0, col);
+        for (std::size_t col = 0; col < m; ++col)
+          stage.D(1, col) = 2.0 * stage.D(0, col);
       }
       SetMixedConstraintFromNominal(&stage, x[i], u[i]);
-      if (mode == ConstraintMode::kRankDeficientMixed && p >= 2) stage.d[1] = 2.0 * stage.d[0];
+      if (mode == ConstraintMode::kRankDeficientMixed && p >= 2)
+        stage.d[1] = 2.0 * stage.d[0];
     } else if (p > 0 && (mode == ConstraintMode::kStateOnly ||
                          (mode == ConstraintMode::kMixed && i % 2 == 1))) {
       stage.E = GeneratedMatrix(p, n, seed + 1100 + static_cast<int>(i), 0.5);
@@ -447,7 +496,8 @@ Problem GeneratedFeasibleProblem(int seed, std::size_t N, std::size_t n, std::si
   problem.terminal_e = Vector(0);
   if (p > 0 && mode == ConstraintMode::kTerminalState) {
     problem.terminal_E = GeneratedMatrix(p, n, seed + 1400, 0.5);
-    SetStateConstraintFromNominal(&problem.terminal_E, &problem.terminal_e, x[N]);
+    SetStateConstraintFromNominal(&problem.terminal_E, &problem.terminal_e,
+                                  x[N]);
   }
   return problem;
 }
@@ -493,49 +543,62 @@ Problem BaseProblem() {
 }
 
 void CheckAgainstKkt(const Problem& p, const std::string& name,
-                     bool expect_singular = false, bool expect_wrong_inertia = false) {
+                     bool expect_singular = false,
+                     bool expect_wrong_inertia = false) {
   Solution sol = SolveWithWorkspace(p);
-  Expect(sol.status == SolveStatus::kOptimal, name + " solver status: " + sol.message);
+  Expect(sol.status == SolveStatus::kOptimal,
+         name + " solver status: " + sol.message);
   ExpectDiagnostics(sol, expect_singular, expect_wrong_inertia, name);
   DenseKktSolution kkt = SolveKkt(p);
   for (std::size_t i = 0; i < sol.states.size(); ++i) {
-    ExpectVectorNear(sol.states[i], kkt.x[i], kTol, name + " x" + std::to_string(i));
+    ExpectVectorNear(sol.states[i], kkt.x[i], kTol,
+                     name + " x" + std::to_string(i));
   }
   for (std::size_t i = 0; i < sol.controls.size(); ++i) {
-    ExpectVectorNear(sol.controls[i], kkt.u[i], kTol, name + " u" + std::to_string(i));
+    ExpectVectorNear(sol.controls[i], kkt.u[i], kTol,
+                     name + " u" + std::to_string(i));
   }
-  ExpectNear(MaxKktResidual(p, sol), 0.0, kTol, name + " full KKT residual");
+  ExpectNear(MaxKktResidual(p, sol), 0.0, kKktTol,
+             name + " full KKT residual");
 }
 
-void UnconstrainedMatchesKkt() { CheckAgainstKkt(BaseProblem(), "unconstrained"); }
+void UnconstrainedMatchesKkt() {
+  CheckAgainstKkt(BaseProblem(), "unconstrained");
+}
 
 void WorkspaceUnconstrainedMatchesKkt() {
-  Problem p = GeneratedFeasibleProblem(321, 4, 3, 2, 0, ConstraintMode::kUnconstrained);
+  Problem p =
+      GeneratedFeasibleProblem(321, 4, 3, 2, 0, ConstraintMode::kUnconstrained);
   constexpr std::size_t kBytes = Workspace::RequiredBytesUniform(4, 3, 2);
   static_assert(kBytes > 0, "workspace size must be positive");
-  Expect(Workspace::RequiredBytes(p) == kBytes, "constexpr workspace byte count");
+  Expect(Workspace::RequiredBytes(p) == kBytes,
+         "constexpr workspace byte count");
 
   alignas(std::max_align_t) std::array<unsigned char, kBytes> memory{};
   Workspace workspace(memory.data(), memory.size());
   SolutionView view = Solve(p, workspace);
   Solution copied = CopySolutionView(view);
   DenseKktSolution kkt = SolveKkt(p);
-  Expect(view.status == SolveStatus::kOptimal, std::string("workspace status: ") + view.message);
+  Expect(view.status == SolveStatus::kOptimal,
+         std::string("workspace status: ") + view.message);
   Expect(view.state_count == kkt.x.size(), "workspace state count");
   Expect(view.control_count == kkt.u.size(), "workspace control count");
   for (std::size_t i = 0; i < view.state_count; ++i) {
-    ExpectVectorViewNear(view.states[i], kkt.x[i], kTol, "workspace state " + std::to_string(i));
+    ExpectVectorViewNear(view.states[i], kkt.x[i], kTol,
+                         "workspace state " + std::to_string(i));
   }
   for (std::size_t i = 0; i < view.control_count; ++i) {
     ExpectVectorViewNear(view.controls[i], kkt.u[i], kTol,
                          "workspace control " + std::to_string(i));
   }
-  ExpectNear(MaxKktResidual(p, copied), 0.0, kTol, "workspace full KKT residual");
+  ExpectNear(MaxKktResidual(p, copied), 0.0, kKktTol,
+             "workspace full KKT residual");
 
   std::vector<unsigned char> too_small(Workspace::RequiredBytes(p) - 1);
   Workspace small_workspace(too_small.data(), too_small.size());
   SolutionView small = Solve(p, small_workspace);
-  Expect(small.status == SolveStatus::kInvalidInput, "undersized workspace status");
+  Expect(small.status == SolveStatus::kInvalidInput,
+         "undersized workspace status");
 }
 
 void WorkspaceConstrainedMatchesKkt() {
@@ -550,18 +613,21 @@ void WorkspaceConstrainedMatchesKkt() {
     workspace.Reserve(p);
     SolutionView view = Solve(p, workspace);
     Solution copied = CopySolutionView(view);
-    const std::string name = "workspace constrained " + std::to_string(case_index);
+    const std::string name =
+        "workspace constrained " + std::to_string(case_index);
     Expect(view.status == SolveStatus::kOptimal,
            name + " status: " + std::string(view.message));
     DenseKktSolution kkt = SolveKkt(p);
     for (std::size_t i = 0; i < view.state_count; ++i) {
-      ExpectVectorViewNear(view.states[i], kkt.x[i], kTol, name + " state " + std::to_string(i));
+      ExpectVectorViewNear(view.states[i], kkt.x[i], kTol,
+                           name + " state " + std::to_string(i));
     }
     for (std::size_t i = 0; i < view.control_count; ++i) {
       ExpectVectorViewNear(view.controls[i], kkt.u[i], kTol,
                            name + " control " + std::to_string(i));
     }
-    ExpectNear(MaxKktResidual(p, copied), 0.0, kTol, name + " full KKT residual");
+    ExpectNear(MaxKktResidual(p, copied), 0.0, kKktTol,
+               name + " full KKT residual");
   }
 }
 
@@ -600,23 +666,26 @@ void GeneratedCasesMatchKkt() {
   const std::vector<Case> cases = {
       {"generated unconstrained", 4, 3, 2, 0, ConstraintMode::kUnconstrained},
       {"generated state-only", 4, 3, 2, 1, ConstraintMode::kStateOnly},
-      {"generated state-only narrow-control", 6, 3, 1, 1, ConstraintMode::kStateOnly},
+      {"generated state-only narrow-control", 6, 3, 1, 1,
+       ConstraintMode::kStateOnly},
       {"generated full mixed", 4, 3, 2, 2, ConstraintMode::kFullMixed},
       {"generated mixed alternating", 6, 4, 2, 2, ConstraintMode::kMixed},
       {"generated p greater than m", 4, 3, 1, 2, ConstraintMode::kFullMixed},
-      {"generated rank-deficient mixed", 4, 3, 2, 2, ConstraintMode::kRankDeficientMixed},
+      {"generated rank-deficient mixed", 4, 3, 2, 2,
+       ConstraintMode::kRankDeficientMixed},
       {"generated terminal state", 5, 3, 2, 1, ConstraintMode::kTerminalState},
       {"generated single stage", 1, 2, 2, 1, ConstraintMode::kFullMixed},
   };
   for (std::size_t i = 0; i < cases.size(); ++i) {
     const Case& c = cases[i];
-    const bool expect_singular = c.mode == ConstraintMode::kStateOnly ||
-                                 c.mode == ConstraintMode::kMixed ||
-                                 c.mode == ConstraintMode::kRankDeficientMixed ||
-                                 (c.mode == ConstraintMode::kFullMixed && c.p > c.m);
-    CheckAgainstKkt(
-        GeneratedFeasibleProblem(100 + static_cast<int>(i), c.N, c.n, c.m, c.p, c.mode),
-        c.name, expect_singular);
+    const bool expect_singular =
+        c.mode == ConstraintMode::kStateOnly ||
+        c.mode == ConstraintMode::kMixed ||
+        c.mode == ConstraintMode::kRankDeficientMixed ||
+        (c.mode == ConstraintMode::kFullMixed && c.p > c.m);
+    CheckAgainstKkt(GeneratedFeasibleProblem(100 + static_cast<int>(i), c.N,
+                                             c.n, c.m, c.p, c.mode),
+                    c.name, expect_singular);
   }
 }
 
@@ -668,7 +737,8 @@ void SingularReducedHessianReported() {
   p.terminal_e = Vector(0);
 
   Solution sol = SolveWithWorkspace(p);
-  Expect(sol.status == SolveStatus::kNumericalFailure, "singular reduced Hessian status");
+  Expect(sol.status == SolveStatus::kNumericalFailure,
+         "singular reduced Hessian status");
   ExpectDiagnostics(sol, true, false, "singular reduced Hessian");
 }
 

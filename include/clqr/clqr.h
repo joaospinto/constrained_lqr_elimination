@@ -45,15 +45,19 @@ enum class SolveStatus {
 };
 
 struct SolveOptions {
-  double tolerance = 1e-9;
+#ifdef CLQR_USE_FLOAT
+  Scalar tolerance = 1e-5f;
+#else
+  Scalar tolerance = 1e-9;
+#endif
 };
 
 struct VectorView {
-  double* data = nullptr;
+  Scalar* data = nullptr;
   std::size_t size = 0;
 
-  double& operator[](std::size_t i) { return data[i]; }
-  const double& operator[](std::size_t i) const { return data[i]; }
+  Scalar& operator[](std::size_t i) { return data[i]; }
+  const Scalar& operator[](std::size_t i) const { return data[i]; }
 };
 
 struct SolutionView {
@@ -74,31 +78,36 @@ struct SolutionView {
   bool newton_kkt_singular = false;
   bool newton_kkt_wrong_inertia = false;
   const char* newton_kkt_diagnostic = "";
-  double objective = 0.0;
+  Scalar objective = Scalar{0};
 };
 
 class Workspace {
  public:
   Workspace() = default;
-  Workspace(void* memory, std::size_t bytes) { UseExternalMemory(memory, bytes); }
+  Workspace(void* memory, std::size_t bytes) {
+    UseExternalMemory(memory, bytes);
+  }
 
   static std::size_t RequiredBytes(const Problem& problem);
-  static std::size_t RequiredBytes(const Problem& problem, const SolveOptions& options);
+  static std::size_t RequiredBytes(const Problem& problem,
+                                   const SolveOptions& options);
   static constexpr std::size_t RequiredBytesUniform(std::size_t stages,
                                                     std::size_t state_dim,
                                                     std::size_t control_dim) {
-    return RequiredBytesUniformWithTerminal(stages, state_dim, state_dim, control_dim);
+    return RequiredBytesUniformWithTerminal(stages, state_dim, state_dim,
+                                            control_dim);
   }
   static constexpr std::size_t RequiredBytesUniformWithTerminal(
       std::size_t stages, std::size_t state_dim, std::size_t terminal_state_dim,
       std::size_t control_dim) {
-    const std::size_t total_state_scalars = stages * state_dim + terminal_state_dim;
+    const std::size_t total_state_scalars =
+        stages * state_dim + terminal_state_dim;
     const std::size_t total_control_scalars = stages * control_dim;
     const std::size_t total_dynamics_scalars =
         stages == 0 ? 0 : (stages - 1) * state_dim + terminal_state_dim;
     const std::size_t total_p = total_state_scalars;
-    const std::size_t total_P =
-        stages * state_dim * state_dim + terminal_state_dim * terminal_state_dim;
+    const std::size_t total_P = stages * state_dim * state_dim +
+                                terminal_state_dim * terminal_state_dim;
     const std::size_t total_K = stages * control_dim * state_dim;
     const std::size_t total_k = total_control_scalars;
     const std::size_t max_state =
@@ -106,27 +115,40 @@ class Workspace {
     const std::size_t max_control = control_dim;
 
     std::size_t bytes = 0;
-    bytes = AddAligned(bytes, alignof(std::size_t), sizeof(std::size_t) * (stages + 1));
-    bytes = AddAligned(bytes, alignof(std::size_t), sizeof(std::size_t) * stages);
-    bytes = AddAligned(bytes, alignof(std::size_t), sizeof(std::size_t) * (stages + 1));
-    bytes = AddAligned(bytes, alignof(std::size_t), sizeof(std::size_t) * (stages + 1));
-    bytes = AddAligned(bytes, alignof(std::size_t), sizeof(std::size_t) * stages);
-    bytes = AddAligned(bytes, alignof(std::size_t), sizeof(std::size_t) * stages);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_P);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_p);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_K);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_k);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_state);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_state * max_state);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_control * max_control);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_state * max_control);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_state * max_state);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_control * max_state);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_state);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_control);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_control * max_control);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_control * max_state);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * max_control);
+    bytes = AddAligned(bytes, alignof(std::size_t),
+                       sizeof(std::size_t) * (stages + 1));
+    bytes =
+        AddAligned(bytes, alignof(std::size_t), sizeof(std::size_t) * stages);
+    bytes = AddAligned(bytes, alignof(std::size_t),
+                       sizeof(std::size_t) * (stages + 1));
+    bytes = AddAligned(bytes, alignof(std::size_t),
+                       sizeof(std::size_t) * (stages + 1));
+    bytes =
+        AddAligned(bytes, alignof(std::size_t), sizeof(std::size_t) * stages);
+    bytes =
+        AddAligned(bytes, alignof(std::size_t), sizeof(std::size_t) * stages);
+    bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * total_P);
+    bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * total_p);
+    bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * total_K);
+    bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * total_k);
+    bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * max_state);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * max_state * max_state);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * max_control * max_control);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * max_state * max_control);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * max_state * max_state);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * max_control * max_state);
+    bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * max_state);
+    bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * max_control);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * max_control * max_control);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * max_control * max_state);
+    bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * max_control);
 
     bytes = AddAligned(bytes, alignof(VectorView),
                        sizeof(VectorView) * (stages + 1));
@@ -134,10 +156,13 @@ class Workspace {
     bytes = AddAligned(bytes, alignof(VectorView), sizeof(VectorView) * stages);
     bytes = AddAligned(bytes, alignof(VectorView), sizeof(VectorView) * stages);
     bytes = AddAligned(bytes, alignof(VectorView), sizeof(VectorView) * stages);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_state_scalars);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_control_scalars);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * state_dim);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_dynamics_scalars);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * total_state_scalars);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * total_control_scalars);
+    bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * state_dim);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * total_dynamics_scalars);
     return bytes;
   }
   static constexpr std::size_t RequiredBytesUniformConstrained(
@@ -148,85 +173,92 @@ class Workspace {
     const std::size_t total_state_scalars = (stages + 1) * state_dim;
     const std::size_t total_control_scalars = stages * control_dim;
     const std::size_t total_dynamics_scalars = stages * state_dim;
-    const std::size_t total_mixed_scalars = stages * mixed_constraints_per_stage;
+    const std::size_t total_mixed_scalars =
+        stages * mixed_constraints_per_stage;
     const std::size_t total_state_multiplier_scalars =
         stages * state_constraints_per_stage;
-    const std::size_t mixed_rows_bound = mixed_constraints_per_stage + state_dim;
-    const std::size_t state_rows_bound =
-        Max(terminal_constraints, state_constraints_per_stage + mixed_rows_bound);
+    const std::size_t mixed_rows_bound =
+        mixed_constraints_per_stage + state_dim;
+    const std::size_t state_rows_bound = Max(
+        terminal_constraints, state_constraints_per_stage + mixed_rows_bound);
     const std::size_t state_pivot_bound = Min(state_dim, state_rows_bound);
     const std::size_t mixed_stage_ops = stages;
-    const std::size_t mixed_stage_doubles =
+    const std::size_t mixed_stage_scalars =
         2 * mixed_rows_bound *
             (control_dim + state_dim + 1 + mixed_rows_bound) +
         control_dim * state_dim + control_dim * control_dim + control_dim +
         control_dim * mixed_rows_bound + mixed_rows_bound * state_dim +
         mixed_rows_bound + mixed_rows_bound * mixed_rows_bound +
-        state_dim * state_dim + control_dim * control_dim + state_dim * control_dim +
-        state_dim * control_dim + state_dim + control_dim + state_dim +
-        8 * state_dim * state_dim + 4 * control_dim * control_dim +
-        6 * state_dim * control_dim + 2 * state_dim * state_dim +
-        2 * state_dim * control_dim + 3 * state_dim + 4 * state_dim +
-        4 * control_dim + (state_rows_bound + mixed_rows_bound) * state_dim +
-        state_rows_bound + mixed_rows_bound + 2 * control_dim * state_dim +
+        state_dim * state_dim + control_dim * control_dim +
+        state_dim * control_dim + state_dim * control_dim + state_dim +
+        control_dim + state_dim + 8 * state_dim * state_dim +
+        4 * control_dim * control_dim + 6 * state_dim * control_dim +
+        2 * state_dim * state_dim + 2 * state_dim * control_dim +
+        3 * state_dim + 4 * state_dim + 4 * control_dim +
+        (state_rows_bound + mixed_rows_bound) * state_dim + state_rows_bound +
+        mixed_rows_bound + 2 * control_dim * state_dim +
         2 * control_dim * control_dim + 3 * control_dim;
-    const std::size_t state_stage_doubles =
+    const std::size_t state_stage_scalars =
         2 * state_rows_bound * (state_dim + 1 + state_rows_bound) +
         state_dim * state_dim + state_dim + state_dim * state_rows_bound +
         3 * state_dim * state_dim + 3 * state_dim * control_dim + 4 * state_dim +
-        8 * state_dim * state_dim + 4 * state_dim * control_dim +
-        2 * control_dim * state_dim + 4 * state_dim + 2 * control_dim +
+        8 * state_dim * state_dim +
+        4 * state_dim * control_dim + 2 * control_dim * state_dim +
+        4 * state_dim + 2 * control_dim +
         (state_pivot_bound + mixed_constraints_per_stage) *
             (state_dim + control_dim + 1) +
-        3 * state_dim * state_dim + 2 * state_dim + 2 * control_dim * state_dim +
-        control_dim * control_dim + control_dim;
-    const std::size_t pullback_stage_doubles =
+        3 * state_dim * state_dim + 2 * state_dim +
+        2 * control_dim * state_dim + control_dim * control_dim + control_dim;
+    const std::size_t pullback_stage_scalars =
         40 * (2 * state_dim + control_dim + mixed_constraints_per_stage +
               state_constraints_per_stage + terminal_constraints + 1);
-
     std::size_t bytes = 0;
     bytes = AddAligned(bytes, alignof(Stage), sizeof(Stage) * stages);
-    bytes = AddAligned(bytes, alignof(Vector), sizeof(Vector) * (10 * stages + 2));
-    bytes = AddAligned(bytes, alignof(Matrix), sizeof(Matrix) * (8 * stages + 2));
+    bytes =
+        AddAligned(bytes, alignof(Vector), sizeof(Vector) * (10 * stages + 2));
+    bytes =
+        AddAligned(bytes, alignof(Matrix), sizeof(Matrix) * (8 * stages + 2));
     bytes = AddAligned(bytes, alignof(std::size_t),
                        sizeof(std::size_t) * (6 * stages + 3));
-    bytes = AddAligned(bytes, alignof(double),
-                       sizeof(double) * (80 * stages + 32));
-    bytes = AddAligned(bytes, alignof(double),
-                       sizeof(double) * stages *
-                           (state_dim * state_dim + state_dim * control_dim + state_dim +
-                            state_dim * state_dim + control_dim * control_dim +
-                            state_dim * control_dim + state_dim + control_dim +
-                            mixed_constraints_per_stage * state_dim +
-                            mixed_constraints_per_stage * control_dim +
-                            mixed_constraints_per_stage +
-                            state_constraints_per_stage * state_dim +
-                            state_constraints_per_stage));
-    bytes = AddAligned(bytes, alignof(double),
-                       sizeof(double) *
-                           (state_dim * state_dim + state_dim +
-                            terminal_constraints * state_dim + terminal_constraints));
-    bytes = AddAligned(bytes, alignof(double),
-                       sizeof(double) *
-                           ((stages + 1) * (state_dim * state_dim + state_dim) +
-                            stages * (control_dim * state_dim +
-                                      control_dim * control_dim + control_dim)));
-    bytes = AddAligned(bytes, alignof(double),
-                       sizeof(double) *
-                           ((stages + 1) *
-                                (2 * state_rows_bound * (state_dim + 1) +
-                                 state_dim * state_dim + state_dim) +
-                            stages * state_stage_doubles +
-                            mixed_stage_ops * mixed_stage_doubles));
-    bytes = AddAligned(bytes, alignof(std::size_t),
-                       sizeof(std::size_t) *
-                           ((stages + 1) * 3 * state_dim +
-                            mixed_stage_ops *
-                                (3 * control_dim + mixed_rows_bound + 3 * state_dim)));
-    bytes = AddAligned(bytes, alignof(Matrix),
-                       sizeof(Matrix) * (4 * stages + 2));
-    bytes = AddAligned(bytes, alignof(Vector),
-                       sizeof(Vector) * (4 * stages + 2));
+    bytes =
+        AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * (80 * stages + 32));
+    bytes = AddAligned(
+        bytes, alignof(Scalar),
+        sizeof(Scalar) * stages *
+            (state_dim * state_dim + state_dim * control_dim + state_dim +
+             state_dim * state_dim + control_dim * control_dim +
+             state_dim * control_dim + state_dim + control_dim +
+             mixed_constraints_per_stage * state_dim +
+             mixed_constraints_per_stage * control_dim +
+             mixed_constraints_per_stage +
+             state_constraints_per_stage * state_dim +
+             state_constraints_per_stage));
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * (state_dim * state_dim + state_dim +
+                                         terminal_constraints * state_dim +
+                                         terminal_constraints));
+    bytes = AddAligned(
+        bytes, alignof(Scalar),
+        sizeof(Scalar) * ((stages + 1) * (state_dim * state_dim + state_dim) +
+                          stages * (control_dim * state_dim +
+                                    control_dim * control_dim + control_dim)));
+    bytes =
+        AddAligned(bytes, alignof(Scalar),
+                   sizeof(Scalar) *
+                       ((stages + 1) * (2 * state_rows_bound * (state_dim + 1) +
+                                        state_dim * state_dim + state_dim) +
+                        stages * state_stage_scalars +
+                        mixed_stage_ops * mixed_stage_scalars));
+    bytes =
+        AddAligned(bytes, alignof(std::size_t),
+                   sizeof(std::size_t) *
+                       ((stages + 1) * 3 * state_dim +
+                        mixed_stage_ops * (3 * control_dim + mixed_rows_bound +
+                                           3 * state_dim)));
+    bytes =
+        AddAligned(bytes, alignof(Matrix), sizeof(Matrix) * (4 * stages + 2));
+    bytes =
+        AddAligned(bytes, alignof(Vector), sizeof(Vector) * (4 * stages + 2));
     bytes += RequiredBytesUniform(stages, state_dim, control_dim);
     bytes = AddAligned(bytes, alignof(VectorView),
                        sizeof(VectorView) * (stages + 1));
@@ -234,26 +266,31 @@ class Workspace {
     bytes = AddAligned(bytes, alignof(VectorView), sizeof(VectorView) * stages);
     bytes = AddAligned(bytes, alignof(VectorView), sizeof(VectorView) * stages);
     bytes = AddAligned(bytes, alignof(VectorView), sizeof(VectorView) * stages);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_state_scalars);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_control_scalars);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * state_dim);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_dynamics_scalars);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * total_mixed_scalars);
-    bytes = AddAligned(bytes, alignof(double),
-                       sizeof(double) * total_state_multiplier_scalars);
-    bytes = AddAligned(bytes, alignof(double), sizeof(double) * terminal_constraints);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * total_state_scalars);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * total_control_scalars);
+    bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * state_dim);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * total_dynamics_scalars);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * total_mixed_scalars);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * total_state_multiplier_scalars);
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) * terminal_constraints);
     bytes = AddAligned(bytes, alignof(Vector),
                        sizeof(Vector) * (2 * stages + 1));
-    bytes = AddAligned(bytes, alignof(double),
-                       sizeof(double) *
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) *
                            (total_dynamics_scalars + total_state_scalars +
-                            stages * pullback_stage_doubles +
+                            stages * pullback_stage_scalars +
                             4 * state_dim *
                                 (state_dim + terminal_constraints + 1)));
     bytes = AddAligned(bytes, alignof(Vector),
                        sizeof(Vector) * (5 * stages + 1));
-    bytes = AddAligned(bytes, alignof(double),
-                       sizeof(double) *
+    bytes = AddAligned(bytes, alignof(Scalar),
+                       sizeof(Scalar) *
                            (total_state_scalars + total_control_scalars +
                             total_dynamics_scalars + total_mixed_scalars +
                             total_state_multiplier_scalars +
@@ -272,10 +309,12 @@ class Workspace {
   const WorkspaceArena& arena() const { return arena_; }
 
  private:
-  static constexpr std::size_t Align(std::size_t offset, std::size_t alignment) {
+  static constexpr std::size_t Align(std::size_t offset,
+                                     std::size_t alignment) {
     return (offset + alignment - 1) & ~(alignment - 1);
   }
-  static constexpr std::size_t AddAligned(std::size_t offset, std::size_t alignment,
+  static constexpr std::size_t AddAligned(std::size_t offset,
+                                          std::size_t alignment,
                                           std::size_t bytes) {
     return Align(offset, alignment) + bytes;
   }

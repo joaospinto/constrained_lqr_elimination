@@ -14,6 +14,14 @@
 
 namespace clqr {
 
+#ifdef CLQR_USE_FLOAT
+using Scalar = float;
+inline constexpr const char* kPrecisionName = "FP32";
+#else
+using Scalar = double;
+inline constexpr const char* kPrecisionName = "FP64";
+#endif
+
 class WorkspaceArena {
  public:
   WorkspaceArena() = default;
@@ -40,7 +48,8 @@ class WorkspaceArena {
   std::size_t size() const { return size_; }
 
  private:
-  static constexpr std::size_t Align(std::size_t offset, std::size_t alignment) {
+  static constexpr std::size_t Align(std::size_t offset,
+                                     std::size_t alignment) {
     return (offset + alignment - 1) & ~(alignment - 1);
   }
 
@@ -72,12 +81,15 @@ class WorkspaceAllocator {
 
   WorkspaceAllocator() : arena_(ActiveWorkspaceArena()) {}
   template <typename U>
-  WorkspaceAllocator(const WorkspaceAllocator<U>& other) : arena_(other.arena()) {}
+  WorkspaceAllocator(const WorkspaceAllocator<U>& other)
+      : arena_(other.arena()) {}
 
   T* allocate(std::size_t n) {
-    if (n > std::numeric_limits<std::size_t>::max() / sizeof(T)) throw std::bad_alloc();
+    if (n > std::numeric_limits<std::size_t>::max() / sizeof(T))
+      throw std::bad_alloc();
     const std::size_t bytes = n * sizeof(T);
-    if (arena_ != nullptr) return static_cast<T*>(arena_->Allocate(bytes, alignof(T)));
+    if (arena_ != nullptr)
+      return static_cast<T*>(arena_->Allocate(bytes, alignof(T)));
     return static_cast<T*>(::operator new(bytes));
   }
 
@@ -112,19 +124,19 @@ using WorkspaceVector = std::vector<T, WorkspaceAllocator<T>>;
 
 class Vector {
  public:
-  using Storage = WorkspaceVector<double>;
+  using Storage = WorkspaceVector<Scalar>;
 
   Vector() = default;
   explicit Vector(std::size_t size);
-  Vector(std::initializer_list<double> values);
+  Vector(std::initializer_list<Scalar> values);
 
   std::size_t size() const { return data_.size(); }
   bool empty() const { return data_.empty(); }
   void reserve(std::size_t size);
   void resize(std::size_t size);
 
-  double& operator[](std::size_t i) { return data_[i]; }
-  double operator[](std::size_t i) const { return data_[i]; }
+  Scalar& operator[](std::size_t i) { return data_[i]; }
+  Scalar operator[](std::size_t i) const { return data_[i]; }
 
   const Storage& data() const { return data_; }
   Storage& data() { return data_; }
@@ -135,11 +147,12 @@ class Vector {
 
 class Matrix {
  public:
-  using Storage = WorkspaceVector<double>;
+  using Storage = WorkspaceVector<Scalar>;
 
   Matrix() = default;
   Matrix(std::size_t rows, std::size_t cols);
-  Matrix(std::size_t rows, std::size_t cols, std::initializer_list<double> values);
+  Matrix(std::size_t rows, std::size_t cols,
+         std::initializer_list<Scalar> values);
 
   std::size_t rows() const { return rows_; }
   std::size_t cols() const { return cols_; }
@@ -147,10 +160,10 @@ class Matrix {
   void reserve(std::size_t rows, std::size_t cols);
   void resize(std::size_t rows, std::size_t cols);
 
-  double& operator()(std::size_t row, std::size_t col) {
+  Scalar& operator()(std::size_t row, std::size_t col) {
     return data_[row * cols_ + col];
   }
-  double operator()(std::size_t row, std::size_t col) const {
+  Scalar operator()(std::size_t row, std::size_t col) const {
     return data_[row * cols_ + col];
   }
 
@@ -180,8 +193,8 @@ Matrix operator*(const Matrix& a, const Matrix& b);
 Vector operator+(const Vector& a, const Vector& b);
 Vector operator-(const Vector& a, const Vector& b);
 Vector operator*(const Matrix& a, const Vector& x);
-Matrix Scale(const Matrix& a, double alpha);
-Vector Scale(const Vector& x, double alpha);
+Matrix Scale(const Matrix& a, Scalar alpha);
+Vector Scale(const Vector& x, Scalar alpha);
 
 Matrix HorizontalConcat(const Matrix& a, const Matrix& b);
 Matrix VerticalConcat(const Matrix& a, const Matrix& b);
@@ -191,16 +204,16 @@ Matrix Cols(const Matrix& a, const WorkspaceVector<std::size_t>& cols);
 Vector Entries(const Vector& a, const WorkspaceVector<std::size_t>& rows);
 Matrix RemoveRows(const Matrix& a, const WorkspaceVector<std::size_t>& remove);
 
-double Dot(const Vector& a, const Vector& b);
-double MaxAbs(const Matrix& a);
-double MaxAbs(const Vector& a);
-bool IsNearlyZero(double value, double tolerance);
+Scalar Dot(const Vector& a, const Vector& b);
+Scalar MaxAbs(const Matrix& a);
+Scalar MaxAbs(const Vector& a);
+bool IsNearlyZero(Scalar value, Scalar tolerance);
 bool AllFinite(const Matrix& a);
 bool AllFinite(const Vector& a);
 
-Vector SolveLinearSystem(Matrix a, Vector b, double tolerance);
-Matrix SolveLinearSystem(Matrix a, Matrix b, double tolerance);
-RrefResult Rref(Matrix a, std::size_t pivot_column_limit, double tolerance);
+Vector SolveLinearSystem(Matrix a, Vector b, Scalar tolerance);
+Matrix SolveLinearSystem(Matrix a, Matrix b, Scalar tolerance);
+RrefResult Rref(Matrix a, std::size_t pivot_column_limit, Scalar tolerance);
 
 std::string Shape(const Matrix& a);
 std::ostream& operator<<(std::ostream& os, const Vector& x);

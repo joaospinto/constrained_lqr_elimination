@@ -31,15 +31,21 @@ from `N - 1` down to `0`. At each stage it:
 After the sweep, all explicit equality constraints have been folded into affine state and
 control maps, so the reduced problem is an unconstrained LQR solved by a standard Riccati
 backward/forward pass. The final state and control trajectories are mapped back through the
-stored affine maps, and the original multipliers are recovered by a backward pass over the
-original KKT stationarity equations. Redundant equality rows mark the Newton-KKT system as
-singular; a reduced control Hessian with the wrong inertia is reported separately when the
-candidate solve can still proceed.
+stored affine maps, and the original multipliers are recovered by applying the transposes of
+the recorded elimination operations to the reduced stationarity covectors. Redundant equality
+rows mark the Newton-KKT system as singular; a reduced control Hessian with the wrong inertia
+is reported separately when the candidate solve can still proceed.
 
-Build and test:
+The C++ API uses `clqr::Scalar` throughout. FP64 is the default; FP32 is a
+separate, pure-precision build selected at compile time. Because the scalar
+type is part of the C++ ABI, libraries and clients must use the same precision
+configuration.
+
+Build and test either precision:
 
 ```sh
-bazel test //...
+bazel test //... --config=fp64
+bazel test //... --config=fp32
 ```
 
 Run the C++ timing benchmark:
@@ -134,7 +140,9 @@ result = _clqr.solve({
 The lightweight package wrapper in `python/clqr/__init__.py` re-exports the same `solve`
 function once `_clqr` is on `PYTHONPATH`.
 
-Arrays are NumPy-compatible `float64` arrays. The result dict contains `status`, `message`,
+The Python boundary accepts and returns NumPy-compatible `float64` arrays; an
+FP32 extension converts them to and from `clqr::Scalar` internally. The result
+dict contains `status`, `message`,
 `newton_kkt_singular`, `newton_kkt_wrong_inertia`, `newton_kkt_diagnostic`, `objective`,
 `states`, `controls`, `initial_multiplier`, `dynamics_multipliers`, `mixed_multipliers`,
 `state_multipliers`, and `terminal_state_multiplier`. The multiplier signs correspond to the

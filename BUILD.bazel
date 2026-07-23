@@ -3,6 +3,11 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
 
+config_setting(
+    name = "fp32",
+    define_values = {"clqr_precision": "fp32"},
+)
+
 cc_library(
     name = "clqr",
     srcs = [
@@ -13,6 +18,10 @@ cc_library(
         "include/clqr/clqr.h",
         "include/clqr/linalg.h",
     ],
+    defines = select({
+        ":fp32": ["CLQR_USE_FLOAT=1"],
+        "//conditions:default": [],
+    }),
     includes = ["include"],
     visibility = ["//visibility:public"],
 )

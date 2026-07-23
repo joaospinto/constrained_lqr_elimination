@@ -108,7 +108,8 @@ nb::list VectorViewListToPython(const clqr::VectorView* vectors, std::size_t cou
   return out;
 }
 
-nb::dict Solve(nb::object problem_object, double tolerance = 1e-9) {
+nb::dict Solve(nb::object problem_object,
+               clqr::Scalar tolerance = clqr::SolveOptions{}.tolerance) {
   std::string step = "start";
   try {
     step = "cast problem";
@@ -180,5 +181,6 @@ nb::dict Solve(nb::object problem_object, double tolerance = 1e-9) {
 
 NB_MODULE(_clqr, module) {
   module.doc() = "Sequential constrained LQR solver.";
-  module.def("solve", &Solve, nb::arg("problem"), nb::arg("tolerance") = 1e-9);
+  module.def("solve", &Solve, nb::arg("problem"),
+             nb::arg("tolerance") = clqr::SolveOptions{}.tolerance);
 }
