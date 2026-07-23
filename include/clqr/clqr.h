@@ -1,7 +1,9 @@
 #ifndef CLQR_CLQR_H_
 #define CLQR_CLQR_H_
 
+#include <array>
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -100,6 +102,10 @@ class Workspace {
   static constexpr std::size_t RequiredBytesUniformWithTerminal(
       std::size_t stages, std::size_t state_dim, std::size_t terminal_state_dim,
       std::size_t control_dim) {
+    const std::size_t largest_dimension =
+        Max(Max(state_dim, terminal_state_dim), control_dim);
+    if (!WorkspaceBoundInputsSafe(stages, largest_dimension))
+      return std::numeric_limits<std::size_t>::max();
     const std::size_t total_state_scalars =
         stages * state_dim + terminal_state_dim;
     const std::size_t total_control_scalars = stages * control_dim;
@@ -170,6 +176,13 @@ class Workspace {
       std::size_t mixed_constraints_per_stage,
       std::size_t state_constraints_per_stage = 0,
       std::size_t terminal_constraints = 0) {
+    const std::size_t largest_dimension =
+        Max(Max(state_dim, control_dim),
+            Max(Max(mixed_constraints_per_stage,
+                    state_constraints_per_stage),
+                terminal_constraints));
+    if (!WorkspaceBoundInputsSafe(stages, largest_dimension))
+      return std::numeric_limits<std::size_t>::max();
     const std::size_t total_state_scalars = (stages + 1) * state_dim;
     const std::size_t total_control_scalars = stages * control_dim;
     const std::size_t total_dynamics_scalars = stages * state_dim;
@@ -259,7 +272,8 @@ class Workspace {
         AddAligned(bytes, alignof(Matrix), sizeof(Matrix) * (4 * stages + 2));
     bytes =
         AddAligned(bytes, alignof(Vector), sizeof(Vector) * (4 * stages + 2));
-    bytes += RequiredBytesUniform(stages, state_dim, control_dim);
+    bytes = AddAligned(bytes, alignof(std::size_t),
+                       RequiredBytesUniform(stages, state_dim, control_dim));
     bytes = AddAligned(bytes, alignof(VectorView),
                        sizeof(VectorView) * (stages + 1));
     bytes = AddAligned(bytes, alignof(VectorView), sizeof(VectorView) * stages);
@@ -287,6 +301,16 @@ class Workspace {
                             stages * pullback_stage_scalars +
                             4 * state_dim *
                                 (state_dim + terminal_constraints + 1)));
+    if (stages == 0) {
+      // Match the runtime constrained-workspace bound for the terminal-only
+      // recovery path.  With no stage-proportional scratch, its dense affine
+      // products and rectangular multiplier RREF coexist in the arena.
+      const std::size_t local_dimension =
+          state_dim + terminal_constraints + 1;
+      bytes = AddAligned(
+          bytes, alignof(Scalar),
+          sizeof(Scalar) * 8 * local_dimension * local_dimension);
+    }
     bytes = AddAligned(bytes, alignof(Vector),
                        sizeof(Vector) * (5 * stages + 1));
     bytes = AddAligned(bytes, alignof(Scalar),
@@ -309,14 +333,23 @@ class Workspace {
   const WorkspaceArena& arena() const { return arena_; }
 
  private:
+  const char* StoreMessage(const char* message);
+
   static constexpr std::size_t Align(std::size_t offset,
                                      std::size_t alignment) {
+    if (offset >
+        std::numeric_limits<std::size_t>::max() - (alignment - 1))
+      return std::numeric_limits<std::size_t>::max();
     return (offset + alignment - 1) & ~(alignment - 1);
   }
   static constexpr std::size_t AddAligned(std::size_t offset,
                                           std::size_t alignment,
                                           std::size_t bytes) {
-    return Align(offset, alignment) + bytes;
+    const std::size_t aligned = Align(offset, alignment);
+    if (aligned == std::numeric_limits<std::size_t>::max() ||
+        bytes > std::numeric_limits<std::size_t>::max() - aligned)
+      return std::numeric_limits<std::size_t>::max();
+    return aligned + bytes;
   }
   static constexpr std::size_t Min(std::size_t a, std::size_t b) {
     return a < b ? a : b;
@@ -324,12 +357,28 @@ class Workspace {
   static constexpr std::size_t Max(std::size_t a, std::size_t b) {
     return a > b ? a : b;
   }
+  static constexpr bool WorkspaceBoundInputsSafe(
+      std::size_t stages, std::size_t largest_dimension) {
+    constexpr std::size_t kCoefficientMargin = 1024;
+    const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+    if (stages == maximum || largest_dimension == maximum) return false;
+    const std::size_t stage_count = stages + 1;
+    const std::size_t dimension = largest_dimension + 1;
+    if (dimension > maximum / dimension) return false;
+    const std::size_t dimension_square = dimension * dimension;
+    if (stage_count > maximum / dimension_square) return false;
+    const std::size_t problem_scale = stage_count * dimension_square;
+    return problem_scale <= maximum / kCoefficientMargin;
+  }
 
   std::vector<unsigned char> owned_;
   unsigned char* external_ = nullptr;
   unsigned char* data_ = nullptr;
   std::size_t size_ = 0;
   WorkspaceArena arena_;
+  std::array<char, 128> message_{};
+
+  friend SolutionView Solve(const Problem&, Workspace&, const SolveOptions&);
 };
 
 SolutionView Solve(const Problem& problem, Workspace& workspace,

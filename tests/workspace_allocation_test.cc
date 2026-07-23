@@ -1,6 +1,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <new>
 #include <vector>
 
@@ -125,6 +126,22 @@ void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
 void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
 
 int main() {
+  constexpr std::size_t kMaximumSize =
+      std::numeric_limits<std::size_t>::max();
+  static_assert(Workspace::RequiredBytesUniform(0, kMaximumSize, 0) ==
+                    kMaximumSize,
+                "unconstrained workspace overflow must saturate");
+  static_assert(Workspace::RequiredBytesUniform(kMaximumSize, 0, 0) ==
+                    kMaximumSize,
+                "unconstrained horizon overflow must saturate");
+  static_assert(Workspace::RequiredBytesUniformConstrained(
+                    0, kMaximumSize, 0, 0, 0, 0) == kMaximumSize,
+                "constrained workspace overflow must saturate");
+  static_assert(Workspace::RequiredBytesUniformConstrained(
+                    kMaximumSize, 0, 0, 0, 0, 0) == kMaximumSize,
+                "constrained horizon overflow must saturate");
+  static_assert(Workspace::RequiredBytesUniform(1000000, 1, 1) != kMaximumSize,
+                "large safe horizons must retain a finite workspace bound");
   Problem problem = MakeProblem(64, 6, 3);
 
   Workspace owned;
@@ -218,6 +235,50 @@ int main() {
   Expect(terminal_solution.status == SolveStatus::kOptimal,
          "terminal constrained workspace solve status");
 
+  Problem zero_horizon_terminal = MakeProblem(0, 3, 0);
+  zero_horizon_terminal.terminal_E =
+      Matrix(2, 3, {1.0, 0.0, 0.0, 0.0, 1.0, 0.0});
+  zero_horizon_terminal.terminal_e =
+      Vector{-zero_horizon_terminal.initial_state[0],
+             -zero_horizon_terminal.initial_state[1]};
+  const std::size_t zero_horizon_required =
+      Workspace::RequiredBytes(zero_horizon_terminal);
+  constexpr std::size_t kZeroHorizonConstrainedBytes =
+      Workspace::RequiredBytesUniformConstrained(0, 3, 0, 0, 0, 2);
+  static_assert(kZeroHorizonConstrainedBytes > 0,
+                "zero-horizon constrained workspace size must be positive");
+  Expect(zero_horizon_required <= kZeroHorizonConstrainedBytes,
+         "zero-horizon constexpr workspace byte count");
+  std::vector<unsigned char> zero_horizon_memory(zero_horizon_required);
+  Workspace zero_horizon_external(zero_horizon_memory.data(),
+                                  zero_horizon_memory.size());
+  StartCounting();
+  SolutionView zero_horizon_solution =
+      Solve(zero_horizon_terminal, zero_horizon_external);
+  StopCounting();
+  const std::size_t zero_horizon_external_allocations =
+      g_allocations.load(std::memory_order_relaxed);
+  const std::size_t zero_horizon_external_bytes =
+      g_bytes.load(std::memory_order_relaxed);
+  Expect(zero_horizon_solution.status == SolveStatus::kOptimal,
+         "zero-horizon terminal constrained workspace solve status");
+  if (zero_horizon_external_allocations != 0) {
+    std::cerr << "zero-horizon external allocations="
+              << zero_horizon_external_allocations
+              << " bytes=" << zero_horizon_external_bytes << "\n";
+  }
+  Expect(zero_horizon_external_allocations == 0,
+         "zero-horizon constrained external solve should not allocate");
+  std::vector<unsigned char> zero_horizon_constexpr_memory(
+      kZeroHorizonConstrainedBytes);
+  Workspace zero_horizon_constexpr_external(
+      zero_horizon_constexpr_memory.data(),
+      zero_horizon_constexpr_memory.size());
+  SolutionView zero_horizon_constexpr_solution =
+      Solve(zero_horizon_terminal, zero_horizon_constexpr_external);
+  Expect(zero_horizon_constexpr_solution.status == SolveStatus::kOptimal,
+         "zero-horizon constexpr workspace solve status");
+
   std::cout << "owned_allocations=" << owned_allocations
             << " owned_bytes=" << owned_bytes
             << " external_allocations=" << external_allocations
@@ -233,7 +294,14 @@ int main() {
             << " terminal_required=" << terminal_required
             << " terminal_external_allocations="
             << terminal_external_allocations
-            << " terminal_external_bytes=" << terminal_external_bytes << "\n";
+            << " terminal_external_bytes=" << terminal_external_bytes
+            << " zero_horizon_required=" << zero_horizon_required
+            << " zero_horizon_constexpr="
+            << kZeroHorizonConstrainedBytes
+            << " zero_horizon_external_allocations="
+            << zero_horizon_external_allocations
+            << " zero_horizon_external_bytes="
+            << zero_horizon_external_bytes << "\n";
   Expect(constrained_owned_allocations == 1,
          "constrained owned workspace should allocate exactly once");
   Expect(constrained_external_allocations == 0,

@@ -15,6 +15,30 @@ max_control_dimension="${CLQR_CUDA_MAX_CONTROL_DIMENSION:-4}"
 max_mixed_constraints="${CLQR_CUDA_MAX_MIXED_CONSTRAINTS:-2}"
 max_state_constraints="${CLQR_CUDA_MAX_STATE_CONSTRAINTS:-2}"
 read -r -a precisions <<< "${CLQR_PRECISIONS:-FP64}"
+native_test_timeout_seconds="${CLQR_NATIVE_TEST_TIMEOUT_SECONDS:-900}"
+
+if [[ ! "${native_test_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CLQR_NATIVE_TEST_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+
+run_native_test() {
+  local sanitizer_tool="$1"
+  local native_test_binary="$2"
+  local -a command=()
+  if [[ -n "${sanitizer_tool}" ]]; then
+    command+=(
+      compute-sanitizer
+      --tool "${sanitizer_tool}"
+      --error-exitcode 99
+    )
+  fi
+  command+=("${native_test_binary}")
+  if [[ "${native_test_binary}" == *adversarial_cuda_extended_test ]]; then
+    command+=(--extended)
+  fi
+  timeout --signal=TERM "${native_test_timeout_seconds}s" "${command[@]}"
+}
 
 bazelisk_version=1.29.0
 bazelisk_sha256=5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992
@@ -61,6 +85,13 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "nvidia-smi is unavailable; select a CUDA GPU runtime first." >&2
   exit 2
 fi
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "GNU timeout is unavailable; install coreutils first." >&2
+  exit 2
+fi
+
+echo "=== Source revision ==="
+git -C "${repo_dir}" rev-parse HEAD
 
 echo "=== Host platform ==="
 uname -a
@@ -129,42 +160,77 @@ for precision in "${precisions[@]}"; do
     "--cuda_max_state_constraints=${max_state_constraints}"
     "--jobs=$(nproc)"
   )
-  test_targets=(
+  host_test_targets=(
     //:clqr_test
     //:workspace_allocation_test
     //:python_binding_test
     //:cuda_stub_test
-    //:cuda_kernel_emulation_test
-    //:cuda_solver_test
   )
-  build_targets=(
-    //:clqr_cuda_jax_fixture
-    //:clqr_cuda_benchmark
-  )
+  native_test_targets=(//:cuda_solver_test)
+  native_test_binaries=("${repo_dir}/bazel-bin/cuda_solver_test")
+  if [[ "${CLQR_RUN_EXTENDED_STRESS:-0}" == "1" ]]; then
+    host_test_targets+=(
+      //:adversarial_cpu_extended_test
+      //:cuda_kernel_emulation_extended_test
+    )
+    native_test_targets+=(//:adversarial_cuda_extended_test)
+    native_test_binaries+=(
+      "${repo_dir}/bazel-bin/adversarial_cuda_extended_test"
+    )
+  else
+    host_test_targets+=(
+      //:adversarial_cpu_test
+      //:cuda_kernel_emulation_test
+    )
+    native_test_targets+=(//:adversarial_cuda_test)
+    native_test_binaries+=("${repo_dir}/bazel-bin/adversarial_cuda_test")
+  fi
+  build_targets=("${native_test_targets[@]}")
+  if [[ "${CLQR_RUN_JAX_CROSS_VALIDATION:-0}" == "1" ]]; then
+    build_targets+=(//:clqr_cuda_jax_fixture)
+  fi
+  if [[ "${CLQR_SKIP_BENCHMARK:-0}" != "1" ]]; then
+    build_targets+=(//:clqr_cuda_benchmark)
+  fi
   cd "${repo_dir}"
   if ! "${bazel_command}" test "${bazel_args[@]}" \
-       --test_output=errors "${test_targets[@]}"; then
-    if command -v compute-sanitizer >/dev/null 2>&1 &&
-       [[ "${CLQR_SKIP_SANITIZER:-0}" != "1" ]] &&
-       [[ -x "${repo_dir}/bazel-bin/cuda_solver_test" ]]; then
-      for sanitizer_tool in memcheck initcheck racecheck synccheck; do
-        echo "=== ${precision} CUDA ${sanitizer_tool} failure diagnostic ==="
-        compute-sanitizer --tool "${sanitizer_tool}" --error-exitcode 99 \
-          "${repo_dir}/bazel-bin/cuda_solver_test" || true
-      done
-    fi
+       --test_output=errors "${host_test_targets[@]}"; then
     exit 8
   fi
   "${bazel_command}" build "${bazel_args[@]}" "${build_targets[@]}"
 
-  if command -v compute-sanitizer >/dev/null 2>&1 && \
+  native_tests_passed=1
+  for native_test_binary in "${native_test_binaries[@]}"; do
+    if ! run_native_test "" "${native_test_binary}"; then
+      native_tests_passed=0
+      break
+    fi
+  done
+
+  if [[ "${native_tests_passed}" != "1" ]] &&
+     command -v compute-sanitizer >/dev/null 2>&1 &&
+     [[ "${CLQR_SKIP_SANITIZER:-0}" != "1" ]]; then
+    sanitizer_tools=(memcheck initcheck racecheck synccheck)
+    for sanitizer_tool in "${sanitizer_tools[@]}"; do
+      echo "=== ${precision} CUDA ${sanitizer_tool} failure diagnostic ==="
+      for sanitizer_binary in "${native_test_binaries[@]}"; do
+        run_native_test "${sanitizer_tool}" "${sanitizer_binary}" || true
+      done
+    done
+  fi
+  if [[ "${native_tests_passed}" != "1" ]]; then
+    exit 8
+  fi
+
+  if command -v compute-sanitizer >/dev/null 2>&1 &&
      [[ "${CLQR_SKIP_SANITIZER:-0}" != "1" ]]; then
     read -r -a sanitizer_tools <<< \
       "${CLQR_SANITIZER_TOOLS:-memcheck initcheck racecheck synccheck}"
     for sanitizer_tool in "${sanitizer_tools[@]}"; do
       echo "=== ${precision} CUDA ${sanitizer_tool} check ==="
-      compute-sanitizer --tool "${sanitizer_tool}" --error-exitcode 99 \
-        "${repo_dir}/bazel-bin/cuda_solver_test"
+      for sanitizer_binary in "${native_test_binaries[@]}"; do
+        run_native_test "${sanitizer_tool}" "${sanitizer_binary}"
+      done
     done
   fi
 
@@ -173,6 +239,8 @@ for precision in "${precisions[@]}"; do
       "${repo_dir}/bazel-bin/clqr_cuda_jax_fixture"
   fi
 
-  "${repo_dir}/bazel-bin/clqr_cuda_benchmark" \
-    --repeats "${CLQR_BENCHMARK_REPEATS:-5}"
+  if [[ "${CLQR_SKIP_BENCHMARK:-0}" != "1" ]]; then
+    "${repo_dir}/bazel-bin/clqr_cuda_benchmark" \
+      --repeats "${CLQR_BENCHMARK_REPEATS:-5}"
+  fi
 done

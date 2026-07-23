@@ -4251,6 +4251,13 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     output->right_dim = right;
   }
   if (shared == 0) {
+    // A zero-dimensional interface disconnects the two value elements.  The
+    // composed cross map is therefore the right-by-left zero matrix.  Compact
+    // scan storage is intentionally uninitialized, so publish those zeros
+    // explicitly rather than relying on allocator contents.
+    for (int linear = threadIdx.x; linear < right * left;
+         linear += blockDim.x)
+      output->A[linear] = Scalar{0};
     for (int linear = threadIdx.x; linear < left * left; linear += blockDim.x) {
       const int row = linear / left;
       const int col = linear % left;

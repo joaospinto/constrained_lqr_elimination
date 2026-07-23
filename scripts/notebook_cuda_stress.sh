@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export CLQR_RUN_EXTENDED_STRESS=1
+export CLQR_SKIP_BENCHMARK=1
+export CLQR_CUDA_MAX_STATE_DIMENSION="${CLQR_CUDA_MAX_STATE_DIMENSION:-8}"
+export CLQR_CUDA_MAX_CONTROL_DIMENSION="${CLQR_CUDA_MAX_CONTROL_DIMENSION:-4}"
+export CLQR_CUDA_MAX_MIXED_CONSTRAINTS="${CLQR_CUDA_MAX_MIXED_CONSTRAINTS:-4}"
+export CLQR_CUDA_MAX_STATE_CONSTRAINTS="${CLQR_CUDA_MAX_STATE_CONSTRAINTS:-4}"
+
+exec "${script_dir}/notebook_cuda.sh" "$@"

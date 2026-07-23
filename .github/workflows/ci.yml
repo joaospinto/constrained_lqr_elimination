@@ -63,6 +63,7 @@ jobs:
         run: >-
           bazel test
           //:clqr_test
+          //:adversarial_cpu_test
           //:workspace_allocation_test
           //:cuda_stub_test
           //:cuda_kernel_emulation_test

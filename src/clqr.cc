@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <sstream>
 #include <stdexcept>
@@ -418,6 +419,12 @@ void AddDiagnostic(NewtonKktDiagnostics* diagnostics,
   if (diagnostics == nullptr) return;
   if (ActiveWorkspaceArena() != nullptr) return;
   diagnostics->messages.push_back(message);
+}
+
+void AddDiagnostic(NewtonKktDiagnostics* diagnostics, const char* message) {
+  if (diagnostics == nullptr) return;
+  if (ActiveWorkspaceArena() != nullptr) return;
+  diagnostics->messages.emplace_back(message);
 }
 
 void AddIndexedDiagnostic(NewtonKktDiagnostics* diagnostics, const char* prefix,
@@ -1650,6 +1657,15 @@ void AddRecoveryStorageBound(const Problem& problem,
   AddScalars(offset,
              4 * dims.terminal_state *
                  (dims.terminal_state + dims.max_terminal_rows + 1));
+  if (N == 0) {
+    // With no stages the terminal-state parametrization, dense affine
+    // products, rectangular multiplier solve, and their RREF traces all
+    // coexist in the monotonic arena. The stage-proportional scratch terms
+    // above vanish, so retain a local quadratic bound explicitly.
+    const std::size_t local_dimension =
+        dims.terminal_state + dims.max_terminal_rows + 1;
+    AddScalars(offset, 8 * local_dimension * local_dimension);
+  }
   AddSolutionStorageBound(problem, offset);
 }
 
@@ -1659,7 +1675,8 @@ std::size_t ConstrainedWorkspaceRequiredBytes(const Problem& problem,
   std::size_t offset = 0;
   AddWorkingProblemStorageBound(problem, &offset);
   AddEliminationStorageBound(problem, options, dims, &offset);
-  offset += RiccatiWorkspace::RequiredBytes(problem.stages);
+  AddWorkspaceBytes(&offset, alignof(std::size_t),
+                    RiccatiWorkspace::RequiredBytes(problem.stages));
   AddSolutionStorageBound(problem, &offset);
   AddRecoveryStorageBound(problem, dims, &offset);
   AddSolutionViewStorageBound(problem, &offset);
@@ -2098,7 +2115,7 @@ SolutionView MakeSolutionViewFromSolution(Solution* solution,
                                           WorkspaceArena* arena) {
   SolutionView view;
   view.status = solution->status;
-  view.message = StatusName(solution->status);
+  view.message = solution->message.c_str();
   view.state_count = solution->states.size();
   view.control_count = solution->controls.size();
   view.dynamics_multiplier_count = solution->dynamics_multipliers.size();
@@ -2146,8 +2163,8 @@ ReducedSolution SolveUnconstrained(const WorkspaceVector<Stage>& stages,
   RiccatiWorkspace workspace;
   if (WorkspaceArena* arena = ActiveWorkspaceArena(); arena != nullptr) {
     const std::size_t bytes = RiccatiWorkspace::RequiredBytes(stages);
-    auto* data =
-        static_cast<unsigned char*>(arena->Allocate(bytes, alignof(Scalar)));
+    auto* data = static_cast<unsigned char*>(
+        arena->Allocate(bytes, alignof(std::size_t)));
     workspace.Assign(stages, data, bytes);
   } else {
     workspace.Reserve(stages);
@@ -2666,8 +2683,8 @@ Solution SolveMixedOnlyIdentityState(const Problem& original,
   RiccatiWorkspace workspace;
   if (WorkspaceArena* arena = ActiveWorkspaceArena(); arena != nullptr) {
     const std::size_t bytes = RiccatiWorkspace::RequiredBytes(stages);
-    auto* data =
-        static_cast<unsigned char*>(arena->Allocate(bytes, alignof(Scalar)));
+    auto* data = static_cast<unsigned char*>(
+        arena->Allocate(bytes, alignof(std::size_t)));
     workspace.Assign(stages, data, bytes);
   } else {
     workspace.Reserve(stages);
@@ -2877,6 +2894,14 @@ void Workspace::UseExternalMemory(void* memory, std::size_t bytes) {
   arena_.Reset(data_, size_);
 }
 
+const char* Workspace::StoreMessage(const char* message) {
+  const std::size_t length =
+      std::min(message_.size() - 1, std::strlen(message));
+  std::memcpy(message_.data(), message, length);
+  message_[length] = '\0';
+  return message_.data();
+}
+
 const char* StatusName(SolveStatus status) {
   switch (status) {
     case SolveStatus::kOptimal:
@@ -2909,7 +2934,10 @@ SolutionView Solve(const Problem& problem, Workspace& workspace,
       workspace.arena().Clear();
       ScopedWorkspaceArena scoped(&workspace.arena());
       Solution solution = SolveInternalResult(problem, options);
-      return MakeSolutionViewFromSolution(&solution, &workspace.arena());
+      SolutionView view =
+          MakeSolutionViewFromSolution(&solution, &workspace.arena());
+      view.message = workspace.StoreMessage(solution.message.c_str());
+      return view;
     }
     SolutionWorkspaceLayout layout = BindSolutionWorkspace(problem, workspace);
     SolveUnconstrainedIntoView(problem, options.tolerance, &layout,
@@ -2917,14 +2945,15 @@ SolutionView Solve(const Problem& problem, Workspace& workspace,
     layout.view.newton_kkt_singular = diagnostics.singular;
     layout.view.newton_kkt_wrong_inertia =
         layout.view.newton_kkt_wrong_inertia || diagnostics.wrong_inertia;
+    layout.view.message = workspace.StoreMessage(layout.view.message);
     return layout.view;
   } catch (const std::invalid_argument& e) {
     out.status = SolveStatus::kInvalidInput;
-    out.message = e.what();
+    out.message = workspace.StoreMessage(e.what());
     return out;
   } catch (const std::exception& e) {
     out.status = SolveStatus::kNumericalFailure;
-    out.message = e.what();
+    out.message = workspace.StoreMessage(e.what());
     return out;
   }
 }

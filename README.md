@@ -138,6 +138,25 @@ additional solution-level JAX cross-validation diagnostic, set
 `CLQR_RUN_JAX_CROSS_VALIDATION=1`; `CLQR_JAX_REVISION` can override its pinned
 reference revision.
 
+For correctness stress testing rather than timing, use
+[`notebooks/kaggle_cuda_stress.ipynb`](notebooks/kaggle_cuda_stress.ipynb).
+Its shell driver, [`scripts/notebook_cuda_stress.sh`](scripts/notebook_cuda_stress.sh),
+runs the extended fixed-seed and long-horizon corpus in FP64 and FP32 through
+the sequential C++ solver and native CUDA, runs the shared standard and
+selected extended corpus through CUDA kernel emulation, and applies Compute
+Sanitizer memcheck, initcheck, racecheck, and synccheck to both native suites.
+The report includes the exact revision, host, compiler, CUDA toolkit, driver,
+and GPU descriptions.
+The normal CI-sized adversarial suite is `//:adversarial_cpu_test`; opt into the
+broader host and emulation suites with:
+
+```sh
+bazel test //:adversarial_cpu_extended_test \
+  //:cuda_kernel_emulation_extended_test \
+  --config=fp64 \
+  --test_output=errors
+```
+
 Build and test either precision:
 
 ```sh

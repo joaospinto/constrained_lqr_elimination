@@ -58,6 +58,35 @@ cc_test(
     deps = [":clqr"],
 )
 
+cc_library(
+    name = "adversarial_test_support",
+    hdrs = ["tests/adversarial_test_support.h"],
+    includes = ["tests"],
+    testonly = True,
+    deps = [":clqr"],
+)
+
+cc_test(
+    name = "adversarial_cpu_test",
+    srcs = ["tests/adversarial_cpu_test.cc"],
+    deps = [
+        ":adversarial_test_support",
+        ":clqr",
+    ],
+)
+
+cc_test(
+    name = "adversarial_cpu_extended_test",
+    srcs = ["tests/adversarial_cpu_test.cc"],
+    args = ["--extended"],
+    size = "large",
+    tags = ["manual"],
+    deps = [
+        ":adversarial_test_support",
+        ":clqr",
+    ],
+)
+
 cc_test(
     name = "workspace_allocation_test",
     srcs = ["tests/workspace_allocation_test.cc"],
@@ -119,6 +148,36 @@ cc_test(
     deps = [":clqr_cuda"],
 )
 
+cc_test(
+    name = "adversarial_cuda_test",
+    srcs = ["tests/adversarial_cuda_test.cc"],
+    tags = [
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = requires_cuda(),
+    deps = [
+        ":adversarial_test_support",
+        ":clqr_cuda",
+    ],
+)
+
+cc_test(
+    name = "adversarial_cuda_extended_test",
+    srcs = ["tests/adversarial_cuda_test.cc"],
+    args = ["--extended"],
+    size = "large",
+    tags = [
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = requires_cuda(),
+    deps = [
+        ":adversarial_test_support",
+        ":clqr_cuda",
+    ],
+)
+
 cc_binary(
     name = "clqr_cuda_jax_fixture",
     srcs = [
@@ -173,6 +232,29 @@ cc_test(
         "//conditions:default": [],
     }),
     deps = [
+        ":adversarial_test_support",
+        ":clqr",
+        ":cuda_kernel_emulation_sources",
+    ],
+)
+
+cc_test(
+    name = "cuda_kernel_emulation_extended_test",
+    srcs = [
+        "benchmarks/cuda_benchmark_problem.h",
+        "tests/cuda_jax_problem.h",
+        "tests/cuda_kernel_emulation_test.cc",
+    ],
+    args = ["--extended"],
+    size = "large",
+    tags = ["manual"],
+    copts = select({
+        ":linux": ["-Wno-maybe-uninitialized"],
+        ":macos": ["-Wno-sometimes-uninitialized"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":adversarial_test_support",
         ":clqr",
         ":cuda_kernel_emulation_sources",
     ],
