@@ -103,6 +103,14 @@ __device__ Scalar WarpMaximum(Scalar value) {
 #endif
 }
 
+__device__ int WarpBroadcastLaneZero(int value) {
+#ifdef CLQR_CUDA_EMULATION
+  return value;
+#else
+  return __shfl_sync(0xffffffffu, value, 0);
+#endif
+}
+
 __device__ void WarpSynchronize() {
 #ifndef CLQR_CUDA_EMULATION
   __syncwarp();
@@ -157,18 +165,18 @@ __device__ void SetFailure(DeviceStatus *status, int code, int stage,
 // independently in every lane before a later warp synchronization can
 // therefore make only part of a warp return.  Have one lane sample the flag
 // and broadcast a warp-uniform decision instead.
-__device__ bool BlockEnabled(const DeviceStatus *status, int *enabled) {
+__device__ bool BlockEnabled(const DeviceStatus *status) {
+  int enabled = 0;
   if (threadIdx.x == 0)
-    *enabled = status->code == kDeviceOk;
-  WarpSynchronize();
-  return *enabled != 0;
+    enabled = status->code == kDeviceOk;
+  return WarpBroadcastLaneZero(enabled) != 0;
 }
 
-__device__ bool BlockEnabled(const int *flag, int *enabled) {
+__device__ bool BlockEnabled(const int *flag) {
+  int enabled = 0;
   if (threadIdx.x == 0)
-    *enabled = *flag != 0;
-  WarpSynchronize();
-  return *enabled != 0;
+    enabled = *flag != 0;
+  return WarpBroadcastLaneZero(enabled) != 0;
 }
 
 // Scale each nonzero equation before pivoting, then use partial row pivoting.
@@ -713,8 +721,7 @@ BuildPrimalLeavesKernel(const PackedStage *stages, int stage_count,
   const int index = blockIdx.x;
   if (index > stage_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   __shared__ Scalar matrix[kMaxRrefEntries];
   __shared__ Scalar factors[kMaxRrefRows];
@@ -970,8 +977,7 @@ ReduceRelationLeavesKernel(const Relation *leaves, int count, int parent_count,
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const int left = 2 * index;
   if (left + 1 >= count) {
@@ -1000,8 +1006,7 @@ __global__ void ReduceRelationTreeLevelKernel(Relation *tree, int child_offset,
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const int left = child_offset + 2 * index;
   if (2 * index + 1 >= child_count) {
@@ -1035,8 +1040,7 @@ __global__ void ExpandRelationContextLevelKernel(
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const int left = child_offset + 2 * index;
   const Relation &parent_context = tree[parent_offset + index];
@@ -1067,8 +1071,7 @@ __global__ void FinalizeRelationSuffixFromParentsKernel(
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const int left = 2 * index;
   const Relation &parent = parent_contexts[index];
@@ -3224,8 +3227,7 @@ __global__ void ReduceAffineLeavesKernel(const AffineMap *leaves, int count,
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const int left = 2 * index;
   if (left + 1 >= count) {
@@ -3243,8 +3245,7 @@ __global__ void ReduceAffineTreeLevelKernel(AffineMap *tree, int child_offset,
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const int left = child_offset + 2 * index;
   if (2 * index + 1 >= child_count) {
@@ -3269,8 +3270,7 @@ ExpandAffineContextLevelKernel(AffineMap *tree, int child_offset,
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const int left = child_offset + 2 * index;
   const AffineMap &parent_context = tree[parent_offset + index];
@@ -3292,8 +3292,7 @@ FinalizeAffinePrefixFromParentsKernel(AffineMap *leaves, int count,
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const int left = 2 * index;
   const AffineMap &parent = parent_contexts[index];
@@ -3389,8 +3388,7 @@ __global__ void BuildDualParametersKernel(
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const PackedStage &stage = stages[index];
   const StateParam &next = state_params[index + 1];
@@ -3532,8 +3530,7 @@ __global__ void BuildDualParameterRelationsKernel(
   const int relation_index = blockIdx.x;
   if (relation_index >= stage_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const int node = relation_index + 1;
   const bool is_terminal = node == stage_count;
@@ -3772,8 +3769,7 @@ ReduceDualTreeLevelKernel(const DualRelation *tree, int child_offset,
   const int index = blockIdx.x;
   if (index >= parent_count || *scan_needed == 0)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   if (2 * index + 1 >= child_count) {
     CopyRelationBlock(tree[child_offset + 2 * index],
@@ -3801,8 +3797,7 @@ __global__ void SolveDualRootKernel(const DualRelation *relation,
                                     DeviceStatus *status, Scalar tolerance) {
   if (blockIdx.x != 0 || *scan_needed == 0)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   if (relation->right_dim != 0) {
     if (threadIdx.x == 0)
@@ -3860,8 +3855,7 @@ __global__ void ExpandDualTreeLevelKernel(
   const int index = blockIdx.x;
   if (index >= parent_count || *scan_needed == 0)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   if (2 * index + 1 >= child_count) {
     const DualNodeValue &parent = parent_values[parent_offset + index];
@@ -3980,8 +3974,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
   const int index = blockIdx.x;
   if (index > stage_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   if (index == stage_count) {
     const ReducedTerminal &terminal = *terminal_ptr;
@@ -4374,8 +4367,7 @@ __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(parallel_ok, &block_enabled))
+  if (!BlockEnabled(parallel_ok))
     return;
   const int left = 2 * index;
   if (left + 1 >= count) {
@@ -4401,8 +4393,7 @@ __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(parallel_ok, &block_enabled))
+  if (!BlockEnabled(parallel_ok))
     return;
   const int left = child_offset + 2 * index;
   if (2 * index + 1 >= child_count) {
@@ -4435,8 +4426,7 @@ __global__ void ExpandValueContextLevelKernel(
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(parallel_ok, &block_enabled))
+  if (!BlockEnabled(parallel_ok))
     return;
   const int left = child_offset + 2 * index;
   const ValueElement &parent_context = tree[parent_offset + index];
@@ -4465,8 +4455,7 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(parallel_ok, &block_enabled))
+  if (!BlockEnabled(parallel_ok))
     return;
   const int left = 2 * index;
   const ValueElement &parent = parent_contexts[index];
@@ -4588,10 +4577,9 @@ __global__ void FeedbackKernel(const ReducedStage *stages,
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
-  if (!BlockEnabled(parallel_ok, &block_enabled))
+  if (!BlockEnabled(parallel_ok))
     return;
   const ReducedStage &s = stages[index];
   const ValueElement &next = suffix[index + 1];
@@ -4639,8 +4627,7 @@ __global__ void SequentialRiccatiKernel(const ReducedStage *stages,
                                         DeviceStatus *status) {
   if (blockIdx.x != 0)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   __shared__ Scalar augmented[kMaxControlDimension *
                               (kMaxControlDimension + kMaxStateDimension + 1)];
@@ -4766,8 +4753,7 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
-  __shared__ int block_enabled;
-  if (!BlockEnabled(status, &block_enabled))
+  if (!BlockEnabled(status))
     return;
   const PackedStage &s = stages[index];
   const StateParam &current = state_params[index];
