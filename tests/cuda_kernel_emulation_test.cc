@@ -136,6 +136,64 @@ void TinyCoefficientRrefCase() {
          "RREF removes a coefficient below its rank tolerance");
 }
 
+void PivotedLuMultiRhsCase() {
+#ifdef CLQR_USE_FLOAT
+  constexpr Scalar solve_tolerance = 1e-5f;
+  constexpr Scalar comparison_tolerance = 2e-5f;
+  const Scalar row_scales[]{1e-3f, 1e3f, 1.0f};
+#else
+  constexpr Scalar solve_tolerance = 1e-9;
+  constexpr Scalar comparison_tolerance = 2e-12;
+  const Scalar row_scales[]{1e-12, 1e12, 1.0};
+#endif
+  constexpr int dimension = 3;
+  constexpr int right_hand_side_count = 3;
+  constexpr int columns = dimension + right_hand_side_count;
+  const Scalar coefficient[dimension * dimension]{
+      Scalar{0}, Scalar{2}, Scalar{-1}, Scalar{1}, Scalar{-2},
+      Scalar{3}, Scalar{4}, Scalar{1},  Scalar{2}};
+  const Scalar expected[dimension * right_hand_side_count]{
+      Scalar{0.25}, Scalar{-0.4}, Scalar{0.8},  Scalar{-0.7}, Scalar{0.3},
+      Scalar{0.1},  Scalar{0.5},  Scalar{-0.2}, Scalar{-0.6}};
+  Scalar augmented[dimension * columns]{};
+  for (int row = 0; row < dimension; ++row) {
+    for (int col = 0; col < dimension; ++col) {
+      augmented[row * columns + col] =
+          row_scales[row] * coefficient[row * dimension + col];
+    }
+    for (int rhs = 0; rhs < right_hand_side_count; ++rhs) {
+      for (int col = 0; col < dimension; ++col) {
+        augmented[row * columns + dimension + rhs] +=
+            augmented[row * columns + col] *
+            expected[col * right_hand_side_count + rhs];
+      }
+    }
+  }
+  Scalar factors[dimension]{};
+  int best_row = -1;
+  threadIdx.x = 0;
+  blockDim.x = 1;
+  Expect(SolveGeneralMultipleRhsBlock(augmented, dimension, columns,
+                                      solve_tolerance, factors, &best_row),
+         "pivoted LU multi-RHS solve");
+  for (int row = 0; row < dimension; ++row) {
+    for (int rhs = 0; rhs < right_hand_side_count; ++rhs) {
+      const int entry = row * right_hand_side_count + rhs;
+      Expect(std::abs(augmented[row * columns + dimension + rhs] -
+                      expected[entry]) < comparison_tolerance,
+             "pivoted LU multi-RHS solution entry " + std::to_string(entry));
+    }
+  }
+
+  Scalar singular[]{Scalar{1}, Scalar{2}, Scalar{3},
+                    Scalar{2}, Scalar{4}, Scalar{6}};
+  Scalar singular_factors[2]{};
+  best_row = -1;
+  Expect(!SolveGeneralMultipleRhsBlock(singular, 2, 3, solve_tolerance,
+                                       singular_factors, &best_row),
+         "pivoted LU rejects a singular coefficient matrix");
+}
+
 void IllConditionedPositiveDefiniteMultiRhsCase() {
 #ifdef CLQR_USE_FLOAT
   constexpr Scalar small_eigenvalue = 5e-4f;
@@ -253,16 +311,12 @@ void FreeFixedFreeValueCompositionCase() {
   DeviceStatus status{kDeviceOk, -1, 0};
   Scalar augmented[1]{};
   Scalar factors[1]{};
-  int pivot_columns[1]{};
-  int pivot_rows[1]{};
-  int rank = 0;
   int best_row = -1;
   threadIdx.x = 0;
   blockDim.x = 1;
 
-  ComposeValueElementsBlock(
-      first, second, kTolerance, &output, &status, 0, augmented, factors,
-      pivot_columns, pivot_rows, &rank, &best_row);
+  ComposeValueElementsBlock(first, second, kTolerance, &output, &status, 0,
+                            augmented, factors, &best_row);
 
   Expect(status.code == kDeviceOk,
          "free-fixed-free value composition status");
@@ -368,9 +422,9 @@ void ScratchPlannerTopologyCase() {
                  DenseEliminationScratchBytes(
                      8, 13, "uniform stage-reduction workspace"),
          "uniform n=8 feasibility launch scratch is unchanged");
-  Expect(uniform.value_compose == DenseEliminationScratchBytes(
-                                      n, 3 * n + 1, "uniform value workspace"),
-         "uniform n=8 value-composition launch scratch is unchanged");
+  Expect(uniform.value_compose ==
+             GeneralSolveScratchBytes(n, 3 * n + 1, "uniform value workspace"),
+         "uniform n=8 value-composition launch scratch uses LU workspace");
   Expect(uniform.value_leaf == value_leaf.bytes &&
              uniform.value_finalize ==
                  ValueFinalizeScratchBytes(uniform_relation, &uniform_relation,
@@ -1518,6 +1572,7 @@ int main(int argc, char **argv) {
     }
   }
   TinyCoefficientRrefCase();
+  PivotedLuMultiRhsCase();
   IllConditionedPositiveDefiniteMultiRhsCase();
   InvalidValueElementCopyCase();
   FreeFixedFreeValueCompositionCase();

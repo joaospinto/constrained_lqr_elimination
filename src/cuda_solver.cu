@@ -103,6 +103,14 @@ std::size_t DenseEliminationScratchBytes(std::size_t rows, std::size_t columns,
   return size.bytes;
 }
 
+std::size_t GeneralSolveScratchBytes(std::size_t rows, std::size_t columns,
+                                     const char *description) {
+  ScratchSize size;
+  size.Add<Scalar>(ScratchCheckedProduct(rows, columns, description));
+  size.Add<Scalar>(rows);
+  return size.bytes;
+}
+
 struct ScanShape {
   std::size_t left = 0;
   std::size_t right = 0;
@@ -247,7 +255,7 @@ std::size_t ValueComposeScratchBytes(const ScanShape &first,
   const std::size_t columns = ScratchCheckedSum(
       {ScratchCheckedProduct(2, first.right, description), first.left, 1},
       description);
-  return DenseEliminationScratchBytes(first.right, columns, description);
+  return GeneralSolveScratchBytes(first.right, columns, description);
 }
 
 std::size_t ValueFinalizeScratchBytes(const ScanShape &left,
@@ -292,8 +300,6 @@ std::size_t ValueFinalizeScratchBytes(const ScanShape &left,
   size.Add<Scalar>(shared_capacity);
   size.Add<ValueElement>(1);
   size.Add<Scalar>(composed_entries);
-  size.Add<int>(shared_capacity);
-  size.Add<int>(shared_capacity);
   return size.bytes;
 }
 
@@ -934,6 +940,94 @@ __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
       matrix[index] = Scalar{0};
   }
   WarpSynchronize();
+}
+
+// Solve A*X=B for a square nonsymmetric A using one row-equilibrated,
+// partial-pivoted LU factorization.  The coefficient and all right-hand sides
+// occupy one augmented row-major matrix.  Elimination is applied to the
+// right-hand sides as the factorization proceeds, and the solved X overwrites
+// B.  Native CUDA and kernel emulation use this same source.
+__device__ bool SolveGeneralMultipleRhsBlock(Scalar *augmented, int dimension,
+                                             int columns, Scalar tolerance,
+                                             Scalar *factors, int *best_row) {
+  for (int row = threadIdx.x; row < dimension; row += blockDim.x) {
+    Scalar scale = Scalar{0};
+    for (int col = 0; col < dimension; ++col) {
+      scale = fmax(scale, DeviceAbs(augmented[row * columns + col]));
+    }
+    factors[row] = scale;
+  }
+  WarpSynchronize();
+  for (int linear = threadIdx.x; linear < dimension * columns;
+       linear += blockDim.x) {
+    const int row = linear / columns;
+    if (factors[row] > Scalar{0})
+      augmented[linear] /= factors[row];
+  }
+  WarpSynchronize();
+
+  for (int pivot_col = 0; pivot_col < dimension; ++pivot_col) {
+    if (threadIdx.x == 0) {
+      *best_row = -1;
+      Scalar best = tolerance;
+      for (int row = pivot_col; row < dimension; ++row) {
+        const Scalar candidate =
+            DeviceAbs(augmented[row * columns + pivot_col]);
+        if (candidate > best) {
+          best = candidate;
+          *best_row = row;
+        }
+      }
+    }
+    WarpSynchronize();
+    const int selected_row = *best_row;
+    if (selected_row < 0)
+      return false;
+
+    if (selected_row != pivot_col) {
+      for (int col = threadIdx.x; col < columns; col += blockDim.x) {
+        const Scalar tmp = augmented[pivot_col * columns + col];
+        augmented[pivot_col * columns + col] =
+            augmented[selected_row * columns + col];
+        augmented[selected_row * columns + col] = tmp;
+      }
+    }
+    WarpSynchronize();
+
+    const Scalar pivot = augmented[pivot_col * columns + pivot_col];
+    for (int row = threadIdx.x; row < dimension; row += blockDim.x) {
+      factors[row] = row > pivot_col
+                         ? augmented[row * columns + pivot_col] / pivot
+                         : Scalar{0};
+    }
+    WarpSynchronize();
+    const int remaining_rows = dimension - pivot_col - 1;
+    const int remaining_columns = columns - pivot_col - 1;
+    for (int linear = threadIdx.x; linear < remaining_rows * remaining_columns;
+         linear += blockDim.x) {
+      const int row = pivot_col + 1 + linear / remaining_columns;
+      const int col = pivot_col + 1 + linear % remaining_columns;
+      augmented[row * columns + col] -=
+          factors[row] * augmented[pivot_col * columns + col];
+    }
+    WarpSynchronize();
+  }
+
+  const int right_hand_side_count = columns - dimension;
+  for (int rhs = threadIdx.x; rhs < right_hand_side_count; rhs += blockDim.x) {
+    for (int reverse = 0; reverse < dimension; ++reverse) {
+      const int row = dimension - 1 - reverse;
+      Scalar value = augmented[row * columns + dimension + rhs];
+      for (int col = row + 1; col < dimension; ++col) {
+        value -= augmented[row * columns + col] *
+                 augmented[col * columns + dimension + rhs];
+      }
+      augmented[row * columns + dimension + rhs] =
+          value / augmented[row * columns + row];
+    }
+  }
+  WarpSynchronize();
+  return true;
 }
 
 __device__ bool InconsistentRref(const Scalar *matrix, int rows, int columns,
@@ -5322,8 +5416,7 @@ __device__ void
 ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
                           Scalar tolerance, ValueElement *output,
                           DeviceStatus *status, int node, Scalar *augmented,
-                          Scalar *factors, int *pivot_columns, int *pivot_rows,
-                          int *rank, int *best_row) {
+                          Scalar *factors, int *best_row) {
   const int shared = first.right_dim;
   if (shared != second.left_dim) {
     if (threadIdx.x == 0)
@@ -5388,9 +5481,8 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     augmented[linear] = value;
   }
   WarpSynchronize();
-  RrefBlock(augmented, shared, columns, shared, tolerance, pivot_columns,
-            pivot_rows, rank, best_row, factors);
-  if (*rank != shared) {
+  if (!SolveGeneralMultipleRhsBlock(augmented, shared, columns, tolerance,
+                                    factors, best_row)) {
     if (threadIdx.x == 0)
       SetFailure(status, kDeviceNumericalFailure, node, 20);
     return;
@@ -5527,8 +5619,7 @@ __device__ void ComposeScanValueBlock(const ValueElement &first,
                                       Scalar tolerance, ValueElement *output,
                                       DeviceStatus *status, int node,
                                       Scalar *augmented, Scalar *factors,
-                                      int *pivot_columns, int *pivot_rows,
-                                      int *rank, int *best_row) {
+                                      int *best_row) {
   if (InvalidScanValueElement(first)) {
     if (InvalidScanValueElement(second)) {
       SetInvalidScanValueElement(output);
@@ -5542,8 +5633,7 @@ __device__ void ComposeScanValueBlock(const ValueElement &first,
     return;
   }
   ComposeValueElementsBlock(first, second, tolerance, output, status, node,
-                            augmented, factors, pivot_columns, pivot_rows, rank,
-                            best_row);
+                            augmented, factors, best_row);
 }
 
 __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
@@ -5567,19 +5657,13 @@ __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) * columns);
   scratch_size.Add<Scalar>(shared);
-  scratch_size.Add<int>(shared);
-  scratch_size.Add<int>(shared);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *augmented =
       scratch.Take<Scalar>(static_cast<std::size_t>(shared) * columns);
   Scalar *factors = scratch.Take<Scalar>(shared);
-  int *pivot_columns = scratch.Take<int>(shared);
-  int *pivot_rows = scratch.Take<int>(shared);
-  __shared__ int rank;
   __shared__ int best_row;
   ComposeValueElementsBlock(first, second, tolerance, &parents[index], status,
-                            index, augmented, factors, pivot_columns,
-                            pivot_rows, &rank, &best_row);
+                            index, augmented, factors, &best_row);
 }
 
 __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
@@ -5604,20 +5688,14 @@ __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) * columns);
   scratch_size.Add<Scalar>(shared);
-  scratch_size.Add<int>(shared);
-  scratch_size.Add<int>(shared);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *augmented =
       scratch.Take<Scalar>(static_cast<std::size_t>(shared) * columns);
   Scalar *factors = scratch.Take<Scalar>(shared);
-  int *pivot_columns = scratch.Take<int>(shared);
-  int *pivot_rows = scratch.Take<int>(shared);
-  __shared__ int rank;
   __shared__ int best_row;
-  ComposeValueElementsBlock(first, second, tolerance,
-                            &tree[parent_offset + index], status,
-                            parent_offset + index, augmented, factors,
-                            pivot_columns, pivot_rows, &rank, &best_row);
+  ComposeValueElementsBlock(
+      first, second, tolerance, &tree[parent_offset + index], status,
+      parent_offset + index, augmented, factors, &best_row);
 }
 
 __global__ void InitializeValueContextRootKernel(ValueElement *tree,
@@ -5647,19 +5725,13 @@ __global__ void ExpandValueContextLevelKernel(
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) * columns);
   scratch_size.Add<Scalar>(shared);
-  scratch_size.Add<int>(shared);
-  scratch_size.Add<int>(shared);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *augmented =
       scratch.Take<Scalar>(static_cast<std::size_t>(shared) * columns);
   Scalar *factors = scratch.Take<Scalar>(shared);
-  int *pivot_columns = scratch.Take<int>(shared);
-  int *pivot_rows = scratch.Take<int>(shared);
-  __shared__ int rank;
   __shared__ int best_row;
   ComposeScanValueBlock(tree[right], parent_context, tolerance, &tree[left],
-                        status, left, augmented, factors, pivot_columns,
-                        pivot_rows, &rank, &best_row);
+                        status, left, augmented, factors, &best_row);
   WarpSynchronize();
   CopyValueElementBlock(parent_context, &tree[right]);
 }
@@ -5705,18 +5777,13 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   scratch_size.Add<Scalar>(shared_capacity);
   scratch_size.Add<ValueElement>(1);
   scratch_size.Add<Scalar>(composed_entries);
-  scratch_size.Add<int>(shared_capacity);
-  scratch_size.Add<int>(shared_capacity);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *augmented = scratch.Take<Scalar>(
       static_cast<std::size_t>(shared_capacity) * columns_capacity);
   Scalar *factors = scratch.Take<Scalar>(shared_capacity);
   ValueElement *composed_ptr = scratch.Take<ValueElement>(1);
   Scalar *composed_storage = scratch.Take<Scalar>(composed_entries);
-  int *pivot_columns = scratch.Take<int>(shared_capacity);
-  int *pivot_rows = scratch.Take<int>(shared_capacity);
   ValueElement &composed = *composed_ptr;
-  __shared__ int rank;
   __shared__ int best_row;
   if (threadIdx.x == 0)
     BindValueElementScratch(&composed, composed_storage, left_capacity,
@@ -5725,8 +5792,7 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   if (left + 1 >= count) {
     if (!InvalidScanValueElement(parent)) {
       ComposeScanValueBlock(leaves[left], parent, tolerance, &composed, status,
-                            left, augmented, factors, pivot_columns, pivot_rows,
-                            &rank, &best_row);
+                            left, augmented, factors, &best_row);
       WarpSynchronize();
       CopyValueElementBlock(composed, &leaves[left]);
     }
@@ -5734,15 +5800,13 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   }
   if (!InvalidScanValueElement(parent)) {
     ComposeScanValueBlock(leaves[right], parent, tolerance, &composed, status,
-                          right, augmented, factors, pivot_columns, pivot_rows,
-                          &rank, &best_row);
+                          right, augmented, factors, &best_row);
     WarpSynchronize();
     CopyValueElementBlock(composed, &leaves[right]);
     WarpSynchronize();
   }
   ComposeValueElementsBlock(leaves[left], leaves[right], tolerance, &composed,
-                            status, left, augmented, factors, pivot_columns,
-                            pivot_rows, &rank, &best_row);
+                            status, left, augmented, factors, &best_row);
   WarpSynchronize();
   CopyValueElementBlock(composed, &leaves[left]);
 }
