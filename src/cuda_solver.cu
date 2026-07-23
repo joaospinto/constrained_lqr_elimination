@@ -69,7 +69,7 @@ DualRelationLeafScratchBytes(std::size_t matrix_entries, std::size_t rows,
   scratch_size.Add<Scalar>(rows);
   scratch_size.Add<Scalar>(state_constraints);
   scratch_size.Add<int>(rows);
-  scratch_size.Add<int>(rows);
+  scratch_size.Add<int>(rows > state_constraints ? rows : state_constraints);
   return scratch_size.bytes;
 }
 
@@ -1028,6 +1028,181 @@ __device__ bool SolveGeneralMultipleRhsBlock(Scalar *augmented, int dimension,
   }
   WarpSynchronize();
   return true;
+}
+
+// Column-pivoted Householder QR followed by triangular normalization. The
+// result has the same echelon conventions as RrefBlock: columns are restored
+// to their original order, pivot_columns records the original pivot
+// variables, and the leading rank rows express those variables as affine
+// functions of the remaining columns. The same source is used by native CUDA
+// and kernel emulation.
+__device__ void OrthogonalEchelonBlock(Scalar *matrix, int rows, int columns,
+                                       int pivot_limit, int equilibration_limit,
+                                       Scalar tolerance, int *pivot_columns,
+                                       int *permutation, int *rank,
+                                       int *best_column, Scalar *reflector,
+                                       Scalar *matrix_scale,
+                                       Scalar minimum_row_scale = Scalar{0}) {
+  for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+    Scalar scale = Scalar{0};
+    for (int col = 0; col < equilibration_limit; ++col)
+      scale = fmax(scale, DeviceAbs(matrix[row * columns + col]));
+    if (scale > minimum_row_scale) {
+      for (int col = 0; col < columns; ++col)
+        matrix[row * columns + col] /= scale;
+    }
+  }
+  for (int col = threadIdx.x; col < pivot_limit; col += blockDim.x)
+    permutation[col] = col;
+  if (threadIdx.x == 0) {
+    *rank = 0;
+    *matrix_scale = Scalar{0};
+  }
+  WarpSynchronize();
+
+  for (int col = 0; col < pivot_limit; ++col) {
+    Scalar squared_norm = Scalar{0};
+    for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+      const Scalar value = matrix[row * columns + col];
+      squared_norm += value * value;
+    }
+    squared_norm = WarpSum(squared_norm);
+    if (threadIdx.x == 0)
+      *matrix_scale = fmax(*matrix_scale, sqrt(squared_norm));
+  }
+  WarpSynchronize();
+  const Scalar rank_threshold = tolerance * fmax(Scalar{1}, *matrix_scale);
+  const int maximum_rank = rows < pivot_limit ? rows : pivot_limit;
+
+  for (int basis = 0; basis < maximum_rank; ++basis) {
+    int selected_column = basis;
+    Scalar best_norm_squared = Scalar{-1};
+    for (int candidate = basis; candidate < pivot_limit; ++candidate) {
+      Scalar squared_norm = Scalar{0};
+      for (int row = basis + threadIdx.x; row < rows; row += blockDim.x) {
+        const Scalar value = matrix[row * columns + candidate];
+        squared_norm += value * value;
+      }
+      squared_norm = WarpSum(squared_norm);
+      if (squared_norm > best_norm_squared) {
+        best_norm_squared = squared_norm;
+        selected_column = candidate;
+      }
+    }
+    const Scalar best_norm = sqrt(best_norm_squared);
+    if (threadIdx.x == 0)
+      *best_column = selected_column;
+    WarpSynchronize();
+    if (!(best_norm > rank_threshold))
+      break;
+
+    selected_column = *best_column;
+    if (selected_column != basis) {
+      for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+        const Scalar value = matrix[row * columns + basis];
+        matrix[row * columns + basis] = matrix[row * columns + selected_column];
+        matrix[row * columns + selected_column] = value;
+      }
+      if (threadIdx.x == 0) {
+        const int variable = permutation[basis];
+        permutation[basis] = permutation[selected_column];
+        permutation[selected_column] = variable;
+      }
+    }
+    WarpSynchronize();
+
+    const Scalar diagonal = matrix[basis * columns + basis];
+    const Scalar alpha = diagonal < Scalar{0} ? best_norm : -best_norm;
+    for (int row = basis + threadIdx.x; row < rows; row += blockDim.x)
+      reflector[row] = matrix[row * columns + basis];
+    WarpSynchronize();
+    if (threadIdx.x == 0) {
+      reflector[basis] -= alpha;
+      matrix[basis * columns + basis] = alpha;
+    }
+    WarpSynchronize();
+    Scalar reflector_norm_squared = Scalar{0};
+    for (int row = basis + threadIdx.x; row < rows; row += blockDim.x)
+      reflector_norm_squared += reflector[row] * reflector[row];
+    reflector_norm_squared = WarpSum(reflector_norm_squared);
+    if (threadIdx.x == 0) {
+      *matrix_scale = reflector_norm_squared > Scalar{0}
+                          ? Scalar{2} / reflector_norm_squared
+                          : Scalar{0};
+    }
+    WarpSynchronize();
+    const Scalar beta = *matrix_scale;
+    if (!(beta > Scalar{0}))
+      break;
+
+    for (int col = basis + 1 + threadIdx.x; col < columns; col += blockDim.x) {
+      Scalar projection = Scalar{0};
+      for (int row = basis; row < rows; ++row)
+        projection += reflector[row] * matrix[row * columns + col];
+      projection *= beta;
+      for (int row = basis; row < rows; ++row)
+        matrix[row * columns + col] -= reflector[row] * projection;
+    }
+    WarpSynchronize();
+    if (threadIdx.x == 0) {
+      pivot_columns[basis] = permutation[basis];
+      *rank = basis + 1;
+    }
+    for (int row = basis + 1 + threadIdx.x; row < rows; row += blockDim.x)
+      matrix[row * columns + basis] = Scalar{0};
+    WarpSynchronize();
+  }
+
+  for (int reverse = 0; reverse < *rank; ++reverse) {
+    const int row = *rank - 1 - reverse;
+    const Scalar diagonal = matrix[row * columns + row];
+    for (int col = row + threadIdx.x; col < columns; col += blockDim.x)
+      matrix[row * columns + col] /= diagonal;
+    WarpSynchronize();
+    for (int upper = 0; upper < row; ++upper) {
+      const Scalar factor = matrix[upper * columns + row];
+      for (int col = row + threadIdx.x; col < columns; col += blockDim.x)
+        matrix[upper * columns + col] -=
+            factor * matrix[row * columns + col];
+    }
+    WarpSynchronize();
+  }
+
+  // permutation[position] is the original variable at that position. Restore
+  // every coefficient column in place without a second dense matrix.
+  for (int original = 0; original < pivot_limit; ++original) {
+    if (threadIdx.x == 0) {
+      *best_column = original;
+      while (permutation[*best_column] != original)
+        ++(*best_column);
+    }
+    WarpSynchronize();
+    const int selected_column = *best_column;
+    if (selected_column != original) {
+      for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+        const Scalar value = matrix[row * columns + original];
+        matrix[row * columns + original] =
+            matrix[row * columns + selected_column];
+        matrix[row * columns + selected_column] = value;
+      }
+      if (threadIdx.x == 0) {
+        const int variable = permutation[original];
+        permutation[original] = permutation[selected_column];
+        permutation[selected_column] = variable;
+      }
+    }
+    WarpSynchronize();
+  }
+
+  for (int index = threadIdx.x; index < rows * columns; index += blockDim.x) {
+    const int row = index / columns;
+    const int col = index % columns;
+    if ((row >= *rank && col < pivot_limit) ||
+        DeviceAbs(matrix[index]) <= tolerance) {
+      matrix[index] = Scalar{0};
+    }
+  }
+  WarpSynchronize();
 }
 
 __device__ bool InconsistentRref(const Scalar *matrix, int rows, int columns,
@@ -4820,8 +4995,10 @@ __global__ void BuildDualParameterRelationsKernel(
   Scalar *factors = scratch.Take<Scalar>(rows);
   Scalar *constraint_scales = scratch.Take<Scalar>(state_constraints);
   int *pivot_columns = scratch.Take<int>(rows);
-  int *pivot_rows = scratch.Take<int>(rows);
+  int *integer_scratch = scratch.Take<int>(DeviceMax(rows, state_constraints));
+  __shared__ Scalar matrix_scale;
   __shared__ int rank;
+  __shared__ int constraint_rank;
   __shared__ int best_row;
   __shared__ int local_ok;
 
@@ -4900,23 +5077,16 @@ __global__ void BuildDualParameterRelationsKernel(
     matrix[row * columns + columns - 1] = rhs;
   }
   WarpSynchronize();
-  // A redundant mixed-constraint multiplier is a true null direction. Its
-  // contribution to state stationarity can cancel exactly or leave only
-  // architecture-dependent roundoff, which must not become a new equation.
-  RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
-            pivot_rows, &rank, &best_row, factors,
-            kMinimumDualRelationRowScale);
+  // Solve for an independent subset of state-equality multipliers using the
+  // same rank-revealing orthogonal factorization as the CPU path. A redundant
+  // multiplier is a true null direction; contributions produced only at the
+  // roundoff level must not be normalized into new equations.
+  OrthogonalEchelonBlock(matrix, rows, columns, state_constraints, columns - 1,
+                         rank_tolerance, pivot_columns, integer_scratch, &rank,
+                         &best_row, factors, &matrix_scale,
+                         kMinimumDualRelationRowScale);
   if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(matrix, rows, columns, columns - 1,
-                                 rank_tolerance, consistency_tolerance);
-    if (!local_ok) {
-      SetFailure(status, kDeviceNumericalFailure, relation_index, 17);
-    }
-  }
-  WarpSynchronize();
-  if (!local_ok)
-    return;
-  if (threadIdx.x == 0) {
+    constraint_rank = rank;
     StateDualParam &out = state_params[relation_index];
     out.constraint_dim = state_constraints;
     out.left_dim = left.free_dim;
@@ -4928,10 +5098,8 @@ __global__ void BuildDualParameterRelationsKernel(
       for (int free = 0; free < right_dim; ++free)
         out.right[constraint * right_dim + free] = Scalar{0};
     }
-    for (int pivot = 0; pivot < rank; ++pivot) {
+    for (int pivot = 0; pivot < constraint_rank; ++pivot) {
       const int constraint = pivot_columns[pivot];
-      if (constraint >= state_constraints)
-        break;
       const Scalar inverse_scale = Scalar{1} / constraint_scales[constraint];
       out.offset[constraint] =
           matrix[pivot * columns + columns - 1] * inverse_scale;
@@ -4948,8 +5116,27 @@ __global__ void BuildDualParameterRelationsKernel(
     }
   }
   WarpSynchronize();
+
+  // Only the rows left after eliminating the state multipliers constrain the
+  // free dynamics/mixed-multiplier parameters. Canonicalize this residual
+  // relation with RREF; the multiplier solve itself remains QR.
+  Scalar *residual_matrix = matrix + constraint_rank * columns;
+  const int residual_rows = rows - constraint_rank;
+  RrefBlock(residual_matrix, residual_rows, columns, columns - 1,
+            rank_tolerance, pivot_columns, integer_scratch, &rank, &best_row,
+            factors, kMinimumDualRelationRowScale);
+  if (threadIdx.x == 0) {
+    local_ok =
+        !InconsistentRref(residual_matrix, residual_rows, columns, columns - 1,
+                          rank_tolerance, consistency_tolerance);
+    if (!local_ok)
+      SetFailure(status, kDeviceNumericalFailure, relation_index, 17);
+  }
+  WarpSynchronize();
+  if (!local_ok)
+    return;
   if (*scan_needed != 0) {
-    ExtractResidualRelation(matrix, columns, rank, pivot_columns,
+    ExtractResidualRelation(residual_matrix, columns, rank, pivot_columns,
                             state_constraints, left.free_dim, right_dim,
                             &relations[relation_index]);
   }

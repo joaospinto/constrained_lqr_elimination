@@ -194,6 +194,64 @@ void PivotedLuMultiRhsCase() {
          "pivoted LU rejects a singular coefficient matrix");
 }
 
+void OrthogonalEchelonCase() {
+#ifdef CLQR_USE_FLOAT
+  constexpr Scalar comparison_tolerance = 2e-4f;
+#else
+  constexpr Scalar comparison_tolerance = 2e-11;
+#endif
+  constexpr int rows = 4;
+  constexpr int variables = 3;
+  constexpr int columns = variables + 1;
+  Scalar matrix[rows * columns]{
+      Scalar{1e6}, Scalar{2e6},  Scalar{0},    Scalar{5e6},
+      Scalar{0},   Scalar{1e-6}, Scalar{1e-6}, Scalar{4e-6},
+      Scalar{3},   Scalar{9},    Scalar{3},    Scalar{27},
+      Scalar{0},   Scalar{0},    Scalar{0},    Scalar{0}};
+  int pivot_columns[variables]{};
+  int permutation[variables]{};
+  int rank = -1;
+  int best_column = -1;
+  Scalar reflector[rows]{};
+  Scalar matrix_scale = Scalar{0};
+  threadIdx.x = 0;
+  blockDim.x = 1;
+
+  OrthogonalEchelonBlock(matrix, rows, columns, variables, variables,
+                         kTolerance, pivot_columns, permutation, &rank,
+                         &best_column, reflector, &matrix_scale);
+
+  Expect(rank == 2, "orthogonal echelon detects the scaled rank");
+  bool pivot[variables]{};
+  for (int row = 0; row < rank; ++row) {
+    const int col = pivot_columns[row];
+    Expect(col >= 0 && col < variables && !pivot[col],
+           "orthogonal echelon returns distinct valid pivots");
+    pivot[col] = true;
+    for (int other = 0; other < rank; ++other) {
+      const Scalar expected = other == row ? Scalar{1} : Scalar{0};
+      Expect(std::abs(matrix[other * columns + col] - expected) <
+                 comparison_tolerance,
+             "orthogonal echelon normalizes its pivot block");
+    }
+  }
+  const Scalar solution[variables]{Scalar{1}, Scalar{2}, Scalar{2}};
+  for (int row = 0; row < rank; ++row) {
+    Scalar residual = -matrix[row * columns + variables];
+    for (int col = 0; col < variables; ++col)
+      residual += matrix[row * columns + col] * solution[col];
+    Expect(std::abs(residual) < comparison_tolerance,
+           "orthogonal echelon preserves the solution relation");
+  }
+  for (int row = rank; row < rows; ++row) {
+    Scalar residual = Scalar{0};
+    for (int col = 0; col < columns; ++col)
+      residual = std::max(residual, std::abs(matrix[row * columns + col]));
+    Expect(residual < comparison_tolerance,
+           "orthogonal echelon removes consistent dependent rows");
+  }
+}
+
 void IllConditionedPositiveDefiniteMultiRhsCase() {
 #ifdef CLQR_USE_FLOAT
   constexpr Scalar small_eigenvalue = 5e-4f;
@@ -348,6 +406,16 @@ void DualRelationLeafScratchSizeCase() {
   Expect(DualRelationLeafScratchBytes(4, 1, 1) ==
              without_constraint_scales.bytes + sizeof(Scalar),
          "dual-relation leaf scratch includes state-constraint scales");
+
+  ScratchSize more_constraints_than_rows;
+  more_constraints_than_rows.Add<Scalar>(6);
+  more_constraints_than_rows.Add<Scalar>(1);
+  more_constraints_than_rows.Add<Scalar>(3);
+  more_constraints_than_rows.Add<int>(1);
+  more_constraints_than_rows.Add<int>(3);
+  Expect(DualRelationLeafScratchBytes(6, 1, 3) ==
+             more_constraints_than_rows.bytes,
+         "dual-relation leaf scratch sizes the QR permutation at runtime");
 }
 
 Problem PathologicalScratchProblem() {
@@ -877,14 +945,22 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
                    const std::vector<Scalar> &dynamics,
                    const std::vector<Scalar> &mixed,
                    const std::vector<Scalar> &state_multipliers,
-                   const std::vector<Scalar> &terminal_multiplier) {
+                   const std::vector<Scalar> &terminal_multiplier,
+                   std::string *worst = nullptr) {
   Scalar residual = 0.0;
-  const auto update = [&](Scalar candidate) {
+  const auto update = [&](Scalar candidate, std::string equation) {
     if (!std::isfinite(candidate)) {
       residual = std::numeric_limits<Scalar>::infinity();
+      if (worst != nullptr)
+        *worst = std::move(equation);
       return;
     }
-    residual = std::max(residual, std::abs(candidate));
+    candidate = std::abs(candidate);
+    if (candidate > residual) {
+      residual = candidate;
+      if (worst != nullptr)
+        *worst = std::move(equation);
+    }
   };
   const int horizon = static_cast<int>(problem.stages.size());
   for (int i = 0; i < horizon; ++i) {
@@ -902,7 +978,7 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
         value -= s.A(row, col) * x[col];
       for (std::size_t col = 0; col < s.B.cols(); ++col)
         value -= s.B(row, col) * u[col];
-      update(value);
+      update(value, "dynamics at stage " + std::to_string(i));
     }
     for (std::size_t row = 0; row < s.C.rows(); ++row) {
       Scalar value = s.d[row];
@@ -915,7 +991,7 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
         value += s.D(row, col) * u[col];
         scale = std::max(scale, std::abs(s.D(row, col)));
       }
-      update(value / scale);
+      update(value / scale, "mixed feasibility at stage " + std::to_string(i));
     }
     for (std::size_t row = 0; row < s.E.rows(); ++row) {
       Scalar value = s.e[row];
@@ -924,7 +1000,7 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
         value += s.E(row, col) * x[col];
         scale = std::max(scale, std::abs(s.E(row, col)));
       }
-      update(value / scale);
+      update(value / scale, "state feasibility at stage " + std::to_string(i));
     }
     for (std::size_t row = 0; row < s.A.cols(); ++row) {
       Scalar value = s.q[row] + left[row];
@@ -941,7 +1017,7 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
         value +=
             s.E(constraint, row) *
             state_multipliers[i * kTestStateConstraintCapacity + constraint];
-      update(value);
+      update(value, "state stationarity at stage " + std::to_string(i));
     }
     for (std::size_t row = 0; row < s.B.cols(); ++row) {
       Scalar value = s.r[row];
@@ -954,7 +1030,7 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
       for (std::size_t constraint = 0; constraint < s.D.rows(); ++constraint)
         value +=
             s.D(constraint, row) * mixed[i * kTestMixedCapacity + constraint];
-      update(value);
+      update(value, "control stationarity at stage " + std::to_string(i));
     }
   }
   const Scalar *terminal = states.data() + horizon * kTestStateCapacity;
@@ -969,7 +1045,7 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
          ++constraint)
       value +=
           problem.terminal_E(constraint, row) * terminal_multiplier[constraint];
-    update(value);
+    update(value, "terminal stationarity");
   }
   return residual;
 }
@@ -1525,16 +1601,17 @@ void RunEmulation(const Problem &problem, const std::string &name,
                                  allowed_failure))
     return;
 
-  const Scalar residual =
-      MaxResidual(problem, states, controls, initial_multiplier, dynamics,
-                  mixed, state_multipliers, terminal_multiplier);
+  std::string worst_residual;
+  const Scalar residual = MaxResidual(
+      problem, states, controls, initial_multiplier, dynamics, mixed,
+      state_multipliers, terminal_multiplier, &worst_residual);
   const Scalar kkt_tolerance = horizon >= 256
                                    ? kLongHorizonKktComparisonTolerance
                                    : kKktComparisonTolerance;
   Expect(std::isfinite(residual) &&
              residual < kkt_tolerance * kkt_tolerance_scale,
-         name + " emulated full KKT residual: " +
-             std::to_string(residual));
+         name + " emulated full KKT residual: " + std::to_string(residual) +
+             " in " + worst_residual);
   const char *validation = compare_cpu ? "matched CPU" : "completed";
   std::cout << name << " CUDA kernel emulation "
             << validation << "; KKT residual=" << residual << '\n';
@@ -1573,6 +1650,7 @@ int main(int argc, char **argv) {
   }
   TinyCoefficientRrefCase();
   PivotedLuMultiRhsCase();
+  OrthogonalEchelonCase();
   IllConditionedPositiveDefiniteMultiRhsCase();
   InvalidValueElementCopyCase();
   FreeFixedFreeValueCompositionCase();
