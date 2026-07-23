@@ -1,11 +1,23 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_python//python:defs.bzl", "py_test")
+load("@clqr_pip//:requirements.bzl", "requirement")
 load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
 
 config_setting(
     name = "fp32",
     define_values = {"clqr_precision": "fp32"},
+)
+
+config_setting(
+    name = "linux",
+    constraint_values = ["@platforms//os:linux"],
+)
+
+config_setting(
+    name = "macos",
+    constraint_values = ["@platforms//os:osx"],
 )
 
 cc_library(
@@ -41,18 +53,26 @@ cc_test(
 nanobind_extension(
     name = "_clqr",
     srcs = ["python/clqr_module.cc"],
+    # Nanobind deliberately uses a zero-length-array extension. Keep all
+    # other warnings enabled and fatal in this translation unit.
+    copts = select({
+        ":linux": ["-Wno-pedantic"],
+        ":macos": [
+            "-Wno-nested-anon-types",
+            "-Wno-zero-length-array",
+        ],
+        "//conditions:default": [],
+    }),
     deps = [":clqr"],
     linkstatic = True,
     visibility = ["//visibility:public"],
 )
 
-cc_test(
+py_test(
     name = "python_binding_test",
-    srcs = ["tests/python_binding_test_runner.cc"],
-    data = [
-        ":_clqr",
-        "tests/python_binding_test.py",
-    ],
+    srcs = ["tests/python_binding_test.py"],
+    data = [":_clqr"],
+    deps = [requirement("numpy")],
 )
 
 cc_binary(

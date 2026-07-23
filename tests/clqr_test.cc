@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -26,7 +27,8 @@ using clqr::Workspace;
 constexpr Scalar kTol = 2e-4f;
 // The elimination pullback accumulates more rounding error in the dual
 // variables than in the primal trajectory when every operation is FP32.
-constexpr Scalar kKktTol = 6e-4f;
+constexpr Scalar kKktTol =
+    1e4f * std::numeric_limits<Scalar>::epsilon();
 constexpr Scalar kLinearSolveTolerance = 1e-7f;
 #else
 constexpr Scalar kTol = 1e-7;

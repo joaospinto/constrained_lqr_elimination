@@ -1,11 +1,12 @@
-startup --output_base=/private/tmp/constrained_lqr_elimination_bazel
-startup --install_base=/private/tmp/constrained_lqr_elimination_bazel_install
-
 build:linux --cxxopt=-std=c++20
 build:linux --cxxopt=-Wall
 build:linux --cxxopt=-Wextra
 build:linux --cxxopt=-Wpedantic
 build:linux --cxxopt=-Werror
+# Keep project warnings fatal without imposing that policy on dependencies.
+build:linux --per_file_copt=external/.*@-Wno-error
+# Nanobind intentionally uses a zero-length-array compiler extension.
+build:linux --per_file_copt=external/nanobind_bazel.*@-Wno-pedantic
 build:linux --cxxopt=-O3
 build:linux --sandbox_add_mount_pair=/tmp
 
@@ -14,6 +15,8 @@ build:macos --cxxopt=-Wall
 build:macos --cxxopt=-Wextra
 build:macos --cxxopt=-Wpedantic
 build:macos --cxxopt=-Werror
+# Keep project warnings fatal without imposing that policy on dependencies.
+build:macos --per_file_copt=external/.*@-Wno-error
 build:macos --cxxopt=-Wno-error=nested-anon-types
 build:macos --cxxopt=-Wno-error=zero-length-array
 build:macos --cxxopt=-O3
@@ -41,25 +44,25 @@ build:debug --cxxopt=-O0
 build:debug --spawn_strategy=local
 
 build:asan -c dbg
-build:asan --copt -fsanitize=address
-build:asan --copt -gfull
-build:asan --copt -O0
+build:asan --copt=-fsanitize=address
+build:asan --copt=-g
+build:asan --copt=-O0
 build:asan --spawn_strategy=local
-build:asan --copt -fno-omit-frame-pointer
-build:asan --linkopt -fsanitize=address
+build:asan --copt=-fno-omit-frame-pointer
+build:asan --linkopt=-fsanitize=address
 
 build:msan -c dbg
-build:msan --copt -fsanitize=memory
-build:msan --copt -gfull
-build:msan --copt -O0
+build:msan --copt=-fsanitize=memory
+build:msan --copt=-g
+build:msan --copt=-O0
 build:msan --spawn_strategy=local
-build:msan --copt -fno-omit-frame-pointer
-build:msan --linkopt -fsanitize=memory
+build:msan --copt=-fno-omit-frame-pointer
+build:msan --linkopt=-fsanitize=memory
 
 build:ubsan -c dbg
-build:ubsan --copt -fsanitize=undefined
-build:ubsan --copt -gfull
-build:ubsan --copt -O0
+build:ubsan --copt=-fsanitize=undefined
+build:ubsan --copt=-g
+build:ubsan --copt=-O0
 build:ubsan --spawn_strategy=local
-build:ubsan --copt -fno-omit-frame-pointer
-build:ubsan --linkopt -fsanitize=undefined
+build:ubsan --copt=-fno-omit-frame-pointer
+build:ubsan --linkopt=-fsanitize=undefined

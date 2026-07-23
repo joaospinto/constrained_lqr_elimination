@@ -34,3 +34,4 @@
 # Bazel internals
 bazel-*
 *.lock
+!requirements.lock
