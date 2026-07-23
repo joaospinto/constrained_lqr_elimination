@@ -57,6 +57,24 @@ void TinyCoefficientRrefCase() {
          "RREF removes a coefficient below its rank tolerance");
 }
 
+void InvalidValueElementCopyCase() {
+  Scalar input_j = Scalar{17};
+  Scalar output_j = Scalar{23};
+  ValueElement input{};
+  input.left_dim = -1;
+  input.right_dim = 0;
+  input.J = &input_j;
+  ValueElement output{};
+  output.J = &output_j;
+
+  CopyValueElementBlock(input, &output);
+
+  Expect(output.left_dim == -1 && output.right_dim == 0,
+         "copy preserves an invalid value-element sentinel");
+  Expect(output_j == Scalar{23},
+         "copy does not access storage for an invalid value element");
+}
+
 Scalar Value(int seed, std::size_t row, std::size_t col = 0) {
   const Scalar x = static_cast<Scalar>(seed * 83 + row * 29 + col * 43);
   return std::sin(0.019 * x) + 0.25 * std::cos(0.037 * x);
@@ -941,6 +959,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
 
 int main() {
   TinyCoefficientRrefCase();
+  InvalidValueElementCopyCase();
   RunEmulation(MakeProblem(), "rank-deficient constrained", true, true);
   RunEmulation(ZeroHorizonProblem(), "zero-horizon", false, false);
   RunEmulation(

@@ -4296,8 +4296,23 @@ __device__ void ComposeValueElementsBlock(
   }
 }
 
+__device__ bool InvalidScanValueElement(const ValueElement &element) {
+  return element.left_dim < 0;
+}
+
+__device__ void SetInvalidScanValueElement(ValueElement *element) {
+  if (threadIdx.x == 0) {
+    element->left_dim = -1;
+    element->right_dim = 0;
+  }
+}
+
 __device__ void CopyValueElementBlock(const ValueElement &input,
                                       ValueElement *output) {
+  if (InvalidScanValueElement(input)) {
+    SetInvalidScanValueElement(output);
+    return;
+  }
   if (threadIdx.x == 0) {
     output->left_dim = input.left_dim;
     output->right_dim = input.right_dim;
@@ -4324,17 +4339,6 @@ __device__ void CopyValueElementBlock(const ValueElement &input,
     const int row = linear / input.left_dim;
     const int col = linear % input.left_dim;
     output->J[row * input.left_dim + col] = input.J[row * input.left_dim + col];
-  }
-}
-
-__device__ bool InvalidScanValueElement(const ValueElement &element) {
-  return element.left_dim < 0;
-}
-
-__device__ void SetInvalidScanValueElement(ValueElement *element) {
-  if (threadIdx.x == 0) {
-    element->left_dim = -1;
-    element->right_dim = 0;
   }
 }
 
