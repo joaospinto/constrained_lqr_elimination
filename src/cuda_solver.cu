@@ -4024,6 +4024,9 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
     }
     for (int row = threadIdx.x; row < s.n; row += blockDim.x)
       out.eta[row] = s.q[row];
+    for (int linear = threadIdx.x; linear < s.next_n * s.next_n;
+         linear += blockDim.x)
+      out.C[linear] = Scalar{0};
     return;
   }
 

@@ -602,6 +602,8 @@ void RunEmulation(const Problem &problem, const std::string &name,
   std::vector<Scalar> value_a_storage(static_cast<std::size_t>(nodes) *
                                       kMaxValueElementEntries);
   std::vector<Scalar> value_b_storage(value_b.size() * kMaxValueElementEntries);
+  std::fill(value_a_storage.begin(), value_a_storage.end(), Scalar{17});
+  std::fill(value_b_storage.begin(), value_b_storage.end(), Scalar{19});
   for (int node = 0; node < nodes; ++node) {
     BindValueElementScratch(&value_a[node], value_a_storage.data() +
                                                 static_cast<std::size_t>(node) *
@@ -662,6 +664,8 @@ void RunEmulation(const Problem &problem, const std::string &name,
   std::vector<ValueElement> sequential_values(nodes);
   std::vector<Scalar> sequential_value_storage(static_cast<std::size_t>(nodes) *
                                                kMaxValueElementEntries);
+  std::fill(sequential_value_storage.begin(), sequential_value_storage.end(),
+            Scalar{23});
   for (int node = 0; node < nodes; ++node) {
     BindValueElementScratch(&sequential_values[node],
                             sequential_value_storage.data() +
