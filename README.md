@@ -77,8 +77,8 @@ positive definite, as in the standard convex LQR setting. A problem violating
 this regularity condition is reported as a numerical failure; the CUDA backend
 does not contain a horizon-sequential Riccati compatibility path.
 
-The public CUDA API is in `clqr/cuda.h`. Reserve a workspace once when solving
-the same shape repeatedly:
+The public CUDA API is in `clqr/cuda.h`. The ordinary owning interface validates
+the problem and copies the result into caller-owned vectors:
 
 ```cpp
 clqr::cuda::Workspace workspace;
@@ -86,6 +86,24 @@ workspace.Reserve(problem);
 clqr::cuda::Solution result;
 clqr::cuda::Solve(problem, workspace, result);
 ```
+
+For repeated solves with unchanged dimensions and matrix/vector shapes, reserve
+once and use the prepared, workspace-backed interface:
+
+```cpp
+clqr::cuda::Workspace workspace;
+workspace.Reserve(problem);
+
+// Numerical entries may change between calls, but the structure must not.
+clqr::cuda::SolutionView result =
+    clqr::cuda::SolvePreparedView(problem, workspace);
+```
+
+`SolutionView` avoids per-solve result allocation and copying. It remains valid
+until the workspace is reused, reserved for another structure, moved, or
+destroyed. Call `Materialize` or `SolvePrepared` when an owning result is
+required. `SolveView` provides the same non-owning representation while
+retaining structural validation on every call.
 
 A CPU-only build provides the same symbols through a stub library:
 `clqr::cuda::Available()` returns false and `Solve` reports an invalid-input
@@ -111,15 +129,16 @@ excessive per-block storage that would sharply reduce occupancy. If a
 factorization does not fit, `Solve` returns a deterministic diagnostic
 describing the required resource; there is no capacity flag to rebuild.
 
-The CUDA benchmark reuses reserved storage and reports both end-to-end wall
-time and pure kernel time. Wall time includes host packing, all transfers,
-synchronization, kernels, and result construction. `cuda_kernel_ms` sums CUDA
-event intervals containing only kernels; `upload_ms` and `download_ms` cover
-the bulk packed inputs and outputs, while `other_wall_ms` also contains the
-small phase-control transfers and synchronization overhead. Multiplier
-consistency rejection is disabled only while timing so the final KKT residual
-can be reported rather than turning a numerical threshold crossing into a
-missing row.
+The CUDA benchmark uses `SolvePreparedView`, reuses reserved storage, and
+reports both end-to-end wall time and pure kernel time. Wall time includes host
+packing, all transfers, synchronization, kernels, and construction of the
+workspace-backed view. `cuda_kernel_ms` sums CUDA event intervals containing
+only kernels; `upload_ms` and `download_ms` cover the bulk packed inputs and
+outputs. The remaining columns separate input packing, compact-layout updates,
+device objective reduction, API setup, and synchronization or phase-control
+overhead. Multiplier consistency rejection is disabled only while timing so
+the final KKT residual can be reported rather than turning a numerical
+threshold crossing into a missing row.
 
 For a reproducible native-CUDA validation and benchmark run, open
 [`notebooks/kaggle_cuda_benchmark.ipynb`](notebooks/kaggle_cuda_benchmark.ipynb)

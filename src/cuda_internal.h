@@ -165,6 +165,7 @@ enum DeviceCode : int {
   kDeviceOk = 0,
   kDeviceInfeasible = 1,
   kDeviceNumericalFailure = 2,
+  kDeviceInvalidInput = 3,
 };
 
 struct DeviceStatus {

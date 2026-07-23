@@ -1,9 +1,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <initializer_list>
 #include <limits>
@@ -834,6 +836,27 @@ __device__ void SetFailure(DeviceStatus *status, int code, int stage,
   if (atomicCAS(&status->code, kDeviceOk, code) == kDeviceOk) {
     status->stage = stage;
     status->detail = detail;
+  }
+}
+
+__global__ void CheckFiniteInputsKernel(const Scalar *problem_data,
+                                        std::size_t problem_entries,
+                                        const Scalar *initial_state,
+                                        std::size_t initial_entries,
+                                        DeviceStatus *status) {
+  const std::size_t total_entries = problem_entries + initial_entries;
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t index =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < total_entries; index += stride) {
+    const Scalar value = index < problem_entries
+                             ? problem_data[index]
+                             : initial_state[index - problem_entries];
+    if (!DeviceFinite(value)) {
+      SetFailure(status, kDeviceInvalidInput, -1, 21);
+      return;
+    }
   }
 }
 
@@ -2205,7 +2228,8 @@ __global__ void FinalizeValueSuffixFromParentsKernel(ValueElement *, int,
                                                      Scalar, DeviceStatus *);
 __global__ void FeedbackKernel(const ReducedStage *, const ValueElement *, int,
                                Scalar, Feedback *, DeviceStatus *);
-__global__ void InitializeAffineMapsKernel(const Feedback *, int, AffineMap *);
+__global__ void InitializeAffineMapsKernel(const Feedback *, int, AffineMap *,
+                                           DeviceStatus *);
 __global__ void ReduceAffineLeavesKernel(const AffineMap *, int, int,
                                          AffineMap *, DeviceStatus *);
 __global__ void ReduceAffineTreeLevelKernel(AffineMap *, int, int, int, int,
@@ -2220,7 +2244,8 @@ __global__ void ReconstructPrimalKernel(const AffineMap *, const StateParam *,
                                         const ControlParam *, const Feedback *,
                                         const Scalar *, const int *,
                                         const int *, const int *, int, Scalar *,
-                                        Scalar *, Scalar *, Scalar *);
+                                        Scalar *, Scalar *, Scalar *,
+                                        DeviceStatus *);
 __global__ void BuildDualParametersKernel(const PackedStage *,
                                           const StateParam *,
                                           const ValueElement *, const Scalar *,
@@ -2232,15 +2257,16 @@ __global__ void BuildDualParameterRelationsKernel(
     const PackedStage *, const PackedTerminal *, const DualParam *, int,
     const Scalar *, const Scalar *, const int *, const int *, Scalar, Scalar,
     DualRelation *, const int *, StateDualParam *, DeviceStatus *);
+__global__ void RecoverParameterizedMultipliersKernel(
+    const DualParam *, const StateDualParam *, const DualNodeValue *,
+    const int *, const int *, const int *, int, Scalar *, Scalar *, Scalar *,
+    Scalar *, DeviceStatus *);
 __global__ void
-RecoverParameterizedMultipliersKernel(const DualParam *, const StateDualParam *,
-                                      const DualNodeValue *, const int *,
-                                      const int *, const int *, int, Scalar *,
-                                      Scalar *, Scalar *, Scalar *);
-__global__ void RecoverInitialMultiplierKernel(
-    const PackedStage *, const PackedTerminal *, int, const Scalar *,
-    const Scalar *, const Scalar *, const Scalar *, const int *, const int *,
-    const int *, const int *, const int *, Scalar *, Scalar *, Scalar *);
+RecoverInitialMultiplierKernel(const PackedStage *, const PackedTerminal *, int,
+                               const Scalar *, const Scalar *, const Scalar *,
+                               const Scalar *, const int *, const int *,
+                               const int *, const int *, const int *, Scalar *,
+                               Scalar *, Scalar *, DeviceStatus *);
 __global__ void ReduceDualTreeLevelKernel(const DualRelation *, int, int, int,
                                           int, Scalar, Scalar, DualRelation *,
                                           const int *, DeviceStatus *);
@@ -2251,6 +2277,11 @@ __global__ void ExpandDualTreeLevelKernel(const DualRelation *, int, int, int,
                                           const DualNodeValue *,
                                           DualNodeValue *, const int *,
                                           DeviceStatus *);
+__global__ void BuildObjectiveTermsKernel(
+    const PackedStage *, int, const PackedTerminal *, const Scalar *,
+    const Scalar *, const int *, const int *, Scalar *, DeviceStatus *);
+__global__ void ReduceObjectiveTreeLevelKernel(Scalar *, int, int, int,
+                                               DeviceStatus *);
 void CudaCheck(cudaError_t error, const char *operation) {
   if (error == cudaSuccess)
     return;
@@ -2266,12 +2297,14 @@ public:
   DeviceBuffer &operator=(const DeviceBuffer &) = delete;
   DeviceBuffer(DeviceBuffer &&other) noexcept
       : data_(std::exchange(other.data_, nullptr)),
-        count_(std::exchange(other.count_, 0)) {}
+        count_(std::exchange(other.count_, 0)),
+        owns_(std::exchange(other.owns_, false)) {}
   DeviceBuffer &operator=(DeviceBuffer &&other) noexcept {
     if (this != &other) {
       Release();
       data_ = std::exchange(other.data_, nullptr);
       count_ = std::exchange(other.count_, 0);
+      owns_ = std::exchange(other.owns_, false);
     }
     return *this;
   }
@@ -2284,17 +2317,25 @@ public:
       throw std::invalid_argument("CUDA device allocation size overflows");
     CudaCheck(cudaMalloc(reinterpret_cast<void **>(&data_), count_ * sizeof(T)),
               "cudaMalloc");
+    owns_ = true;
   }
   void Reserve(std::size_t count) {
     const std::size_t required = std::max<std::size_t>(count, 1);
     if (count_ < required)
       Allocate(required);
   }
+  void Bind(T *data, std::size_t count) {
+    Release();
+    data_ = data;
+    count_ = std::max<std::size_t>(count, 1);
+    owns_ = false;
+  }
   void Release() {
-    if (data_ != nullptr)
+    if (owns_ && data_ != nullptr)
       cudaFree(data_);
     data_ = nullptr;
     count_ = 0;
+    owns_ = false;
   }
   T *get() { return data_; }
   const T *get() const { return data_; }
@@ -2303,6 +2344,7 @@ public:
 private:
   T *data_ = nullptr;
   std::size_t count_ = 0;
+  bool owns_ = false;
 };
 
 template <typename T> class PinnedBuffer {
@@ -2310,6 +2352,21 @@ public:
   PinnedBuffer() = default;
   PinnedBuffer(const PinnedBuffer &) = delete;
   PinnedBuffer &operator=(const PinnedBuffer &) = delete;
+  PinnedBuffer(PinnedBuffer &&other) noexcept
+      : data_(std::exchange(other.data_, nullptr)),
+        size_(std::exchange(other.size_, 0)),
+        capacity_(std::exchange(other.capacity_, 0)),
+        owns_(std::exchange(other.owns_, false)) {}
+  PinnedBuffer &operator=(PinnedBuffer &&other) noexcept {
+    if (this != &other) {
+      Release();
+      data_ = std::exchange(other.data_, nullptr);
+      size_ = std::exchange(other.size_, 0);
+      capacity_ = std::exchange(other.capacity_, 0);
+      owns_ = std::exchange(other.owns_, false);
+    }
+    return *this;
+  }
   ~PinnedBuffer() { Release(); }
 
   void Reserve(std::size_t count) {
@@ -2323,17 +2380,26 @@ public:
         cudaMallocHost(reinterpret_cast<void **>(&data_), required * sizeof(T)),
         "cudaMallocHost");
     capacity_ = required;
+    owns_ = true;
   }
   void Resize(std::size_t count) {
     Reserve(count);
     size_ = count;
   }
+  void Bind(T *data, std::size_t capacity, std::size_t size) {
+    Release();
+    data_ = data;
+    capacity_ = std::max<std::size_t>(capacity, 1);
+    size_ = size;
+    owns_ = false;
+  }
   void Release() {
-    if (data_ != nullptr)
+    if (owns_ && data_ != nullptr)
       cudaFreeHost(data_);
     data_ = nullptr;
     size_ = 0;
     capacity_ = 0;
+    owns_ = false;
   }
   T *data() { return data_; }
   const T *data() const { return data_; }
@@ -2347,12 +2413,104 @@ private:
   T *data_ = nullptr;
   std::size_t size_ = 0;
   std::size_t capacity_ = 0;
+  bool owns_ = false;
 };
+
+class ArenaCursor {
+public:
+  explicit ArenaCursor(std::byte *base) : base_(base) {}
+
+  template <typename T> void Add(DeviceBuffer<T> *buffer, std::size_t count) {
+    const std::size_t capacity = std::max<std::size_t>(count, 1);
+    Align(alignof(T));
+    const std::size_t entries = CheckedBytes<T>(capacity);
+    if (base_ != nullptr)
+      buffer->Bind(reinterpret_cast<T *>(base_ + bytes_), capacity);
+    Advance(entries);
+  }
+
+  template <typename T> void Add(PinnedBuffer<T> *buffer, std::size_t count) {
+    const std::size_t capacity = std::max<std::size_t>(count, 1);
+    Align(alignof(T));
+    const std::size_t entries = CheckedBytes<T>(capacity);
+    if (base_ != nullptr)
+      buffer->Bind(reinterpret_cast<T *>(base_ + bytes_), capacity, count);
+    Advance(entries);
+  }
+
+  // Consecutive fields in a bulk-transfer record must not acquire the
+  // one-element backing space normally reserved for empty arena slices.
+  template <typename T>
+  void AddTightlyPacked(DeviceBuffer<T> *buffer, std::size_t count) {
+    Align(alignof(T));
+    const std::size_t entries = CheckedBytes<T>(count);
+    if (base_ != nullptr)
+      buffer->Bind(reinterpret_cast<T *>(base_ + bytes_), count);
+    Advance(entries);
+  }
+
+  template <typename T>
+  void AddTightlyPacked(PinnedBuffer<T> *buffer, std::size_t count) {
+    Align(alignof(T));
+    const std::size_t entries = CheckedBytes<T>(count);
+    if (base_ != nullptr)
+      buffer->Bind(reinterpret_cast<T *>(base_ + bytes_), count, count);
+    Advance(entries);
+  }
+
+  std::size_t bytes() const { return bytes_; }
+
+private:
+  template <typename T> static std::size_t CheckedBytes(std::size_t count) {
+    if (count > std::numeric_limits<std::size_t>::max() / sizeof(T))
+      throw std::invalid_argument("CUDA arena allocation size overflows");
+    return count * sizeof(T);
+  }
+
+  void Align(std::size_t alignment) {
+    if (bytes_ > std::numeric_limits<std::size_t>::max() - (alignment - 1))
+      throw std::invalid_argument("CUDA arena allocation size overflows");
+    bytes_ = AlignUp(bytes_, alignment);
+  }
+
+  void Advance(std::size_t count) {
+    if (count > std::numeric_limits<std::size_t>::max() - bytes_)
+      throw std::invalid_argument("CUDA arena allocation size overflows");
+    bytes_ += count;
+  }
+
+  std::byte *base_;
+  std::size_t bytes_ = 0;
+};
+
+struct SolveMetadata {
+  SolveStatus status = SolveStatus::kInvalidInput;
+  std::string message;
+  Scalar objective = Scalar{0};
+  Timings timings;
+};
+
+enum class TimingSlot : std::size_t {
+  kPrimary,
+  kUpload,
+  kRiccati,
+  kReconstruction,
+  kDualParameters,
+  kMultiplierRecovery,
+  kObjective,
+  kCount,
+};
+
+constexpr std::size_t TimingSlotCount() {
+  return static_cast<std::size_t>(TimingSlot::kCount);
+}
 
 struct WorkspaceStorage {
   int device = -1;
-  cudaEvent_t event_start = nullptr;
-  cudaEvent_t event_stop = nullptr;
+  std::array<cudaEvent_t, TimingSlotCount()> event_start{};
+  std::array<cudaEvent_t, TimingSlotCount()> event_stop{};
+  DeviceBuffer<std::byte> fixed_device_arena;
+  PinnedBuffer<std::byte> fixed_host_arena;
   DeviceBuffer<PackedStage> device_stages;
   DeviceBuffer<PackedTerminal> device_terminal;
   DeviceBuffer<Scalar> device_problem_data;
@@ -2365,6 +2523,7 @@ struct WorkspaceStorage {
   DeviceBuffer<ControlParam> control_params;
   DeviceBuffer<ReducedStage> reduced_stages;
   DeviceBuffer<ReducedTerminal> reduced_terminal;
+  DeviceBuffer<std::byte> stage_layout_arena;
   DeviceBuffer<Scalar> stage_data;
   DeviceBuffer<int> stage_indices;
   DeviceBuffer<Scalar> reduced_initial;
@@ -2391,6 +2550,7 @@ struct WorkspaceStorage {
   DeviceBuffer<int> dual_dimensions;
   DeviceBuffer<int> dual_scan_needed;
   DeviceBuffer<StateDualParam> state_dual_params;
+  DeviceBuffer<std::byte> dual_layout_arena;
   DeviceBuffer<DualRelation> dual_tree;
   DeviceBuffer<DualNodeValue> dual_values;
   DeviceBuffer<Scalar> dual_relation_data;
@@ -2400,6 +2560,7 @@ struct WorkspaceStorage {
   DeviceBuffer<Scalar> mixed_multipliers;
   DeviceBuffer<Scalar> state_multipliers;
   DeviceBuffer<Scalar> terminal_multiplier;
+  DeviceBuffer<Scalar> objective_tree;
 
   PinnedBuffer<PackedStage> host_stages;
   PinnedBuffer<PackedTerminal> host_terminal;
@@ -2412,6 +2573,7 @@ struct WorkspaceStorage {
   PinnedBuffer<Scalar> host_mixed;
   PinnedBuffer<Scalar> host_state_multipliers;
   PinnedBuffer<Scalar> host_terminal_multiplier;
+  PinnedBuffer<Scalar> host_objective;
   PinnedBuffer<int> host_state_offsets;
   PinnedBuffer<int> host_reduced_state_offsets;
   PinnedBuffer<int> host_control_offsets;
@@ -2435,9 +2597,17 @@ struct WorkspaceStorage {
   PinnedBuffer<AffineMap> host_map_scan;
   PinnedBuffer<int> host_dual_scan_needed;
   PinnedBuffer<int> host_dual_dimensions;
+  PinnedBuffer<std::byte> host_dual_layout_arena;
   PinnedBuffer<DualRelation> host_dual_tree;
   PinnedBuffer<DualNodeValue> host_dual_values;
   PinnedBuffer<DeviceStatus> host_status;
+  std::vector<VectorView> state_views;
+  std::vector<VectorView> control_views;
+  std::vector<VectorView> dynamics_views;
+  std::vector<VectorView> mixed_views;
+  std::vector<VectorView> state_multiplier_views;
+  SolveMetadata result;
+  int synchronization_count = 0;
   std::vector<int> node_level_offsets;
   std::vector<int> node_level_counts;
   std::vector<int> stage_level_offsets;
@@ -2456,10 +2626,113 @@ struct WorkspaceStorage {
   ~WorkspaceStorage() {
     if (device >= 0)
       cudaSetDevice(device);
-    if (event_stop != nullptr)
-      cudaEventDestroy(event_stop);
-    if (event_start != nullptr)
-      cudaEventDestroy(event_start);
+    for (cudaEvent_t event : event_stop) {
+      if (event != nullptr)
+        cudaEventDestroy(event);
+    }
+    for (cudaEvent_t event : event_start) {
+      if (event != nullptr)
+        cudaEventDestroy(event);
+    }
+  }
+
+  void AddFixedDeviceBuffers(
+      ArenaCursor *arena, int stage_count, int node_count, int total_tree_nodes,
+      int total_stage_tree_nodes, std::size_t state_entries,
+      std::size_t control_entries, std::size_t mixed_entries,
+      std::size_t state_constraint_entries, std::size_t problem_data_entries,
+      int initial_state_dimension, int terminal_constraint_dimension) {
+    arena->Add(&device_stages, stage_count);
+    arena->Add(&device_terminal, 1);
+    arena->AddTightlyPacked(&device_problem_data, problem_data_entries);
+    arena->AddTightlyPacked(&device_initial, initial_state_dimension);
+    arena->Add(&device_status, 1);
+    arena->Add(&relation_leaves, node_count);
+    arena->Add(&relation_scan, total_tree_nodes - node_count);
+    arena->Add(&state_params, node_count);
+    arena->Add(&control_params, stage_count);
+    arena->Add(&reduced_stages, stage_count);
+    arena->Add(&reduced_terminal, 1);
+    arena->Add(&reduced_initial, initial_state_dimension);
+    arena->Add(&value_leaves, node_count);
+    arena->Add(&value_scan, total_tree_nodes - node_count);
+    arena->Add(&feedback, stage_count);
+    arena->Add(&map_leaves, stage_count);
+    arena->Add(&map_scan, total_stage_tree_nodes - std::max(stage_count, 1));
+    arena->Add(&reduced_controls, control_entries);
+    arena->AddTightlyPacked(&states, state_entries);
+    arena->AddTightlyPacked(&controls, control_entries);
+    arena->AddTightlyPacked(&initial_multiplier, initial_state_dimension);
+    arena->AddTightlyPacked(&dynamics_multipliers,
+                            state_entries - initial_state_dimension);
+    arena->AddTightlyPacked(&mixed_multipliers, mixed_entries);
+    arena->AddTightlyPacked(&state_multipliers, state_constraint_entries);
+    arena->AddTightlyPacked(&terminal_multiplier,
+                            terminal_constraint_dimension);
+    arena->Add(&state_offsets, node_count + 1);
+    arena->Add(&reduced_state_offsets, node_count + 1);
+    arena->Add(&control_offsets, stage_count + 1);
+    arena->Add(&dynamics_offsets, stage_count + 1);
+    arena->Add(&mixed_offsets, stage_count + 1);
+    arena->Add(&state_constraint_offsets, stage_count + 1);
+    arena->Add(&state_dimensions, static_cast<std::size_t>(2) * node_count);
+    arena->Add(&control_dimensions, static_cast<std::size_t>(2) * stage_count);
+    arena->Add(&dual_params, stage_count);
+    arena->Add(&dual_dimensions, stage_count);
+    arena->Add(&dual_scan_needed, 1);
+    arena->Add(&state_dual_params, stage_count);
+    arena->Add(&objective_tree, total_tree_nodes);
+  }
+
+  void AddFixedHostBuffers(
+      ArenaCursor *arena, int stage_count, int node_count, int total_tree_nodes,
+      int total_stage_tree_nodes, std::size_t state_entries,
+      std::size_t control_entries, std::size_t mixed_entries,
+      std::size_t state_constraint_entries, std::size_t problem_data_entries,
+      int initial_state_dimension, int terminal_constraint_dimension) {
+    arena->Add(&host_stages, stage_count);
+    arena->Add(&host_terminal, 1);
+    arena->AddTightlyPacked(&host_problem_data, problem_data_entries);
+    arena->AddTightlyPacked(&host_initial, initial_state_dimension);
+    arena->AddTightlyPacked(&host_states, state_entries);
+    arena->AddTightlyPacked(&host_controls, control_entries);
+    arena->AddTightlyPacked(&host_initial_multiplier,
+                            initial_state_dimension);
+    arena->AddTightlyPacked(&host_dynamics,
+                            state_entries - initial_state_dimension);
+    arena->AddTightlyPacked(&host_mixed, mixed_entries);
+    arena->AddTightlyPacked(&host_state_multipliers,
+                            state_constraint_entries);
+    arena->AddTightlyPacked(&host_terminal_multiplier,
+                            terminal_constraint_dimension);
+    arena->Add(&host_objective, 1);
+    arena->Add(&host_state_offsets, node_count + 1);
+    arena->Add(&host_reduced_state_offsets, node_count + 1);
+    arena->Add(&host_control_offsets, stage_count + 1);
+    arena->Add(&host_dynamics_offsets, stage_count + 1);
+    arena->Add(&host_mixed_offsets, stage_count + 1);
+    arena->Add(&host_state_constraint_offsets, stage_count + 1);
+    arena->Add(&host_state_dimensions,
+               static_cast<std::size_t>(2) * node_count);
+    arena->Add(&host_control_dimensions,
+               static_cast<std::size_t>(2) * stage_count);
+    arena->Add(&host_relation_leaves, node_count);
+    arena->Add(&host_relation_scan, total_tree_nodes - node_count);
+    arena->Add(&host_state_params, node_count);
+    arena->Add(&host_control_params, stage_count);
+    arena->Add(&host_reduced_stages, stage_count);
+    arena->Add(&host_reduced_terminal, 1);
+    arena->Add(&host_feedback, stage_count);
+    arena->Add(&host_dual_params, stage_count);
+    arena->Add(&host_state_dual_params, stage_count);
+    arena->Add(&host_value_leaves, node_count);
+    arena->Add(&host_value_scan, total_tree_nodes - node_count);
+    arena->Add(&host_map_leaves, stage_count);
+    arena->Add(&host_map_scan,
+               total_stage_tree_nodes - std::max(stage_count, 1));
+    arena->Add(&host_dual_scan_needed, 1);
+    arena->Add(&host_dual_dimensions, stage_count);
+    arena->Add(&host_status, 1);
   }
 
   void Reserve(int requested_device, int stage_count, int node_count,
@@ -2472,10 +2745,13 @@ struct WorkspaceStorage {
           "a CUDA workspace cannot be reused across devices");
     }
     device = requested_device;
-    if (event_start == nullptr)
-      CudaCheck(cudaEventCreate(&event_start), "cudaEventCreate(start)");
-    if (event_stop == nullptr)
-      CudaCheck(cudaEventCreate(&event_stop), "cudaEventCreate(stop)");
+    for (std::size_t index = 0; index < TimingSlotCount(); ++index) {
+      if (event_start[index] == nullptr)
+        CudaCheck(cudaEventCreate(&event_start[index]),
+                  "cudaEventCreate(start)");
+      if (event_stop[index] == nullptr)
+        CudaCheck(cudaEventCreate(&event_stop[index]), "cudaEventCreate(stop)");
+    }
     int total_tree_nodes = 0;
     for (int level_count = node_count;; level_count = (level_count + 1) / 2) {
       total_tree_nodes += level_count;
@@ -2489,94 +2765,120 @@ struct WorkspaceStorage {
       if (level_count == 1)
         break;
     }
-    device_stages.Reserve(stage_count);
-    device_terminal.Reserve(1);
-    device_problem_data.Reserve(problem_data_entries);
-    device_initial.Reserve(initial_state_dimension);
-    device_status.Reserve(1);
-    relation_leaves.Reserve(node_count);
-    relation_scan.Reserve(total_tree_nodes - node_count);
-    state_params.Reserve(node_count);
-    control_params.Reserve(stage_count);
-    reduced_stages.Reserve(stage_count);
-    reduced_terminal.Reserve(1);
-    reduced_initial.Reserve(initial_state_dimension);
-    value_leaves.Reserve(node_count);
-    value_scan.Reserve(total_tree_nodes - node_count);
-    feedback.Reserve(stage_count);
-    map_leaves.Reserve(stage_count);
-    map_scan.Reserve(total_stage_tree_nodes - std::max(stage_count, 1));
-    states.Reserve(state_entries);
-    reduced_controls.Reserve(control_entries);
-    controls.Reserve(control_entries);
-    state_offsets.Reserve(node_count + 1);
-    reduced_state_offsets.Reserve(node_count + 1);
-    control_offsets.Reserve(stage_count + 1);
-    dynamics_offsets.Reserve(stage_count + 1);
-    mixed_offsets.Reserve(stage_count + 1);
-    state_constraint_offsets.Reserve(stage_count + 1);
-    state_dimensions.Reserve(static_cast<std::size_t>(2) * node_count);
-    control_dimensions.Reserve(static_cast<std::size_t>(2) * stage_count);
-    dual_params.Reserve(stage_count);
-    dual_dimensions.Reserve(stage_count);
-    dual_scan_needed.Reserve(1);
-    state_dual_params.Reserve(stage_count);
-    initial_multiplier.Reserve(initial_state_dimension);
-    dynamics_multipliers.Reserve(state_entries - initial_state_dimension);
-    mixed_multipliers.Reserve(mixed_entries);
-    state_multipliers.Reserve(state_constraint_entries);
-    terminal_multiplier.Reserve(terminal_constraint_dimension);
+    ArenaCursor device_plan(nullptr);
+    AddFixedDeviceBuffers(
+        &device_plan, stage_count, node_count, total_tree_nodes,
+        total_stage_tree_nodes, state_entries, control_entries, mixed_entries,
+        state_constraint_entries, problem_data_entries, initial_state_dimension,
+        terminal_constraint_dimension);
+    fixed_device_arena.Reserve(device_plan.bytes());
+    ArenaCursor device_bind(fixed_device_arena.get());
+    AddFixedDeviceBuffers(
+        &device_bind, stage_count, node_count, total_tree_nodes,
+        total_stage_tree_nodes, state_entries, control_entries, mixed_entries,
+        state_constraint_entries, problem_data_entries, initial_state_dimension,
+        terminal_constraint_dimension);
+    if (device_bind.bytes() != device_plan.bytes())
+      throw std::logic_error("internal CUDA device-arena layout mismatch");
 
-    host_stages.Resize(stage_count);
-    host_terminal.Resize(1);
-    host_problem_data.Resize(problem_data_entries);
-    host_initial.Resize(initial_state_dimension);
-    host_states.Resize(state_entries);
-    host_controls.Resize(control_entries);
-    host_initial_multiplier.Resize(initial_state_dimension);
-    host_dynamics.Resize(state_entries - initial_state_dimension);
-    host_mixed.Resize(mixed_entries);
-    host_state_multipliers.Resize(state_constraint_entries);
-    host_terminal_multiplier.Resize(terminal_constraint_dimension);
-    host_state_offsets.Resize(node_count + 1);
-    host_reduced_state_offsets.Resize(node_count + 1);
-    host_control_offsets.Resize(stage_count + 1);
-    host_dynamics_offsets.Resize(stage_count + 1);
-    host_mixed_offsets.Resize(stage_count + 1);
-    host_state_constraint_offsets.Resize(stage_count + 1);
-    host_state_dimensions.Resize(static_cast<std::size_t>(2) * node_count);
-    host_control_dimensions.Resize(static_cast<std::size_t>(2) * stage_count);
-    host_relation_leaves.Resize(node_count);
-    host_relation_scan.Resize(total_tree_nodes - node_count);
-    host_state_params.Resize(node_count);
-    host_control_params.Resize(stage_count);
-    host_reduced_stages.Resize(stage_count);
-    host_reduced_terminal.Resize(1);
-    host_feedback.Resize(stage_count);
-    host_dual_params.Resize(stage_count);
-    host_state_dual_params.Resize(stage_count);
-    host_value_leaves.Resize(node_count);
-    host_value_scan.Resize(total_tree_nodes - node_count);
-    host_map_leaves.Resize(stage_count);
-    host_map_scan.Resize(total_stage_tree_nodes - std::max(stage_count, 1));
-    host_dual_scan_needed.Resize(1);
-    host_dual_dimensions.Resize(stage_count);
-    host_status.Resize(1);
+    ArenaCursor host_plan(nullptr);
+    AddFixedHostBuffers(&host_plan, stage_count, node_count, total_tree_nodes,
+                        total_stage_tree_nodes, state_entries, control_entries,
+                        mixed_entries, state_constraint_entries,
+                        problem_data_entries, initial_state_dimension,
+                        terminal_constraint_dimension);
+    fixed_host_arena.Resize(host_plan.bytes());
+    ArenaCursor host_bind(fixed_host_arena.data());
+    AddFixedHostBuffers(&host_bind, stage_count, node_count, total_tree_nodes,
+                        total_stage_tree_nodes, state_entries, control_entries,
+                        mixed_entries, state_constraint_entries,
+                        problem_data_entries, initial_state_dimension,
+                        terminal_constraint_dimension);
+    if (host_bind.bytes() != host_plan.bytes())
+      throw std::logic_error("internal CUDA pinned-arena layout mismatch");
+
+    const auto verify_tight_span =
+        [](const Scalar *first, const Scalar *last,
+           std::size_t last_entries, std::size_t total_entries,
+           const char *description) {
+          const std::uintptr_t begin =
+              reinterpret_cast<std::uintptr_t>(first);
+          const std::uintptr_t end =
+              reinterpret_cast<std::uintptr_t>(last) +
+              last_entries * sizeof(Scalar);
+          if (end < begin ||
+              end - begin != total_entries * sizeof(Scalar)) {
+            throw std::logic_error(std::string("internal ") + description +
+                                   " layout mismatch");
+          }
+        };
+    const std::size_t input_entries = ScratchCheckedSum(
+        {problem_data_entries,
+         static_cast<std::size_t>(initial_state_dimension)},
+        "CUDA compact input");
+    verify_tight_span(device_problem_data.get(), device_initial.get(),
+                      initial_state_dimension, input_entries,
+                      "CUDA device-arena input");
+    verify_tight_span(host_problem_data.data(), host_initial.data(),
+                      initial_state_dimension, input_entries,
+                      "CUDA pinned-arena input");
+
+    const std::size_t output_entries = ScratchCheckedSum(
+        {state_entries, control_entries,
+         static_cast<std::size_t>(initial_state_dimension),
+         state_entries - static_cast<std::size_t>(initial_state_dimension),
+         mixed_entries, state_constraint_entries,
+         static_cast<std::size_t>(terminal_constraint_dimension)},
+        "CUDA compact output");
+    verify_tight_span(states.get(), terminal_multiplier.get(),
+                      terminal_constraint_dimension, output_entries,
+                      "CUDA device-arena output");
+    verify_tight_span(host_states.data(), host_terminal_multiplier.data(),
+                      terminal_constraint_dimension, output_entries,
+                      "CUDA pinned-arena output");
   }
 };
 
-template <typename Function>
-double TimeGpu(WorkspaceStorage &workspace, Function &&function) {
-  CudaCheck(cudaEventRecord(workspace.event_start), "cudaEventRecord(start)");
-  function();
-  CudaCheck(cudaGetLastError(), "CUDA kernel launch");
-  CudaCheck(cudaEventRecord(workspace.event_stop), "cudaEventRecord(stop)");
-  CudaCheck(cudaEventSynchronize(workspace.event_stop), "cudaEventSynchronize");
+std::size_t TimingIndex(TimingSlot slot) {
+  return static_cast<std::size_t>(slot);
+}
+
+void StartTiming(WorkspaceStorage &workspace, TimingSlot slot) {
+  CudaCheck(cudaEventRecord(workspace.event_start[TimingIndex(slot)]),
+            "cudaEventRecord(start)");
+}
+
+void StopTiming(WorkspaceStorage &workspace, TimingSlot slot) {
+  CudaCheck(cudaEventRecord(workspace.event_stop[TimingIndex(slot)]),
+            "cudaEventRecord(stop)");
+}
+
+double ElapsedTiming(WorkspaceStorage &workspace, TimingSlot slot) {
   float milliseconds = 0.0f;
-  CudaCheck(cudaEventElapsedTime(&milliseconds, workspace.event_start,
-                                 workspace.event_stop),
+  CudaCheck(cudaEventElapsedTime(&milliseconds,
+                                 workspace.event_start[TimingIndex(slot)],
+                                 workspace.event_stop[TimingIndex(slot)]),
             "cudaEventElapsedTime");
   return milliseconds;
+}
+
+template <typename Function>
+void QueueTimed(WorkspaceStorage &workspace, TimingSlot slot,
+                Function &&function) {
+  StartTiming(workspace, slot);
+  function();
+  CudaCheck(cudaGetLastError(), "CUDA kernel launch");
+  StopTiming(workspace, slot);
+}
+
+template <typename Function>
+double TimeGpu(WorkspaceStorage &workspace, Function &&function) {
+  QueueTimed(workspace, TimingSlot::kPrimary, std::forward<Function>(function));
+  CudaCheck(cudaEventSynchronize(
+                workspace.event_stop[TimingIndex(TimingSlot::kPrimary)]),
+            "cudaEventSynchronize");
+  ++workspace.synchronization_count;
+  return ElapsedTiming(workspace, TimingSlot::kPrimary);
 }
 
 // Queue setup transfers before the start event and result/control transfers
@@ -2589,18 +2891,28 @@ double TimeGpuKernels(WorkspaceStorage &workspace, Before &&before,
                       Function &&function, After &&after) {
   before();
   CudaCheck(cudaGetLastError(), "CUDA phase setup");
-  CudaCheck(cudaEventRecord(workspace.event_start), "cudaEventRecord(start)");
+  StartTiming(workspace, TimingSlot::kPrimary);
   function();
   CudaCheck(cudaGetLastError(), "CUDA kernel launch");
-  CudaCheck(cudaEventRecord(workspace.event_stop), "cudaEventRecord(stop)");
+  StopTiming(workspace, TimingSlot::kPrimary);
   after();
   CudaCheck(cudaGetLastError(), "CUDA phase result transfer");
   CudaCheck(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize");
-  float milliseconds = 0.0f;
-  CudaCheck(cudaEventElapsedTime(&milliseconds, workspace.event_start,
-                                 workspace.event_stop),
-            "cudaEventElapsedTime");
-  return milliseconds;
+  ++workspace.synchronization_count;
+  return ElapsedTiming(workspace, TimingSlot::kPrimary);
+}
+
+template <typename Before, typename Function, typename After>
+void QueueTimedKernels(WorkspaceStorage &workspace, TimingSlot slot,
+                       Before &&before, Function &&function, After &&after) {
+  before();
+  CudaCheck(cudaGetLastError(), "CUDA phase setup");
+  StartTiming(workspace, slot);
+  function();
+  CudaCheck(cudaGetLastError(), "CUDA kernel launch");
+  StopTiming(workspace, slot);
+  after();
+  CudaCheck(cudaGetLastError(), "CUDA phase result transfer");
 }
 
 bool Finite(const Matrix &matrix) {
@@ -2803,9 +3115,24 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
 }
 
 bool PackScalars(const Scalar *source, std::size_t entries,
-                 Scalar **host_cursor, Scalar **device_cursor,
-                 const Scalar **target) {
-  *target = *device_cursor;
+                 Scalar **host_cursor, Scalar *host_end,
+                 Scalar **device_cursor, const Scalar **target,
+                 bool validate_values) {
+  if (entries > 0) {
+    Require(*host_cursor != nullptr && host_end != nullptr &&
+                entries <= static_cast<std::size_t>(host_end - *host_cursor),
+            "problem structure differs from reserved CUDA workspace");
+  }
+  if (target != nullptr) {
+    *target = *device_cursor;
+    *device_cursor += entries;
+  }
+  if (!validate_values) {
+    if (entries > 0)
+      std::memcpy(*host_cursor, source, entries * sizeof(Scalar));
+    *host_cursor += entries;
+    return true;
+  }
   bool finite = true;
   for (std::size_t index = 0; index < entries; ++index) {
     const Scalar value = source[index];
@@ -2813,65 +3140,146 @@ bool PackScalars(const Scalar *source, std::size_t entries,
     finite &= std::isfinite(value);
   }
   *host_cursor += entries;
-  *device_cursor += entries;
   return finite;
 }
 
-bool PackMatrix(const Matrix &source, Scalar **host_cursor,
-                Scalar **device_cursor, const Scalar **target) {
+bool PackMatrix(const Matrix &source, Scalar **host_cursor, Scalar *host_end,
+                Scalar **device_cursor, const Scalar **target,
+                bool validate_values) {
   return PackScalars(source.data().data(), source.rows() * source.cols(),
-                     host_cursor, device_cursor, target);
+                     host_cursor, host_end, device_cursor, target,
+                     validate_values);
 }
 
-bool PackVector(const Vector &source, Scalar **host_cursor,
-                Scalar **device_cursor, const Scalar **target) {
-  return PackScalars(source.data().data(), source.size(), host_cursor,
-                     device_cursor, target);
+bool PackVector(const Vector &source, Scalar **host_cursor, Scalar *host_end,
+                Scalar **device_cursor, const Scalar **target,
+                bool validate_values) {
+  return PackScalars(source.data().data(), source.size(), host_cursor, host_end,
+                     device_cursor, target, validate_values);
 }
 
-bool PackStage(const Stage &source, Scalar **host_cursor,
-               Scalar **device_cursor, PackedStage *out) {
-  out->n = static_cast<int>(source.A.cols());
-  out->next_n = static_cast<int>(source.A.rows());
-  out->m = static_cast<int>(source.B.cols());
-  out->mixed = static_cast<int>(source.C.rows());
-  out->state = static_cast<int>(source.E.rows());
+bool PackStage(const Stage &source, Scalar **host_cursor, Scalar *host_end,
+               Scalar **device_cursor, PackedStage *out,
+               bool validate_values, bool bind_metadata) {
+  if (bind_metadata) {
+    out->n = static_cast<int>(source.A.cols());
+    out->next_n = static_cast<int>(source.A.rows());
+    out->m = static_cast<int>(source.B.cols());
+    out->mixed = static_cast<int>(source.C.rows());
+    out->state = static_cast<int>(source.E.rows());
+  }
+  auto target = [bind_metadata](const Scalar **field) {
+    return bind_metadata ? field : nullptr;
+  };
   bool finite = true;
-  finite &= PackMatrix(source.A, host_cursor, device_cursor, &out->A);
-  finite &= PackMatrix(source.B, host_cursor, device_cursor, &out->B);
-  finite &= PackVector(source.c, host_cursor, device_cursor, &out->c);
-  finite &= PackMatrix(source.Q, host_cursor, device_cursor, &out->Q);
-  finite &= PackMatrix(source.R, host_cursor, device_cursor, &out->R);
-  finite &= PackMatrix(source.M, host_cursor, device_cursor, &out->M);
-  finite &= PackVector(source.q, host_cursor, device_cursor, &out->q);
-  finite &= PackVector(source.r, host_cursor, device_cursor, &out->r);
-  finite &= PackMatrix(source.C, host_cursor, device_cursor, &out->C);
-  finite &= PackMatrix(source.D, host_cursor, device_cursor, &out->D);
-  finite &= PackVector(source.d, host_cursor, device_cursor, &out->d);
-  finite &= PackMatrix(source.E, host_cursor, device_cursor, &out->E);
-  finite &= PackVector(source.e, host_cursor, device_cursor, &out->e);
+  finite &= PackMatrix(source.A, host_cursor, host_end, device_cursor,
+                       target(&out->A), validate_values);
+  finite &= PackMatrix(source.B, host_cursor, host_end, device_cursor,
+                       target(&out->B), validate_values);
+  finite &= PackVector(source.c, host_cursor, host_end, device_cursor,
+                       target(&out->c), validate_values);
+  finite &= PackMatrix(source.Q, host_cursor, host_end, device_cursor,
+                       target(&out->Q), validate_values);
+  finite &= PackMatrix(source.R, host_cursor, host_end, device_cursor,
+                       target(&out->R), validate_values);
+  finite &= PackMatrix(source.M, host_cursor, host_end, device_cursor,
+                       target(&out->M), validate_values);
+  finite &= PackVector(source.q, host_cursor, host_end, device_cursor,
+                       target(&out->q), validate_values);
+  finite &= PackVector(source.r, host_cursor, host_end, device_cursor,
+                       target(&out->r), validate_values);
+  finite &= PackMatrix(source.C, host_cursor, host_end, device_cursor,
+                       target(&out->C), validate_values);
+  finite &= PackMatrix(source.D, host_cursor, host_end, device_cursor,
+                       target(&out->D), validate_values);
+  finite &= PackVector(source.d, host_cursor, host_end, device_cursor,
+                       target(&out->d), validate_values);
+  finite &= PackMatrix(source.E, host_cursor, host_end, device_cursor,
+                       target(&out->E), validate_values);
+  finite &= PackVector(source.e, host_cursor, host_end, device_cursor,
+                       target(&out->e), validate_values);
   return finite;
 }
 
 bool PackTerminal(const Problem &problem, Scalar **host_cursor,
-                  Scalar **device_cursor, PackedTerminal *out) {
-  out->n = static_cast<int>(problem.terminal_Q.rows());
-  out->state = static_cast<int>(problem.terminal_E.rows());
+                  Scalar *host_end, Scalar **device_cursor, PackedTerminal *out,
+                  bool validate_values, bool bind_metadata) {
+  if (bind_metadata) {
+    out->n = static_cast<int>(problem.terminal_Q.rows());
+    out->state = static_cast<int>(problem.terminal_E.rows());
+  }
+  auto target = [bind_metadata](const Scalar **field) {
+    return bind_metadata ? field : nullptr;
+  };
   bool finite = true;
   finite &=
-      PackMatrix(problem.terminal_Q, host_cursor, device_cursor, &out->Q);
+      PackMatrix(problem.terminal_Q, host_cursor, host_end, device_cursor,
+                 target(&out->Q), validate_values);
+  finite &= PackVector(problem.terminal_q, host_cursor, host_end,
+                       device_cursor, target(&out->q), validate_values);
   finite &=
-      PackVector(problem.terminal_q, host_cursor, device_cursor, &out->q);
-  finite &=
-      PackMatrix(problem.terminal_E, host_cursor, device_cursor, &out->E);
-  finite &=
-      PackVector(problem.terminal_e, host_cursor, device_cursor, &out->e);
+      PackMatrix(problem.terminal_E, host_cursor, host_end, device_cursor,
+                 target(&out->E), validate_values);
+  finite &= PackVector(problem.terminal_e, host_cursor, host_end,
+                       device_cursor, target(&out->e), validate_values);
   return finite;
+}
+
+bool PackProblemData(const Problem &problem, WorkspaceStorage *workspace,
+                     bool validate_values, bool bind_metadata) {
+  Require(problem.stages.size() == workspace->host_stages.size(),
+          "problem structure differs from reserved CUDA workspace");
+  Scalar *host_cursor = workspace->host_problem_data.data();
+  Scalar *host_end = host_cursor;
+  if (workspace->host_problem_data.size() > 0)
+    host_end += workspace->host_problem_data.size();
+  Scalar *device_cursor =
+      bind_metadata ? workspace->device_problem_data.get() : nullptr;
+  for (std::size_t index = 0; index < problem.stages.size(); ++index) {
+    if (!PackStage(problem.stages[index], &host_cursor, host_end,
+                   &device_cursor, &workspace->host_stages[index],
+                   validate_values, bind_metadata)) {
+      return false;
+    }
+  }
+  if (!PackTerminal(problem, &host_cursor, host_end, &device_cursor,
+                    &workspace->host_terminal[0], validate_values,
+                    bind_metadata)) {
+    return false;
+  }
+  Require(host_cursor == workspace->host_problem_data.data() +
+                                 workspace->host_problem_data.size(),
+          "internal CUDA problem-packing size mismatch");
+  if (bind_metadata) {
+    Require(device_cursor == workspace->device_problem_data.get() +
+                                 workspace->host_problem_data.size(),
+            "internal CUDA problem-binding size mismatch");
+  }
+
+  auto &host_initial = workspace->host_initial;
+  Require(problem.initial_state.size() == host_initial.size(),
+          "problem structure differs from reserved CUDA workspace");
+  if (validate_values) {
+    bool finite = true;
+    for (std::size_t index = 0; index < problem.initial_state.size(); ++index) {
+      const Scalar value = problem.initial_state[index];
+      host_initial[index] = value;
+      finite &= std::isfinite(value);
+    }
+    return finite;
+  }
+  if (!problem.initial_state.empty()) {
+    std::memcpy(host_initial.data(), problem.initial_state.data().data(),
+                problem.initial_state.size() * sizeof(Scalar));
+  }
+  return true;
 }
 
 std::string DeviceFailureMessage(const DeviceStatus &status) {
   std::ostringstream out;
-  if (status.code == kDeviceInfeasible) {
+  if (status.code == kDeviceInvalidInput) {
+    out << "CUDA input contains a non-finite value";
+  } else if (status.code == kDeviceInfeasible) {
     out << "CUDA feasibility elimination found an inconsistent relation";
   } else if (status.detail == 19) {
     out << "CUDA conditional-value scan requires a positive-definite reduced "
@@ -2888,13 +3296,17 @@ std::string DeviceFailureMessage(const DeviceStatus &status) {
   return out.str();
 }
 
-bool ApplyDeviceFailure(const DeviceStatus &status, Solution *solution) {
+bool ApplyDeviceFailure(const DeviceStatus &status, SolveMetadata *result) {
   if (status.code == kDeviceOk)
     return false;
-  solution->status = status.code == kDeviceInfeasible
-                         ? SolveStatus::kInfeasible
-                         : SolveStatus::kNumericalFailure;
-  solution->message = DeviceFailureMessage(status);
+  if (status.code == kDeviceInvalidInput) {
+    result->status = SolveStatus::kInvalidInput;
+  } else if (status.code == kDeviceInfeasible) {
+    result->status = SolveStatus::kInfeasible;
+  } else {
+    result->status = SolveStatus::kNumericalFailure;
+  }
+  result->message = DeviceFailureMessage(status);
   return true;
 }
 
@@ -3045,8 +3457,15 @@ void PrepareStageStorage(const Problem &problem, WorkspaceStorage *workspace) {
   scalars(square(terminal_n));
   scalars(terminal_n);
 
-  workspace->stage_data.Reserve(scalar_entries);
-  workspace->stage_indices.Reserve(index_entries);
+  ArenaCursor stage_plan(nullptr);
+  stage_plan.Add(&workspace->stage_data, scalar_entries);
+  stage_plan.Add(&workspace->stage_indices, index_entries);
+  workspace->stage_layout_arena.Reserve(stage_plan.bytes());
+  ArenaCursor stage_bind(workspace->stage_layout_arena.get());
+  stage_bind.Add(&workspace->stage_data, scalar_entries);
+  stage_bind.Add(&workspace->stage_indices, index_entries);
+  Require(stage_bind.bytes() == stage_plan.bytes(),
+          "internal CUDA stage-arena layout mismatch");
   Scalar *scalar_cursor = workspace->stage_data.get();
   int *index_cursor = workspace->stage_indices.get();
 
@@ -3180,6 +3599,40 @@ void BuildCompactOffsets(const Problem &problem, WorkspaceStorage *workspace) {
   }
   state[problem.stages.size() + 1] = append_offset(
       state[problem.stages.size()], problem.terminal_Q.rows(), "state");
+}
+
+void PrepareOutputViews(const Problem &problem, WorkspaceStorage *workspace) {
+  const std::size_t stage_count = problem.stages.size();
+  workspace->state_views.resize(stage_count + 1);
+  workspace->control_views.resize(stage_count);
+  workspace->dynamics_views.resize(stage_count);
+  workspace->mixed_views.resize(stage_count);
+  workspace->state_multiplier_views.resize(stage_count);
+  for (std::size_t stage = 0; stage < stage_count; ++stage) {
+    const Stage &source = problem.stages[stage];
+    workspace->state_views[stage] = {workspace->host_states.data() +
+                                         workspace->host_state_offsets[stage],
+                                     source.A.cols()};
+    workspace->control_views[stage] = {
+        workspace->host_controls.data() +
+            workspace->host_control_offsets[stage],
+        source.B.cols()};
+    workspace->dynamics_views[stage] = {
+        workspace->host_dynamics.data() +
+            workspace->host_dynamics_offsets[stage],
+        source.A.rows()};
+    workspace->mixed_views[stage] = {workspace->host_mixed.data() +
+                                         workspace->host_mixed_offsets[stage],
+                                     source.C.rows()};
+    workspace->state_multiplier_views[stage] = {
+        workspace->host_state_multipliers.data() +
+            workspace->host_state_constraint_offsets[stage],
+        source.E.rows()};
+  }
+  workspace->state_views[stage_count] = {
+      workspace->host_states.data() +
+          workspace->host_state_offsets[stage_count],
+      problem.terminal_Q.rows()};
 }
 
 struct ValueCapacity {
@@ -3385,14 +3838,9 @@ bool PrepareRelationStorage(const Problem &problem,
   return true;
 }
 
-bool PrepareValueStorage(WorkspaceStorage *workspace, int stage_count) {
+bool PrepareValueStorage(WorkspaceStorage *workspace, int stage_count,
+                         bool layout_matches) {
   const int node_count = stage_count + 1;
-  bool layout_matches = workspace->value_layout_key.size() ==
-                        static_cast<std::size_t>(node_count);
-  for (int node = 0; node < node_count && layout_matches; ++node) {
-    layout_matches &= workspace->value_layout_key[node] ==
-                      workspace->host_state_dimensions[2 * node + 1];
-  }
   if (layout_matches)
     return false;
   const auto &level_offsets = workspace->node_level_offsets;
@@ -3434,16 +3882,10 @@ bool PrepareValueStorage(WorkspaceStorage *workspace, int stage_count) {
   return true;
 }
 
-bool PrepareMapStorage(WorkspaceStorage *workspace, int stage_count) {
+bool PrepareMapStorage(WorkspaceStorage *workspace, int stage_count,
+                       bool layout_matches) {
   if (stage_count == 0)
     return false;
-  const int node_count = stage_count + 1;
-  bool layout_matches =
-      workspace->map_layout_key.size() == static_cast<std::size_t>(node_count);
-  for (int node = 0; node < node_count && layout_matches; ++node) {
-    layout_matches &= workspace->map_layout_key[node] ==
-                      workspace->host_state_dimensions[2 * node + 1];
-  }
   if (layout_matches)
     return false;
   const auto &level_offsets = workspace->stage_level_offsets;
@@ -3583,12 +4025,29 @@ bool PrepareDualStorage(WorkspaceStorage *workspace, int stage_count) {
     CheckedAccumulate(value_capacity[node].Entries(), &value_entries,
                       "dual-value layout");
   }
-  workspace->dual_tree.Reserve(tree_size);
-  workspace->dual_values.Reserve(tree_size);
-  workspace->dual_relation_data.Reserve(relation_entries);
-  workspace->dual_value_data.Reserve(value_entries);
-  workspace->host_dual_tree.Resize(tree_size);
-  workspace->host_dual_values.Resize(tree_size);
+  ArenaCursor device_plan(nullptr);
+  device_plan.Add(&workspace->dual_tree, tree_size);
+  device_plan.Add(&workspace->dual_values, tree_size);
+  device_plan.Add(&workspace->dual_relation_data, relation_entries);
+  device_plan.Add(&workspace->dual_value_data, value_entries);
+  workspace->dual_layout_arena.Reserve(device_plan.bytes());
+  ArenaCursor device_bind(workspace->dual_layout_arena.get());
+  device_bind.Add(&workspace->dual_tree, tree_size);
+  device_bind.Add(&workspace->dual_values, tree_size);
+  device_bind.Add(&workspace->dual_relation_data, relation_entries);
+  device_bind.Add(&workspace->dual_value_data, value_entries);
+  Require(device_bind.bytes() == device_plan.bytes(),
+          "internal CUDA dual-arena layout mismatch");
+
+  ArenaCursor host_plan(nullptr);
+  host_plan.Add(&workspace->host_dual_tree, tree_size);
+  host_plan.Add(&workspace->host_dual_values, tree_size);
+  workspace->host_dual_layout_arena.Resize(host_plan.bytes());
+  ArenaCursor host_bind(workspace->host_dual_layout_arena.data());
+  host_bind.Add(&workspace->host_dual_tree, tree_size);
+  host_bind.Add(&workspace->host_dual_values, tree_size);
+  Require(host_bind.bytes() == host_plan.bytes(),
+          "internal CUDA pinned dual-arena layout mismatch");
   Scalar *relation_cursor = workspace->dual_relation_data.get();
   Scalar *value_cursor = workspace->dual_value_data.get();
   for (int node = 0; node < tree_size; ++node) {
@@ -3631,7 +4090,17 @@ void PrepareProblemStructure(const Problem &problem, int device,
                      entries.problem_data,
                      static_cast<int>(problem.initial_state.size()),
                      static_cast<int>(problem.terminal_E.rows()));
+  // Arena slices may move whenever the structure changes. Rebuild every
+  // pointer-bearing compact layout before any slice is uploaded or launched.
+  workspace->relation_layout_key.clear();
+  workspace->stage_layout_key.clear();
+  workspace->value_layout_key.clear();
+  workspace->map_layout_key.clear();
+  workspace->dual_layout_key.clear();
+  workspace->relation_layout_uploaded = false;
+  workspace->stage_layout_uploaded = false;
   BuildCompactOffsets(problem, workspace);
+  PrepareOutputViews(problem, workspace);
   PrepareStageStorage(problem, workspace);
   BuildTreeLevels(node_count, &workspace->node_level_offsets,
                   &workspace->node_level_counts);
@@ -3639,59 +4108,45 @@ void PrepareProblemStructure(const Problem &problem, int device,
                   &workspace->stage_level_counts);
   if (PrepareRelationStorage(problem, workspace))
     workspace->relation_layout_uploaded = false;
+  Require(PackProblemData(problem, workspace, false, true),
+          "internal CUDA problem binding failed");
   workspace->structure_ready = true;
 }
 
-Scalar ObjectiveFromCompact(const Problem &problem, const int *state_offsets,
-                            const int *control_offsets, const Scalar *states,
-                            const Scalar *controls) {
-  Scalar objective = Scalar{0};
-  for (std::size_t i = 0; i < problem.stages.size(); ++i) {
-    const Stage &s = problem.stages[i];
-    const Scalar *x = states + state_offsets[i];
-    const Scalar *u = controls + control_offsets[i];
-    for (std::size_t row = 0; row < s.Q.rows(); ++row) {
-      objective += s.q[row] * x[row];
-      for (std::size_t col = 0; col < s.Q.cols(); ++col)
-        objective += Scalar{0.5} * x[row] * s.Q(row, col) * x[col];
-      for (std::size_t col = 0; col < s.M.cols(); ++col)
-        objective += x[row] * s.M(row, col) * u[col];
-    }
-    for (std::size_t row = 0; row < s.R.rows(); ++row) {
-      objective += s.r[row] * u[row];
-      for (std::size_t col = 0; col < s.R.cols(); ++col)
-        objective += Scalar{0.5} * u[row] * s.R(row, col) * u[col];
-    }
-  }
-  const Scalar *x = states + state_offsets[problem.stages.size()];
-  for (std::size_t row = 0; row < problem.terminal_Q.rows(); ++row) {
-    objective += problem.terminal_q[row] * x[row];
-    for (std::size_t col = 0; col < problem.terminal_Q.cols(); ++col)
-      objective += Scalar{0.5} * x[row] * problem.terminal_Q(row, col) * x[col];
-  }
-  return objective;
-}
-
-Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
-                    Solution &solution, const Options &options) {
-  const bool structure_matches =
-      ValidateCudaProblem(problem, options, workspace.structure_key, false);
-  int device_count = 0;
-  CudaCheck(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
-  Require(options.device < device_count, "CUDA device index is out of range");
-  if (workspace.structure_ready) {
+SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
+                         SolveMetadata &result, const Options &options,
+                         bool prepared) {
+  bool structure_matches = true;
+  if (prepared) {
+    Require(std::isfinite(options.tolerance) && options.tolerance > Scalar{0},
+            "CUDA tolerance must be finite and positive");
+    Require(options.device >= 0, "CUDA device index must be nonnegative");
+    Require(workspace.structure_ready,
+            "SolvePreparedView requires Workspace::Reserve first");
     Require(workspace.device == options.device,
-            "a CUDA workspace cannot be reused across devices");
+            "prepared CUDA workspace device differs from solve options");
+  } else {
+    structure_matches =
+        ValidateCudaProblem(problem, options, workspace.structure_key, false);
+    int device_count = 0;
+    CudaCheck(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
+    Require(device_count > 0, "no CUDA device is available");
+    Require(options.device < device_count, "CUDA device index is out of range");
+    if (workspace.structure_ready) {
+      Require(workspace.device == options.device,
+              "a CUDA workspace cannot be reused across devices");
+    }
   }
   CudaCheck(cudaSetDevice(options.device), "cudaSetDevice");
-  if (!workspace.structure_ready || !structure_matches)
+  if (!prepared && (!workspace.structure_ready || !structure_matches))
     PrepareProblemStructure(problem, options.device, &workspace);
   const ScratchRequirements &scratch = workspace.scratch;
   const auto total_start = std::chrono::steady_clock::now();
-  solution.status = SolveStatus::kInvalidInput;
-  solution.message.clear();
-  solution.objective = Scalar{0};
-  solution.timings = Timings{};
+  result.status = SolveStatus::kInvalidInput;
+  result.message.clear();
+  result.objective = Scalar{0};
+  result.timings = Timings{};
+  workspace.synchronization_count = 0;
   const int stage_count = static_cast<int>(problem.stages.size());
   const int node_count = stage_count + 1;
   auto &level_offsets = workspace.node_level_offsets;
@@ -3700,26 +4155,17 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &stage_level_offsets = workspace.stage_level_offsets;
   auto &stage_level_counts = workspace.stage_level_counts;
   auto &host_stages = workspace.host_stages;
-  Scalar *host_problem_cursor = workspace.host_problem_data.data();
-  Scalar *device_problem_cursor = workspace.device_problem_data.get();
-  bool finite = true;
-  for (std::size_t index = 0; index < problem.stages.size(); ++index) {
-    finite &= PackStage(problem.stages[index], &host_problem_cursor,
-                        &device_problem_cursor, &host_stages[index]);
-  }
+  const auto input_pack_start = std::chrono::steady_clock::now();
+  const bool validate_values_on_host = !prepared;
+  const bool finite =
+      PackProblemData(problem, &workspace, validate_values_on_host, false);
   PackedTerminal &terminal = workspace.host_terminal[0];
-  finite &= PackTerminal(problem, &host_problem_cursor, &device_problem_cursor,
-                         &terminal);
-  Require(host_problem_cursor == workspace.host_problem_data.data() +
-                                     workspace.host_problem_data.size(),
-          "internal CUDA problem-packing size mismatch");
   auto &host_initial = workspace.host_initial;
-  for (std::size_t i = 0; i < problem.initial_state.size(); ++i) {
-    const Scalar value = problem.initial_state[i];
-    host_initial[i] = value;
-    finite &= std::isfinite(value);
-  }
   Require(finite, "problem contains a non-finite value");
+  result.timings.input_pack_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - input_pack_start)
+          .count();
 
   auto &device_stages = workspace.device_stages;
   auto &device_terminal = workspace.device_terminal;
@@ -3742,8 +4188,11 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &reduced_initial = workspace.reduced_initial;
   const bool stage_layout_upload = !workspace.stage_layout_uploaded;
   const bool relation_layout_upload = !workspace.relation_layout_uploaded;
+  const std::size_t packed_input_entries =
+      CheckedSum({workspace.host_problem_data.size(), host_initial.size()},
+                 "CUDA compact input");
 
-  solution.timings.upload_ms = TimeGpu(workspace, [&] {
+  QueueTimed(workspace, TimingSlot::kUpload, [&] {
     if (relation_layout_upload) {
       CudaCheck(cudaMemcpyAsync(
                     relation_a.get(), workspace.host_relation_leaves.data(),
@@ -3758,14 +4207,12 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                   "upload compact relation tree");
       }
     }
-    if (stage_count > 0) {
-      CudaCheck(cudaMemcpyAsync(device_stages.get(), host_stages.data(),
-                                host_stages.size() * sizeof(PackedStage),
-                                cudaMemcpyHostToDevice),
-                "upload stages");
-    }
     if (stage_layout_upload) {
       if (stage_count > 0) {
+        CudaCheck(cudaMemcpyAsync(device_stages.get(), host_stages.data(),
+                                  host_stages.size() * sizeof(PackedStage),
+                                  cudaMemcpyHostToDevice),
+                  "upload stage metadata");
         CudaCheck(cudaMemcpyAsync(control_params.get(),
                                   workspace.host_control_params.data(),
                                   workspace.host_control_params.size() *
@@ -3806,47 +4253,49 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                 sizeof(ReducedTerminal),
                                 cudaMemcpyHostToDevice),
                 "upload reduced-terminal layout");
+      CudaCheck(
+          cudaMemcpyAsync(device_terminal.get(), &terminal,
+                          sizeof(PackedTerminal), cudaMemcpyHostToDevice),
+          "upload terminal metadata");
+      CudaCheck(
+          cudaMemcpyAsync(state_offsets.get(),
+                          workspace.host_state_offsets.data(),
+                          workspace.host_state_offsets.size() * sizeof(int),
+                          cudaMemcpyHostToDevice),
+          "upload state offsets");
+      CudaCheck(
+          cudaMemcpyAsync(control_offsets.get(),
+                          workspace.host_control_offsets.data(),
+                          workspace.host_control_offsets.size() * sizeof(int),
+                          cudaMemcpyHostToDevice),
+          "upload control offsets");
+      CudaCheck(
+          cudaMemcpyAsync(dynamics_offsets.get(),
+                          workspace.host_dynamics_offsets.data(),
+                          workspace.host_dynamics_offsets.size() * sizeof(int),
+                          cudaMemcpyHostToDevice),
+          "upload dynamics-multiplier offsets");
+      CudaCheck(
+          cudaMemcpyAsync(mixed_offsets.get(),
+                          workspace.host_mixed_offsets.data(),
+                          workspace.host_mixed_offsets.size() * sizeof(int),
+                          cudaMemcpyHostToDevice),
+          "upload mixed offsets");
+      CudaCheck(cudaMemcpyAsync(
+                    state_constraint_offsets.get(),
+                    workspace.host_state_constraint_offsets.data(),
+                    workspace.host_state_constraint_offsets.size() *
+                        sizeof(int),
+                    cudaMemcpyHostToDevice),
+                "upload state-constraint offsets");
     }
-    CudaCheck(cudaMemcpyAsync(device_terminal.get(), &terminal,
-                              sizeof(PackedTerminal), cudaMemcpyHostToDevice),
-              "upload terminal data");
-    CudaCheck(
-        cudaMemcpyAsync(workspace.device_problem_data.get(),
-                        workspace.host_problem_data.data(),
-                        workspace.host_problem_data.size() * sizeof(Scalar),
-                        cudaMemcpyHostToDevice),
-        "upload compact problem data");
-    CudaCheck(cudaMemcpyAsync(device_initial.get(), host_initial.data(),
-                              host_initial.size() * sizeof(Scalar),
-                              cudaMemcpyHostToDevice),
-              "upload initial state");
-    CudaCheck(cudaMemcpyAsync(state_offsets.get(),
-                              workspace.host_state_offsets.data(),
-                              workspace.host_state_offsets.size() * sizeof(int),
-                              cudaMemcpyHostToDevice),
-              "upload state offsets");
-    CudaCheck(cudaMemcpyAsync(
-                  control_offsets.get(), workspace.host_control_offsets.data(),
-                  workspace.host_control_offsets.size() * sizeof(int),
-                  cudaMemcpyHostToDevice),
-              "upload control offsets");
-    CudaCheck(
-        cudaMemcpyAsync(dynamics_offsets.get(),
-                        workspace.host_dynamics_offsets.data(),
-                        workspace.host_dynamics_offsets.size() * sizeof(int),
-                        cudaMemcpyHostToDevice),
-        "upload dynamics-multiplier offsets");
-    CudaCheck(cudaMemcpyAsync(mixed_offsets.get(),
-                              workspace.host_mixed_offsets.data(),
-                              workspace.host_mixed_offsets.size() * sizeof(int),
-                              cudaMemcpyHostToDevice),
-              "upload mixed offsets");
-    CudaCheck(cudaMemcpyAsync(state_constraint_offsets.get(),
-                              workspace.host_state_constraint_offsets.data(),
-                              workspace.host_state_constraint_offsets.size() *
-                                  sizeof(int),
-                              cudaMemcpyHostToDevice),
-              "upload state-constraint offsets");
+    if (packed_input_entries > 0) {
+      CudaCheck(cudaMemcpyAsync(workspace.device_problem_data.get(),
+                                workspace.host_problem_data.data(),
+                                packed_input_entries * sizeof(Scalar),
+                                cudaMemcpyHostToDevice),
+                "upload compact problem and initial state");
+    }
     CudaCheck(cudaMemsetAsync(device_status.get(), 0, sizeof(DeviceStatus)),
               "clear CUDA status");
   });
@@ -3856,7 +4305,12 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   Scalar feasibility_consistency_tolerance = std::max(
       options.tolerance, kMinimumFeasibilityConsistencyTolerance *
                              static_cast<Scalar>(feasibility_scan_levels + 2));
-  solution.timings.feasibility_ms = TimeGpuKernels(
+  const int finite_input_blocks =
+      prepared && packed_input_entries > 0
+          ? static_cast<int>(std::min<std::size_t>(
+                (packed_input_entries - 1) / kThreads + 1, 65535))
+          : 0;
+  result.timings.feasibility_ms = TimeGpuKernels(
       workspace,
       [&] {
         // A failing block may cause other blocks to stop before publishing
@@ -3868,6 +4322,12 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                   "initialize reduced state dimensions");
       },
       [&] {
+        if (finite_input_blocks > 0) {
+          CheckFiniteInputsKernel<<<finite_input_blocks, kThreads>>>(
+              workspace.device_problem_data.get(),
+              workspace.host_problem_data.size(), device_initial.get(),
+              host_initial.size(), device_status.get());
+        }
         BuildPrimalLeavesKernel<<<node_count, kThreads, scratch.primal_leaf>>>(
             device_stages.get(), stage_count, device_terminal.get(),
             options.tolerance, feasibility_consistency_tolerance,
@@ -3921,33 +4381,57 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                   cudaMemcpyDeviceToHost),
                   "download reduced state dimensions");
       });
+  result.timings.upload_ms = ElapsedTiming(workspace, TimingSlot::kUpload);
   Relation *suffix = relation_a.get();
   DeviceStatus status = workspace.host_status[0];
-  if (ApplyDeviceFailure(status, &solution)) {
-    solution.timings.total_ms =
+  if (ApplyDeviceFailure(status, &result)) {
+    result.timings.total_ms =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - total_start)
             .count();
-    return solution;
+    return result;
   }
-  workspace.host_reduced_state_offsets[0] = 0;
-  for (int index = 0; index < node_count; ++index) {
-    workspace.host_reduced_state_offsets[index + 1] =
-        workspace.host_reduced_state_offsets[index] +
-        workspace.host_state_dimensions[2 * index + 1];
+  const auto state_layout_start = std::chrono::steady_clock::now();
+  bool primal_layout_matches =
+      workspace.value_layout_key.size() ==
+          static_cast<std::size_t>(node_count) &&
+      (stage_count == 0 ||
+       workspace.map_layout_key.size() ==
+           static_cast<std::size_t>(node_count));
+  for (int node = 0; node < node_count && primal_layout_matches; ++node) {
+    const int dimension = workspace.host_state_dimensions[2 * node + 1];
+    primal_layout_matches &= workspace.value_layout_key[node] == dimension;
+    if (stage_count > 0)
+      primal_layout_matches &= workspace.map_layout_key[node] == dimension;
   }
-  workspace.reduced_states.Reserve(
-      workspace.host_reduced_state_offsets[node_count]);
+  const bool primal_layout_changed = !primal_layout_matches;
+  if (primal_layout_changed) {
+    workspace.host_reduced_state_offsets[0] = 0;
+    for (int index = 0; index < node_count; ++index) {
+      workspace.host_reduced_state_offsets[index + 1] =
+          workspace.host_reduced_state_offsets[index] +
+          workspace.host_state_dimensions[2 * index + 1];
+    }
+    workspace.reduced_states.Reserve(
+        workspace.host_reduced_state_offsets[node_count]);
+  }
+  result.timings.layout_ms +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - state_layout_start)
+          .count();
 
-  solution.timings.reduction_ms = TimeGpuKernels(
+  result.timings.reduction_ms = TimeGpuKernels(
       workspace,
       [&] {
-        CudaCheck(cudaMemcpyAsync(reduced_state_offsets.get(),
-                                  workspace.host_reduced_state_offsets.data(),
-                                  workspace.host_reduced_state_offsets.size() *
-                                      sizeof(int),
-                                  cudaMemcpyHostToDevice),
-                  "upload reduced-state offsets");
+        if (primal_layout_changed) {
+          CudaCheck(cudaMemcpyAsync(
+                        reduced_state_offsets.get(),
+                        workspace.host_reduced_state_offsets.data(),
+                        workspace.host_reduced_state_offsets.size() *
+                            sizeof(int),
+                        cudaMemcpyHostToDevice),
+                    "upload reduced-state offsets");
+        }
         if (stage_count > 0) {
           CudaCheck(cudaMemsetAsync(control_dimensions.get(), 0,
                                     workspace.host_control_dimensions.size() *
@@ -3986,24 +4470,30 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                   "read reduction status");
       });
   status = workspace.host_status[0];
-  if (ApplyDeviceFailure(status, &solution)) {
-    solution.timings.total_ms =
+  if (ApplyDeviceFailure(status, &result)) {
+    result.timings.total_ms =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - total_start)
             .count();
-    return solution;
+    return result;
   }
 
+  const auto primal_layout_start = std::chrono::steady_clock::now();
   const bool value_layout_changed =
-      PrepareValueStorage(&workspace, stage_count);
-  const bool map_layout_changed = PrepareMapStorage(&workspace, stage_count);
+      PrepareValueStorage(&workspace, stage_count, primal_layout_matches);
+  const bool map_layout_changed =
+      PrepareMapStorage(&workspace, stage_count, primal_layout_matches);
+  result.timings.layout_ms +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - primal_layout_start)
+          .count();
 
   auto &value_a = workspace.value_leaves;
   auto &value_b = workspace.value_scan;
   auto &feedback = workspace.feedback;
   const ValueElement *value_suffix = value_a.get();
-  solution.timings.riccati_ms = TimeGpuKernels(
-      workspace,
+  QueueTimedKernels(
+      workspace, TimingSlot::kRiccati,
       [&] {
         if (value_layout_changed) {
           CudaCheck(cudaMemcpyAsync(value_a.get(),
@@ -4063,21 +4553,7 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               options.tolerance, feedback.get(), device_status.get());
         }
       },
-      [&] {
-        CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
-                                  device_status.get(), sizeof(DeviceStatus),
-                                  cudaMemcpyDeviceToHost),
-                  "read Riccati status");
-      });
-
-  status = workspace.host_status[0];
-  if (ApplyDeviceFailure(status, &solution)) {
-    solution.timings.total_ms =
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - total_start)
-            .count();
-    return solution;
-  }
+      [] {});
 
   auto &map_a = workspace.map_leaves;
   auto &map_b = workspace.map_scan;
@@ -4085,8 +4561,8 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &states = workspace.states;
   auto &controls = workspace.controls;
   AffineMap *prefix = map_a.get();
-  solution.timings.reconstruction_ms = TimeGpuKernels(
-      workspace,
+  QueueTimedKernels(
+      workspace, TimingSlot::kReconstruction,
       [&] {
         if (stage_count > 0 && map_layout_changed) {
           CudaCheck(cudaMemcpyAsync(
@@ -4106,7 +4582,7 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       [&] {
         if (stage_count > 0) {
           InitializeAffineMapsKernel<<<stage_count, kThreads>>>(
-              feedback.get(), stage_count, map_a.get());
+              feedback.get(), stage_count, map_a.get(), device_status.get());
           if (stage_count > 1) {
             const int first_parent_count = stage_level_counts[1];
             ReduceAffineLeavesKernel<<<first_parent_count, kThreads>>>(
@@ -4145,22 +4621,9 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
             reduced_initial.get(), reduced_state_offsets.get(),
             state_offsets.get(), control_offsets.get(), stage_count,
             reduced_states.get(), workspace.reduced_controls.get(),
-            states.get(), controls.get());
+            states.get(), controls.get(), device_status.get());
       },
-      [&] {
-        CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
-                                  device_status.get(), sizeof(DeviceStatus),
-                                  cudaMemcpyDeviceToHost),
-                  "read reconstruction status");
-      });
-  status = workspace.host_status[0];
-  if (ApplyDeviceFailure(status, &solution)) {
-    solution.timings.total_ms =
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - total_start)
-            .count();
-    return solution;
-  }
+      [] {});
 
   // First recover the part of each dynamics/mixed multiplier fixed by the
   // reduced costate and control stationarity.  Only genuinely free components
@@ -4188,10 +4651,24 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &terminal_multiplier = workspace.terminal_multiplier;
   int &host_dual_scan_needed = workspace.host_dual_scan_needed[0];
   host_dual_scan_needed = 0;
-  solution.timings.multiplier_ms = 0.0;
+  result.timings.multiplier_ms = 0.0;
+  const std::size_t multiplier_output_entries = CheckedSum(
+      {workspace.host_initial_multiplier.size(), workspace.host_dynamics.size(),
+       workspace.host_mixed.size(),
+       workspace.host_state_multipliers.size(),
+       workspace.host_terminal_multiplier.size()},
+      "CUDA multiplier output");
+  const auto initialize_multiplier_outputs = [&] {
+    if (multiplier_output_entries > 0) {
+      CudaCheck(cudaMemsetAsync(
+                    initial_multiplier.get(), 0,
+                    multiplier_output_entries * sizeof(Scalar)),
+                "initialize compact multipliers");
+    }
+  };
   if (stage_count > 0) {
-    solution.timings.multiplier_ms += TimeGpuKernels(
-        workspace,
+    QueueTimedKernels(
+        workspace, TimingSlot::kDualParameters,
         [&] {
           CudaCheck(cudaMemsetAsync(dual_scan_needed.get(), 0, sizeof(int)),
                     "initialize dual scan flag");
@@ -4227,24 +4704,37 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                     cudaMemcpyDeviceToHost),
                     "read dual parameter status");
         });
+    CudaCheck(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize");
+    ++workspace.synchronization_count;
+    result.timings.riccati_ms = ElapsedTiming(workspace, TimingSlot::kRiccati);
+    result.timings.reconstruction_ms =
+        ElapsedTiming(workspace, TimingSlot::kReconstruction);
+    result.timings.multiplier_ms =
+        ElapsedTiming(workspace, TimingSlot::kDualParameters);
     status = workspace.host_status[0];
-    if (ApplyDeviceFailure(status, &solution)) {
-      solution.timings.total_ms =
+    if (ApplyDeviceFailure(status, &result)) {
+      result.timings.total_ms =
           std::chrono::duration<double, std::milli>(
               std::chrono::steady_clock::now() - total_start)
               .count();
-      return solution;
+      return result;
     }
+    const auto dual_layout_start = std::chrono::steady_clock::now();
     const bool dual_layout_changed =
         host_dual_scan_needed != 0 ? PrepareDualStorage(&workspace, stage_count)
                                    : false;
+    result.timings.layout_ms +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - dual_layout_start)
+            .count();
     DualRelation *dual_relations =
         host_dual_scan_needed != 0 ? dual_tree.get() : nullptr;
     DualNodeValue *dual_leaf_values =
         host_dual_scan_needed != 0 ? dual_values.get() : nullptr;
-    solution.timings.multiplier_ms += TimeGpuKernels(
-        workspace,
+    QueueTimedKernels(
+        workspace, TimingSlot::kMultiplierRecovery,
         [&] {
+          initialize_multiplier_outputs();
           if (dual_layout_changed) {
             CudaCheck(cudaMemcpyAsync(dual_tree.get(),
                                       workspace.host_dual_tree.data(),
@@ -4303,7 +4793,8 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               dynamics_offsets.get(), mixed_offsets.get(),
               state_constraint_offsets.get(), stage_count,
               dynamics_multipliers.get(), mixed_multipliers.get(),
-              state_multipliers.get(), terminal_multiplier.get());
+              state_multipliers.get(), terminal_multiplier.get(),
+              device_status.get());
           RecoverInitialMultiplierKernel<<<1, kThreads>>>(
               device_stages.get(), device_terminal.get(), stage_count,
               states.get(), controls.get(), dynamics_multipliers.get(),
@@ -4311,18 +4802,14 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               control_offsets.get(), dynamics_offsets.get(),
               mixed_offsets.get(), state_constraint_offsets.get(),
               initial_multiplier.get(), state_multipliers.get(),
-              terminal_multiplier.get());
+              terminal_multiplier.get(), device_status.get());
         },
-        [&] {
-          CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
-                                    device_status.get(), sizeof(DeviceStatus),
-                                    cudaMemcpyDeviceToHost),
-                    "read multiplier status");
-        });
+        [] {});
   }
   if (stage_count == 0) {
-    solution.timings.multiplier_ms += TimeGpuKernels(
-        workspace, [] {},
+    QueueTimedKernels(
+        workspace, TimingSlot::kMultiplierRecovery,
+        initialize_multiplier_outputs,
         [&] {
           RecoverInitialMultiplierKernel<<<1, kThreads>>>(
               device_stages.get(), device_terminal.get(), stage_count,
@@ -4331,23 +4818,33 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               control_offsets.get(), dynamics_offsets.get(),
               mixed_offsets.get(), state_constraint_offsets.get(),
               initial_multiplier.get(), state_multipliers.get(),
-              terminal_multiplier.get());
+              terminal_multiplier.get(), device_status.get());
         },
-        [&] {
-          CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
-                                    device_status.get(), sizeof(DeviceStatus),
-                                    cudaMemcpyDeviceToHost),
-                    "read multiplier status");
-        });
+        [] {});
   }
-  status = workspace.host_status[0];
-  if (ApplyDeviceFailure(status, &solution)) {
-    solution.timings.total_ms =
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - total_start)
-            .count();
-    return solution;
-  }
+
+  auto &objective_tree = workspace.objective_tree;
+  QueueTimedKernels(
+      workspace, TimingSlot::kObjective,
+      [&] {
+        CudaCheck(cudaMemsetAsync(objective_tree.get(), 0,
+                                  objective_tree.count() * sizeof(Scalar)),
+                  "initialize objective tree");
+      },
+      [&] {
+        BuildObjectiveTermsKernel<<<node_count, kThreads>>>(
+            device_stages.get(), stage_count, device_terminal.get(),
+            states.get(), controls.get(), state_offsets.get(),
+            control_offsets.get(), objective_tree.get(), device_status.get());
+        for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
+          const int parent_count = level_counts[level + 1];
+          const int blocks = (parent_count + kThreads - 1) / kThreads;
+          ReduceObjectiveTreeLevelKernel<<<blocks, kThreads>>>(
+              objective_tree.get(), level_offsets[level], level_counts[level],
+              level_offsets[level + 1], device_status.get());
+        }
+      },
+      [] {});
 
   auto &host_states = workspace.host_states;
   auto &host_controls = workspace.host_controls;
@@ -4356,97 +4853,95 @@ Solution &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &host_mixed = workspace.host_mixed;
   auto &host_state_multipliers = workspace.host_state_multipliers;
   auto &host_terminal_multiplier = workspace.host_terminal_multiplier;
-  auto &host_state_dimensions = workspace.host_state_dimensions;
-  auto &host_control_dimensions = workspace.host_control_dimensions;
-  solution.timings.download_ms = TimeGpu(workspace, [&] {
-    CudaCheck(cudaMemcpyAsync(host_states.data(), states.get(),
-                              host_states.size() * sizeof(Scalar),
-                              cudaMemcpyDeviceToHost),
-              "download states");
-    CudaCheck(cudaMemcpyAsync(host_controls.data(), controls.get(),
-                              host_controls.size() * sizeof(Scalar),
-                              cudaMemcpyDeviceToHost),
-              "download controls");
-    CudaCheck(cudaMemcpyAsync(host_initial_multiplier.data(),
-                              initial_multiplier.get(),
-                              host_initial_multiplier.size() * sizeof(Scalar),
-                              cudaMemcpyDeviceToHost),
-              "download initial multiplier");
-    CudaCheck(cudaMemcpyAsync(host_dynamics.data(), dynamics_multipliers.get(),
-                              host_dynamics.size() * sizeof(Scalar),
-                              cudaMemcpyDeviceToHost),
-              "download dynamics multipliers");
-    CudaCheck(cudaMemcpyAsync(host_mixed.data(), mixed_multipliers.get(),
-                              host_mixed.size() * sizeof(Scalar),
-                              cudaMemcpyDeviceToHost),
-              "download mixed multipliers");
-    CudaCheck(cudaMemcpyAsync(host_state_multipliers.data(),
-                              state_multipliers.get(),
-                              host_state_multipliers.size() * sizeof(Scalar),
-                              cudaMemcpyDeviceToHost),
-              "download state multipliers");
-    CudaCheck(cudaMemcpyAsync(host_terminal_multiplier.data(),
-                              terminal_multiplier.get(),
-                              host_terminal_multiplier.size() * sizeof(Scalar),
-                              cudaMemcpyDeviceToHost),
-              "download terminal multiplier");
+  const std::size_t solution_output_entries = CheckedSum(
+      {host_states.size(), host_controls.size(),
+       host_initial_multiplier.size(), host_dynamics.size(), host_mixed.size(),
+       host_state_multipliers.size(), host_terminal_multiplier.size()},
+      "CUDA compact output");
+  result.timings.download_ms = TimeGpu(workspace, [&] {
+    CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
+                              sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
+              "read multiplier status");
+    if (solution_output_entries > 0) {
+      CudaCheck(cudaMemcpyAsync(host_states.data(), states.get(),
+                                solution_output_entries * sizeof(Scalar),
+                                cudaMemcpyDeviceToHost),
+                "download compact primal-dual solution");
+    }
+    CudaCheck(cudaMemcpyAsync(
+                  workspace.host_objective.data(),
+                  objective_tree.get() + level_offsets.back(), sizeof(Scalar),
+                  cudaMemcpyDeviceToHost),
+              "download objective");
   });
+  result.timings.riccati_ms = ElapsedTiming(workspace, TimingSlot::kRiccati);
+  result.timings.reconstruction_ms =
+      ElapsedTiming(workspace, TimingSlot::kReconstruction);
+  result.timings.multiplier_ms +=
+      ElapsedTiming(workspace, TimingSlot::kMultiplierRecovery);
+  result.timings.objective_ms =
+      ElapsedTiming(workspace, TimingSlot::kObjective);
+  status = workspace.host_status[0];
+  if (ApplyDeviceFailure(status, &result)) {
+    result.timings.total_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - total_start)
+            .count();
+    return result;
+  }
 
-  solution.states.resize(node_count);
-  solution.reduced_state_dimensions.resize(node_count);
-  for (int i = 0; i < node_count; ++i) {
-    const int n = host_state_dimensions[2 * i];
-    solution.states[i].resize(n);
-    for (int row = 0; row < n; ++row)
-      solution.states[i][row] =
-          host_states[workspace.host_state_offsets[i] + row];
-    solution.reduced_state_dimensions[i] = host_state_dimensions[2 * i + 1];
-  }
-  solution.controls.resize(stage_count);
-  solution.reduced_control_dimensions.resize(stage_count);
-  solution.dynamics_multipliers.resize(stage_count);
-  solution.mixed_multipliers.resize(stage_count);
-  solution.state_multipliers.resize(stage_count);
-  for (int i = 0; i < stage_count; ++i) {
-    const PackedStage &s = host_stages[i];
-    solution.controls[i].resize(s.m);
-    for (int row = 0; row < s.m; ++row)
-      solution.controls[i][row] =
-          host_controls[workspace.host_control_offsets[i] + row];
-    solution.reduced_control_dimensions[i] = host_control_dimensions[2 * i + 1];
-    solution.dynamics_multipliers[i].resize(s.next_n);
-    for (int row = 0; row < s.next_n; ++row)
-      solution.dynamics_multipliers[i][row] =
-          host_dynamics[workspace.host_dynamics_offsets[i] + row];
-    solution.mixed_multipliers[i].resize(s.mixed);
-    for (int row = 0; row < s.mixed; ++row)
-      solution.mixed_multipliers[i][row] =
-          host_mixed[workspace.host_mixed_offsets[i] + row];
-    solution.state_multipliers[i].resize(s.state);
-    for (int row = 0; row < s.state; ++row)
-      solution.state_multipliers[i][row] =
-          host_state_multipliers[workspace.host_state_constraint_offsets[i] +
-                                 row];
-  }
-  solution.initial_multiplier.resize(problem.initial_state.size());
-  for (std::size_t row = 0; row < problem.initial_state.size(); ++row)
-    solution.initial_multiplier[row] = host_initial_multiplier[row];
-  solution.terminal_state_multiplier.resize(terminal.state);
-  for (int row = 0; row < terminal.state; ++row)
-    solution.terminal_state_multiplier[row] = host_terminal_multiplier[row];
-  solution.objective =
-      ObjectiveFromCompact(problem, workspace.host_state_offsets.data(),
-                           workspace.host_control_offsets.data(),
-                           host_states.data(), host_controls.data());
-  solution.status = SolveStatus::kOptimal;
-  solution.message = "optimal (parallel CUDA conditional-value scan)";
+  result.objective = workspace.host_objective[0];
+  result.status = SolveStatus::kOptimal;
+  result.message = "optimal (parallel CUDA conditional-value scan)";
   if (!options.enforce_multiplier_consistency)
-    solution.message += "; multiplier consistency unchecked";
-  solution.timings.total_ms =
-      std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - total_start)
-          .count();
-  return solution;
+    result.message += "; multiplier consistency unchecked";
+  result.timings.synchronization_count = workspace.synchronization_count;
+  result.timings.total_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - total_start)
+                                .count();
+  return result;
+}
+
+SolutionView ViewFromWorkspace(WorkspaceStorage &workspace) {
+  SolutionView view;
+  const SolveMetadata &result = workspace.result;
+  view.status = result.status;
+  view.message = result.message.c_str();
+  view.states =
+      workspace.state_views.empty() ? nullptr : workspace.state_views.data();
+  view.state_count = workspace.state_views.size();
+  view.controls = workspace.control_views.empty()
+                      ? nullptr
+                      : workspace.control_views.data();
+  view.control_count = workspace.control_views.size();
+  view.initial_multiplier = {workspace.host_initial_multiplier.data(),
+                             workspace.host_initial_multiplier.size()};
+  view.dynamics_multipliers = workspace.dynamics_views.empty()
+                                  ? nullptr
+                                  : workspace.dynamics_views.data();
+  view.dynamics_multiplier_count = workspace.dynamics_views.size();
+  view.mixed_multipliers =
+      workspace.mixed_views.empty() ? nullptr : workspace.mixed_views.data();
+  view.mixed_multiplier_count = workspace.mixed_views.size();
+  view.state_multipliers = workspace.state_multiplier_views.empty()
+                               ? nullptr
+                               : workspace.state_multiplier_views.data();
+  view.state_multiplier_count = workspace.state_multiplier_views.size();
+  view.terminal_state_multiplier = {workspace.host_terminal_multiplier.data(),
+                                    workspace.host_terminal_multiplier.size()};
+  view.reduced_state_dimensions = {
+      workspace.host_state_dimensions.size() > 1
+          ? workspace.host_state_dimensions.data() + 1
+          : nullptr,
+      workspace.state_views.size(), 2};
+  view.reduced_control_dimensions = {
+      workspace.host_control_dimensions.size() > 1
+          ? workspace.host_control_dimensions.data() + 1
+          : nullptr,
+      workspace.control_views.size(), 2};
+  view.objective = result.objective;
+  view.timings = result.timings;
+  return view;
 }
 
 } // namespace
@@ -4508,27 +5003,126 @@ std::string DeviceDescription(int device) {
   return out.str();
 }
 
-Solution &Solve(const Problem &problem, Workspace &workspace, Solution &result,
-                const Options &options) {
+namespace {
+
+SolutionView RunSolveView(const Problem &problem,
+                          detail::WorkspaceStorage &storage,
+                          const Options &options, bool prepared) {
+  detail::SolveMetadata &result = storage.result;
+  result.status = SolveStatus::kInvalidInput;
+  result.message.clear();
+  result.objective = Scalar{0};
+  result.timings = Timings{};
+  storage.synchronization_count = 0;
   try {
-    if (!Available()) {
-      result.status = SolveStatus::kInvalidInput;
-      result.message = "no CUDA device is available";
-      return result;
-    }
-    if (!workspace.impl_)
-      workspace.impl_ = std::make_unique<Workspace::Impl>();
-    return detail::SolveImpl(problem, workspace.impl_->storage, result,
-                             options);
+    detail::SolveImpl(problem, storage, result, options, prepared);
   } catch (const std::invalid_argument &error) {
     result.status = SolveStatus::kInvalidInput;
     result.message = error.what();
-    return result;
   } catch (const std::exception &error) {
     result.status = SolveStatus::kNumericalFailure;
     result.message = error.what();
-    return result;
   }
+  result.timings.synchronization_count = storage.synchronization_count;
+  return detail::ViewFromWorkspace(storage);
+}
+
+} // namespace
+
+SolutionView SolveView(const Problem &problem, Workspace &workspace,
+                       const Options &options) {
+  if (!workspace.impl_)
+    workspace.impl_ = std::make_unique<Workspace::Impl>();
+  return RunSolveView(problem, workspace.impl_->storage, options, false);
+}
+
+SolutionView SolvePreparedView(const Problem &problem, Workspace &workspace,
+                               const Options &options) {
+  if (!workspace.impl_)
+    workspace.impl_ = std::make_unique<Workspace::Impl>();
+  return RunSolveView(problem, workspace.impl_->storage, options, true);
+}
+
+namespace {
+
+void CopyVectorView(const VectorView &source, Vector *destination) {
+  destination->resize(source.size);
+  for (std::size_t index = 0; index < source.size; ++index)
+    (*destination)[index] = source[index];
+}
+
+void ClearSolutionStorage(Solution *result) {
+  result->states.clear();
+  result->controls.clear();
+  result->initial_multiplier.resize(0);
+  result->dynamics_multipliers.clear();
+  result->mixed_multipliers.clear();
+  result->state_multipliers.clear();
+  result->terminal_state_multiplier.resize(0);
+  result->reduced_state_dimensions.clear();
+  result->reduced_control_dimensions.clear();
+}
+
+} // namespace
+
+Solution &Materialize(const SolutionView &view, Solution &result) {
+  const auto start = std::chrono::steady_clock::now();
+  result.status = view.status;
+  result.message = view.message;
+  result.objective = view.objective;
+  result.timings = view.timings;
+  ClearSolutionStorage(&result);
+  if (view.status == SolveStatus::kOptimal) {
+    result.states.resize(view.state_count);
+    for (std::size_t index = 0; index < view.state_count; ++index)
+      CopyVectorView(view.states[index], &result.states[index]);
+    result.controls.resize(view.control_count);
+    for (std::size_t index = 0; index < view.control_count; ++index)
+      CopyVectorView(view.controls[index], &result.controls[index]);
+    CopyVectorView(view.initial_multiplier, &result.initial_multiplier);
+    result.dynamics_multipliers.resize(view.dynamics_multiplier_count);
+    for (std::size_t index = 0; index < view.dynamics_multiplier_count; ++index)
+      CopyVectorView(view.dynamics_multipliers[index],
+                     &result.dynamics_multipliers[index]);
+    result.mixed_multipliers.resize(view.mixed_multiplier_count);
+    for (std::size_t index = 0; index < view.mixed_multiplier_count; ++index)
+      CopyVectorView(view.mixed_multipliers[index],
+                     &result.mixed_multipliers[index]);
+    result.state_multipliers.resize(view.state_multiplier_count);
+    for (std::size_t index = 0; index < view.state_multiplier_count; ++index)
+      CopyVectorView(view.state_multipliers[index],
+                     &result.state_multipliers[index]);
+    CopyVectorView(view.terminal_state_multiplier,
+                   &result.terminal_state_multiplier);
+    result.reduced_state_dimensions.resize(view.reduced_state_dimensions.size);
+    for (std::size_t index = 0; index < view.reduced_state_dimensions.size;
+         ++index)
+      result.reduced_state_dimensions[index] =
+          view.reduced_state_dimensions[index];
+    result.reduced_control_dimensions.resize(
+        view.reduced_control_dimensions.size);
+    for (std::size_t index = 0; index < view.reduced_control_dimensions.size;
+         ++index)
+      result.reduced_control_dimensions[index] =
+          view.reduced_control_dimensions[index];
+  }
+  const double materialization_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start)
+          .count();
+  result.timings.result_ms += materialization_ms;
+  result.timings.total_ms += materialization_ms;
+  return result;
+}
+
+Solution &Solve(const Problem &problem, Workspace &workspace, Solution &result,
+                const Options &options) {
+  return Materialize(SolveView(problem, workspace, options), result);
+}
+
+Solution &SolvePrepared(const Problem &problem, Workspace &workspace,
+                        Solution &result, const Options &options) {
+  return Materialize(SolvePreparedView(problem, workspace, options), result);
 }
 
 Solution Solve(const Problem &problem, const Options &options) {
@@ -4548,9 +5142,12 @@ namespace detail {
 namespace {
 
 __global__ void InitializeAffineMapsKernel(const Feedback *feedback, int count,
-                                           AffineMap *maps) {
+                                           AffineMap *maps,
+                                           DeviceStatus *status) {
   const int index = blockIdx.x;
   if (index >= count)
+    return;
+  if (!BlockEnabled(status))
     return;
   const Feedback &fb = feedback[index];
   if (threadIdx.x == 0) {
@@ -4761,9 +5358,11 @@ __global__ void ReconstructPrimalKernel(
     const Scalar *initial, const int *reduced_state_offsets,
     const int *state_offsets, const int *control_offsets, int stage_count,
     Scalar *reduced_states, Scalar *reduced_controls, Scalar *states,
-    Scalar *controls) {
+    Scalar *controls, DeviceStatus *status) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index > stage_count)
+    return;
+  if (!BlockEnabled(status))
     return;
   const StateParam &state = state_params[index];
   Scalar *z = reduced_states + reduced_state_offsets[index];
@@ -5147,9 +5746,12 @@ __global__ void RecoverParameterizedMultipliersKernel(
     const DualNodeValue *leaf_values, const int *dynamics_offsets,
     const int *mixed_offsets, const int *state_constraint_offsets,
     int stage_count, Scalar *dynamics_multipliers, Scalar *mixed_multipliers,
-    Scalar *state_multipliers, Scalar *terminal_multiplier) {
+    Scalar *state_multipliers, Scalar *terminal_multiplier,
+    DeviceStatus *status) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= stage_count)
+    return;
+  if (!BlockEnabled(status))
     return;
   const DualParam &param = params[index];
   for (int row = 0; row < param.physical_dim; ++row) {
@@ -5194,8 +5796,11 @@ __global__ void RecoverInitialMultiplierKernel(
     const int *state_offsets, const int *control_offsets,
     const int *dynamics_offsets, const int *mixed_offsets,
     const int *state_constraint_offsets, Scalar *initial_multiplier,
-    Scalar *state_multipliers, Scalar *terminal_multiplier) {
+    Scalar *state_multipliers, Scalar *terminal_multiplier,
+    DeviceStatus *status) {
   if (blockIdx.x != 0)
+    return;
+  if (!BlockEnabled(status))
     return;
   const PackedTerminal &terminal = *terminal_ptr;
   if (stage_count == 0) {
@@ -6565,6 +7170,74 @@ __global__ void InitialReducedStateKernel(const StateParam *state_params,
       SetFailure(status, kDeviceInfeasible, 0, 8);
     }
   }
+}
+
+__global__ void BuildObjectiveTermsKernel(
+    const PackedStage *stages, int stage_count,
+    const PackedTerminal *terminal_ptr, const Scalar *states,
+    const Scalar *controls, const int *state_offsets,
+    const int *control_offsets, Scalar *objective_tree,
+    DeviceStatus *status) {
+  const int node = blockIdx.x;
+  if (node > stage_count || !BlockEnabled(status))
+    return;
+  const Scalar *x = states + state_offsets[node];
+  Scalar local = Scalar{0};
+  if (node < stage_count) {
+    const PackedStage &stage = stages[node];
+    const Scalar *u = controls + control_offsets[node];
+    for (int row = threadIdx.x; row < stage.n; row += blockDim.x)
+      local += stage.q[row] * x[row];
+    for (int linear = threadIdx.x; linear < stage.n * stage.n;
+         linear += blockDim.x) {
+      const int row = linear / stage.n;
+      const int col = linear % stage.n;
+      local += Scalar{0.5} * x[row] * stage.Q[linear] * x[col];
+    }
+    for (int linear = threadIdx.x; linear < stage.n * stage.m;
+         linear += blockDim.x) {
+      const int row = linear / stage.m;
+      const int col = linear % stage.m;
+      local += x[row] * stage.M[linear] * u[col];
+    }
+    for (int row = threadIdx.x; row < stage.m; row += blockDim.x)
+      local += stage.r[row] * u[row];
+    for (int linear = threadIdx.x; linear < stage.m * stage.m;
+         linear += blockDim.x) {
+      const int row = linear / stage.m;
+      const int col = linear % stage.m;
+      local += Scalar{0.5} * u[row] * stage.R[linear] * u[col];
+    }
+  } else {
+    const PackedTerminal &terminal = *terminal_ptr;
+    for (int row = threadIdx.x; row < terminal.n; row += blockDim.x)
+      local += terminal.q[row] * x[row];
+    for (int linear = threadIdx.x; linear < terminal.n * terminal.n;
+         linear += blockDim.x) {
+      const int row = linear / terminal.n;
+      const int col = linear % terminal.n;
+      local += Scalar{0.5} * x[row] * terminal.Q[linear] * x[col];
+    }
+  }
+  local = WarpSum(local);
+  if (threadIdx.x == 0)
+    objective_tree[node] = local;
+}
+
+__global__ void ReduceObjectiveTreeLevelKernel(Scalar *objective_tree,
+                                               int child_offset,
+                                               int child_count,
+                                               int parent_offset,
+                                               DeviceStatus *status) {
+  const int parent = blockIdx.x * blockDim.x + threadIdx.x;
+  const int parent_count = (child_count + 1) / 2;
+  if (!BlockEnabled(status) || parent >= parent_count)
+    return;
+  const int left = 2 * parent;
+  Scalar value = objective_tree[child_offset + left];
+  if (left + 1 < child_count)
+    value += objective_tree[child_offset + left + 1];
+  objective_tree[parent_offset + parent] = value;
 }
 
 } // namespace

@@ -27,7 +27,8 @@ double Median(std::vector<double> values) {
 
 double KernelTotal(const clqr::cuda::Timings &timings) {
   return timings.feasibility_ms + timings.reduction_ms + timings.riccati_ms +
-         timings.reconstruction_ms + timings.multiplier_ms;
+         timings.reconstruction_ms + timings.multiplier_ms +
+         timings.objective_ms;
 }
 
 double EventTotal(const clqr::cuda::Timings &timings) {
@@ -165,17 +166,22 @@ int main(int argc, char **argv) {
   std::cout << "# cpp_cpu_ms and CUDA timings use the same scalar precision.\n";
   std::cout
       << "# CUDA wall time reuses reserved storage and includes packing, "
-         "transfers, kernels, synchronization, and result construction.\n"
+         "transfers, kernels, synchronization, and construction of a "
+         "workspace-backed result view.\n"
          "# cuda_kernel_ms sums pure kernel event times and excludes all "
          "host-device transfers; upload_ms and download_ms cover the bulk "
          "packed inputs and outputs.\n"
+         "# objective_ms is the device-side objective reduction and is "
+         "included in cuda_kernel_ms.\n"
          "# other_wall_ms is wall time minus bulk upload, kernels, and bulk "
-         "download; it includes host packing/result construction, "
+         "download; it includes host packing/view construction, "
          "phase-control "
          "transfers, synchronization, and API setup/validation.\n"
          "# api_overhead_ms is time outside the backend's internal timer "
          "(validation and device/workspace setup); internal_other_ms is "
-         "internal wall time not covered by bulk-transfer or kernel events.\n";
+         "internal wall time not covered by bulk-transfer or kernel events.\n"
+         "# The timed CUDA path uses a prepared workspace: numerical values "
+         "may change, while dimensions and shapes remain fixed.\n";
   if (cpu_max_horizon == std::numeric_limits<std::size_t>::max()) {
     std::cout << "# The sequential C++ solver is timed at every horizon.\n";
   } else {
@@ -186,7 +192,9 @@ int main(int argc, char **argv) {
                "accuracy.\n";
   std::cout << "N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_internal_ms,"
                "cuda_kernel_ms,wall_speedup,kernel_speedup,other_wall_ms,"
-               "api_overhead_ms,internal_other_ms,upload_ms,"
+               "api_overhead_ms,internal_other_ms,input_pack_ms,layout_ms,"
+               "result_ms,objective_ms,synchronizations,"
+               "unattributed_internal_ms,upload_ms,"
                "feasibility_ms,reduction_ms,riccati_ms,reconstruction_ms,"
                "multiplier_ms,download_ms,min_reduced_n,"
                "min_reduced_m,cuda_kkt_residual\n";
@@ -209,10 +217,11 @@ int main(int argc, char **argv) {
     cuda_options.enforce_multiplier_consistency = false;
     cuda_workspace.Reserve(problem, cuda_options);
     clqr::cuda::Solution gpu;
-    clqr::cuda::Solve(problem, cuda_workspace, gpu, cuda_options);
-    if (gpu.status != clqr::SolveStatus::kOptimal) {
+    clqr::cuda::SolutionView gpu_view =
+        clqr::cuda::SolvePreparedView(problem, cuda_workspace, cuda_options);
+    if (gpu_view.status != clqr::SolveStatus::kOptimal) {
       std::cout << "# CUDA warmup failed at N=" << horizon << ": "
-                << gpu.message << "\n";
+                << gpu_view.message << "\n";
       continue;
     }
 
@@ -223,6 +232,11 @@ int main(int argc, char **argv) {
     std::vector<double> other_wall_times;
     std::vector<double> api_overhead_times;
     std::vector<double> internal_other_times;
+    std::vector<double> input_pack;
+    std::vector<double> layout;
+    std::vector<double> result;
+    std::vector<double> objective;
+    std::vector<double> unattributed_internal;
     std::vector<double> feasibility;
     std::vector<double> upload;
     std::vector<double> reduction;
@@ -244,32 +258,41 @@ int main(int argc, char **argv) {
       }
 
       const auto gpu_start = Clock::now();
-      clqr::cuda::Solve(problem, cuda_workspace, gpu, cuda_options);
+      gpu_view =
+          clqr::cuda::SolvePreparedView(problem, cuda_workspace, cuda_options);
       const auto gpu_stop = Clock::now();
-      if (gpu.status != clqr::SolveStatus::kOptimal) {
+      if (gpu_view.status != clqr::SolveStatus::kOptimal) {
         std::cout << "# CUDA timed solve failed at N=" << horizon
-                  << ", repeat=" << repeat << ": " << gpu.message << "\n";
+                  << ", repeat=" << repeat << ": " << gpu_view.message << "\n";
         repeat_failed = true;
         break;
       }
       const double gpu_wall_time =
           std::chrono::duration<double, std::milli>(gpu_stop - gpu_start)
               .count();
-      const double gpu_kernel_time = KernelTotal(gpu.timings);
+      const double gpu_kernel_time = KernelTotal(gpu_view.timings);
       gpu_wall_times.push_back(gpu_wall_time);
-      gpu_internal_times.push_back(gpu.timings.total_ms);
+      gpu_internal_times.push_back(gpu_view.timings.total_ms);
       gpu_kernel_times.push_back(gpu_kernel_time);
-      other_wall_times.push_back(gpu_wall_time - EventTotal(gpu.timings));
-      api_overhead_times.push_back(gpu_wall_time - gpu.timings.total_ms);
-      internal_other_times.push_back(gpu.timings.total_ms -
-                                     EventTotal(gpu.timings));
-      upload.push_back(gpu.timings.upload_ms);
-      feasibility.push_back(gpu.timings.feasibility_ms);
-      reduction.push_back(gpu.timings.reduction_ms);
-      riccati.push_back(gpu.timings.riccati_ms);
-      reconstruction.push_back(gpu.timings.reconstruction_ms);
-      multiplier.push_back(gpu.timings.multiplier_ms);
-      download.push_back(gpu.timings.download_ms);
+      other_wall_times.push_back(gpu_wall_time - EventTotal(gpu_view.timings));
+      api_overhead_times.push_back(gpu_wall_time - gpu_view.timings.total_ms);
+      internal_other_times.push_back(gpu_view.timings.total_ms -
+                                     EventTotal(gpu_view.timings));
+      input_pack.push_back(gpu_view.timings.input_pack_ms);
+      layout.push_back(gpu_view.timings.layout_ms);
+      result.push_back(gpu_view.timings.result_ms);
+      objective.push_back(gpu_view.timings.objective_ms);
+      unattributed_internal.push_back(
+          gpu_view.timings.total_ms - EventTotal(gpu_view.timings) -
+          gpu_view.timings.input_pack_ms - gpu_view.timings.layout_ms -
+          gpu_view.timings.result_ms);
+      upload.push_back(gpu_view.timings.upload_ms);
+      feasibility.push_back(gpu_view.timings.feasibility_ms);
+      reduction.push_back(gpu_view.timings.reduction_ms);
+      riccati.push_back(gpu_view.timings.riccati_ms);
+      reconstruction.push_back(gpu_view.timings.reconstruction_ms);
+      multiplier.push_back(gpu_view.timings.multiplier_ms);
+      download.push_back(gpu_view.timings.download_ms);
     }
     if (repeat_failed)
       continue;
@@ -280,19 +303,27 @@ int main(int argc, char **argv) {
     const double gpu_kernel_ms = Median(gpu_kernel_times);
     int min_reduced_n = std::numeric_limits<int>::max();
     int min_reduced_m = std::numeric_limits<int>::max();
-    for (int value : gpu.reduced_state_dimensions)
-      min_reduced_n = std::min(min_reduced_n, value);
-    for (int value : gpu.reduced_control_dimensions)
-      min_reduced_m = std::min(min_reduced_m, value);
+    for (std::size_t index = 0; index < gpu_view.reduced_state_dimensions.size;
+         ++index)
+      min_reduced_n =
+          std::min(min_reduced_n, gpu_view.reduced_state_dimensions[index]);
+    for (std::size_t index = 0;
+         index < gpu_view.reduced_control_dimensions.size; ++index)
+      min_reduced_m =
+          std::min(min_reduced_m, gpu_view.reduced_control_dimensions[index]);
+    clqr::cuda::Materialize(gpu_view, gpu);
     const Scalar kkt_residual = MaxKktResidual(problem, gpu);
     std::cout << horizon << ',' << n << ',' << m << ',' << p << ',' << repeats
               << ',' << std::fixed << std::setprecision(6) << cpu_ms << ','
-              << gpu_wall_ms << ',' << gpu_internal_ms << ','
-              << gpu_kernel_ms << ','
-              << cpu_ms / gpu_wall_ms << ',' << cpu_ms / gpu_kernel_ms << ','
-              << Median(other_wall_times) << ',' << Median(api_overhead_times)
-              << ',' << Median(internal_other_times) << ',' << Median(upload)
-              << ','
+              << gpu_wall_ms << ',' << gpu_internal_ms << ',' << gpu_kernel_ms
+              << ',' << cpu_ms / gpu_wall_ms << ',' << cpu_ms / gpu_kernel_ms
+              << ',' << Median(other_wall_times) << ','
+              << Median(api_overhead_times) << ','
+              << Median(internal_other_times) << ',' << Median(input_pack)
+              << ',' << Median(layout) << ',' << Median(result) << ','
+              << Median(objective) << ','
+              << gpu_view.timings.synchronization_count << ','
+              << Median(unattributed_internal) << ',' << Median(upload) << ','
               << Median(feasibility) << ',' << Median(reduction) << ','
               << Median(riccati) << ',' << Median(reconstruction) << ','
               << Median(multiplier) << ',' << Median(download) << ','

@@ -893,6 +893,79 @@ template <typename Function> void Launch(int blocks, Function function) {
   }
 }
 
+void FiniteInputValidationCase() {
+  Scalar problem_data[]{Scalar{1},
+                        std::numeric_limits<Scalar>::quiet_NaN()};
+  Scalar initial_state[]{Scalar{2}};
+  DeviceStatus status{};
+  Launch(2, [&] {
+    CheckFiniteInputsKernel(problem_data, std::size(problem_data),
+                            initial_state, std::size(initial_state), &status);
+  });
+  Expect(status.code == kDeviceInvalidInput && status.stage == -1 &&
+             status.detail == 21,
+         "device input validation rejects a non-finite problem coefficient");
+
+  problem_data[1] = Scalar{3};
+  initial_state[0] = std::numeric_limits<Scalar>::infinity();
+  status = DeviceStatus{};
+  Launch(2, [&] {
+    CheckFiniteInputsKernel(problem_data, std::size(problem_data),
+                            initial_state, std::size(initial_state), &status);
+  });
+  Expect(status.code == kDeviceInvalidInput,
+         "device input validation rejects a non-finite initial state");
+
+  initial_state[0] = Scalar{4};
+  status = DeviceStatus{};
+  Launch(2, [&] {
+    CheckFiniteInputsKernel(problem_data, std::size(problem_data),
+                            initial_state, std::size(initial_state), &status);
+  });
+  Expect(status.code == kDeviceOk,
+         "device input validation accepts finite values");
+}
+
+void DeviceObjectiveCase() {
+  Scalar Q[]{Scalar{2}, Scalar{1}, Scalar{1}, Scalar{4}};
+  Scalar R[]{Scalar{3}};
+  Scalar M[]{Scalar{1}, Scalar{-2}};
+  Scalar q[]{Scalar{0.5}, Scalar{-1}};
+  Scalar r[]{Scalar{0.25}};
+  PackedStage stage{};
+  stage.n = 2;
+  stage.m = 1;
+  stage.Q = Q;
+  stage.R = R;
+  stage.M = M;
+  stage.q = q;
+  stage.r = r;
+  Scalar terminal_Q[]{Scalar{5}};
+  Scalar terminal_q[]{Scalar{2}};
+  PackedTerminal terminal{};
+  terminal.n = 1;
+  terminal.Q = terminal_Q;
+  terminal.q = terminal_q;
+  Scalar states[]{Scalar{1}, Scalar{2}, Scalar{3}};
+  Scalar controls[]{Scalar{4}};
+  int state_offsets[]{0, 2, 3};
+  int control_offsets[]{0, 1};
+  Scalar objective_tree[3]{};
+  DeviceStatus status{};
+
+  Launch(2, [&] {
+    BuildObjectiveTermsKernel(&stage, 1, &terminal, states, controls,
+                              state_offsets, control_offsets, objective_tree,
+                              &status);
+  });
+  Launch(1, [&] {
+    ReduceObjectiveTreeLevelKernel(objective_tree, 0, 2, 2, &status);
+  });
+  Expect(status.code == kDeviceOk &&
+             std::abs(objective_tree[2] - Scalar{51}) < Scalar{1e-5},
+         "device objective reduction matches the dense quadratic objective");
+}
+
 void NonPositiveDefiniteReducedControlCostCase() {
   ReducedStage stage{};
   Scalar stage_a[1]{};
@@ -1370,7 +1443,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
                          kTestStateCapacity, kTestStateCapacity);
   }
   Launch(horizon, [&] {
-    InitializeAffineMapsKernel(feedback.data(), horizon, map_a.data());
+    InitializeAffineMapsKernel(feedback.data(), horizon, map_a.data(), &status);
   });
   AffineMap *prefix = map_a.data();
   if (horizon > 1) {
@@ -1428,7 +1501,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
                             reduced_state_offsets.data(), state_offsets.data(),
                             control_offsets.data(), horizon,
                             reduced_states.data(), reduced_controls.data(),
-                            states.data(), controls.data());
+                            states.data(), controls.data(), &status);
   });
   if (FinishAllowedDeviceFailure(status, name, "affine rollout",
                                  allowed_failure))
@@ -1586,7 +1659,8 @@ void RunEmulation(const Problem &problem, const std::string &name,
           dual_params.data(), state_dual_params.data(), dual_values.data(),
           dynamics_offsets.data(), mixed_offsets.data(),
           state_constraint_offsets.data(), horizon, dynamics.data(),
-          mixed.data(), state_multipliers.data(), terminal_multiplier.data());
+          mixed.data(), state_multipliers.data(), terminal_multiplier.data(),
+          &status);
     });
   }
   Launch(1, [&] {
@@ -1595,7 +1669,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
         dynamics.data(), mixed.data(), state_offsets.data(),
         control_offsets.data(), dynamics_offsets.data(), mixed_offsets.data(),
         state_constraint_offsets.data(), initial_multiplier.data(),
-        state_multipliers.data(), terminal_multiplier.data());
+        state_multipliers.data(), terminal_multiplier.data(), &status);
   });
   if (FinishAllowedDeviceFailure(status, name, "multiplier recovery",
                                  allowed_failure))
@@ -1649,6 +1723,8 @@ int main(int argc, char **argv) {
     }
   }
   TinyCoefficientRrefCase();
+  FiniteInputValidationCase();
+  DeviceObjectiveCase();
   PivotedLuMultiRhsCase();
   OrthogonalEchelonCase();
   IllConditionedPositiveDefiniteMultiRhsCase();

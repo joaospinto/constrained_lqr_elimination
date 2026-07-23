@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -507,6 +508,71 @@ void LongHorizonCase() {
          name + " full primal-dual KKT residual");
 }
 
+void WorkspaceBackedViewCase() {
+  const std::string name = "workspace-backed result view";
+  std::cout << "case: " << name << std::endl;
+  const Problem problem =
+      GeneratedProblem(130, 5, 4, 2, 1, ConstraintMode::kState);
+  clqr::cuda::Workspace workspace;
+  const clqr::cuda::SolutionView unprepared =
+      clqr::cuda::SolvePreparedView(problem, workspace);
+  Expect(unprepared.status == SolveStatus::kInvalidInput,
+         name + " rejects an unprepared workspace");
+  workspace.Reserve(problem);
+  const clqr::cuda::SolutionView view =
+      clqr::cuda::SolvePreparedView(problem, workspace);
+  Expect(view.status == SolveStatus::kOptimal,
+         name + " status: " + view.message);
+  Expect(view.state_count == problem.stages.size() + 1, name + " state count");
+  Expect(view.control_count == problem.stages.size(), name + " control count");
+  Expect(view.reduced_state_dimensions.size == view.state_count,
+         name + " reduced state count");
+  Expect(view.reduced_control_dimensions.size == view.control_count,
+         name + " reduced control count");
+  Expect(view.timings.result_ms == 0.0,
+         name + " does not materialize owning vectors");
+
+  clqr::cuda::Solution materialized;
+  clqr::cuda::Materialize(view, materialized);
+  Expect(materialized.status == SolveStatus::kOptimal,
+         name + " materialized status");
+  Expect(materialized.states.size() == view.state_count,
+         name + " materialized state count");
+  Expect(materialized.controls.size() == view.control_count,
+         name + " materialized control count");
+  Expect(MaxKktResidual(problem, materialized) <= kTolerance,
+         name + " materialized full primal-dual KKT residual");
+
+  Problem oversized = problem;
+  const std::size_t terminal_n = oversized.terminal_Q.rows();
+  oversized.terminal_Q = Matrix(terminal_n + 1, terminal_n + 1);
+  const clqr::cuda::SolutionView oversized_view =
+      clqr::cuda::SolvePreparedView(oversized, workspace);
+  Expect(oversized_view.status == SolveStatus::kInvalidInput,
+         name + " safely rejects an oversized prepared input");
+  Expect(oversized_view.objective == Scalar{0} &&
+             oversized_view.timings.total_ms == 0.0,
+         name + " clears metadata after an early prepared-input error");
+
+  clqr::cuda::Options invalid_options;
+  invalid_options.tolerance = Scalar{0};
+  const clqr::cuda::SolutionView invalid_option_view =
+      clqr::cuda::SolvePreparedView(problem, workspace, invalid_options);
+  Expect(invalid_option_view.status == SolveStatus::kInvalidInput,
+         name + " rejects invalid prepared options");
+  Expect(invalid_option_view.objective == Scalar{0} &&
+             invalid_option_view.timings.total_ms == 0.0,
+         name + " clears metadata after prepared-option validation");
+
+  Problem invalid = problem;
+  invalid.stages[0].A(0, 0) =
+      std::numeric_limits<Scalar>::quiet_NaN();
+  const clqr::cuda::SolutionView invalid_view =
+      clqr::cuda::SolvePreparedView(invalid, workspace);
+  Expect(invalid_view.status == SolveStatus::kInvalidInput,
+         name + " prepared solve rejects non-finite numerical values");
+}
+
 void InfeasibleCase() {
   Problem problem = GeneratedProblem(90, 2, 3, 2, 0, ConstraintMode::kNone);
   problem.stages[0].E = Matrix(2, 3, {1.0, 0.0, 0.0, 1.0, 0.0, 0.0});
@@ -585,6 +651,7 @@ int main() {
   CompareWithCpu(GeneratedProblem(111, 3, 3, 1, 1, ConstraintMode::kState),
                  "reusable workspace cached layout", nullptr,
                  &reusable_cuda_workspace, &reusable_cuda_solution);
+  WorkspaceBackedViewCase();
   LongHorizonCase();
   InfeasibleCase();
   InvalidDeviceCases();
