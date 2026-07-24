@@ -223,9 +223,8 @@ for horizon in sorted(baseline.keys() & candidate.keys()):
     def value(report, field):
         return report.get(field, float("nan"))
 
-    pack_transfer = (
-        cand["input_pack_ms"] + cand["upload_ms"] + cand["download_ms"]
-    )
+    input_pack = value(cand, "input_pack_ms")
+    pack_transfer = input_pack + cand["upload_ms"] + cand["download_ms"]
     non_kernel = cand["cuda_wall_ms"] - cand["cuda_kernel_ms"]
     pack_transfer_share = (
         pack_transfer / non_kernel if non_kernel > 0.0 else float("nan")
@@ -239,7 +238,7 @@ for horizon in sorted(baseline.keys() & candidate.keys()):
         f"{ratio('cuda_wall_ms'):.4f},"
         f"{base['cuda_kernel_ms']:.6f},{cand['cuda_kernel_ms']:.6f},"
         f"{ratio('cuda_kernel_ms'):.4f},"
-        f"{cand['input_pack_ms']:.6f},{cand['upload_ms']:.6f},"
+        f"{input_pack:.6f},{cand['upload_ms']:.6f},"
         f"{cand['download_ms']:.6f},{pack_transfer:.6f},"
         f"{non_kernel:.6f},{pack_transfer_share:.4f},"
         f"{ratio('feasibility_ms'):.4f},{ratio('reduction_ms'):.4f},"

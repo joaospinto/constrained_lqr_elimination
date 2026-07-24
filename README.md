@@ -164,13 +164,14 @@ comparisons. The default CSV includes absolute candidate packing/transfer time
 and its share of the wall--kernel gap. Temporary build trees are removed
 automatically; set `CLQR_KEEP_COMPARE_OUTPUT=1` to retain them.
 
-Revision-specific build flags can be supplied without shell evaluation. For a
-fair comparison against the tuned compile-time-capacity implementation, use:
+Revision-specific build flags can be supplied without shell evaluation. To
+isolate the transition from tuned compile-time capacities to runtime-sized
+CUDA dimensions, use the direct parent and candidate revisions:
 
 ```sh
-CLQR_BASE_REVISION=b3b66cc4f71c72464c5c15a1ac38edd8068f3b71 \
+CLQR_BASE_REVISION=3d225eae7e8f7c24c42ddd1cfbf921ef4d540764 \
 CLQR_BASE_EXTRA_BAZEL_ARGS="--cuda_max_state_dimension=8 --cuda_max_control_dimension=4 --cuda_max_mixed_constraints=2 --cuda_max_state_constraints=2" \
-CLQR_CANDIDATE_REVISION=HEAD \
+CLQR_CANDIDATE_REVISION=511cd314445a421c35dcb77cd6154a70e99267e2 \
 CLQR_CUDA_ARCH=60 bash scripts/compare_cuda_revisions.sh
 ```
 
