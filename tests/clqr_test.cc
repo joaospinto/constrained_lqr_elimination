@@ -1163,6 +1163,58 @@ void IndependentlyRescaledConstraintsAreInvariant() {
   }
 }
 
+void FullRankRescaledMixedRowsRemainActive() {
+  Problem reference_problem =
+      GeneratedFeasibleProblem(1901, 5, 4, 3, 3,
+                               ConstraintMode::kFullMixed);
+  Problem scaled_problem = reference_problem;
+  for (std::size_t stage_index = 0;
+       stage_index < scaled_problem.stages.size(); ++stage_index) {
+    Stage& stage = scaled_problem.stages[stage_index];
+    const Scalar scales[3] = {
+        kSmallConstraintScale, Scalar{1}, kLargeConstraintScale};
+    for (std::size_t row = 0; row < stage.C.rows(); ++row) {
+      const Scalar scale = scales[(row + stage_index) % 3];
+      ScaleConstraintRow(&stage.C, &stage.d, row, scale);
+      for (std::size_t col = 0; col < stage.D.cols(); ++col)
+        stage.D(row, col) *= scale;
+    }
+  }
+
+  const Solution reference = SolveWithWorkspace(reference_problem);
+  const Solution scaled = SolveWithWorkspace(scaled_problem);
+  Expect(reference.status == SolveStatus::kOptimal,
+         "full-rank row-scaling reference status: " + reference.message);
+  Expect(scaled.status == SolveStatus::kOptimal,
+         "full-rank row-scaling candidate status: " + scaled.message);
+  for (std::size_t stage = 0; stage < reference.states.size(); ++stage) {
+    ExpectVectorNear(scaled.states[stage], reference.states[stage],
+                     kScalingInvariantTolerance,
+                     "full-rank row-scaling state " +
+                         std::to_string(stage));
+  }
+  for (std::size_t stage = 0; stage < reference.controls.size(); ++stage) {
+    ExpectVectorNear(scaled.controls[stage], reference.controls[stage],
+                     kScalingInvariantTolerance,
+                     "full-rank row-scaling control " +
+                         std::to_string(stage));
+    const Scalar scales[3] = {
+        kSmallConstraintScale, Scalar{1}, kLargeConstraintScale};
+    for (std::size_t row = 0;
+         row < reference.mixed_multipliers[stage].size(); ++row) {
+      const Scalar recovered =
+          scales[(row + stage) % 3] * scaled.mixed_multipliers[stage][row];
+      ExpectNear(recovered, reference.mixed_multipliers[stage][row],
+                 Scalar{32} * kScalingInvariantTolerance,
+                 "full-rank row-scaling multiplier " +
+                     std::to_string(stage) + ":" + std::to_string(row));
+    }
+  }
+  ExpectNear(MaxKktStationarityResidual(scaled_problem, scaled), Scalar{0},
+             Scalar{4} * kKktTol,
+             "full-rank row-scaling stationarity residual");
+}
+
 Problem EssentialSingleRowProblem(bool terminal_constraint, Scalar scale) {
   Problem problem;
   problem.initial_state = Vector{Scalar{1}};
@@ -1332,6 +1384,7 @@ int main() {
   SingularReducedHessianReported();
   InfeasibleConstraintDetected();
   IndependentlyRescaledConstraintsAreInvariant();
+  FullRankRescaledMixedRowsRemainActive();
   EssentialSingleRowsRemainActiveWhenScaled();
   ExtremeFiniteConstraintRowsAreSafe();
   std::cout << "all C++ tests passed\n";
