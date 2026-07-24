@@ -281,6 +281,11 @@ state values with unchanged dimensions, and performs no heap allocation when
 given a reserved workspace. The first API slice deliberately rejects equality
 constraints; CUDA, JAX, and constrained factorization remain follow-up work.
 
+The native C++ `Problem`, `SolveRhs`, and NumPy dictionary APIs keep
+`terminal_Q` and `terminal_q` as separate fields. The padded JAX representation
+alone folds them into `factors.Q[-1]` and `rhs.q[-1]`; `pack_problem` performs
+that conversion from the native dictionary schema.
+
 The Python extension is built by the Bazel target `//:_clqr`; the shared-object output is
 addressable as `//:_clqr.so`. It exposes the `_clqr` module directly:
 
@@ -304,8 +309,29 @@ result = _clqr.solve({
 })
 ```
 
+For repeated unconstrained solves, the Python extension exposes the same
+matrix/RHS split as C++:
+
+```python
+factors = _clqr.factor(problem)
+solve_rhs = _clqr.rhs(problem)
+
+first = factors.solve(solve_rhs)
+solve_rhs.initial_state = next_initial_state
+solve_rhs.stage(0).c = next_dynamics_offset
+solve_rhs.stage(0).q = next_state_gradient
+solve_rhs.stage(0).r = next_control_gradient
+solve_rhs.terminal_q = next_terminal_gradient
+second = factors.solve(solve_rhs)
+```
+
+`Factorization` owns the matrices and internally reuses its native solve
+workspace. Assigning an RHS property copies that array into owned native
+storage; result arrays are newly owned NumPy arrays. This factorized Python
+path currently rejects equality-constrained problems.
+
 The lightweight package wrapper in `python/clqr/__init__.py` re-exports the same `solve`
-function once `_clqr` is on `PYTHONPATH`.
+function, as well as `factor` and `rhs`, once `_clqr` is on `PYTHONPATH`.
 
 The Python boundary accepts and returns NumPy-compatible `float64` arrays; an
 FP32 extension converts them to and from `clqr::Scalar` internally. The result
@@ -339,9 +365,11 @@ result = jax.jit(solve)(jax.device_put(packed, jax.devices()[0]))
 only at the interface, while each C++/CUDA stage still operates on its active
 runtime dimensions. `factors.Q` and `rhs.q` have `N + 1` entries, with their
 last entries holding the terminal cost; the other stage arrays have `N`
-entries. The split lets callers replace any RHS vector without changing the
-compiled JAX shape. It is not yet a numerical factor/solve split: the current
-call refactors after either part changes.
+entries. `pack_problem` still accepts `terminal_Q` and `terminal_q` as separate
+input-dictionary fields and folds them into those last entries. The split lets
+callers replace any RHS vector without changing the compiled JAX shape. It is
+not yet a numerical factor/solve split: the current call refactors after either
+part changes.
 
 CPU arrays dispatch to the sequential C++ solver. When `//:_clqr_cuda` is
 installed, CUDA arrays dispatch to the CUDA solver on the device selected by
