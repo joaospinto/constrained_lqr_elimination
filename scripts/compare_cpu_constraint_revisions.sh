@@ -5,7 +5,7 @@ set -euo pipefail
 
 repo_dir="$(git rev-parse --show-toplevel)"
 base_revision="${CLQR_BASE_REVISION:-b92d127}"
-candidate_revision="${CLQR_CANDIDATE_REVISION:-9641f73}"
+candidate_revision="${CLQR_CANDIDATE_REVISION:-HEAD}"
 repeats="${CLQR_BENCHMARK_REPEATS:-101}"
 rounds="${CLQR_COMPARISON_ROUNDS:-7}"
 precisions="${CLQR_PRECISIONS:-FP64 FP32}"
