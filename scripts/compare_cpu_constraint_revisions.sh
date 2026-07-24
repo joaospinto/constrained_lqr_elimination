@@ -45,7 +45,7 @@ build_revision() {
   "${cxx}" -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Werror \
     "${precision_flag}" \
     -I"${source_dir}/include" \
-    -I"${source_dir}/tests" \
+    -I"${comparison_dir}/candidate/tests" \
     "${source_dir}/src/clqr.cc" \
     "${source_dir}/src/linalg.cc" \
     "${repo_dir}/benchmarks/cpu_constraint_revision_benchmark.cc" \
@@ -124,8 +124,15 @@ for precision in precisions:
         candidate_statuses = {row["status"] for row in candidate}
         baseline_messages = {row["message"] for row in baseline}
         candidate_messages = {row["message"] for row in candidate}
-        if len(baseline_statuses) != 1 or len(candidate_statuses) != 1:
-            raise RuntimeError(f"non-deterministic status for {precision} {case}")
+        if (
+            len(baseline_statuses) != 1
+            or len(candidate_statuses) != 1
+            or len(baseline_messages) != 1
+            or len(candidate_messages) != 1
+        ):
+            raise RuntimeError(
+                f"non-deterministic status/message for {precision} {case}"
+            )
         baseline_time = statistics.median(
             float(row["median_us"]) for row in baseline
         )

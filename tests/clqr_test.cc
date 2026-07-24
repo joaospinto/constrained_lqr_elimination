@@ -1172,7 +1172,7 @@ void FullRankRescaledMixedRowsRemainActive() {
        stage_index < scaled_problem.stages.size(); ++stage_index) {
     Stage& stage = scaled_problem.stages[stage_index];
     const Scalar scales[3] = {
-        kSmallConstraintScale, Scalar{1}, kLargeConstraintScale};
+        kSmallConstraintScale, Scalar{-1}, kLargeConstraintScale};
     for (std::size_t row = 0; row < stage.C.rows(); ++row) {
       const Scalar scale = scales[(row + stage_index) % 3];
       ScaleConstraintRow(&stage.C, &stage.d, row, scale);
@@ -1199,7 +1199,7 @@ void FullRankRescaledMixedRowsRemainActive() {
                      "full-rank row-scaling control " +
                          std::to_string(stage));
     const Scalar scales[3] = {
-        kSmallConstraintScale, Scalar{1}, kLargeConstraintScale};
+        kSmallConstraintScale, Scalar{-1}, kLargeConstraintScale};
     for (std::size_t row = 0;
          row < reference.mixed_multipliers[stage].size(); ++row) {
       const Scalar recovered =

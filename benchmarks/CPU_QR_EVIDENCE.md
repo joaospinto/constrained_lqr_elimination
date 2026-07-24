@@ -6,11 +6,12 @@ The final QR candidate also includes `33d8d2c`, which normalizes independently
 scaled mixed-constraint columns during multiplier recovery. It does not use
 regularization, iterative refinement, or changed solver tolerances.
 
-The benchmark compiles both revisions with the same sources and compiler flags,
+The benchmark compiles both revisions with the same benchmark source, pinned
+fixture/oracle header from the candidate checkout, and compiler flags. It
 reserves one workspace per problem, performs five untimed warmups, and times
-101 solves per process. Seven process rounds alternate baseline/candidate order;
-the table reports the median of the seven within-process medians. Primal and KKT
-residuals are computed outside the timed region by the adversarial test oracle.
+101 solves per process. Seven process rounds alternate baseline/candidate
+order; the table reports the median of the seven within-process medians. Primal
+and KKT residuals are computed outside the timed region by that common oracle.
 
 Run:
 
@@ -40,8 +41,8 @@ Recorded 2026-07-24 on arm64 macOS (Darwin 25.5.0, Apple clang 21.0.0,
 QR costs 5-19% on cases that repeatedly eliminate mixed constraints (23% for
 the independently-scaled stress case). The strongest FP64 accuracy changes are
 a 791x lower KKT residual for alternating constraints, 5.6x for more mixed rows
-than controls, and 3.5x for redundant rows. Cases that do not improve remain
-near FP64 machine precision.
+than controls, and 3.5x for redundant rows. All reported FP64 residuals remain
+at or below `4.8e-11`.
 
 The uncorrected QR commit `9641f73` returned `numerical_failure` for the
 independently-scaled N32 case in both precisions (`mixed-only multiplier
