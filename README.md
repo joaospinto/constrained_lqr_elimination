@@ -260,9 +260,7 @@ scripts/compare_cpu_constraint_revisions.sh
 ```
 
 The focused comparison defaults to FP64 and FP32, 101 timed solves per process,
-and seven alternating-order rounds. See
-[`benchmarks/CPU_QR_EVIDENCE.md`](benchmarks/CPU_QR_EVIDENCE.md) for the
-RREF-versus-QR methodology and recorded results.
+and seven alternating-order rounds.
 
 C++ users include `clqr/clqr.h` and call `clqr::Solve` with a workspace:
 
