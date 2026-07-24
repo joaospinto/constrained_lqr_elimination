@@ -221,36 +221,18 @@ for precision in "${precisions[@]}"; do
 done
 
 if [[ "${CLQR_COMPARE_DIMENSION_BASELINE:-0}" == "1" ]]; then
-  baseline_revision="${CLQR_DIMENSION_BASELINE_REVISION:-b3b66cc4f71c72464c5c15a1ac38edd8068f3b71}"
-  baseline_dir="${CLQR_DIMENSION_BASELINE_DIR:-${notebook_work_dir}/constrained_lqr_elimination_dimension_baseline}"
-  if [[ ! -d "${baseline_dir}/.git" ]]; then
-    git clone --filter=blob:none --no-checkout \
-      https://github.com/joaospinto/constrained_lqr_elimination.git \
-      "${baseline_dir}"
-  fi
-  git -C "${baseline_dir}" fetch --depth 1 origin "${baseline_revision}"
-  git -C "${baseline_dir}" checkout --detach FETCH_HEAD
-  echo "=== Compile-time-capacity baseline ==="
-  echo "baseline revision: $(git -C "${baseline_dir}" rev-parse HEAD)"
-  echo "capacities: state=8, control=4, mixed=2, state constraints=2"
+  baseline_revision="${CLQR_DIMENSION_BASELINE_REVISION:-3d225eae7e8f7c24c42ddd1cfbf921ef4d540764}"
+  candidate_revision="${CLQR_DIMENSION_CANDIDATE_REVISION:-511cd314445a421c35dcb77cd6154a70e99267e2}"
+  dimension_base_args="--cuda_max_state_dimension=8 --cuda_max_control_dimension=4 --cuda_max_mixed_constraints=2 --cuda_max_state_constraints=2"
   for precision in "${precisions[@]}"; do
-    precision_suffix="$(printf '%s' "${precision}" | tr '[:upper:]' '[:lower:]')"
-    baseline_args=(
-      "--config=${precision_suffix}"
-      --config=cuda
-      "--cuda_archs=sm_${cuda_arch}"
-      --cuda_max_state_dimension=8
-      --cuda_max_control_dimension=4
-      --cuda_max_mixed_constraints=2
-      --cuda_max_state_constraints=2
-      "--jobs=$(nproc)"
-    )
-    echo "=== ${precision} compile-time-capacity baseline benchmark ==="
-    (
-      cd "${baseline_dir}"
-      "${bazel_command}" build "${baseline_args[@]}" //:clqr_cuda_benchmark
-      "${baseline_dir}/bazel-bin/clqr_cuda_benchmark" \
-        --repeats "${CLQR_BENCHMARK_REPEATS:-5}"
-    )
+    echo "=== ${precision} isolated runtime-dimension comparison ==="
+    CLQR_BASE_REVISION="${baseline_revision}" \
+    CLQR_BASE_EXTRA_BAZEL_ARGS="${dimension_base_args}" \
+    CLQR_CANDIDATE_REVISION="${candidate_revision}" \
+    CLQR_PRECISION="${precision}" \
+    CLQR_CUDA_ARCH="${cuda_arch}" \
+    CLQR_BENCHMARK_REPEATS="${CLQR_BENCHMARK_REPEATS:-11}" \
+    CLQR_COMPARISON_ROUNDS="${CLQR_COMPARISON_ROUNDS:-3}" \
+      bash "${repo_dir}/scripts/compare_cuda_revisions.sh"
   done
 fi
