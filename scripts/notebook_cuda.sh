@@ -231,7 +231,7 @@ if [[ "${CLQR_COMPARE_DIMENSION_BASELINE:-0}" == "1" ]]; then
     CLQR_CANDIDATE_REVISION="${candidate_revision}" \
     CLQR_PRECISION="${precision}" \
     CLQR_CUDA_ARCH="${cuda_arch}" \
-    CLQR_BENCHMARK_REPEATS="${CLQR_BENCHMARK_REPEATS:-11}" \
+    CLQR_BENCHMARK_REPEATS="${CLQR_COMPARISON_REPEATS:-11}" \
     CLQR_COMPARISON_ROUNDS="${CLQR_COMPARISON_ROUNDS:-3}" \
       bash "${repo_dir}/scripts/compare_cuda_revisions.sh"
   done
