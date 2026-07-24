@@ -170,6 +170,34 @@ int main() {
   Expect(external_allocations == 0,
          "external workspace solve should not allocate");
 
+  clqr::Factorization factorization = clqr::Factor(problem);
+  Expect(factorization.status() == SolveStatus::kOptimal,
+         "reusable factorization status");
+  clqr::SolveRhs rhs = clqr::ExtractRhs(problem);
+  Workspace factored_workspace;
+  factored_workspace.Reserve(factorization);
+  StartCounting();
+  SolutionView first_factored =
+      clqr::Solve(factorization, rhs, factored_workspace);
+  rhs.initial_state[0] += Scalar{0.25};
+  rhs.stages[0].c[0] -= Scalar{0.1};
+  rhs.stages[0].q[0] += Scalar{0.2};
+  rhs.stages[0].r[0] -= Scalar{0.15};
+  rhs.terminal_q[0] += Scalar{0.3};
+  SolutionView second_factored =
+      clqr::Solve(factorization, rhs, factored_workspace);
+  StopCounting();
+  const std::size_t factored_allocations =
+      g_allocations.load(std::memory_order_relaxed);
+  const std::size_t factored_bytes =
+      g_bytes.load(std::memory_order_relaxed);
+  Expect(first_factored.status == SolveStatus::kOptimal,
+         "first reusable factored solve status");
+  Expect(second_factored.status == SolveStatus::kOptimal,
+         "second reusable factored solve status");
+  Expect(factored_allocations == 0,
+         "reusable factored solves should not allocate");
+
   Problem constrained = MakeConstrainedProblem(16, 4, 2);
   constexpr std::size_t kConstrainedBytes =
       Workspace::RequiredBytesUniformConstrained(16, 4, 2, 1);
@@ -283,6 +311,8 @@ int main() {
             << " owned_bytes=" << owned_bytes
             << " external_allocations=" << external_allocations
             << " external_bytes=" << external_bytes
+            << " factored_allocations=" << factored_allocations
+            << " factored_bytes=" << factored_bytes
             << " constrained_required=" << constrained_required
             << " constrained_constexpr=" << kConstrainedBytes
             << " constrained_owned_allocations="

@@ -48,11 +48,199 @@ def test_python_solve():
     np.testing.assert_allclose(result["states"][0], np.array([1.0]), atol=1e-9)
     np.testing.assert_allclose(result["controls"][0], np.array([-1.0]), atol=1e-9)
     np.testing.assert_allclose(result["states"][1], np.array([0.0]), atol=1e-9)
-    np.testing.assert_allclose(result["initial_multiplier"], np.array([-3.0]), atol=1e-9)
-    np.testing.assert_allclose(result["dynamics_multipliers"][0], np.array([0.0]), atol=1e-9)
-    np.testing.assert_allclose(result["mixed_multipliers"][0], np.array([2.0]), atol=1e-9)
+    np.testing.assert_allclose(
+        result["initial_multiplier"], np.array([-3.0]), atol=1e-9
+    )
+    np.testing.assert_allclose(
+        result["dynamics_multipliers"][0], np.array([0.0]), atol=1e-9
+    )
+    np.testing.assert_allclose(
+        result["mixed_multipliers"][0], np.array([2.0]), atol=1e-9
+    )
     assert result["state_multipliers"][0].shape == (0,)
     assert result["terminal_state_multiplier"].shape == (0,)
+
+
+def _unconstrained_factor_problem():
+    return {
+        "initial_state": np.array([0.8, -0.3], dtype=np.float64),
+        "stages": [
+            {
+                "A": np.array([[1.0, 0.2], [0.0, 0.9]], dtype=np.float64),
+                "B": np.array([[0.1], [0.7]], dtype=np.float64),
+                "c": np.array([0.05, -0.1], dtype=np.float64),
+                "Q": np.array([[2.0, 0.1], [0.1, 1.5]], dtype=np.float64),
+                "R": np.array([[1.7]], dtype=np.float64),
+                "M": np.array([[0.05], [-0.03]], dtype=np.float64),
+                "q": np.array([0.2, -0.15], dtype=np.float64),
+                "r": np.array([0.12], dtype=np.float64),
+            },
+            {
+                "A": np.array([[0.95, 0.0], [0.1, 1.05]], dtype=np.float64),
+                "B": np.array([[0.3], [0.4]], dtype=np.float64),
+                "c": np.array([-0.02, 0.08], dtype=np.float64),
+                "Q": np.array([[1.4, 0.0], [0.0, 1.8]], dtype=np.float64),
+                "R": np.array([[2.2]], dtype=np.float64),
+                "M": np.array([[0.02], [0.04]], dtype=np.float64),
+                "q": np.array([-0.1, 0.25], dtype=np.float64),
+                "r": np.array([-0.2], dtype=np.float64),
+            },
+        ],
+        "terminal_Q": np.array([[2.5, 0.2], [0.2, 3.0]], dtype=np.float64),
+        "terminal_q": np.array([0.3, -0.35], dtype=np.float64),
+    }
+
+
+def _assert_primal_results_close(actual, expected):
+    assert actual["status"] == expected["status"] == "optimal", (actual, expected)
+    assert len(actual["states"]) == len(expected["states"])
+    assert len(actual["controls"]) == len(expected["controls"])
+    for got, want in zip(actual["states"], expected["states"]):
+        np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
+    for got, want in zip(actual["controls"], expected["controls"]):
+        np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(
+        actual["initial_multiplier"],
+        expected["initial_multiplier"],
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    for got, want in zip(
+        actual["dynamics_multipliers"], expected["dynamics_multipliers"]
+    ):
+        np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(
+        actual["objective"], expected["objective"], rtol=2e-5, atol=2e-6
+    )
+
+
+def test_python_reusable_factorization():
+    clqr = _load_extension()
+    problem = _unconstrained_factor_problem()
+    factors = clqr.factor(problem)
+    solve_rhs = clqr.rhs(problem)
+    assert factors.stage_count == 2
+    assert factors.workspace_bytes > 0
+    assert solve_rhs.stage_count == 2
+
+    first = factors.solve(solve_rhs)
+    _assert_primal_results_close(first, clqr.solve(problem))
+
+    changed = _unconstrained_factor_problem()
+    changed["initial_state"] = np.array([-0.45, 0.65], dtype=np.float64)
+    changed["stages"][0]["c"] = np.array([-0.2, 0.3], dtype=np.float64)
+    changed["stages"][0]["q"] = np.array([-0.4, 0.55], dtype=np.float64)
+    changed["stages"][0]["r"] = np.array([0.35], dtype=np.float64)
+    changed["stages"][1]["c"] = np.array([0.15, -0.25], dtype=np.float64)
+    changed["stages"][1]["q"] = np.array([0.45, -0.5], dtype=np.float64)
+    changed["stages"][1]["r"] = np.array([-0.3], dtype=np.float64)
+    changed["terminal_q"] = np.array([0.7, -0.8], dtype=np.float64)
+
+    solve_rhs.initial_state = changed["initial_state"]
+    for index in range(2):
+        stage_rhs = solve_rhs.stage(index)
+        stage_rhs.c = changed["stages"][index]["c"]
+        stage_rhs.q = changed["stages"][index]["q"]
+        stage_rhs.r = changed["stages"][index]["r"]
+    solve_rhs.terminal_q = changed["terminal_q"]
+    second = factors.solve(solve_rhs)
+    _assert_primal_results_close(second, clqr.solve(changed))
+
+    # The factorization owns its matrix data and does not observe later changes
+    # to the input mapping.
+    changed["stages"][0]["A"][0, 0] = 20.0
+    repeated = factors.solve(solve_rhs)
+    _assert_primal_results_close(repeated, second)
+
+    solve_rhs.stage(0).q = np.zeros(1, dtype=np.float64)
+    invalid = factors.solve(solve_rhs)
+    assert invalid["status"] == "invalid_input", invalid
+    assert "q shape mismatch" in invalid["message"]
+
+
+def test_python_factorization_rejects_constraints():
+    clqr = _load_extension()
+    problems = []
+
+    mixed = _unconstrained_factor_problem()
+    mixed["stages"][0]["C"] = np.array([[1.0, 0.0]], dtype=np.float64)
+    mixed["stages"][0]["D"] = np.array([[0.0]], dtype=np.float64)
+    mixed["stages"][0]["d"] = np.array([0.0], dtype=np.float64)
+    problems.append(mixed)
+
+    state = _unconstrained_factor_problem()
+    state["stages"][1]["E"] = np.array([[0.0, 1.0]], dtype=np.float64)
+    state["stages"][1]["e"] = np.array([0.0], dtype=np.float64)
+    problems.append(state)
+
+    terminal = _unconstrained_factor_problem()
+    terminal["terminal_E"] = np.array([[1.0, 0.0]], dtype=np.float64)
+    terminal["terminal_e"] = np.array([0.0], dtype=np.float64)
+    problems.append(terminal)
+
+    for problem in problems:
+        try:
+            clqr.factor(problem)
+        except (ValueError, RuntimeError) as error:
+            assert "unconstrained problems only" in str(error)
+        else:
+            raise AssertionError("constrained factorization unexpectedly succeeded")
+
+
+def test_python_factorization_reports_indefinite_factor():
+    clqr = _load_extension()
+    problem = {
+        "initial_state": np.array([0.4], dtype=np.float64),
+        "stages": [
+            {
+                "A": np.array([[0.8]], dtype=np.float64),
+                "B": np.array([[0.2, -0.3]], dtype=np.float64),
+                "c": np.array([0.1], dtype=np.float64),
+                "Q": np.array([[1.2]], dtype=np.float64),
+                "R": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64),
+                "M": np.array([[0.5, -0.25]], dtype=np.float64),
+                "q": np.array([-0.2], dtype=np.float64),
+                "r": np.array([0.3, -0.6], dtype=np.float64),
+            }
+        ],
+        "terminal_Q": np.array([[0.0]], dtype=np.float64),
+        "terminal_q": np.array([0.0], dtype=np.float64),
+    }
+    factors = clqr.factor(problem)
+    factored = factors.solve(clqr.rhs(problem))
+    ordinary = clqr.solve(problem)
+    _assert_primal_results_close(factored, ordinary)
+    assert factored["newton_kkt_singular"] is False
+    assert factored["newton_kkt_wrong_inertia"] is True
+    assert "wrong inertia" in factored["newton_kkt_diagnostic"]
+
+
+def test_python_factorization_rejects_nonfinite_inputs():
+    clqr = _load_extension()
+    nonfinite_matrix = _unconstrained_factor_problem()
+    nonfinite_matrix["stages"][0]["Q"][0, 0] = np.nan
+    try:
+        clqr.factor(nonfinite_matrix)
+    except ValueError as error:
+        assert "finite" in str(error)
+    else:
+        raise AssertionError("nonfinite factor matrix unexpectedly accepted")
+
+    for tolerance in (np.inf, 0.0):
+        try:
+            clqr.factor(_unconstrained_factor_problem(), tolerance=tolerance)
+        except ValueError as error:
+            assert "tolerance" in str(error)
+        else:
+            raise AssertionError("invalid factor tolerance unexpectedly accepted")
+
+    problem = _unconstrained_factor_problem()
+    factors = clqr.factor(problem)
+    solve_rhs = clqr.rhs(problem)
+    solve_rhs.stage(0).c = np.array([np.inf, 0.0], dtype=np.float64)
+    result = factors.solve(solve_rhs)
+    assert result["status"] == "invalid_input", result
+    assert "finite" in result["message"]
 
 
 def test_python_multiplier_shapes_multistage():
@@ -123,4 +311,8 @@ def test_python_multiplier_shapes_multistage():
 
 if __name__ == "__main__":
     test_python_solve()
+    test_python_reusable_factorization()
+    test_python_factorization_rejects_constraints()
+    test_python_factorization_reports_indefinite_factor()
+    test_python_factorization_rejects_nonfinite_inputs()
     test_python_multiplier_shapes_multistage()
