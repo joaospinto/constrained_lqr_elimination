@@ -9,6 +9,34 @@
 #include <stdexcept>
 
 namespace clqr {
+
+struct Factorization::Impl {
+  struct StageData {
+    Matrix A;
+    Matrix B;
+    Matrix Q;
+    Matrix R;
+    Matrix M;
+    Matrix P;
+    Matrix K;
+    Matrix lower;
+    Matrix Hxu;
+  };
+
+  SolveStatus status = SolveStatus::kInvalidInput;
+  std::string message = "factorization has not been initialized";
+  Scalar tolerance = SolveOptions{}.tolerance;
+  WorkspaceVector<StageData> stages;
+  Matrix terminal_Q;
+  WorkspaceVector<std::size_t> state_offsets;
+  WorkspaceVector<std::size_t> control_offsets;
+  std::size_t total_state = 0;
+  std::size_t total_control = 0;
+  std::size_t total_dynamics = 0;
+  std::size_t initial_state_size = 0;
+  std::size_t required_solve_bytes = 0;
+};
+
 namespace {
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -1495,6 +1523,66 @@ void SolveWithCholeskyRaw(const Scalar* CLQR_RESTRICT lower,
   }
 }
 
+bool BuildMatrixFactors(const Problem& problem, Scalar tolerance,
+                        Factorization::Impl* factorization) {
+  const std::size_t N = problem.stages.size();
+  factorization->stages.resize(N);
+  factorization->terminal_Q = problem.terminal_Q;
+  for (std::size_t rev = 0; rev < N; ++rev) {
+    const std::size_t i = N - 1 - rev;
+    const Stage& source = problem.stages[i];
+    Factorization::Impl::StageData& stage = factorization->stages[i];
+    stage.A = source.A;
+    stage.B = source.B;
+    stage.Q = source.Q;
+    stage.R = source.R;
+    stage.M = source.M;
+
+    const Matrix& P_next =
+        i + 1 == N ? factorization->terminal_Q
+                   : factorization->stages[i + 1].P;
+    const Matrix A_T_P = Transpose(stage.A) * P_next;
+    const Matrix B_T_P = Transpose(stage.B) * P_next;
+    const Matrix Hxx = stage.Q + A_T_P * stage.A;
+    const Matrix Huu = stage.R + B_T_P * stage.B;
+    stage.Hxu = stage.M + A_T_P * stage.B;
+
+    const std::size_t n = stage.A.cols();
+    const std::size_t m = stage.B.cols();
+    stage.lower = Matrix(m, m);
+    if (!CholeskyFactorizeRaw(Huu.data().data(), m, tolerance,
+                              stage.lower.data().data())) {
+      factorization->status = SolveStatus::kNumericalFailure;
+      factorization->message =
+          "reduced control Hessian is not positive definite";
+      return false;
+    }
+
+    Matrix solved(m, n);
+    Vector zero_rhs(m);
+    Vector solved_zero(m);
+    SolveWithCholeskyRaw(stage.lower.data().data(),
+                         stage.Hxu.data().data(), zero_rhs.data().data(), n, m,
+                         solved.data().data(), solved_zero.data().data());
+    stage.K = Matrix(m, n);
+    for (std::size_t row = 0; row < m; ++row) {
+      for (std::size_t col = 0; col < n; ++col) {
+        stage.K(row, col) = -solved(row, col);
+      }
+    }
+    stage.P = Hxx - stage.Hxu * solved;
+    for (std::size_t row = 0; row < n; ++row) {
+      for (std::size_t col = 0; col < row; ++col) {
+        const Scalar value =
+            Scalar{0.5} * (stage.P(row, col) + stage.P(col, row));
+        stage.P(row, col) = value;
+        stage.P(col, row) = value;
+      }
+    }
+  }
+  return true;
+}
+
 void CopyRawToMatrix(const Scalar* data, std::size_t rows, std::size_t cols,
                      Matrix* out) {
   out->resize(rows, cols);
@@ -1574,6 +1662,118 @@ void AddScalars(std::size_t* offset, std::size_t count) {
 
 void AddIndices(std::size_t* offset, std::size_t count) {
   AddObjects<std::size_t>(offset, count);
+}
+
+std::size_t FactoredSolveRequiredBytes(
+    const Factorization::Impl& factorization) {
+  const std::size_t N = factorization.stages.size();
+  std::size_t offset = 0;
+  AddObjects<VectorView>(&offset, N + 1);
+  AddObjects<VectorView>(&offset, N);
+  AddObjects<VectorView>(&offset, N);
+  AddObjects<VectorView>(&offset, N);
+  AddObjects<VectorView>(&offset, N);
+  AddScalars(&offset, factorization.total_state);
+  AddScalars(&offset, factorization.total_control);
+  AddScalars(&offset, factorization.initial_state_size);
+  AddScalars(&offset, factorization.total_dynamics);
+  AddScalars(&offset, factorization.total_state);
+  AddScalars(&offset, factorization.total_control);
+  return offset;
+}
+
+struct FactoredSolveWorkspaceLayout {
+  SolutionView view;
+  Scalar* p = nullptr;
+  Scalar* k = nullptr;
+};
+
+FactoredSolveWorkspaceLayout BindFactoredSolveWorkspace(
+    const Factorization::Impl& factorization, Workspace& workspace) {
+  if (workspace.size() < factorization.required_solve_bytes) {
+    throw std::invalid_argument("workspace is too small");
+  }
+  const std::size_t N = factorization.stages.size();
+  std::size_t offset = 0;
+  FactoredSolveWorkspaceLayout layout;
+  layout.view.states =
+      WorkspaceSlice<VectorView>(workspace.data(), &offset, N + 1);
+  layout.view.controls =
+      WorkspaceSlice<VectorView>(workspace.data(), &offset, N);
+  layout.view.dynamics_multipliers =
+      WorkspaceSlice<VectorView>(workspace.data(), &offset, N);
+  layout.view.mixed_multipliers =
+      WorkspaceSlice<VectorView>(workspace.data(), &offset, N);
+  layout.view.state_multipliers =
+      WorkspaceSlice<VectorView>(workspace.data(), &offset, N);
+  Scalar* state_data = WorkspaceSlice<Scalar>(
+      workspace.data(), &offset, factorization.total_state);
+  Scalar* control_data = WorkspaceSlice<Scalar>(
+      workspace.data(), &offset, factorization.total_control);
+  Scalar* initial_multiplier_data = WorkspaceSlice<Scalar>(
+      workspace.data(), &offset, factorization.initial_state_size);
+  Scalar* dynamics_data = WorkspaceSlice<Scalar>(
+      workspace.data(), &offset, factorization.total_dynamics);
+  layout.p = WorkspaceSlice<Scalar>(workspace.data(), &offset,
+                                    factorization.total_state);
+  layout.k = WorkspaceSlice<Scalar>(workspace.data(), &offset,
+                                    factorization.total_control);
+
+  layout.view.state_count = N + 1;
+  layout.view.control_count = N;
+  layout.view.dynamics_multiplier_count = N;
+  layout.view.mixed_multiplier_count = N;
+  layout.view.state_multiplier_count = N;
+  for (std::size_t node = 0; node <= N; ++node) {
+    const std::size_t begin = factorization.state_offsets[node];
+    const std::size_t end =
+        node == N ? factorization.total_state
+                  : factorization.state_offsets[node + 1];
+    layout.view.states[node] = {
+        state_data == nullptr ? nullptr : state_data + begin, end - begin};
+  }
+  std::size_t dynamics_offset = 0;
+  for (std::size_t i = 0; i < N; ++i) {
+    const Factorization::Impl::StageData& stage = factorization.stages[i];
+    layout.view.controls[i] = {
+        control_data == nullptr
+            ? nullptr
+            : control_data + factorization.control_offsets[i],
+        stage.B.cols()};
+    layout.view.dynamics_multipliers[i] = {
+        dynamics_data == nullptr ? nullptr : dynamics_data + dynamics_offset,
+        stage.A.rows()};
+    dynamics_offset += stage.A.rows();
+    layout.view.mixed_multipliers[i] = {nullptr, 0};
+    layout.view.state_multipliers[i] = {nullptr, 0};
+  }
+  layout.view.initial_multiplier = {initial_multiplier_data,
+                                    factorization.initial_state_size};
+  layout.view.terminal_state_multiplier = {nullptr, 0};
+  return layout;
+}
+
+void ValidateSolveRhs(const Factorization::Impl& factorization,
+                      const SolveRhs& rhs) {
+  const std::size_t N = factorization.stages.size();
+  Check(rhs.stages.size() == N, "RHS stage count mismatch");
+  Check(rhs.initial_state.size() == factorization.initial_state_size,
+        "initial_state shape mismatch");
+  Check(rhs.terminal_q.size() == factorization.terminal_Q.rows(),
+        "terminal_q shape mismatch");
+  Check(rhs.terminal_e.empty(),
+        "terminal_e must be empty for an unconstrained factorization");
+  for (std::size_t i = 0; i < N; ++i) {
+    const Factorization::Impl::StageData& factor = factorization.stages[i];
+    const StageRhs& stage = rhs.stages[i];
+    Check(stage.c.size() == factor.A.rows(), "c shape mismatch");
+    Check(stage.q.size() == factor.A.cols(), "q shape mismatch");
+    Check(stage.r.size() == factor.B.cols(), "r shape mismatch");
+    Check(stage.d.empty(),
+          "d must be empty for an unconstrained factorization");
+    Check(stage.e.empty(),
+          "e must be empty for an unconstrained factorization");
+  }
 }
 
 std::size_t MatrixScalars(const Matrix& matrix) {
@@ -2981,6 +3181,78 @@ Solution RecoverUnmapped(const Problem& original, ReducedSolution&& reduced,
 
 }  // namespace
 
+Factorization::Factorization() : impl_(std::make_unique<Impl>()) {}
+Factorization::~Factorization() = default;
+Factorization::Factorization(Factorization&&) noexcept = default;
+Factorization& Factorization::operator=(Factorization&&) noexcept = default;
+
+SolveStatus Factorization::status() const { return impl_->status; }
+const char* Factorization::message() const { return impl_->message.c_str(); }
+std::size_t Factorization::stage_count() const {
+  return impl_->stages.size();
+}
+std::size_t Factorization::RequiredSolveBytes() const {
+  return impl_->required_solve_bytes;
+}
+
+SolveRhs ExtractRhs(const Problem& problem) {
+  SolveRhs rhs;
+  rhs.stages.resize(problem.stages.size());
+  for (std::size_t i = 0; i < problem.stages.size(); ++i) {
+    rhs.stages[i].c = problem.stages[i].c;
+    rhs.stages[i].q = problem.stages[i].q;
+    rhs.stages[i].r = problem.stages[i].r;
+    rhs.stages[i].d = problem.stages[i].d;
+    rhs.stages[i].e = problem.stages[i].e;
+  }
+  rhs.terminal_q = problem.terminal_q;
+  rhs.terminal_e = problem.terminal_e;
+  rhs.initial_state = problem.initial_state;
+  return rhs;
+}
+
+Factorization Factor(const Problem& problem, const SolveOptions& options) {
+  Factorization out;
+  try {
+    ValidateProblem(problem);
+    if (AnyOriginalConstraints(problem)) {
+      throw std::invalid_argument(
+          "reusable factorization currently supports unconstrained problems "
+          "only");
+    }
+    out.impl_->tolerance = options.tolerance;
+    const std::size_t N = problem.stages.size();
+    out.impl_->initial_state_size =
+        N == 0 ? problem.terminal_Q.rows() : problem.stages.front().A.cols();
+    out.impl_->state_offsets.resize(N + 1);
+    out.impl_->control_offsets.resize(N);
+    out.impl_->total_state = out.impl_->initial_state_size;
+    out.impl_->state_offsets[0] = 0;
+    out.impl_->total_control = 0;
+    out.impl_->total_dynamics = 0;
+    for (std::size_t i = 0; i < N; ++i) {
+      out.impl_->control_offsets[i] = out.impl_->total_control;
+      out.impl_->total_control += problem.stages[i].B.cols();
+      out.impl_->total_dynamics += problem.stages[i].A.rows();
+      out.impl_->state_offsets[i + 1] = out.impl_->total_state;
+      out.impl_->total_state += problem.stages[i].A.rows();
+    }
+    if (!BuildMatrixFactors(problem, options.tolerance, out.impl_.get())) {
+      return out;
+    }
+    out.impl_->required_solve_bytes = FactoredSolveRequiredBytes(*out.impl_);
+    out.impl_->status = SolveStatus::kOptimal;
+    out.impl_->message = "factorized";
+  } catch (const std::invalid_argument& e) {
+    out.impl_->status = SolveStatus::kInvalidInput;
+    out.impl_->message = e.what();
+  } catch (const std::exception& e) {
+    out.impl_->status = SolveStatus::kNumericalFailure;
+    out.impl_->message = e.what();
+  }
+  return out;
+}
+
 std::size_t Workspace::RequiredBytes(const Problem& problem) {
   return WorkspaceRequiredBytesInternal(problem, SolveOptions{});
 }
@@ -2990,12 +3262,25 @@ std::size_t Workspace::RequiredBytes(const Problem& problem,
   return WorkspaceRequiredBytesInternal(problem, options);
 }
 
+std::size_t Workspace::RequiredBytes(const Factorization& factorization) {
+  return factorization.RequiredSolveBytes();
+}
+
 void Workspace::Reserve(const Problem& problem) {
   Reserve(problem, SolveOptions{});
 }
 
 void Workspace::Reserve(const Problem& problem, const SolveOptions& options) {
   const std::size_t required = RequiredBytes(problem, options);
+  owned_.assign(required, 0);
+  external_ = nullptr;
+  data_ = owned_.data();
+  size_ = owned_.size();
+  arena_.Reset(data_, size_);
+}
+
+void Workspace::Reserve(const Factorization& factorization) {
+  const std::size_t required = RequiredBytes(factorization);
   owned_.assign(required, 0);
   external_ = nullptr;
   data_ = owned_.data();
@@ -3062,6 +3347,162 @@ SolutionView Solve(const Problem& problem, Workspace& workspace,
     layout.view.newton_kkt_wrong_inertia =
         layout.view.newton_kkt_wrong_inertia || diagnostics.wrong_inertia;
     layout.view.message = workspace.StoreMessage(layout.view.message);
+    return layout.view;
+  } catch (const std::invalid_argument& e) {
+    out.status = SolveStatus::kInvalidInput;
+    out.message = workspace.StoreMessage(e.what());
+    return out;
+  } catch (const std::exception& e) {
+    out.status = SolveStatus::kNumericalFailure;
+    out.message = workspace.StoreMessage(e.what());
+    return out;
+  }
+}
+
+SolutionView Solve(const Factorization& factorization, const SolveRhs& rhs,
+                   Workspace& workspace) {
+  SolutionView out;
+  if (factorization.impl_->status != SolveStatus::kOptimal) {
+    out.status = factorization.impl_->status;
+    out.message = workspace.StoreMessage(factorization.impl_->message.c_str());
+    return out;
+  }
+  try {
+    ValidateSolveRhs(*factorization.impl_, rhs);
+    FactoredSolveWorkspaceLayout layout =
+        BindFactoredSolveWorkspace(*factorization.impl_, workspace);
+    const Factorization::Impl& factors = *factorization.impl_;
+    const std::size_t N = factors.stages.size();
+
+    Scalar* terminal_p = layout.p + factors.state_offsets[N];
+    for (std::size_t row = 0; row < rhs.terminal_q.size(); ++row) {
+      terminal_p[row] = rhs.terminal_q[row];
+    }
+    for (std::size_t rev = 0; rev < N; ++rev) {
+      const std::size_t i = N - 1 - rev;
+      const Factorization::Impl::StageData& stage = factors.stages[i];
+      const StageRhs& stage_rhs = rhs.stages[i];
+      const std::size_t n = stage.A.cols();
+      const std::size_t next_n = stage.A.rows();
+      const std::size_t m = stage.B.cols();
+      const Matrix& P_next =
+          i + 1 == N ? factors.terminal_Q : factors.stages[i + 1].P;
+      const Scalar* p_next = layout.p + factors.state_offsets[i + 1];
+      Scalar* p = layout.p + factors.state_offsets[i];
+      Scalar* k = layout.k + factors.control_offsets[i];
+      for (std::size_t row = 0; row < n; ++row) p[row] = stage_rhs.q[row];
+      for (std::size_t row = 0; row < m; ++row) k[row] = stage_rhs.r[row];
+      for (std::size_t shared = 0; shared < next_n; ++shared) {
+        Scalar pc = p_next[shared];
+        for (std::size_t col = 0; col < next_n; ++col) {
+          pc += P_next(shared, col) * stage_rhs.c[col];
+        }
+        for (std::size_t col = 0; col < n; ++col) {
+          p[col] += stage.A(shared, col) * pc;
+        }
+        for (std::size_t col = 0; col < m; ++col) {
+          k[col] += stage.B(shared, col) * pc;
+        }
+      }
+      for (std::size_t row = 0; row < m; ++row) {
+        Scalar value = k[row];
+        for (std::size_t col = 0; col < row; ++col) {
+          value -= stage.lower(row, col) * k[col];
+        }
+        k[row] = value / stage.lower(row, row);
+      }
+      for (std::size_t reverse_row = 0; reverse_row < m; ++reverse_row) {
+        const std::size_t row = m - 1 - reverse_row;
+        Scalar value = k[row];
+        for (std::size_t col = row + 1; col < m; ++col) {
+          value -= stage.lower(col, row) * k[col];
+        }
+        k[row] = value / stage.lower(row, row);
+      }
+      for (std::size_t row = 0; row < m; ++row) k[row] = -k[row];
+      for (std::size_t row = 0; row < n; ++row) {
+        for (std::size_t col = 0; col < m; ++col) {
+          p[row] += stage.Hxu(row, col) * k[col];
+        }
+      }
+    }
+
+    for (std::size_t row = 0; row < rhs.initial_state.size(); ++row) {
+      layout.view.states[0][row] = rhs.initial_state[row];
+    }
+    Scalar objective = Scalar{0};
+    for (std::size_t i = 0; i < N; ++i) {
+      const Factorization::Impl::StageData& stage = factors.stages[i];
+      const StageRhs& stage_rhs = rhs.stages[i];
+      const std::size_t n = stage.A.cols();
+      const std::size_t m = stage.B.cols();
+      const Scalar* k = layout.k + factors.control_offsets[i];
+      VectorView x = layout.view.states[i];
+      VectorView u = layout.view.controls[i];
+      for (std::size_t row = 0; row < m; ++row) {
+        Scalar value = k[row];
+        for (std::size_t col = 0; col < n; ++col) {
+          value += stage.K(row, col) * x[col];
+        }
+        u[row] = value;
+      }
+      for (std::size_t row = 0; row < stage.A.rows(); ++row) {
+        Scalar value = stage_rhs.c[row];
+        for (std::size_t col = 0; col < stage.A.cols(); ++col) {
+          value += stage.A(row, col) * x[col];
+        }
+        for (std::size_t col = 0; col < stage.B.cols(); ++col) {
+          value += stage.B(row, col) * u[col];
+        }
+        layout.view.states[i + 1][row] = value;
+      }
+      for (std::size_t row = 0; row < n; ++row) {
+        Scalar Qx = Scalar{0};
+        Scalar Mu = Scalar{0};
+        for (std::size_t col = 0; col < n; ++col)
+          Qx += stage.Q(row, col) * x[col];
+        for (std::size_t col = 0; col < m; ++col)
+          Mu += stage.M(row, col) * u[col];
+        objective += Scalar{0.5} * x[row] * Qx + x[row] * Mu +
+                     stage_rhs.q[row] * x[row];
+      }
+      for (std::size_t row = 0; row < m; ++row) {
+        Scalar Ru = Scalar{0};
+        for (std::size_t col = 0; col < m; ++col)
+          Ru += stage.R(row, col) * u[col];
+        objective += Scalar{0.5} * u[row] * Ru +
+                     stage_rhs.r[row] * u[row];
+      }
+    }
+    const VectorView terminal = layout.view.states[N];
+    for (std::size_t row = 0; row < factors.terminal_Q.rows(); ++row) {
+      Scalar Qx = Scalar{0};
+      for (std::size_t col = 0; col < factors.terminal_Q.cols(); ++col) {
+        Qx += factors.terminal_Q(row, col) * terminal[col];
+      }
+      objective += Scalar{0.5} * terminal[row] * Qx +
+                   rhs.terminal_q[row] * terminal[row];
+    }
+
+    for (std::size_t node = 0; node <= N; ++node) {
+      const Matrix& P =
+          node == N ? factors.terminal_Q : factors.stages[node].P;
+      const Scalar* p = layout.p + factors.state_offsets[node];
+      const VectorView x = layout.view.states[node];
+      VectorView multiplier =
+          node == 0 ? layout.view.initial_multiplier
+                    : layout.view.dynamics_multipliers[node - 1];
+      for (std::size_t row = 0; row < x.size; ++row) {
+        Scalar value = p[row];
+        for (std::size_t col = 0; col < x.size; ++col) {
+          value += P(row, col) * x[col];
+        }
+        multiplier[row] = -value;
+      }
+    }
+    layout.view.status = SolveStatus::kOptimal;
+    layout.view.message = workspace.StoreMessage("optimal");
+    layout.view.objective = objective;
     return layout.view;
   } catch (const std::invalid_argument& e) {
     out.status = SolveStatus::kInvalidInput;

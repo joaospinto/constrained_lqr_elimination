@@ -611,6 +611,117 @@ void WorkspaceUnconstrainedMatchesKkt() {
          "undersized workspace status");
 }
 
+void ReusableFactorizationSolvesNewRightHandSides() {
+  Problem original = BaseProblem();
+  clqr::Factorization factorization = clqr::Factor(original);
+  Expect(factorization.status() == SolveStatus::kOptimal,
+         std::string("factorization status: ") + factorization.message());
+  Expect(factorization.stage_count() == original.stages.size(),
+         "factorization stage count");
+  Expect(factorization.RequiredSolveBytes() > 0,
+         "factorization solve workspace bytes");
+
+  Workspace workspace;
+  workspace.Reserve(factorization);
+  const Solution first =
+      CopySolutionView(clqr::Solve(factorization, clqr::ExtractRhs(original),
+                                   workspace));
+  const Solution first_reference = SolveWithWorkspace(original);
+  Expect(first.status == SolveStatus::kOptimal,
+         "first factored solve status: " + first.message);
+  for (std::size_t i = 0; i < first.states.size(); ++i) {
+    ExpectVectorNear(first.states[i], first_reference.states[i], kTol,
+                     "first factored state " + std::to_string(i));
+  }
+  for (std::size_t i = 0; i < first.controls.size(); ++i) {
+    ExpectVectorNear(first.controls[i], first_reference.controls[i], kTol,
+                     "first factored control " + std::to_string(i));
+    ExpectVectorNear(first.dynamics_multipliers[i],
+                     first_reference.dynamics_multipliers[i], kTol,
+                     "first factored dynamics multiplier " +
+                         std::to_string(i));
+  }
+  ExpectVectorNear(first.initial_multiplier,
+                   first_reference.initial_multiplier, kTol,
+                   "first factored initial multiplier");
+  ExpectNear(first.objective, first_reference.objective, kTol,
+             "first factored objective");
+
+  Problem changed = original;
+  changed.initial_state = Vector{-0.75, 0.9};
+  changed.stages[0].c = Vector{-0.2, 0.35};
+  changed.stages[0].q = Vector{-0.4, 0.6};
+  changed.stages[0].r = Vector{0.15, -0.25};
+  changed.stages[1].c = Vector{0.3, -0.1};
+  changed.stages[1].q = Vector{0.45, -0.55};
+  changed.stages[1].r = Vector{-0.35};
+  changed.terminal_q = Vector{0.8, -0.65};
+  const Solution changed_factored = CopySolutionView(
+      clqr::Solve(factorization, clqr::ExtractRhs(changed), workspace));
+  const Solution changed_reference = SolveWithWorkspace(changed);
+  Expect(changed_factored.status == SolveStatus::kOptimal,
+         "changed RHS factored solve status: " + changed_factored.message);
+  ExpectNear(changed_factored.objective, changed_reference.objective, kTol,
+             "changed RHS factored objective");
+  for (std::size_t i = 0; i < changed_factored.states.size(); ++i) {
+    ExpectVectorNear(changed_factored.states[i], changed_reference.states[i],
+                     kTol, "changed RHS factored state " + std::to_string(i));
+  }
+  for (std::size_t i = 0; i < changed_factored.controls.size(); ++i) {
+    ExpectVectorNear(changed_factored.controls[i],
+                     changed_reference.controls[i], kTol,
+                     "changed RHS factored control " + std::to_string(i));
+    ExpectVectorNear(changed_factored.dynamics_multipliers[i],
+                     changed_reference.dynamics_multipliers[i], kTol,
+                     "changed RHS factored dynamics multiplier " +
+                         std::to_string(i));
+  }
+  ExpectVectorNear(changed_factored.initial_multiplier,
+                   changed_reference.initial_multiplier, kTol,
+                   "changed RHS factored initial multiplier");
+  ExpectNear(MaxKktResidual(changed, changed_factored), Scalar{0}, kKktTol,
+             "changed RHS factored KKT residual");
+
+  std::vector<unsigned char> too_small(
+      factorization.RequiredSolveBytes() - 1);
+  Workspace small_workspace(too_small.data(), too_small.size());
+  const SolutionView small = clqr::Solve(
+      factorization, clqr::ExtractRhs(changed), small_workspace);
+  Expect(small.status == SolveStatus::kInvalidInput,
+         "factored undersized workspace status");
+
+  Problem constrained = original;
+  constrained.stages[0].C = Matrix(1, 2, {Scalar{1}, Scalar{0}});
+  constrained.stages[0].D = Matrix(1, 2, {Scalar{0}, Scalar{1}});
+  constrained.stages[0].d = Vector{Scalar{0}};
+  const clqr::Factorization unsupported = clqr::Factor(constrained);
+  Expect(unsupported.status() == SolveStatus::kInvalidInput,
+         "constrained factorization is explicitly rejected");
+
+  Problem zero_horizon;
+  zero_horizon.initial_state = Vector{Scalar{0.4}, Scalar{-0.6}};
+  zero_horizon.terminal_Q =
+      Matrix(2, 2, {Scalar{2}, Scalar{0.1}, Scalar{0.1}, Scalar{3}});
+  zero_horizon.terminal_q = Vector{Scalar{-0.2}, Scalar{0.3}};
+  zero_horizon.terminal_E = Matrix(0, 2);
+  zero_horizon.terminal_e = Vector(0);
+  clqr::Factorization zero_factorization = clqr::Factor(zero_horizon);
+  Workspace zero_workspace;
+  zero_workspace.Reserve(zero_factorization);
+  const Solution zero_factored = CopySolutionView(clqr::Solve(
+      zero_factorization, clqr::ExtractRhs(zero_horizon), zero_workspace));
+  const Solution zero_reference = SolveWithWorkspace(zero_horizon);
+  Expect(zero_factored.status == SolveStatus::kOptimal,
+         "zero-horizon factored status: " + zero_factored.message);
+  ExpectVectorNear(zero_factored.states[0], zero_reference.states[0], kTol,
+                   "zero-horizon factored state");
+  ExpectVectorNear(zero_factored.initial_multiplier,
+                   zero_reference.initial_multiplier, kTol,
+                   "zero-horizon factored initial multiplier");
+  ExpectNear(zero_factored.objective, zero_reference.objective, kTol,
+             "zero-horizon factored objective");
+}
+
 void WorkspaceConstrainedMatchesKkt() {
   const std::vector<Problem> problems = {
       GeneratedFeasibleProblem(410, 4, 3, 2, 1, ConstraintMode::kStateOnly),
@@ -1029,6 +1140,7 @@ void EssentialSingleRowsRemainActiveWhenScaled() {
 int main() {
   UnconstrainedMatchesKkt();
   WorkspaceUnconstrainedMatchesKkt();
+  ReusableFactorizationSolvesNewRightHandSides();
   WorkspaceConstrainedMatchesKkt();
   MixedConstraintMatchesKkt();
   RankDeficientMixedConstraintMatchesKkt();

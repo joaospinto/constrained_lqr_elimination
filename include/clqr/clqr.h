@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,23 @@ struct Problem {
   Vector terminal_e;
   Vector initial_state;
 };
+
+struct StageRhs {
+  Vector c;
+  Vector q;
+  Vector r;
+  Vector d;
+  Vector e;
+};
+
+struct SolveRhs {
+  WorkspaceVector<StageRhs> stages;
+  Vector terminal_q;
+  Vector terminal_e;
+  Vector initial_state;
+};
+
+SolveRhs ExtractRhs(const Problem& problem);
 
 enum class SolveStatus {
   kOptimal,
@@ -83,6 +101,34 @@ struct SolutionView {
   Scalar objective = Scalar{0};
 };
 
+class Workspace;
+
+class Factorization {
+ public:
+  struct Impl;
+
+  Factorization();
+  ~Factorization();
+  Factorization(Factorization&&) noexcept;
+  Factorization& operator=(Factorization&&) noexcept;
+  Factorization(const Factorization&) = delete;
+  Factorization& operator=(const Factorization&) = delete;
+
+  SolveStatus status() const;
+  const char* message() const;
+  std::size_t stage_count() const;
+  std::size_t RequiredSolveBytes() const;
+
+ private:
+  std::unique_ptr<Impl> impl_;
+
+  friend Factorization Factor(const Problem&, const SolveOptions&);
+  friend SolutionView Solve(const Factorization&, const SolveRhs&, Workspace&);
+};
+
+Factorization Factor(const Problem& problem,
+                     const SolveOptions& options = SolveOptions{});
+
 class Workspace {
  public:
   Workspace() = default;
@@ -93,6 +139,7 @@ class Workspace {
   static std::size_t RequiredBytes(const Problem& problem);
   static std::size_t RequiredBytes(const Problem& problem,
                                    const SolveOptions& options);
+  static std::size_t RequiredBytes(const Factorization& factorization);
   static constexpr std::size_t RequiredBytesUniform(std::size_t stages,
                                                     std::size_t state_dim,
                                                     std::size_t control_dim) {
@@ -324,6 +371,7 @@ class Workspace {
 
   void Reserve(const Problem& problem);
   void Reserve(const Problem& problem, const SolveOptions& options);
+  void Reserve(const Factorization& factorization);
   void UseExternalMemory(void* memory, std::size_t bytes);
   unsigned char* data() { return data_; }
   const unsigned char* data() const { return data_; }
@@ -379,10 +427,13 @@ class Workspace {
   std::array<char, 128> message_{};
 
   friend SolutionView Solve(const Problem&, Workspace&, const SolveOptions&);
+  friend SolutionView Solve(const Factorization&, const SolveRhs&, Workspace&);
 };
 
 SolutionView Solve(const Problem& problem, Workspace& workspace,
                    const SolveOptions& options = SolveOptions{});
+SolutionView Solve(const Factorization& factorization, const SolveRhs& rhs,
+                   Workspace& workspace);
 const char* StatusName(SolveStatus status);
 
 }  // namespace clqr

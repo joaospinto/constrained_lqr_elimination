@@ -260,6 +260,27 @@ The workspace API covers constrained and unconstrained problems. Unconstrained p
 the raw Riccati path directly. Constrained problems activate the workspace arena and run the
 constraint-elimination algorithm, including the reduced Riccati solve and multiplier recovery.
 
+For repeated unconstrained solves with fixed matrices and new right-hand
+sides, factor the matrix-dependent Riccati recursion once:
+
+```cpp
+clqr::Factorization factors = clqr::Factor(problem);
+clqr::SolveRhs rhs = clqr::ExtractRhs(problem);
+clqr::Workspace solve_workspace;
+solve_workspace.Reserve(factors);
+
+clqr::SolutionView first = clqr::Solve(factors, rhs, solve_workspace);
+rhs.initial_state = next_initial_state;
+rhs.stages[0].q = next_state_gradient;
+clqr::SolutionView second = clqr::Solve(factors, rhs, solve_workspace);
+```
+
+`Factor` owns the fixed `A`, `B`, `Q`, `R`, `M`, and terminal `Q` data.
+Each factored `Solve` accepts new `c`, `q`, `r`, terminal `q`, and initial
+state values with unchanged dimensions, and performs no heap allocation when
+given a reserved workspace. The first API slice deliberately rejects equality
+constraints; CUDA, JAX, and constrained factorization remain follow-up work.
+
 The Python extension is built by the Bazel target `//:_clqr`; the shared-object output is
 addressable as `//:_clqr.so`. It exposes the `_clqr` module directly:
 
