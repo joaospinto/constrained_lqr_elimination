@@ -221,8 +221,14 @@ for precision in "${precisions[@]}"; do
 done
 
 if [[ "${CLQR_COMPARE_DIMENSION_BASELINE:-0}" == "1" ]]; then
-  baseline_revision="${CLQR_DIMENSION_BASELINE_REVISION:-3d225eae7e8f7c24c42ddd1cfbf921ef4d540764}"
-  candidate_revision="${CLQR_DIMENSION_CANDIDATE_REVISION:-511cd314445a421c35dcb77cd6154a70e99267e2}"
+  baseline_revision="${CLQR_DIMENSION_BASELINE_REVISION:-}"
+  candidate_revision="${CLQR_DIMENSION_CANDIDATE_REVISION:-}"
+  if [[ -z "${baseline_revision}" || -z "${candidate_revision}" ]]; then
+    echo "set CLQR_DIMENSION_BASELINE_REVISION and" \
+      "CLQR_DIMENSION_CANDIDATE_REVISION when" \
+      "CLQR_COMPARE_DIMENSION_BASELINE=1" >&2
+    exit 2
+  fi
   dimension_base_args="--cuda_max_state_dimension=8 --cuda_max_control_dimension=4 --cuda_max_mixed_constraints=2 --cuda_max_state_constraints=2"
   for precision in "${precisions[@]}"; do
     echo "=== ${precision} isolated runtime-dimension comparison ==="
