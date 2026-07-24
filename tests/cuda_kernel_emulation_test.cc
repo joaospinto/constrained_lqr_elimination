@@ -609,6 +609,12 @@ void ScratchPlannerTopologyCase() {
                                             uniform_relation),
          "uniform n=8 Riccati/reconstruction launch scratch matches active "
          "dimensions");
+  const ScratchRequirements odd =
+      PlanScratch(clqr::benchmark::StateOnlyProblem(7, 5, 3, 1));
+  Expect(odd.affine_terms == AffineTermsScratchBytes(5) &&
+             odd.affine_terms >= 5 * sizeof(Scalar),
+         "odd affine scratch dimensions include a complete shared-memory "
+         "transaction");
   Expect(uniform.dual_relation ==
              DenseEliminationScratchBytes(4 * n, 3 * n + 1,
                                           "uniform dual workspace"),

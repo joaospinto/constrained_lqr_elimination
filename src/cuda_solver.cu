@@ -52,6 +52,19 @@ __host__ __device__ constexpr std::size_t AlignUp(std::size_t value,
   return (value + alignment - 1) / alignment * alignment;
 }
 
+constexpr std::size_t kSharedVectorAccessBytes = 16;
+static_assert(kSharedVectorAccessBytes % sizeof(Scalar) == 0);
+
+// NVCC may combine adjacent shared-memory scalar accesses into one maximum-
+// width scalar-vector instruction. Pad runtime-sized vectors to that exact
+// instruction width so the physical access footprint remains in bounds.
+__host__ __device__ constexpr std::size_t
+SharedScalarEntries(std::size_t entries) {
+  constexpr std::size_t transaction_entries =
+      kSharedVectorAccessBytes / sizeof(Scalar);
+  return AlignUp(entries, transaction_entries);
+}
+
 struct ScratchSize {
   std::size_t bytes = 0;
 
@@ -69,6 +82,13 @@ struct ScratchSize {
     bytes += count * sizeof(T);
   }
 };
+
+__host__ __device__ std::size_t
+AffineTermsScratchBytes(std::size_t entries) {
+  ScratchSize scratch_size;
+  scratch_size.Add<Scalar>(SharedScalarEntries(entries));
+  return scratch_size.bytes;
+}
 
 __host__ __device__ std::size_t
 DualRelationLeafScratchBytes(std::size_t matrix_entries, std::size_t rows,
@@ -438,9 +458,8 @@ ScratchRequirements PlanScratch(const Problem &problem) {
         m, ScratchCheckedSum({m, n}, "feedback workspace"),
         "feedback workspace"));
     result.feedback = std::max(result.feedback, feedback.bytes);
-    ScratchSize affine_terms;
-    affine_terms.Add<Scalar>(next);
-    result.affine_terms = std::max(result.affine_terms, affine_terms.bytes);
+    result.affine_terms =
+        std::max(result.affine_terms, AffineTermsScratchBytes(next));
 
     ScratchSize dual_parameter;
     const std::size_t dual_rows =
@@ -6757,10 +6776,10 @@ __global__ void InitializeCostateMapsKernel(const ReducedStage *stages,
   const ValueElement &next = suffix[index + 1];
   const Feedback &fb = feedback[index];
   AffineMap &map = maps[stage_count - 1 - index];
-  ScratchSize scratch_size;
-  scratch_size.Add<Scalar>(stage.next_n);
-  CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
-  Scalar *future_offset = scratch.Take<Scalar>(stage.next_n);
+  const int shared_entries =
+      static_cast<int>(SharedScalarEntries(stage.next_n));
+  CLQR_BLOCK_SCRATCH(scratch, AffineTermsScratchBytes(stage.next_n));
+  Scalar *future_offset = scratch.Take<Scalar>(shared_entries);
   if (threadIdx.x == 0) {
     map.left_dim = stage.next_n;
     map.right_dim = stage.n;
@@ -6771,10 +6790,12 @@ __global__ void InitializeCostateMapsKernel(const ReducedStage *stages,
     const int col = linear % stage.next_n;
     map.linear[row * stage.next_n + col] = fb.transition[col * stage.n + row];
   }
-  for (int row = threadIdx.x; row < stage.next_n; row += blockDim.x) {
+  for (int row = threadIdx.x; row < shared_entries; row += blockDim.x) {
     Scalar value = Scalar{0};
-    for (int col = 0; col < stage.next_n; ++col)
-      value += next.J[row * next.left_dim + col] * stage.c[col];
+    if (row < stage.next_n) {
+      for (int col = 0; col < stage.next_n; ++col)
+        value += next.J[row * next.left_dim + col] * stage.c[col];
+    }
     future_offset[row] = value;
   }
   WarpSynchronize();
@@ -6829,14 +6850,17 @@ __global__ void FinalizeFeedbackKernel(const ReducedStage *stages,
   Feedback &fb = feedback[index];
   const Scalar *next_costate =
       stage.next_n > 0 ? costates + reduced_state_offsets[index + 1] : nullptr;
-  ScratchSize scratch_size;
-  scratch_size.Add<Scalar>(stage.next_n);
-  CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
-  Scalar *future = scratch.Take<Scalar>(stage.next_n);
-  for (int row = threadIdx.x; row < stage.next_n; row += blockDim.x) {
-    Scalar value = next_costate[row];
-    for (int col = 0; col < stage.next_n; ++col)
-      value += next.J[row * next.left_dim + col] * stage.c[col];
+  const int shared_entries =
+      static_cast<int>(SharedScalarEntries(stage.next_n));
+  CLQR_BLOCK_SCRATCH(scratch, AffineTermsScratchBytes(stage.next_n));
+  Scalar *future = scratch.Take<Scalar>(shared_entries);
+  for (int row = threadIdx.x; row < shared_entries; row += blockDim.x) {
+    Scalar value = Scalar{0};
+    if (row < stage.next_n) {
+      value = next_costate[row];
+      for (int col = 0; col < stage.next_n; ++col)
+        value += next.J[row * next.left_dim + col] * stage.c[col];
+    }
     future[row] = value;
   }
   WarpSynchronize();
