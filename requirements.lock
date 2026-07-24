@@ -1,1 +1,8 @@
+jax==0.11.0
+jax-cuda12-plugin==0.11.0; sys_platform == "linux"
+jax-cuda12-pjrt==0.11.0; sys_platform == "linux"
+jaxlib==0.11.0
+ml_dtypes==0.5.4
 numpy==2.3.5
+opt_einsum==3.4.0
+scipy==1.18.0

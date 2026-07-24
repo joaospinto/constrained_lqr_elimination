@@ -124,8 +124,12 @@ for precision in "${precisions[@]}"; do
     //:clqr_test
     //:workspace_allocation_test
     //:python_binding_test
+    //:jax_binding_test
     //:cuda_stub_test
   )
+  if [[ "${CLQR_RUN_JAX_FFI_TEST:-0}" == "1" ]]; then
+    host_test_targets+=(//:jax_cuda_binding_test)
+  fi
   native_test_targets=(//:cuda_solver_test)
   native_test_binaries=("${repo_dir}/bazel-bin/cuda_solver_test")
   if [[ "${CLQR_RUN_EXTENDED_STRESS:-0}" == "1" ]]; then

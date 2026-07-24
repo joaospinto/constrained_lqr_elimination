@@ -9,9 +9,31 @@ load(
     "requires_cuda",
 )
 load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
+load("@rules_python//python:pip.bzl", "whl_filegroup")
+
 config_setting(
     name = "fp32",
     define_values = {"clqr_precision": "fp32"},
+)
+
+whl_filegroup(
+    name = "jaxlib_ffi_header_files",
+    pattern = "jaxlib/include/xla/ffi/api/.*\\.h",
+    whl = "@clqr_pip//jaxlib:whl",
+)
+
+cc_library(
+    name = "jaxlib_ffi_headers",
+    hdrs = [":jaxlib_ffi_header_files"],
+    includes = ["jaxlib_ffi_header_files/jaxlib/include"],
+    visibility = ["//visibility:private"],
+)
+
+cc_library(
+    name = "jax_ffi_problem",
+    srcs = ["python/jax_ffi_problem.cc"],
+    hdrs = ["python/jax_ffi_problem.h"],
+    deps = [":clqr"],
 )
 
 config_setting(
@@ -261,11 +283,134 @@ nanobind_extension(
     visibility = ["//visibility:public"],
 )
 
+nanobind_extension(
+    name = "_clqr_jax_cpu",
+    srcs = [
+        "python/jax_ffi_cpu.cc",
+        "python/jax_ffi_cpu.h",
+        "python/jax_ffi_cpu_module.cc",
+    ],
+    copts = select({
+        ":linux": [
+            "-Wno-pedantic",
+            "-Wno-sign-compare",
+            "-Wno-unused-parameter",
+        ],
+        ":macos": [
+            "-Wno-gnu-zero-variadic-macro-arguments",
+            "-Wno-nested-anon-types",
+            "-Wno-sign-compare",
+            "-Wno-unused-parameter",
+            "-Wno-zero-length-array",
+        ],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":clqr",
+        ":jax_ffi_problem",
+        ":jaxlib_ffi_headers",
+    ],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+)
+
+cuda_library(
+    name = "jax_ffi_cuda_handler",
+    srcs = ["python/jax_ffi_cuda.cu"],
+    hdrs = ["python/jax_ffi_cuda.h"],
+    copts = ["-Wno-deprecated-gpu-targets"],
+    host_copts = [
+        "-std=c++17",
+        "-Wno-pedantic",
+        "-Wno-sign-compare",
+        "-Wno-unused-parameter",
+    ],
+    target_compatible_with = requires_cuda(),
+    deps = [
+        ":clqr_cuda",
+        ":jax_ffi_problem",
+        ":jaxlib_ffi_headers",
+    ],
+)
+
+nanobind_extension(
+    name = "_clqr_cuda",
+    srcs = ["python/jax_ffi_cuda_module.cc"],
+    copts = select({
+        ":linux": [
+            "-Wno-pedantic",
+            "-Wno-sign-compare",
+            "-Wno-unused-parameter",
+        ],
+        ":macos": [
+            "-Wno-gnu-zero-variadic-macro-arguments",
+            "-Wno-nested-anon-types",
+            "-Wno-sign-compare",
+            "-Wno-unused-parameter",
+            "-Wno-zero-length-array",
+        ],
+        "//conditions:default": [],
+    }),
+    linkstatic = True,
+    target_compatible_with = requires_cuda(),
+    deps = [
+        ":jax_ffi_cuda_handler",
+        ":jaxlib_ffi_headers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 py_test(
     name = "python_binding_test",
     srcs = ["tests/python_binding_test.py"],
     data = [":_clqr"],
     deps = [requirement("numpy")],
+)
+
+py_library(
+    name = "clqr_jax_python",
+    srcs = [
+        "python/clqr/__init__.py",
+        "python/clqr/jax.py",
+    ],
+)
+
+py_test(
+    name = "jax_binding_test",
+    srcs = ["tests/jax_binding_test.py"],
+    data = [
+        ":_clqr",
+        ":_clqr_jax_cpu",
+    ],
+    main = "tests/jax_binding_test.py",
+    deps = [
+        ":clqr_jax_python",
+        requirement("jax"),
+        requirement("numpy"),
+    ],
+)
+
+py_test(
+    name = "jax_cuda_binding_test",
+    srcs = ["tests/jax_cuda_binding_test.py"],
+    data = [
+        ":_clqr",
+        ":_clqr_cuda",
+        ":_clqr_jax_cpu",
+    ],
+    main = "tests/jax_cuda_binding_test.py",
+    tags = [
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = requires_cuda(),
+    deps = [
+        ":clqr_jax_python",
+        requirement("jax"),
+        requirement("jax-cuda12-plugin"),
+        requirement("jax-cuda12-pjrt"),
+        requirement("numpy"),
+    ],
 )
 
 cc_binary(

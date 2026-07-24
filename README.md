@@ -294,3 +294,45 @@ dict contains `status`, `message`,
 `state_multipliers`, and `terminal_state_multiplier`. The multiplier signs correspond to the
 constraints exactly as written above. The Newton-KKT diagnostic fields are reported separately
 from `status`; when the reduced solve can proceed, a candidate solution is still returned.
+
+### JAX
+
+`python/clqr/jax.py` exposes the solver through JAX's typed FFI:
+
+```bash
+bazel build //:_clqr //:_clqr_jax_cpu //:_clqr_cuda --config=cuda
+PYTHONPATH="$PWD/python:$PWD/bazel-bin" python your_program.py
+```
+
+```python
+import jax
+
+from clqr.jax import pack_problem, solve
+
+packed = pack_problem(problem)
+result = jax.jit(solve)(jax.device_put(packed, jax.devices()[0]))
+```
+
+`PackedProblem.factors` contains the matrices and active dimensions;
+`PackedProblem.rhs` contains the vectors and initial state. Arrays are padded
+only at the interface, while each C++/CUDA stage still operates on its active
+runtime dimensions. The split lets callers update the RHS without changing the
+compiled JAX shape. It is not yet a numerical factor/solve split: the current
+call refactors after either part changes.
+
+CPU arrays dispatch to the sequential C++ solver. When `//:_clqr_cuda` is
+installed, CUDA arrays dispatch to the CUDA solver on the device selected by
+JAX. The CUDA bridge preserves JAX stream ordering and reuses pinned staging
+buffers and the native CUDA workspace for unchanged dimensions. It currently
+stages the padded FFI inputs through host memory because the public CUDA solver
+accepts a host `Problem`; a future device-packed entry point can remove that
+round trip.
+
+The typed FFI lives in optional `_clqr_jax_cpu` and `_clqr_cuda` extensions;
+the existing `_clqr` Python binding remains independent of JAX.
+
+The raw FFI call supports eager execution, `jax.jit`, and sequential `jax.vmap`.
+Automatic differentiation and sharded-problem rules are not implemented.
+Build/test the CPU binding with `//:jax_binding_test`. On a CUDA 12 machine,
+`//:jax_cuda_binding_test --config=cuda` exercises GPU dispatch; the notebook
+driver includes it when `CLQR_RUN_JAX_FFI_TEST=1`.
