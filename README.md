@@ -280,6 +280,10 @@ Each factored `Solve` accepts new `c`, `q`, `r`, terminal `q`, and initial
 state values with unchanged dimensions, and performs no heap allocation when
 given a reserved workspace. The first API slice deliberately rejects equality
 constraints; CUDA, JAX, and constrained factorization remain follow-up work.
+As with the ordinary workspace API, every buffer and string referenced by the
+returned `SolutionView` is workspace-backed and remains valid only until that
+workspace is reused or destroyed. Copy any values that must survive the next
+solve.
 
 The native C++ `Problem`, `SolveRhs`, and NumPy dictionary APIs keep
 `terminal_Q` and `terminal_q` as separate fields. The padded JAX representation

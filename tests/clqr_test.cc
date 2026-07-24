@@ -27,8 +27,7 @@ using clqr::Workspace;
 constexpr Scalar kTol = 2e-4f;
 // The elimination pullback accumulates more rounding error in the dual
 // variables than in the primal trajectory when every operation is FP32.
-constexpr Scalar kKktTol =
-    1e4f * std::numeric_limits<Scalar>::epsilon();
+constexpr Scalar kKktTol = 1e4f * std::numeric_limits<Scalar>::epsilon();
 constexpr Scalar kLinearSolveTolerance = 1e-7f;
 constexpr Scalar kSmallConstraintScale = 1e-4f;
 constexpr Scalar kLargeConstraintScale = 1e4f;
@@ -568,8 +567,7 @@ void CheckAgainstKkt(const Problem& p, const std::string& name,
     ExpectVectorNear(sol.controls[i], kkt.u[i], kTol,
                      name + " u" + std::to_string(i));
   }
-  ExpectNear(MaxKktResidual(p, sol), 0.0, kKktTol,
-             name + " full KKT residual");
+  ExpectNear(MaxKktResidual(p, sol), 0.0, kKktTol, name + " full KKT residual");
 }
 
 void UnconstrainedMatchesKkt() {
@@ -623,9 +621,8 @@ void ReusableFactorizationSolvesNewRightHandSides() {
 
   Workspace workspace;
   workspace.Reserve(factorization);
-  const Solution first =
-      CopySolutionView(clqr::Solve(factorization, clqr::ExtractRhs(original),
-                                   workspace));
+  const Solution first = CopySolutionView(
+      clqr::Solve(factorization, clqr::ExtractRhs(original), workspace));
   const Solution first_reference = SolveWithWorkspace(original);
   Expect(first.status == SolveStatus::kOptimal,
          "first factored solve status: " + first.message);
@@ -638,12 +635,10 @@ void ReusableFactorizationSolvesNewRightHandSides() {
                      "first factored control " + std::to_string(i));
     ExpectVectorNear(first.dynamics_multipliers[i],
                      first_reference.dynamics_multipliers[i], kTol,
-                     "first factored dynamics multiplier " +
-                         std::to_string(i));
+                     "first factored dynamics multiplier " + std::to_string(i));
   }
-  ExpectVectorNear(first.initial_multiplier,
-                   first_reference.initial_multiplier, kTol,
-                   "first factored initial multiplier");
+  ExpectVectorNear(first.initial_multiplier, first_reference.initial_multiplier,
+                   kTol, "first factored initial multiplier");
   ExpectNear(first.objective, first_reference.objective, kTol,
              "first factored objective");
 
@@ -671,10 +666,10 @@ void ReusableFactorizationSolvesNewRightHandSides() {
     ExpectVectorNear(changed_factored.controls[i],
                      changed_reference.controls[i], kTol,
                      "changed RHS factored control " + std::to_string(i));
-    ExpectVectorNear(changed_factored.dynamics_multipliers[i],
-                     changed_reference.dynamics_multipliers[i], kTol,
-                     "changed RHS factored dynamics multiplier " +
-                         std::to_string(i));
+    ExpectVectorNear(
+        changed_factored.dynamics_multipliers[i],
+        changed_reference.dynamics_multipliers[i], kTol,
+        "changed RHS factored dynamics multiplier " + std::to_string(i));
   }
   ExpectVectorNear(changed_factored.initial_multiplier,
                    changed_reference.initial_multiplier, kTol,
@@ -682,11 +677,10 @@ void ReusableFactorizationSolvesNewRightHandSides() {
   ExpectNear(MaxKktResidual(changed, changed_factored), Scalar{0}, kKktTol,
              "changed RHS factored KKT residual");
 
-  std::vector<unsigned char> too_small(
-      factorization.RequiredSolveBytes() - 1);
+  std::vector<unsigned char> too_small(factorization.RequiredSolveBytes() - 1);
   Workspace small_workspace(too_small.data(), too_small.size());
-  const SolutionView small = clqr::Solve(
-      factorization, clqr::ExtractRhs(changed), small_workspace);
+  const SolutionView small =
+      clqr::Solve(factorization, clqr::ExtractRhs(changed), small_workspace);
   Expect(small.status == SolveStatus::kInvalidInput,
          "factored undersized workspace status");
 
@@ -697,6 +691,16 @@ void ReusableFactorizationSolvesNewRightHandSides() {
   const clqr::Factorization unsupported = clqr::Factor(constrained);
   Expect(unsupported.status() == SolveStatus::kInvalidInput,
          "constrained factorization is explicitly rejected");
+  constrained = original;
+  constrained.stages[1].E = Matrix(1, 2, {Scalar{1}, Scalar{-1}});
+  constrained.stages[1].e = Vector{Scalar{0}};
+  Expect(clqr::Factor(constrained).status() == SolveStatus::kInvalidInput,
+         "state-constrained factorization is explicitly rejected");
+  constrained = original;
+  constrained.terminal_E = Matrix(1, 2, {Scalar{0}, Scalar{1}});
+  constrained.terminal_e = Vector{Scalar{0}};
+  Expect(clqr::Factor(constrained).status() == SolveStatus::kInvalidInput,
+         "terminal-constrained factorization is explicitly rejected");
 
   Problem zero_horizon;
   zero_horizon.initial_state = Vector{Scalar{0.4}, Scalar{-0.6}};
@@ -720,6 +724,74 @@ void ReusableFactorizationSolvesNewRightHandSides() {
                    "zero-horizon factored initial multiplier");
   ExpectNear(zero_factored.objective, zero_reference.objective, kTol,
              "zero-horizon factored objective");
+}
+
+void ReusableFactorizationHandlesChangingAndZeroDimensions() {
+  Problem problem;
+  problem.initial_state = Vector{Scalar{0.2}, Scalar{-0.4}};
+  problem.stages.resize(2);
+
+  Stage& first = problem.stages[0];
+  first.A = Matrix(3, 2,
+                   {Scalar{1}, Scalar{0.1}, Scalar{0}, Scalar{0.9},
+                    Scalar{-0.2}, Scalar{0.3}});
+  first.B = Matrix(3, 0);
+  first.c = Vector{Scalar{0.1}, Scalar{-0.2}, Scalar{0.05}};
+  first.Q = Matrix(2, 2, {Scalar{1.5}, Scalar{0.1}, Scalar{0.1}, Scalar{2}});
+  first.R = Matrix(0, 0);
+  first.M = Matrix(2, 0);
+  first.q = Vector{Scalar{0.2}, Scalar{-0.3}};
+  first.r = Vector(0);
+  first.C = Matrix(0, 2);
+  first.D = Matrix(0, 0);
+  first.d = Vector(0);
+  first.E = Matrix(0, 2);
+  first.e = Vector(0);
+
+  Stage& second = problem.stages[1];
+  second.A = Matrix(1, 3, {Scalar{0.4}, Scalar{-0.2}, Scalar{0.7}});
+  second.B = Matrix(1, 2, {Scalar{0.3}, Scalar{-0.5}});
+  second.c = Vector{Scalar{-0.1}};
+  second.Q = Matrix(3, 3,
+                    {Scalar{1}, Scalar{0}, Scalar{0}, Scalar{0}, Scalar{1.2},
+                     Scalar{0.1}, Scalar{0}, Scalar{0.1}, Scalar{1.4}});
+  second.R = Matrix(2, 2, {Scalar{2}, Scalar{0.2}, Scalar{0.2}, Scalar{1.5}});
+  second.M = Matrix(3, 2,
+                    {Scalar{0.1}, Scalar{0}, Scalar{-0.05}, Scalar{0.03},
+                     Scalar{0.02}, Scalar{-0.04}});
+  second.q = Vector{Scalar{0.1}, Scalar{-0.2}, Scalar{0.3}};
+  second.r = Vector{Scalar{-0.15}, Scalar{0.25}};
+  second.C = Matrix(0, 3);
+  second.D = Matrix(0, 2);
+  second.d = Vector(0);
+  second.E = Matrix(0, 3);
+  second.e = Vector(0);
+
+  problem.terminal_Q = Matrix(1, 1, {Scalar{2.5}});
+  problem.terminal_q = Vector{Scalar{-0.35}};
+  problem.terminal_E = Matrix(0, 1);
+  problem.terminal_e = Vector(0);
+
+  clqr::Factorization factors = clqr::Factor(problem);
+  Expect(factors.status() == SolveStatus::kOptimal,
+         "nonuniform reusable factorization status");
+  Workspace workspace;
+  workspace.Reserve(factors);
+  const Solution factored = CopySolutionView(
+      clqr::Solve(factors, clqr::ExtractRhs(problem), workspace));
+  const Solution ordinary = SolveWithWorkspace(problem);
+  Expect(factored.status == SolveStatus::kOptimal,
+         "nonuniform reusable solve status");
+  for (std::size_t i = 0; i < factored.states.size(); ++i) {
+    ExpectVectorNear(factored.states[i], ordinary.states[i], kTol,
+                     "nonuniform reusable state " + std::to_string(i));
+  }
+  Expect(factored.controls[0].empty(),
+         "nonuniform reusable zero control stage");
+  ExpectVectorNear(factored.controls[1], ordinary.controls[1], kTol,
+                   "nonuniform reusable control");
+  ExpectNear(MaxKktResidual(problem, factored), Scalar{0}, kKktTol,
+             "nonuniform reusable KKT residual");
 }
 
 void WorkspaceConstrainedMatchesKkt() {
@@ -849,10 +921,109 @@ void WrongInertiaReportedWithCandidate() {
   const Solution reference = SolveWithWorkspace(changed);
   Expect(factored.status == SolveStatus::kOptimal,
          "wrong-inertia factored solve status");
+  ExpectDiagnostics(factored, false, true,
+                    "wrong-inertia factored diagnostics");
+  Expect(
+      factored.newton_kkt_diagnostic.find("wrong inertia") != std::string::npos,
+      "wrong-inertia factored diagnostic message");
   ExpectVectorNear(factored.controls[0], reference.controls[0], kTol,
                    "wrong-inertia factored control");
   ExpectNear(MaxKktResidual(changed, factored), Scalar{0}, kKktTol,
              "wrong-inertia factored KKT residual");
+}
+
+void ReusablePivotedFactorMatchesOrdinarySolve() {
+  Problem problem;
+  problem.initial_state = Vector{Scalar{0.4}};
+  problem.stages.resize(1);
+  Stage& stage = problem.stages[0];
+  stage.A = Matrix(1, 1, {Scalar{0.8}});
+  stage.B = Matrix(1, 2, {Scalar{0.2}, Scalar{-0.3}});
+  stage.c = Vector{Scalar{0.1}};
+  stage.Q = Matrix(1, 1, {Scalar{1.2}});
+  stage.R = Matrix(2, 2, {Scalar{0}, Scalar{1}, Scalar{1}, Scalar{0}});
+  stage.M = Matrix(1, 2, {Scalar{0.5}, Scalar{-0.25}});
+  stage.q = Vector{Scalar{-0.2}};
+  stage.r = Vector{Scalar{0.3}, Scalar{-0.6}};
+  stage.C = Matrix(0, 1);
+  stage.D = Matrix(0, 2);
+  stage.d = Vector(0);
+  stage.E = Matrix(0, 1);
+  stage.e = Vector(0);
+  problem.terminal_Q = Matrix(1, 1, {Scalar{0}});
+  problem.terminal_q = Vector{Scalar{0}};
+  problem.terminal_E = Matrix(0, 1);
+  problem.terminal_e = Vector(0);
+
+  clqr::Factorization factors = clqr::Factor(problem);
+  Expect(factors.status() == SolveStatus::kOptimal,
+         "pivoted reusable factorization status");
+  Workspace workspace;
+  workspace.Reserve(factors);
+  const Solution factored = CopySolutionView(
+      clqr::Solve(factors, clqr::ExtractRhs(problem), workspace));
+  const Solution ordinary = SolveWithWorkspace(problem);
+  Expect(factored.status == SolveStatus::kOptimal,
+         "pivoted reusable solve status");
+  ExpectDiagnostics(factored, false, true, "pivoted reusable diagnostics");
+  ExpectVectorNear(factored.controls[0], ordinary.controls[0], kTol,
+                   "pivoted reusable control");
+  ExpectVectorNear(factored.states[1], ordinary.states[1], kTol,
+                   "pivoted reusable terminal state");
+  ExpectNear(MaxKktResidual(problem, factored), Scalar{0}, kKktTol,
+             "pivoted reusable KKT residual");
+}
+
+void ReusableFactorizationRejectsNonfiniteInputs() {
+  Problem problem = BaseProblem();
+  problem.stages[0].Q(0, 0) = std::numeric_limits<Scalar>::quiet_NaN();
+  clqr::Factorization nonfinite_matrix = clqr::Factor(problem);
+  Expect(nonfinite_matrix.status() == SolveStatus::kInvalidInput,
+         "nonfinite factor matrix status");
+  Expect(std::string(nonfinite_matrix.message()).find("finite") !=
+             std::string::npos,
+         "nonfinite factor matrix message");
+
+  problem = BaseProblem();
+  clqr::SolveOptions options;
+  options.tolerance = std::numeric_limits<Scalar>::infinity();
+  Expect(clqr::Factor(problem, options).status() == SolveStatus::kInvalidInput,
+         "nonfinite factor tolerance status");
+  options.tolerance = Scalar{0};
+  Expect(clqr::Factor(problem, options).status() == SolveStatus::kInvalidInput,
+         "nonpositive factor tolerance status");
+
+  clqr::Factorization factors = clqr::Factor(problem);
+  Workspace workspace;
+  workspace.Reserve(factors);
+  clqr::SolveRhs rhs = clqr::ExtractRhs(problem);
+  rhs.stages[0].c[0] = std::numeric_limits<Scalar>::infinity();
+  const SolutionView nonfinite_rhs = clqr::Solve(factors, rhs, workspace);
+  Expect(nonfinite_rhs.status == SolveStatus::kInvalidInput,
+         "nonfinite factored RHS status");
+  Expect(std::string(nonfinite_rhs.message).find("finite") != std::string::npos,
+         "nonfinite factored RHS message");
+
+}
+
+void MovedFromFactorizationIsSafe() {
+  Problem problem = BaseProblem();
+  clqr::Factorization source = clqr::Factor(problem);
+  clqr::Factorization destination = std::move(source);
+  Expect(destination.status() == SolveStatus::kOptimal,
+         "moved-to factorization status");
+  Expect(source.status() == SolveStatus::kInvalidInput,
+         "moved-from factorization status");
+  Expect(source.stage_count() == 0, "moved-from factorization stage count");
+  Expect(source.RequiredSolveBytes() == 0,
+         "moved-from factorization workspace bytes");
+  Workspace workspace;
+  const SolutionView solution =
+      clqr::Solve(source, clqr::ExtractRhs(problem), workspace);
+  Expect(solution.status == SolveStatus::kInvalidInput,
+         "moved-from factorization solve status");
+  Expect(std::string(solution.message).find("moved from") != std::string::npos,
+         "moved-from factorization solve message");
 }
 
 void SingularReducedHessianReported() {
@@ -902,8 +1073,7 @@ void ScaleConstraintRow(Matrix* matrix, Vector* vector, std::size_t row,
 
 void IndependentlyRescaledConstraintsAreInvariant() {
   Problem original =
-      GeneratedFeasibleProblem(1701, 5, 4, 3, 2,
-                               ConstraintMode::kMixed);
+      GeneratedFeasibleProblem(1701, 5, 4, 3, 2, ConstraintMode::kMixed);
   original.terminal_E = GeneratedMatrix(2, 4, 1711, Scalar{0.5});
   const Vector terminal_nominal = GeneratedVector(4, 1806, Scalar{0.8});
   SetStateConstraintFromNominal(&original.terminal_E, &original.terminal_e,
@@ -914,8 +1084,7 @@ void IndependentlyRescaledConstraintsAreInvariant() {
        ++stage_index) {
     Stage& stage = scaled.stages[stage_index];
     if (stage.C.rows() > 0) {
-      const Scalar scales[2] = {kSmallConstraintScale,
-                                kLargeConstraintScale};
+      const Scalar scales[2] = {kSmallConstraintScale, kLargeConstraintScale};
       for (std::size_t row = 0; row < stage.C.rows(); ++row) {
         const Scalar scale = scales[(row + stage_index) % 2];
         ScaleConstraintRow(&stage.C, &stage.d, row, scale);
@@ -924,8 +1093,7 @@ void IndependentlyRescaledConstraintsAreInvariant() {
       }
     }
     if (stage.E.rows() > 0) {
-      const Scalar scales[2] = {kLargeConstraintScale,
-                                kSmallConstraintScale};
+      const Scalar scales[2] = {kLargeConstraintScale, kSmallConstraintScale};
       for (std::size_t row = 0; row < stage.E.rows(); ++row) {
         ScaleConstraintRow(&stage.E, &stage.e, row,
                            scales[(row + stage_index) % 2]);
@@ -960,39 +1128,32 @@ void IndependentlyRescaledConstraintsAreInvariant() {
   }
   for (std::size_t stage_index = 0;
        stage_index < reference.mixed_multipliers.size(); ++stage_index) {
-    const Scalar scales[2] = {kSmallConstraintScale,
-                              kLargeConstraintScale};
+    const Scalar scales[2] = {kSmallConstraintScale, kLargeConstraintScale};
     for (std::size_t row = 0;
          row < reference.mixed_multipliers[stage_index].size(); ++row) {
-      const Scalar recovered =
-          scales[(row + stage_index) % 2] *
-          candidate.mixed_multipliers[stage_index][row];
-      ExpectNear(recovered,
-                 reference.mixed_multipliers[stage_index][row],
+      const Scalar recovered = scales[(row + stage_index) % 2] *
+                               candidate.mixed_multipliers[stage_index][row];
+      ExpectNear(recovered, reference.mixed_multipliers[stage_index][row],
                  Scalar{16} * kScalingInvariantTolerance,
-                 "row-scaling mixed multiplier " +
-                     std::to_string(stage_index) + ":" +
-                     std::to_string(row));
+                 "row-scaling mixed multiplier " + std::to_string(stage_index) +
+                     ":" + std::to_string(row));
     }
   }
   for (std::size_t stage_index = 0;
        stage_index < reference.state_multipliers.size(); ++stage_index) {
-    const Scalar scales[2] = {kLargeConstraintScale,
-                              kSmallConstraintScale};
+    const Scalar scales[2] = {kLargeConstraintScale, kSmallConstraintScale};
     for (std::size_t row = 0;
          row < reference.state_multipliers[stage_index].size(); ++row) {
-      const Scalar recovered =
-          scales[(row + stage_index) % 2] *
-          candidate.state_multipliers[stage_index][row];
+      const Scalar recovered = scales[(row + stage_index) % 2] *
+                               candidate.state_multipliers[stage_index][row];
       ExpectNear(recovered, reference.state_multipliers[stage_index][row],
                  Scalar{16} * kScalingInvariantTolerance,
-                 "row-scaling state multiplier " +
-                     std::to_string(stage_index) + ":" +
-                     std::to_string(row));
+                 "row-scaling state multiplier " + std::to_string(stage_index) +
+                     ":" + std::to_string(row));
     }
   }
-  for (std::size_t row = 0;
-       row < reference.terminal_state_multiplier.size(); ++row) {
+  for (std::size_t row = 0; row < reference.terminal_state_multiplier.size();
+       ++row) {
     const Scalar scale =
         row % 2 == 0 ? kSmallConstraintScale : kLargeConstraintScale;
     ExpectNear(scale * candidate.terminal_state_multiplier[row],
@@ -1050,8 +1211,7 @@ Problem ExtremeFiniteRowProblem(bool terminal_constraint, Scalar scale,
   stage.R = Matrix(1, 1, {Scalar{1}});
   stage.M = Matrix(1, 1, {Scalar{0}});
   stage.q = Vector{Scalar{0}};
-  stage.r =
-      Vector{nonzero_multiplier ? Scalar{0} : Scalar{-1}};
+  stage.r = Vector{nonzero_multiplier ? Scalar{0} : Scalar{-1}};
   stage.C = Matrix(0, 1);
   stage.D = Matrix(0, 1);
   stage.d = Vector(0);
@@ -1076,19 +1236,16 @@ void ExtremeFiniteConstraintRowsAreSafe() {
   const Scalar scales[2] = {std::numeric_limits<Scalar>::denorm_min(),
                             std::numeric_limits<Scalar>::max()};
   for (bool terminal_constraint : {false, true}) {
-    const std::string kind =
-        terminal_constraint ? "terminal" : "mixed";
+    const std::string kind = terminal_constraint ? "terminal" : "mixed";
     for (Scalar scale : scales) {
       const Problem problem =
           ExtremeFiniteRowProblem(terminal_constraint, scale, false);
       const Solution solution = SolveWithWorkspace(problem);
       Expect(solution.status == SolveStatus::kOptimal,
              "extreme " + kind + " row status: " + solution.message);
-      ExpectNear(solution.controls[0][0], Scalar{1},
-                 kScalingInvariantTolerance,
+      ExpectNear(solution.controls[0][0], Scalar{1}, kScalingInvariantTolerance,
                  "extreme " + kind + " row control");
-      ExpectNear(solution.states[1][0], Scalar{1},
-                 kScalingInvariantTolerance,
+      ExpectNear(solution.states[1][0], Scalar{1}, kScalingInvariantTolerance,
                  "extreme " + kind + " row terminal state");
       ExpectNear(MaxKktResidual(problem, solution), Scalar{0}, kKktTol,
                  "extreme " + kind + " row KKT residual");
@@ -1102,8 +1259,8 @@ void ExtremeFiniteConstraintRowsAreSafe() {
            "unrepresentable " + kind + " multiplier status");
     Expect(unrepresentable_solution.message.find("not representable") !=
                std::string::npos,
-           "unrepresentable " + kind + " multiplier diagnostic: " +
-               unrepresentable_solution.message);
+           "unrepresentable " + kind +
+               " multiplier diagnostic: " + unrepresentable_solution.message);
 
     Problem huge_rhs = ExtremeFiniteRowProblem(
         terminal_constraint, std::numeric_limits<Scalar>::denorm_min(), false);
@@ -1117,8 +1274,8 @@ void ExtremeFiniteConstraintRowsAreSafe() {
            "unrepresentable " + kind + " normalized row status");
     Expect(huge_rhs_solution.message.find("not representable") !=
                std::string::npos,
-           "unrepresentable " + kind + " normalized row diagnostic: " +
-               huge_rhs_solution.message);
+           "unrepresentable " + kind +
+               " normalized row diagnostic: " + huge_rhs_solution.message);
   }
 }
 
@@ -1126,9 +1283,8 @@ void EssentialSingleRowsRemainActiveWhenScaled() {
   for (bool terminal_constraint : {false, true}) {
     const std::string name =
         terminal_constraint ? "essential terminal row" : "essential mixed row";
-    const Solution reference =
-        SolveWithWorkspace(EssentialSingleRowProblem(terminal_constraint,
-                                                     Scalar{1}));
+    const Solution reference = SolveWithWorkspace(
+        EssentialSingleRowProblem(terminal_constraint, Scalar{1}));
     const Problem scaled_problem = EssentialSingleRowProblem(
         terminal_constraint, kEssentialConstraintScale);
     const Solution scaled = SolveWithWorkspace(scaled_problem);
@@ -1141,11 +1297,11 @@ void EssentialSingleRowsRemainActiveWhenScaled() {
     ExpectVectorNear(scaled.states[1], reference.states[1],
                      kScalingInvariantTolerance, name + " terminal state");
     if (terminal_constraint) {
-      ExpectNear(kEssentialConstraintScale *
-                     scaled.terminal_state_multiplier[0],
-                 reference.terminal_state_multiplier[0],
-                 Scalar{16} * kScalingInvariantTolerance,
-                 name + " multiplier pullback");
+      ExpectNear(
+          kEssentialConstraintScale * scaled.terminal_state_multiplier[0],
+          reference.terminal_state_multiplier[0],
+          Scalar{16} * kScalingInvariantTolerance,
+          name + " multiplier pullback");
     } else {
       ExpectNear(kEssentialConstraintScale * scaled.mixed_multipliers[0][0],
                  reference.mixed_multipliers[0][0],
@@ -1163,12 +1319,16 @@ int main() {
   UnconstrainedMatchesKkt();
   WorkspaceUnconstrainedMatchesKkt();
   ReusableFactorizationSolvesNewRightHandSides();
+  ReusableFactorizationHandlesChangingAndZeroDimensions();
   WorkspaceConstrainedMatchesKkt();
   MixedConstraintMatchesKkt();
   RankDeficientMixedConstraintMatchesKkt();
   StateConstraintMatchesKkt();
   GeneratedCasesMatchKkt();
   WrongInertiaReportedWithCandidate();
+  ReusablePivotedFactorMatchesOrdinarySolve();
+  ReusableFactorizationRejectsNonfiniteInputs();
+  MovedFromFactorizationIsSafe();
   SingularReducedHessianReported();
   InfeasibleConstraintDetected();
   IndependentlyRescaledConstraintsAreInvariant();

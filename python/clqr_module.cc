@@ -18,12 +18,15 @@ nb::object Get(nb::dict dict, const char* key, bool required = true) {
   PyObject* value = PyDict_GetItemString(dict.ptr(), key);
   if (value != nullptr) return nb::borrow<nb::object>(value);
   if (PyErr_Occurred()) nb::raise_python_error();
-  if (required) throw nb::key_error(("missing required key '" + std::string(key) + "'").c_str());
+  if (required)
+    throw nb::key_error(
+        ("missing required key '" + std::string(key) + "'").c_str());
   return nb::none();
 }
 
 void Set(nb::dict dict, const char* key, nb::handle value) {
-  if (PyDict_SetItemString(dict.ptr(), key, value.ptr()) != 0) nb::raise_python_error();
+  if (PyDict_SetItemString(dict.ptr(), key, value.ptr()) != 0)
+    nb::raise_python_error();
 }
 
 clqr::Vector ReadVector(nb::handle object, const char* name) {
@@ -31,7 +34,8 @@ clqr::Vector ReadVector(nb::handle object, const char* name) {
   try {
     array = nb::cast<Array1>(object);
   } catch (const std::exception& e) {
-    throw std::runtime_error("failed to read vector '" + std::string(name) + "': " + e.what());
+    throw std::runtime_error("failed to read vector '" + std::string(name) +
+                             "': " + e.what());
   }
   clqr::Vector out(static_cast<std::size_t>(array.shape(0)));
   const double* data = array.data();
@@ -44,7 +48,8 @@ clqr::Matrix ReadMatrix(nb::handle object, const char* name) {
   try {
     array = nb::cast<Array2>(object);
   } catch (const std::exception& e) {
-    throw std::runtime_error("failed to read matrix '" + std::string(name) + "': " + e.what());
+    throw std::runtime_error("failed to read matrix '" + std::string(name) +
+                             "': " + e.what());
   }
   clqr::Matrix out(static_cast<std::size_t>(array.shape(0)),
                    static_cast<std::size_t>(array.shape(1)));
@@ -57,14 +62,15 @@ clqr::Matrix ReadMatrix(nb::handle object, const char* name) {
   return out;
 }
 
-clqr::Matrix ReadOptionalMatrix(nb::dict dict, const char* key, std::size_t rows,
-                                std::size_t cols) {
+clqr::Matrix ReadOptionalMatrix(nb::dict dict, const char* key,
+                                std::size_t rows, std::size_t cols) {
   nb::object value = Get(dict, key, false);
   if (value.is_none()) return clqr::Matrix(rows, cols);
   return ReadMatrix(value, key);
 }
 
-clqr::Vector ReadOptionalVector(nb::dict dict, const char* key, std::size_t size) {
+clqr::Vector ReadOptionalVector(nb::dict dict, const char* key,
+                                std::size_t size) {
   nb::object value = Get(dict, key, false);
   if (value.is_none()) return clqr::Vector(size);
   return ReadVector(value, key);
@@ -75,7 +81,8 @@ clqr::Stage ReadStage(nb::handle object) {
   try {
     dict = nb::cast<nb::dict>(object);
   } catch (const std::exception& e) {
-    throw std::runtime_error("failed to read stage dict: " + std::string(e.what()));
+    throw std::runtime_error("failed to read stage dict: " +
+                             std::string(e.what()));
   }
   clqr::Stage stage;
   stage.A = ReadMatrix(Get(dict, "A"), "A");
@@ -171,7 +178,8 @@ clqr::SolveRhs ReadSolveRhs(nb::handle object) {
 auto VectorViewToNumpy(const clqr::VectorView& x) {
   double* data = new double[x.size];
   for (std::size_t i = 0; i < x.size; ++i) data[i] = x[i];
-  nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<double*>(p); });
+  nb::capsule owner(data,
+                    [](void* p) noexcept { delete[] static_cast<double*>(p); });
   return nb::ndarray<nb::numpy, double, nb::ndim<1>>(
       data, {static_cast<unsigned long>(x.size)}, owner);
 }
@@ -185,9 +193,11 @@ auto VectorToNumpy(const clqr::Vector& x) {
       data, {static_cast<unsigned long>(x.size())}, owner);
 }
 
-nb::list VectorViewListToPython(const clqr::VectorView* vectors, std::size_t count) {
+nb::list VectorViewListToPython(const clqr::VectorView* vectors,
+                                std::size_t count) {
   nb::list out;
-  for (std::size_t i = 0; i < count; ++i) out.append(VectorViewToNumpy(vectors[i]));
+  for (std::size_t i = 0; i < count; ++i)
+    out.append(VectorViewToNumpy(vectors[i]));
   return out;
 }
 
@@ -201,15 +211,12 @@ nb::dict SolutionToPython(const clqr::SolutionView& solution) {
       VectorViewListToPython(solution.states, solution.state_count);
   nb::list controls =
       VectorViewListToPython(solution.controls, solution.control_count);
-  nb::list dynamics_multipliers =
-      VectorViewListToPython(solution.dynamics_multipliers,
-                             solution.dynamics_multiplier_count);
-  nb::list mixed_multipliers =
-      VectorViewListToPython(solution.mixed_multipliers,
-                             solution.mixed_multiplier_count);
-  nb::list state_multipliers =
-      VectorViewListToPython(solution.state_multipliers,
-                             solution.state_multiplier_count);
+  nb::list dynamics_multipliers = VectorViewListToPython(
+      solution.dynamics_multipliers, solution.dynamics_multiplier_count);
+  nb::list mixed_multipliers = VectorViewListToPython(
+      solution.mixed_multipliers, solution.mixed_multiplier_count);
+  nb::list state_multipliers = VectorViewListToPython(
+      solution.state_multipliers, solution.state_multiplier_count);
   Set(result, "status", status);
   Set(result, "message", message);
   result[nb::str("newton_kkt_singular")] =
@@ -247,7 +254,8 @@ nb::dict Solve(nb::object problem_object,
     step = "build result";
     return SolutionToPython(solution);
   } catch (const std::exception& e) {
-    throw std::runtime_error("clqr.solve failed during " + step + ": " + e.what());
+    throw std::runtime_error("clqr.solve failed during " + step + ": " +
+                             e.what());
   }
 }
 
@@ -257,7 +265,10 @@ struct PythonFactorization {
     options.tolerance = tolerance;
     factorization = clqr::Factor(problem, options);
     if (factorization.status() != clqr::SolveStatus::kOptimal) {
-      throw std::invalid_argument(factorization.message());
+      if (factorization.status() == clqr::SolveStatus::kInvalidInput) {
+        throw std::invalid_argument(factorization.message());
+      }
+      throw std::runtime_error(factorization.message());
     }
     workspace.Reserve(factorization);
   }
@@ -306,9 +317,7 @@ NB_MODULE(_clqr, module) {
 
   nb::class_<clqr::SolveRhs>(module, "Rhs")
       .def_prop_ro("stage_count",
-                   [](const clqr::SolveRhs& rhs) {
-                     return rhs.stages.size();
-                   })
+                   [](const clqr::SolveRhs& rhs) { return rhs.stages.size(); })
       .def(
           "stage",
           [](clqr::SolveRhs& rhs, std::size_t index) -> clqr::StageRhs& {
@@ -345,13 +354,13 @@ NB_MODULE(_clqr, module) {
 
   nb::class_<PythonFactorization>(module, "Factorization")
       .def("solve", &PythonFactorization::Solve, nb::arg("rhs"))
-      .def_prop_ro("stage_count", [](const PythonFactorization& factors) {
-        return factors.factorization.stage_count();
-      })
-      .def_prop_ro("workspace_bytes",
+      .def_prop_ro("stage_count",
                    [](const PythonFactorization& factors) {
-                     return factors.factorization.RequiredSolveBytes();
-                   });
+                     return factors.factorization.stage_count();
+                   })
+      .def_prop_ro("workspace_bytes", [](const PythonFactorization& factors) {
+        return factors.factorization.RequiredSolveBytes();
+      });
 
   module.def("rhs", &ReadSolveRhs, nb::arg("problem_or_rhs"));
   module.def(
@@ -359,7 +368,6 @@ NB_MODULE(_clqr, module) {
       [](nb::object problem, clqr::Scalar tolerance) {
         return new PythonFactorization(ReadProblem(problem), tolerance);
       },
-      nb::arg("problem"),
-      nb::arg("tolerance") = clqr::SolveOptions{}.tolerance,
+      nb::arg("problem"), nb::arg("tolerance") = clqr::SolveOptions{}.tolerance,
       nb::rv_policy::take_ownership);
 }

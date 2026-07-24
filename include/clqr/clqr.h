@@ -202,6 +202,8 @@ class Workspace {
     bytes = AddAligned(bytes, alignof(Scalar),
                        sizeof(Scalar) * max_control * max_state);
     bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * max_control);
+    bytes = AddAligned(bytes, alignof(std::size_t),
+                       sizeof(std::size_t) * max_control);
 
     bytes = AddAligned(bytes, alignof(VectorView),
                        sizeof(VectorView) * (stages + 1));
@@ -225,8 +227,7 @@ class Workspace {
       std::size_t terminal_constraints = 0) {
     const std::size_t largest_dimension =
         Max(Max(state_dim, control_dim),
-            Max(Max(mixed_constraints_per_stage,
-                    state_constraints_per_stage),
+            Max(Max(mixed_constraints_per_stage, state_constraints_per_stage),
                 terminal_constraints));
     if (!WorkspaceBoundInputsSafe(stages, largest_dimension))
       return std::numeric_limits<std::size_t>::max();
@@ -261,8 +262,8 @@ class Workspace {
     const std::size_t state_stage_scalars =
         2 * state_rows_bound * (state_dim + 1 + state_rows_bound) +
         state_dim * state_dim + state_dim + state_dim * state_rows_bound +
-        3 * state_dim * state_dim + 3 * state_dim * control_dim + 4 * state_dim +
-        8 * state_dim * state_dim +
+        3 * state_dim * state_dim + 3 * state_dim * control_dim +
+        4 * state_dim + 8 * state_dim * state_dim +
         4 * state_dim * control_dim + 2 * control_dim * state_dim +
         4 * state_dim + 2 * control_dim +
         (state_pivot_bound + mixed_constraints_per_stage) *
@@ -340,32 +341,31 @@ class Workspace {
                        sizeof(Scalar) * total_state_multiplier_scalars);
     bytes = AddAligned(bytes, alignof(Scalar),
                        sizeof(Scalar) * terminal_constraints);
-    bytes = AddAligned(bytes, alignof(Vector),
-                       sizeof(Vector) * (2 * stages + 1));
-    bytes = AddAligned(bytes, alignof(Scalar),
-                       sizeof(Scalar) *
-                           (total_dynamics_scalars + total_state_scalars +
-                            stages * pullback_stage_scalars +
-                            4 * state_dim *
-                                (state_dim + terminal_constraints + 1)));
+    bytes =
+        AddAligned(bytes, alignof(Vector), sizeof(Vector) * (2 * stages + 1));
+    bytes = AddAligned(
+        bytes, alignof(Scalar),
+        sizeof(Scalar) *
+            (total_dynamics_scalars + total_state_scalars +
+             stages * pullback_stage_scalars +
+             4 * state_dim * (state_dim + terminal_constraints + 1)));
     if (stages == 0) {
       // Match the runtime constrained-workspace bound for the terminal-only
       // recovery path.  With no stage-proportional scratch, its dense affine
       // products and rectangular multiplier RREF coexist in the arena.
-      const std::size_t local_dimension =
-          state_dim + terminal_constraints + 1;
-      bytes = AddAligned(
-          bytes, alignof(Scalar),
-          sizeof(Scalar) * 8 * local_dimension * local_dimension);
+      const std::size_t local_dimension = state_dim + terminal_constraints + 1;
+      bytes =
+          AddAligned(bytes, alignof(Scalar),
+                     sizeof(Scalar) * 8 * local_dimension * local_dimension);
     }
-    bytes = AddAligned(bytes, alignof(Vector),
-                       sizeof(Vector) * (5 * stages + 1));
-    bytes = AddAligned(bytes, alignof(Scalar),
-                       sizeof(Scalar) *
-                           (total_state_scalars + total_control_scalars +
-                            total_dynamics_scalars + total_mixed_scalars +
-                            total_state_multiplier_scalars +
-                            terminal_constraints + state_dim));
+    bytes =
+        AddAligned(bytes, alignof(Vector), sizeof(Vector) * (5 * stages + 1));
+    bytes = AddAligned(
+        bytes, alignof(Scalar),
+        sizeof(Scalar) * (total_state_scalars + total_control_scalars +
+                          total_dynamics_scalars + total_mixed_scalars +
+                          total_state_multiplier_scalars +
+                          terminal_constraints + state_dim));
     return bytes;
   }
 
@@ -382,11 +382,11 @@ class Workspace {
 
  private:
   const char* StoreMessage(const char* message);
+  const char* StoreDiagnostic(const char* diagnostic);
 
   static constexpr std::size_t Align(std::size_t offset,
                                      std::size_t alignment) {
-    if (offset >
-        std::numeric_limits<std::size_t>::max() - (alignment - 1))
+    if (offset > std::numeric_limits<std::size_t>::max() - (alignment - 1))
       return std::numeric_limits<std::size_t>::max();
     return (offset + alignment - 1) & ~(alignment - 1);
   }
@@ -425,6 +425,7 @@ class Workspace {
   std::size_t size_ = 0;
   WorkspaceArena arena_;
   std::array<char, 128> message_{};
+  std::array<char, 256> diagnostic_{};
 
   friend SolutionView Solve(const Problem&, Workspace&, const SolveOptions&);
   friend SolutionView Solve(const Factorization&, const SolveRhs&, Workspace&);
