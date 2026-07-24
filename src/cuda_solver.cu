@@ -32,6 +32,7 @@ constexpr Scalar kMinimumFeasibilityConsistencyTolerance = 1e-4f;
 constexpr Scalar kMinimumMultiplierRankTolerance = 1e-4f;
 constexpr Scalar kMultiplierConsistencyTolerancePerTreeLevel = 2e-2f;
 constexpr Scalar kMinimumDualRelationRowScale = 1e-6f;
+constexpr Scalar kMaximumRefinedKktResidual = 3e-2f;
 #else
 constexpr Scalar kMinimumFeasibilityConsistencyTolerance = Scalar{0};
 constexpr Scalar kMinimumMultiplierRankTolerance = 1e-7;
@@ -40,9 +41,29 @@ constexpr Scalar kMinimumDualRelationRowScale = 1e-14;
 #endif
 constexpr Scalar kScalarMax = std::numeric_limits<Scalar>::max();
 
+#ifdef CLQR_CUDA_EMULATION
+// White-box instrumentation: every nontrivial matrix-value composition shares
+// one pivoted LU factorization across all of its matrix right-hand sides.
+int g_value_matrix_combinations = 0;
+int g_value_matrix_factorizations = 0;
+#endif
+
 __host__ __device__ constexpr std::size_t AlignUp(std::size_t value,
                                                   std::size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
+}
+
+constexpr std::size_t kSharedVectorAccessBytes = 16;
+static_assert(kSharedVectorAccessBytes % sizeof(Scalar) == 0);
+
+// NVCC may combine adjacent shared-memory scalar accesses into one maximum-
+// width scalar-vector instruction. Pad runtime-sized vectors to that exact
+// instruction width so the physical access footprint remains in bounds.
+__host__ __device__ constexpr std::size_t
+SharedScalarEntries(std::size_t entries) {
+  constexpr std::size_t transaction_entries =
+      kSharedVectorAccessBytes / sizeof(Scalar);
+  return AlignUp(entries, transaction_entries);
 }
 
 struct ScratchSize {
@@ -62,6 +83,13 @@ struct ScratchSize {
     bytes += count * sizeof(T);
   }
 };
+
+__host__ __device__ std::size_t
+AffineTermsScratchBytes(std::size_t entries) {
+  ScratchSize scratch_size;
+  scratch_size.Add<Scalar>(SharedScalarEntries(entries));
+  return scratch_size.bytes;
+}
 
 __host__ __device__ std::size_t
 DualRelationLeafScratchBytes(std::size_t matrix_entries, std::size_t rows,
@@ -255,7 +283,7 @@ std::size_t RelationFinalizeScratchBytes(const ScanShape &left,
 std::size_t ValueComposeScratchBytes(const ScanShape &first,
                                      const char *description) {
   const std::size_t columns = ScratchCheckedSum(
-      {ScratchCheckedProduct(2, first.right, description), first.left, 1},
+      {ScratchCheckedProduct(2, first.right, description), first.left},
       description);
   return GeneralSolveScratchBytes(first.right, columns, description);
 }
@@ -268,7 +296,7 @@ std::size_t ValueFinalizeScratchBytes(const ScanShape &left,
   std::size_t shared_capacity = left.right;
   std::size_t columns_capacity = ScratchCheckedSum(
       {ScratchCheckedProduct(2, left.right, "value-scan final workspace"),
-       left.left, 1},
+       left.left},
       "value-scan final workspace");
   if (right != nullptr) {
     left_capacity = std::max(left_capacity, right->left);
@@ -283,16 +311,14 @@ std::size_t ValueFinalizeScratchBytes(const ScanShape &left,
         columns_capacity,
         ScratchCheckedSum({ScratchCheckedProduct(2, child.right,
                                                  "value-scan final workspace"),
-                           child.left, 1},
+                           child.left},
                           "value-scan final workspace"));
   }
   const std::size_t composed_entries =
       ScratchCheckedSum({ScratchCheckedProduct(right_capacity, left_capacity,
                                                "value-scan final workspace"),
-                         right_capacity,
                          ScratchCheckedProduct(right_capacity, right_capacity,
                                                "value-scan final workspace"),
-                         left_capacity,
                          ScratchCheckedProduct(left_capacity, left_capacity,
                                                "value-scan final workspace")},
                         "value-scan final workspace");
@@ -367,6 +393,7 @@ struct ScratchRequirements {
   std::size_t value_compose = 0;
   std::size_t value_finalize = 0;
   std::size_t feedback = 0;
+  std::size_t affine_terms = 0;
   std::size_t affine_finalize = 0;
   std::size_t dual_parameter = 0;
   std::size_t dual_relation_leaf = 0;
@@ -377,9 +404,9 @@ struct ScratchRequirements {
   std::size_t Maximum() const {
     return std::max({primal_leaf, primal_relation, primal_relation_final,
                      state_parameter, stage_reduction, value_leaf,
-                     value_compose, value_finalize, feedback, affine_finalize,
-                     dual_parameter, dual_relation_leaf, dual_relation,
-                     dual_root, dual_expand});
+                     value_compose, value_finalize, feedback, affine_terms,
+                     affine_finalize, dual_parameter, dual_relation_leaf,
+                     dual_relation, dual_root, dual_expand});
   }
 };
 
@@ -422,16 +449,16 @@ ScratchRequirements PlanScratch(const Problem &problem) {
     ScratchSize value_leaf;
     value_leaf.Add<Scalar>(ScratchCheckedProduct(m, m, "value-leaf workspace"));
     value_leaf.Add<Scalar>(ScratchCheckedProduct(
-        m, ScratchCheckedSum({n, next, 1}, "value-leaf workspace"),
+        m, ScratchCheckedSum({n, next}, "value-leaf workspace"),
         "value-leaf workspace"));
     result.value_leaf = std::max(result.value_leaf, value_leaf.bytes);
     ScratchSize feedback;
     feedback.Add<Scalar>(ScratchCheckedProduct(
-        m, ScratchCheckedSum({m, n, 1}, "feedback workspace"),
+        m, ScratchCheckedSum({m, n}, "feedback workspace"),
         "feedback workspace"));
-    feedback.Add<Scalar>(
-        ScratchCheckedProduct(m, m, "feedback workspace"));
     result.feedback = std::max(result.feedback, feedback.bytes);
+    result.affine_terms =
+        std::max(result.affine_terms, AffineTermsScratchBytes(next));
 
     ScratchSize dual_parameter;
     const std::size_t dual_rows =
@@ -549,18 +576,26 @@ ScratchRequirements PlanScratch(const Problem &problem) {
   }
 
   if (stage_count > 1) {
-    const ScanPlan affine_tree = BuildScanPlan(affine_leaves);
-    const auto &parents = affine_tree.prefix_contexts[1];
-    for (std::size_t parent = 0; parent < parents.size(); ++parent) {
-      const std::size_t child = 2 * parent;
-      const ScanShape *right = child + 1 < affine_leaves.size()
-                                   ? &affine_leaves[child + 1]
-                                   : nullptr;
-      result.affine_finalize =
-          std::max(result.affine_finalize,
-                   AffineFinalizeScratchBytes(affine_leaves[child], right,
-                                              parents[parent]));
+    const auto include_affine_scan = [&](const std::vector<ScanShape> &leaves) {
+      const ScanPlan tree = BuildScanPlan(leaves);
+      const auto &parents = tree.prefix_contexts[1];
+      for (std::size_t parent = 0; parent < parents.size(); ++parent) {
+        const std::size_t child = 2 * parent;
+        const ScanShape *right =
+            child + 1 < leaves.size() ? &leaves[child + 1] : nullptr;
+        result.affine_finalize = std::max(
+            result.affine_finalize,
+            AffineFinalizeScratchBytes(leaves[child], right, parents[parent]));
+      }
+    };
+    include_affine_scan(affine_leaves);
+    std::vector<ScanShape> costate_leaves(stage_count);
+    for (std::size_t leaf = 0; leaf < stage_count; ++leaf) {
+      const std::size_t stage = stage_count - 1 - leaf;
+      costate_leaves[leaf] =
+          MakeScanShape(state_bounds[stage + 1], state_bounds[stage]);
     }
+    include_affine_scan(costate_leaves);
   }
 
   if (stage_count > 0) {
@@ -797,10 +832,8 @@ __device__ void SolvePositiveDefiniteMultipleRhsBlock(
 __device__ void BindValueElementScratch(ValueElement *element, Scalar *storage,
                                         int left_capacity, int right_capacity) {
   element->A = storage;
-  element->b = element->A + right_capacity * left_capacity;
-  element->C = element->b + right_capacity;
-  element->eta = element->C + right_capacity * right_capacity;
-  element->J = element->eta + left_capacity;
+  element->C = element->A + right_capacity * left_capacity;
+  element->J = element->C + right_capacity * right_capacity;
 }
 
 __device__ void BindAffineMapScratch(AffineMap *map, Scalar *storage,
@@ -845,8 +878,7 @@ __global__ void CheckFiniteInputsKernel(const Scalar *problem_data,
                                         std::size_t initial_entries,
                                         DeviceStatus *status) {
   const std::size_t total_entries = problem_entries + initial_entries;
-  const std::size_t stride =
-      static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t index =
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        index < total_entries; index += stride) {
@@ -1185,8 +1217,7 @@ __device__ void OrthogonalEchelonBlock(Scalar *matrix, int rows, int columns,
     for (int upper = 0; upper < row; ++upper) {
       const Scalar factor = matrix[upper * columns + row];
       for (int col = row + threadIdx.x; col < columns; col += blockDim.x)
-        matrix[upper * columns + col] -=
-            factor * matrix[row * columns + col];
+        matrix[upper * columns + col] -= factor * matrix[row * columns + col];
     }
     WarpSynchronize();
   }
@@ -2226,8 +2257,36 @@ __global__ void ExpandValueContextLevelKernel(ValueElement *, int, int, int,
 __global__ void FinalizeValueSuffixFromParentsKernel(ValueElement *, int,
                                                      const ValueElement *, int,
                                                      Scalar, DeviceStatus *);
-__global__ void FeedbackKernel(const ReducedStage *, const ValueElement *, int,
-                               Scalar, Feedback *, DeviceStatus *);
+__global__ void MatrixFeedbackKernel(const ReducedStage *, const ValueElement *,
+                                     int, Scalar, Feedback *, DeviceStatus *);
+__global__ void InitializeCostateMapsKernel(const ReducedStage *,
+                                            const ValueElement *,
+                                            const Feedback *, int, AffineMap *,
+                                            DeviceStatus *);
+__global__ void RecoverCostatesKernel(const AffineMap *,
+                                      const ReducedTerminal *, const int *, int,
+                                      Scalar *, DeviceStatus *);
+#ifdef CLQR_USE_FLOAT
+__global__ void
+InitializeCostateRefinementMapsKernel(const ReducedStage *, const Scalar *,
+                                      const Scalar *, const int *, const int *,
+                                      int, AffineMap *, DeviceStatus *);
+__global__ void InitializeTerminalCostateKernel(const ReducedTerminal *,
+                                                const Scalar *, const int *,
+                                                int, Scalar *, DeviceStatus *);
+__global__ void RecoverCostatesFromTerminalKernel(const AffineMap *,
+                                                  const Scalar *, const int *,
+                                                  int, Scalar *,
+                                                  DeviceStatus *);
+__global__ void ConvertCostatesToValueLinearKernel(const ValueElement *,
+                                                   const Scalar *, const int *,
+                                                   int, Scalar *,
+                                                   DeviceStatus *);
+#endif
+__global__ void FinalizeFeedbackKernel(const ReducedStage *,
+                                       const ValueElement *, const Scalar *,
+                                       const int *, int, Feedback *,
+                                       DeviceStatus *);
 __global__ void InitializeAffineMapsKernel(const Feedback *, int, AffineMap *,
                                            DeviceStatus *);
 __global__ void ReduceAffineLeavesKernel(const AffineMap *, int, int,
@@ -2246,13 +2305,12 @@ __global__ void ReconstructPrimalKernel(const AffineMap *, const StateParam *,
                                         const int *, const int *, int, Scalar *,
                                         Scalar *, Scalar *, Scalar *,
                                         DeviceStatus *);
-__global__ void BuildDualParametersKernel(const PackedStage *,
-                                          const StateParam *,
-                                          const ValueElement *, const Scalar *,
-                                          const Scalar *, const Scalar *,
-                                          const int *, const int *, const int *,
-                                          int, Scalar, Scalar, DualParam *,
-                                          int *, int *, DeviceStatus *);
+__global__ void
+BuildDualParametersKernel(const PackedStage *, const StateParam *,
+                          const ValueElement *, const Scalar *, const Scalar *,
+                          const Scalar *, const Scalar *, const int *,
+                          const int *, const int *, int, Scalar, Scalar,
+                          DualParam *, int *, int *, DeviceStatus *);
 __global__ void BuildDualParameterRelationsKernel(
     const PackedStage *, const PackedTerminal *, const DualParam *, int,
     const Scalar *, const Scalar *, const int *, const int *, Scalar, Scalar,
@@ -2277,9 +2335,11 @@ __global__ void ExpandDualTreeLevelKernel(const DualRelation *, int, int, int,
                                           const DualNodeValue *,
                                           DualNodeValue *, const int *,
                                           DeviceStatus *);
-__global__ void BuildObjectiveTermsKernel(
-    const PackedStage *, int, const PackedTerminal *, const Scalar *,
-    const Scalar *, const int *, const int *, Scalar *, DeviceStatus *);
+__global__ void BuildObjectiveTermsKernel(const PackedStage *, int,
+                                          const PackedTerminal *,
+                                          const Scalar *, const Scalar *,
+                                          const int *, const int *, Scalar *,
+                                          DeviceStatus *);
 __global__ void ReduceObjectiveTreeLevelKernel(Scalar *, int, int, int,
                                                DeviceStatus *);
 void CudaCheck(cudaError_t error, const char *operation) {
@@ -2535,6 +2595,7 @@ struct WorkspaceStorage {
   DeviceBuffer<AffineMap> map_scan;
   DeviceBuffer<Scalar> map_data;
   DeviceBuffer<Scalar> reduced_states;
+  DeviceBuffer<Scalar> reduced_value_linear;
   DeviceBuffer<Scalar> reduced_controls;
   DeviceBuffer<Scalar> states;
   DeviceBuffer<Scalar> controls;
@@ -2696,13 +2757,11 @@ struct WorkspaceStorage {
     arena->AddTightlyPacked(&host_initial, initial_state_dimension);
     arena->AddTightlyPacked(&host_states, state_entries);
     arena->AddTightlyPacked(&host_controls, control_entries);
-    arena->AddTightlyPacked(&host_initial_multiplier,
-                            initial_state_dimension);
+    arena->AddTightlyPacked(&host_initial_multiplier, initial_state_dimension);
     arena->AddTightlyPacked(&host_dynamics,
                             state_entries - initial_state_dimension);
     arena->AddTightlyPacked(&host_mixed, mixed_entries);
-    arena->AddTightlyPacked(&host_state_multipliers,
-                            state_constraint_entries);
+    arena->AddTightlyPacked(&host_state_multipliers, state_constraint_entries);
     arena->AddTightlyPacked(&host_terminal_multiplier,
                             terminal_constraint_dimension);
     arena->Add(&host_objective, 1);
@@ -2798,24 +2857,20 @@ struct WorkspaceStorage {
       throw std::logic_error("internal CUDA pinned-arena layout mismatch");
 
     const auto verify_tight_span =
-        [](const Scalar *first, const Scalar *last,
-           std::size_t last_entries, std::size_t total_entries,
-           const char *description) {
-          const std::uintptr_t begin =
-              reinterpret_cast<std::uintptr_t>(first);
-          const std::uintptr_t end =
-              reinterpret_cast<std::uintptr_t>(last) +
-              last_entries * sizeof(Scalar);
-          if (end < begin ||
-              end - begin != total_entries * sizeof(Scalar)) {
+        [](const Scalar *first, const Scalar *last, std::size_t last_entries,
+           std::size_t total_entries, const char *description) {
+          const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(first);
+          const std::uintptr_t end = reinterpret_cast<std::uintptr_t>(last) +
+                                     last_entries * sizeof(Scalar);
+          if (end < begin || end - begin != total_entries * sizeof(Scalar)) {
             throw std::logic_error(std::string("internal ") + description +
                                    " layout mismatch");
           }
         };
-    const std::size_t input_entries = ScratchCheckedSum(
-        {problem_data_entries,
-         static_cast<std::size_t>(initial_state_dimension)},
-        "CUDA compact input");
+    const std::size_t input_entries =
+        ScratchCheckedSum({problem_data_entries,
+                           static_cast<std::size_t>(initial_state_dimension)},
+                          "CUDA compact input");
     verify_tight_span(device_problem_data.get(), device_initial.get(),
                       initial_state_dimension, input_entries,
                       "CUDA device-arena input");
@@ -3049,8 +3104,8 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
         static_cast<std::size_t>(std::numeric_limits<int>::max());
     RequireAtStage(n <= kMaxIndex && next <= kMaxIndex,
                    "state dimension exceeds CUDA index range", i);
-    RequireAtStage(m <= kMaxIndex,
-                   "control dimension exceeds CUDA index range", i);
+    RequireAtStage(m <= kMaxIndex, "control dimension exceeds CUDA index range",
+                   i);
     RequireAtStage(s.C.rows() <= kMaxIndex,
                    "mixed constraint count exceeds CUDA index range", i);
     RequireAtStage(s.E.rows() <= kMaxIndex,
@@ -3071,9 +3126,9 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
           [&](std::initializer_list<std::size_t> terms,
               const char *description) {
             if (CheckedSum(terms, description) > kMaxIndex) {
-              throw std::invalid_argument(std::string(description) +
-                                          " exceeds CUDA index range at stage " +
-                                          std::to_string(i));
+              throw std::invalid_argument(
+                  std::string(description) +
+                  " exceeds CUDA index range at stage " + std::to_string(i));
             }
           };
       require_index_sum({next, mixed}, "dual dimension");
@@ -3100,14 +3155,13 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
     const std::size_t expected_next = i + 1 == count
                                           ? problem.terminal_Q.rows()
                                           : problem.stages[i + 1].A.cols();
-    RequireAtStage(next == expected_next,
-                   "neighboring state dimensions differ", i);
+    RequireAtStage(next == expected_next, "neighboring state dimensions differ",
+                   i);
     if (validate_values) {
-      RequireAtStage(Finite(s.A) && Finite(s.B) && Finite(s.c) &&
-                         Finite(s.Q) && Finite(s.R) && Finite(s.M) &&
-                         Finite(s.q) && Finite(s.r) && Finite(s.C) &&
-                         Finite(s.D) && Finite(s.d) && Finite(s.E) &&
-                         Finite(s.e),
+      RequireAtStage(Finite(s.A) && Finite(s.B) && Finite(s.c) && Finite(s.Q) &&
+                         Finite(s.R) && Finite(s.M) && Finite(s.q) &&
+                         Finite(s.r) && Finite(s.C) && Finite(s.D) &&
+                         Finite(s.d) && Finite(s.E) && Finite(s.e),
                      "problem contains a non-finite value", i);
     }
   }
@@ -3248,7 +3302,7 @@ bool PackProblemData(const Problem &problem, WorkspaceStorage *workspace,
     return false;
   }
   Require(host_cursor == workspace->host_problem_data.data() +
-                                 workspace->host_problem_data.size(),
+                             workspace->host_problem_data.size(),
           "internal CUDA problem-packing size mismatch");
   if (bind_metadata) {
     Require(device_cursor == workspace->device_problem_data.get() +
@@ -3287,6 +3341,9 @@ std::string DeviceFailureMessage(const DeviceStatus &status) {
   } else if (status.detail == 20) {
     out << "CUDA conditional-value scan encountered a singular or "
            "incompatible interval composition";
+  } else if (status.detail == 25) {
+    out << "CUDA FP32 affine refinement failed its final KKT consistency "
+           "check";
   } else {
     out << "CUDA backend encountered a rank or consistency failure";
   }
@@ -3433,6 +3490,7 @@ void PrepareStageStorage(const Problem &problem, WorkspaceStorage *workspace) {
     scalars(m); // ReducedStage.
     scalars(rectangle(m, n));
     scalars(m);
+    scalars(square(m));
     scalars(rectangle(next, n));
     scalars(next); // Feedback.
     indices(dual); // DualParam free columns.
@@ -3508,6 +3566,7 @@ void PrepareStageStorage(const Problem &problem, WorkspaceStorage *workspace) {
     feedback = {};
     feedback.K = TakeStorage(&scalar_cursor, rectangle(m, n));
     feedback.k = TakeStorage(&scalar_cursor, m);
+    feedback.control_factor = TakeStorage(&scalar_cursor, square(m));
     feedback.transition = TakeStorage(&scalar_cursor, rectangle(next, n));
     feedback.offset = TakeStorage(&scalar_cursor, next);
 
@@ -3635,26 +3694,156 @@ void PrepareOutputViews(const Problem &problem, WorkspaceStorage *workspace) {
       problem.terminal_Q.rows()};
 }
 
+#ifdef CLQR_USE_FLOAT
+double MaximumRefinedKktResidual(const Problem &problem,
+                                 const WorkspaceStorage &workspace) {
+  double maximum = 0.0;
+  const auto include = [&](double residual) {
+    if (!std::isfinite(residual)) {
+      maximum = std::numeric_limits<double>::infinity();
+    } else {
+      maximum = std::max(maximum, std::abs(residual));
+    }
+  };
+  const auto include_scaled = [&](double residual, double scale) {
+    include(residual / std::max(1.0, scale));
+  };
+  const std::size_t stage_count = problem.stages.size();
+  const VectorView initial_multiplier{workspace.host_initial_multiplier.data(),
+                                      problem.initial_state.size()};
+  for (std::size_t row = 0; row < problem.initial_state.size(); ++row) {
+    include(workspace.state_views[0][row] - problem.initial_state[row]);
+  }
+  for (std::size_t index = 0; index < stage_count; ++index) {
+    const Stage &stage = problem.stages[index];
+    const VectorView state = workspace.state_views[index];
+    const VectorView next_state = workspace.state_views[index + 1];
+    const VectorView control = workspace.control_views[index];
+    const VectorView dynamics = workspace.dynamics_views[index];
+    const VectorView mixed = workspace.mixed_views[index];
+    const VectorView state_multiplier = workspace.state_multiplier_views[index];
+    const VectorView previous_dynamics =
+        index == 0 ? initial_multiplier : workspace.dynamics_views[index - 1];
+
+    for (std::size_t row = 0; row < stage.A.rows(); ++row) {
+      double residual = next_state[row] - stage.c[row];
+      for (std::size_t col = 0; col < stage.A.cols(); ++col)
+        residual -= static_cast<double>(stage.A(row, col)) * state[col];
+      for (std::size_t col = 0; col < stage.B.cols(); ++col)
+        residual -= static_cast<double>(stage.B(row, col)) * control[col];
+      include(residual);
+    }
+    for (std::size_t row = 0; row < stage.C.rows(); ++row) {
+      double residual = stage.d[row];
+      double scale = std::abs(static_cast<double>(stage.d[row]));
+      for (std::size_t col = 0; col < stage.C.cols(); ++col) {
+        residual += static_cast<double>(stage.C(row, col)) * state[col];
+        scale =
+            std::max(scale, std::abs(static_cast<double>(stage.C(row, col))));
+      }
+      for (std::size_t col = 0; col < stage.D.cols(); ++col) {
+        residual += static_cast<double>(stage.D(row, col)) * control[col];
+        scale =
+            std::max(scale, std::abs(static_cast<double>(stage.D(row, col))));
+      }
+      include_scaled(residual, scale);
+    }
+    for (std::size_t row = 0; row < stage.E.rows(); ++row) {
+      double residual = stage.e[row];
+      double scale = std::abs(static_cast<double>(stage.e[row]));
+      for (std::size_t col = 0; col < stage.E.cols(); ++col) {
+        residual += static_cast<double>(stage.E(row, col)) * state[col];
+        scale =
+            std::max(scale, std::abs(static_cast<double>(stage.E(row, col))));
+      }
+      include_scaled(residual, scale);
+    }
+
+    for (std::size_t row = 0; row < stage.Q.rows(); ++row) {
+      double residual = stage.q[row] + previous_dynamics[row];
+      for (std::size_t col = 0; col < stage.Q.cols(); ++col)
+        residual += static_cast<double>(stage.Q(row, col)) * state[col];
+      for (std::size_t col = 0; col < stage.M.cols(); ++col)
+        residual += static_cast<double>(stage.M(row, col)) * control[col];
+      for (std::size_t col = 0; col < stage.A.rows(); ++col)
+        residual -= static_cast<double>(stage.A(col, row)) * dynamics[col];
+      for (std::size_t constraint = 0; constraint < stage.C.rows();
+           ++constraint) {
+        residual +=
+            static_cast<double>(stage.C(constraint, row)) * mixed[constraint];
+      }
+      for (std::size_t constraint = 0; constraint < stage.E.rows();
+           ++constraint) {
+        residual += static_cast<double>(stage.E(constraint, row)) *
+                    state_multiplier[constraint];
+      }
+      include(residual);
+    }
+    for (std::size_t row = 0; row < stage.R.rows(); ++row) {
+      double residual = stage.r[row];
+      for (std::size_t col = 0; col < stage.M.rows(); ++col)
+        residual += static_cast<double>(stage.M(col, row)) * state[col];
+      for (std::size_t col = 0; col < stage.R.cols(); ++col)
+        residual += static_cast<double>(stage.R(row, col)) * control[col];
+      for (std::size_t col = 0; col < stage.B.rows(); ++col)
+        residual -= static_cast<double>(stage.B(col, row)) * dynamics[col];
+      for (std::size_t constraint = 0; constraint < stage.D.rows();
+           ++constraint) {
+        residual +=
+            static_cast<double>(stage.D(constraint, row)) * mixed[constraint];
+      }
+      include(residual);
+    }
+  }
+
+  const VectorView terminal_state = workspace.state_views[stage_count];
+  const VectorView terminal_dynamics =
+      stage_count == 0 ? initial_multiplier
+                       : workspace.dynamics_views[stage_count - 1];
+  const VectorView terminal_multiplier{
+      workspace.host_terminal_multiplier.data(), problem.terminal_E.rows()};
+  for (std::size_t row = 0; row < problem.terminal_E.rows(); ++row) {
+    double residual = problem.terminal_e[row];
+    double scale = std::abs(static_cast<double>(problem.terminal_e[row]));
+    for (std::size_t col = 0; col < problem.terminal_E.cols(); ++col) {
+      residual += static_cast<double>(problem.terminal_E(row, col)) *
+                  terminal_state[col];
+      scale = std::max(
+          scale, std::abs(static_cast<double>(problem.terminal_E(row, col))));
+    }
+    include_scaled(residual, scale);
+  }
+  for (std::size_t row = 0; row < problem.terminal_Q.rows(); ++row) {
+    double residual = problem.terminal_q[row] + terminal_dynamics[row];
+    for (std::size_t col = 0; col < problem.terminal_Q.cols(); ++col) {
+      residual += static_cast<double>(problem.terminal_Q(row, col)) *
+                  terminal_state[col];
+    }
+    for (std::size_t constraint = 0; constraint < problem.terminal_E.rows();
+         ++constraint) {
+      residual += static_cast<double>(problem.terminal_E(constraint, row)) *
+                  terminal_multiplier[constraint];
+    }
+    include(residual);
+  }
+  return maximum;
+}
+#endif
+
 struct ValueCapacity {
   std::size_t a = 0;
-  std::size_t b = 0;
   std::size_t c = 0;
-  std::size_t eta = 0;
   std::size_t j = 0;
 
   void Include(const ScanShape &shape) {
     if (!shape.valid)
       return;
     a = std::max(a, CheckedProduct(shape.right, shape.left, "value layout"));
-    b = std::max(b, shape.right);
     c = std::max(c, CheckedProduct(shape.right, shape.right, "value layout"));
-    eta = std::max(eta, shape.left);
     j = std::max(j, CheckedProduct(shape.left, shape.left, "value layout"));
   }
 
-  std::size_t Entries() const {
-    return CheckedSum({a, b, c, eta, j}, "value layout");
-  }
+  std::size_t Entries() const { return CheckedSum({a, c, j}, "value layout"); }
 };
 
 struct RelationCapacity {
@@ -3744,18 +3933,63 @@ void PlanSuffixScanStorage(const std::vector<ScanShape> &leaves,
   }
 }
 
+template <typename Capacity>
+void IncludePrefixScanStorage(const std::vector<ScanShape> &leaves,
+                              const std::vector<int> &level_offsets,
+                              std::vector<Capacity> *leaf_capacity,
+                              std::vector<Capacity> *internal_capacity) {
+  const int leaf_count = static_cast<int>(leaves.size());
+  if (leaf_count == 0) {
+    leaf_capacity->clear();
+    internal_capacity->clear();
+    return;
+  }
+  const ScanPlan tree = BuildScanPlan(leaves);
+  const int internal_count = level_offsets.back() +
+                             static_cast<int>(tree.reductions.back().size()) -
+                             leaf_count;
+  if (leaf_capacity->empty())
+    leaf_capacity->assign(leaf_count, Capacity{});
+  if (internal_capacity->empty())
+    internal_capacity->assign(internal_count, Capacity{});
+  Require(static_cast<int>(leaf_capacity->size()) == leaf_count &&
+              static_cast<int>(internal_capacity->size()) == internal_count,
+          "internal CUDA affine-scan capacity size mismatch");
+
+  for (int leaf = 0; leaf < leaf_count; ++leaf)
+    (*leaf_capacity)[leaf].Include(leaves[leaf]);
+  for (std::size_t level = 1; level < tree.reductions.size(); ++level) {
+    const int offset = level_offsets[level] - leaf_count;
+    for (std::size_t node = 0; node < tree.reductions[level].size(); ++node) {
+      (*internal_capacity)[offset + node].Include(tree.reductions[level][node]);
+      (*internal_capacity)[offset + node].Include(
+          tree.prefix_contexts[level][node]);
+    }
+  }
+
+  if (leaf_count <= 1)
+    return;
+  for (std::size_t parent = 0; parent < tree.prefix_contexts[1].size();
+       ++parent) {
+    const std::size_t child = 2 * parent;
+    const ScanShape left_prefix =
+        ComposeScanShapes(tree.prefix_contexts[1][parent], leaves[child]);
+    (*leaf_capacity)[child].Include(left_prefix);
+    if (child + 1 < leaves.size()) {
+      (*leaf_capacity)[child + 1].Include(
+          ComposeScanShapes(left_prefix, leaves[child + 1]));
+    }
+  }
+}
+
 void BindValueStorage(ValueElement *element, Scalar **cursor,
                       const ValueCapacity &capacity) {
   element->left_dim = -1;
   element->right_dim = 0;
   element->A = *cursor;
   *cursor += capacity.a;
-  element->b = *cursor;
-  *cursor += capacity.b;
   element->C = *cursor;
   *cursor += capacity.c;
-  element->eta = *cursor;
-  *cursor += capacity.eta;
   element->J = *cursor;
   *cursor += capacity.j;
 }
@@ -3889,44 +4123,35 @@ bool PrepareMapStorage(WorkspaceStorage *workspace, int stage_count,
   if (layout_matches)
     return false;
   const auto &level_offsets = workspace->stage_level_offsets;
-  std::vector<ScanShape> leaves(stage_count);
+  std::vector<ScanShape> state_leaves(stage_count);
   std::vector<int> key;
   key.reserve(stage_count + 1);
   key.push_back(workspace->host_state_dimensions[1]);
-  std::vector<MapCapacity> leaf_capacity(stage_count);
   for (int stage = 0; stage < stage_count; ++stage) {
-    leaves[stage] =
+    state_leaves[stage] =
         MakeScanShape(workspace->host_state_dimensions[2 * stage + 1],
                       workspace->host_state_dimensions[2 * stage + 3]);
-    leaf_capacity[stage].Include(leaves[stage]);
-    key.push_back(static_cast<int>(leaves[stage].right));
+    key.push_back(static_cast<int>(state_leaves[stage].right));
   }
 
   const int internal_count = static_cast<int>(workspace->host_map_scan.size());
-  std::vector<MapCapacity> internal_capacity(internal_count);
-  const ScanPlan tree = BuildScanPlan(leaves);
-  for (std::size_t level = 1; level < tree.reductions.size(); ++level) {
-    const int offset = level_offsets[level] - stage_count;
-    for (std::size_t node = 0; node < tree.reductions[level].size(); ++node) {
-      internal_capacity[offset + node].Include(tree.reductions[level][node]);
-      internal_capacity[offset + node].Include(
-          tree.prefix_contexts[level][node]);
-    }
-  }
+  std::vector<MapCapacity> leaf_capacity;
+  std::vector<MapCapacity> internal_capacity;
+  IncludePrefixScanStorage(state_leaves, level_offsets, &leaf_capacity,
+                           &internal_capacity);
 
-  if (stage_count > 1) {
-    for (std::size_t parent = 0; parent < tree.prefix_contexts[1].size();
-         ++parent) {
-      const std::size_t child = 2 * parent;
-      const ScanShape left_prefix =
-          ComposeScanShapes(tree.prefix_contexts[1][parent], leaves[child]);
-      leaf_capacity[child].Include(left_prefix);
-      if (child + 1 < leaves.size()) {
-        leaf_capacity[child + 1].Include(
-            ComposeScanShapes(left_prefix, leaves[child + 1]));
-      }
-    }
+  // Reversing the leaf order turns p_i=f_i(p_{i+1}) into an ordinary affine
+  // prefix scan. Merge its runtime-sized capacities with the forward state
+  // scan, since both phases reuse the same compact tree storage.
+  std::vector<ScanShape> costate_leaves(stage_count);
+  for (int leaf = 0; leaf < stage_count; ++leaf) {
+    const int stage = stage_count - 1 - leaf;
+    costate_leaves[leaf] =
+        MakeScanShape(workspace->host_state_dimensions[2 * stage + 3],
+                      workspace->host_state_dimensions[2 * stage + 1]);
   }
+  IncludePrefixScanStorage(costate_leaves, level_offsets, &leaf_capacity,
+                           &internal_capacity);
 
   std::size_t entries = 0;
   for (const MapCapacity &capacity : leaf_capacity)
@@ -4253,16 +4478,14 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                 sizeof(ReducedTerminal),
                                 cudaMemcpyHostToDevice),
                 "upload reduced-terminal layout");
-      CudaCheck(
-          cudaMemcpyAsync(device_terminal.get(), &terminal,
-                          sizeof(PackedTerminal), cudaMemcpyHostToDevice),
-          "upload terminal metadata");
-      CudaCheck(
-          cudaMemcpyAsync(state_offsets.get(),
-                          workspace.host_state_offsets.data(),
-                          workspace.host_state_offsets.size() * sizeof(int),
-                          cudaMemcpyHostToDevice),
-          "upload state offsets");
+      CudaCheck(cudaMemcpyAsync(device_terminal.get(), &terminal,
+                                sizeof(PackedTerminal), cudaMemcpyHostToDevice),
+                "upload terminal metadata");
+      CudaCheck(cudaMemcpyAsync(
+                    state_offsets.get(), workspace.host_state_offsets.data(),
+                    workspace.host_state_offsets.size() * sizeof(int),
+                    cudaMemcpyHostToDevice),
+                "upload state offsets");
       CudaCheck(
           cudaMemcpyAsync(control_offsets.get(),
                           workspace.host_control_offsets.data(),
@@ -4275,18 +4498,16 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                           workspace.host_dynamics_offsets.size() * sizeof(int),
                           cudaMemcpyHostToDevice),
           "upload dynamics-multiplier offsets");
-      CudaCheck(
-          cudaMemcpyAsync(mixed_offsets.get(),
-                          workspace.host_mixed_offsets.data(),
-                          workspace.host_mixed_offsets.size() * sizeof(int),
-                          cudaMemcpyHostToDevice),
-          "upload mixed offsets");
       CudaCheck(cudaMemcpyAsync(
-                    state_constraint_offsets.get(),
-                    workspace.host_state_constraint_offsets.data(),
-                    workspace.host_state_constraint_offsets.size() *
-                        sizeof(int),
+                    mixed_offsets.get(), workspace.host_mixed_offsets.data(),
+                    workspace.host_mixed_offsets.size() * sizeof(int),
                     cudaMemcpyHostToDevice),
+                "upload mixed offsets");
+      CudaCheck(cudaMemcpyAsync(state_constraint_offsets.get(),
+                                workspace.host_state_constraint_offsets.data(),
+                                workspace.host_state_constraint_offsets.size() *
+                                    sizeof(int),
+                                cudaMemcpyHostToDevice),
                 "upload state-constraint offsets");
     }
     if (packed_input_entries > 0) {
@@ -4396,8 +4617,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       workspace.value_layout_key.size() ==
           static_cast<std::size_t>(node_count) &&
       (stage_count == 0 ||
-       workspace.map_layout_key.size() ==
-           static_cast<std::size_t>(node_count));
+       workspace.map_layout_key.size() == static_cast<std::size_t>(node_count));
   for (int node = 0; node < node_count && primal_layout_matches; ++node) {
     const int dimension = workspace.host_state_dimensions[2 * node + 1];
     primal_layout_matches &= workspace.value_layout_key[node] == dimension;
@@ -4414,6 +4634,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     }
     workspace.reduced_states.Reserve(
         workspace.host_reduced_state_offsets[node_count]);
+    workspace.reduced_value_linear.Reserve(
+        workspace.host_reduced_state_offsets[node_count]);
   }
   result.timings.layout_ms +=
       std::chrono::duration<double, std::milli>(
@@ -4424,13 +4646,13 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       workspace,
       [&] {
         if (primal_layout_changed) {
-          CudaCheck(cudaMemcpyAsync(
-                        reduced_state_offsets.get(),
-                        workspace.host_reduced_state_offsets.data(),
-                        workspace.host_reduced_state_offsets.size() *
-                            sizeof(int),
-                        cudaMemcpyHostToDevice),
-                    "upload reduced-state offsets");
+          CudaCheck(
+              cudaMemcpyAsync(reduced_state_offsets.get(),
+                              workspace.host_reduced_state_offsets.data(),
+                              workspace.host_reduced_state_offsets.size() *
+                                  sizeof(int),
+                              cudaMemcpyHostToDevice),
+              "upload reduced-state offsets");
         }
         if (stage_count > 0) {
           CudaCheck(cudaMemsetAsync(control_dimensions.get(), 0,
@@ -4491,7 +4713,40 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &value_a = workspace.value_leaves;
   auto &value_b = workspace.value_scan;
   auto &feedback = workspace.feedback;
+  auto &map_a = workspace.map_leaves;
+  auto &map_b = workspace.map_scan;
   const ValueElement *value_suffix = value_a.get();
+  const auto queue_affine_prefix_scan = [&] {
+    if (stage_count <= 1)
+      return;
+    const int first_parent_count = stage_level_counts[1];
+    ReduceAffineLeavesKernel<<<first_parent_count, kThreads>>>(
+        map_a.get(), stage_count, first_parent_count, map_b.get(),
+        device_status.get());
+    for (std::size_t level = 1; level + 1 < stage_level_counts.size();
+         ++level) {
+      ReduceAffineTreeLevelKernel<<<stage_level_counts[level + 1], kThreads>>>(
+          map_b.get(), stage_level_offsets[level] - stage_count,
+          stage_level_offsets[level + 1] - stage_count,
+          stage_level_counts[level], stage_level_counts[level + 1],
+          device_status.get());
+    }
+    InitializeAffineContextRootKernel<<<1, kThreads>>>(
+        map_b.get(), stage_level_offsets.back() - stage_count);
+    for (int level = static_cast<int>(stage_level_counts.size()) - 2;
+         level >= 1; --level) {
+      ExpandAffineContextLevelKernel<<<stage_level_counts[level + 1],
+                                       kThreads>>>(
+          map_b.get(), stage_level_offsets[level] - stage_count,
+          stage_level_offsets[level + 1] - stage_count,
+          stage_level_counts[level], stage_level_counts[level + 1],
+          device_status.get());
+    }
+    FinalizeAffinePrefixFromParentsKernel<<<first_parent_count, kThreads,
+                                            scratch.affine_finalize>>>(
+        map_a.get(), stage_count, map_b.get(), first_parent_count,
+        device_status.get());
+  };
   QueueTimedKernels(
       workspace, TimingSlot::kRiccati,
       [&] {
@@ -4509,6 +4764,20 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                           sizeof(ValueElement),
                                       cudaMemcpyHostToDevice),
                       "upload compact value tree");
+          }
+        }
+        if (stage_count > 0 && map_layout_changed) {
+          CudaCheck(cudaMemcpyAsync(
+                        map_a.get(), workspace.host_map_leaves.data(),
+                        workspace.host_map_leaves.size() * sizeof(AffineMap),
+                        cudaMemcpyHostToDevice),
+                    "upload compact affine leaves");
+          if (workspace.host_map_scan.size() > 0) {
+            CudaCheck(cudaMemcpyAsync(
+                          map_b.get(), workspace.host_map_scan.data(),
+                          workspace.host_map_scan.size() * sizeof(AffineMap),
+                          cudaMemcpyHostToDevice),
+                      "upload compact affine tree");
           }
         }
       },
@@ -4548,71 +4817,39 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               options.tolerance, device_status.get());
         }
         if (stage_count > 0) {
-          FeedbackKernel<<<stage_count, kThreads, scratch.feedback>>>(
+          MatrixFeedbackKernel<<<stage_count, kThreads, scratch.feedback>>>(
               reduced_stages.get(), value_suffix, stage_count,
               options.tolerance, feedback.get(), device_status.get());
+          InitializeCostateMapsKernel<<<stage_count, kThreads,
+                                        scratch.affine_terms>>>(
+              reduced_stages.get(), value_suffix, feedback.get(), stage_count,
+              map_a.get(), device_status.get());
+          queue_affine_prefix_scan();
+          const int costate_blocks = (node_count + kThreads - 1) / kThreads;
+          RecoverCostatesKernel<<<costate_blocks, kThreads>>>(
+              map_a.get(), reduced_terminal.get(), reduced_state_offsets.get(),
+              stage_count, workspace.reduced_value_linear.get(),
+              device_status.get());
+          FinalizeFeedbackKernel<<<stage_count, kThreads,
+                                   scratch.affine_terms>>>(
+              reduced_stages.get(), value_suffix,
+              workspace.reduced_value_linear.get(), reduced_state_offsets.get(),
+              stage_count, feedback.get(), device_status.get());
         }
       },
       [] {});
 
-  auto &map_a = workspace.map_leaves;
-  auto &map_b = workspace.map_scan;
   auto &reduced_states = workspace.reduced_states;
   auto &states = workspace.states;
   auto &controls = workspace.controls;
   AffineMap *prefix = map_a.get();
   QueueTimedKernels(
-      workspace, TimingSlot::kReconstruction,
-      [&] {
-        if (stage_count > 0 && map_layout_changed) {
-          CudaCheck(cudaMemcpyAsync(
-                        map_a.get(), workspace.host_map_leaves.data(),
-                        workspace.host_map_leaves.size() * sizeof(AffineMap),
-                        cudaMemcpyHostToDevice),
-                    "upload compact affine leaves");
-          if (workspace.host_map_scan.size() > 0) {
-            CudaCheck(cudaMemcpyAsync(
-                          map_b.get(), workspace.host_map_scan.data(),
-                          workspace.host_map_scan.size() * sizeof(AffineMap),
-                          cudaMemcpyHostToDevice),
-                      "upload compact affine tree");
-          }
-        }
-      },
+      workspace, TimingSlot::kReconstruction, [] {},
       [&] {
         if (stage_count > 0) {
           InitializeAffineMapsKernel<<<stage_count, kThreads>>>(
               feedback.get(), stage_count, map_a.get(), device_status.get());
-          if (stage_count > 1) {
-            const int first_parent_count = stage_level_counts[1];
-            ReduceAffineLeavesKernel<<<first_parent_count, kThreads>>>(
-                map_a.get(), stage_count, first_parent_count, map_b.get(),
-                device_status.get());
-            for (std::size_t level = 1; level + 1 < stage_level_counts.size();
-                 ++level) {
-              ReduceAffineTreeLevelKernel<<<stage_level_counts[level + 1],
-                                            kThreads>>>(
-                  map_b.get(), stage_level_offsets[level] - stage_count,
-                  stage_level_offsets[level + 1] - stage_count,
-                  stage_level_counts[level], stage_level_counts[level + 1],
-                  device_status.get());
-            }
-            InitializeAffineContextRootKernel<<<1, kThreads>>>(
-                map_b.get(), stage_level_offsets.back() - stage_count);
-            for (int level = static_cast<int>(stage_level_counts.size()) - 2;
-                 level >= 1; --level) {
-              ExpandAffineContextLevelKernel<<<stage_level_counts[level + 1],
-                                               kThreads>>>(
-                  map_b.get(), stage_level_offsets[level] - stage_count,
-                  stage_level_offsets[level + 1] - stage_count,
-                  stage_level_counts[level], stage_level_counts[level + 1],
-                  device_status.get());
-            }
-            FinalizeAffinePrefixFromParentsKernel<<<
-                first_parent_count, kThreads, scratch.affine_finalize>>>(
-                map_a.get(), stage_count, map_b.get(), first_parent_count,
-                device_status.get());
-          }
+          queue_affine_prefix_scan();
           prefix = map_a.get();
         }
         const int state_blocks = (node_count + kThreads - 1) / kThreads;
@@ -4638,6 +4875,14 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                      kMultiplierConsistencyTolerancePerTreeLevel *
                          stage_level_counts.size())
           : kScalarMax;
+  // A leaf residual has not crossed the relation tree yet. Applying the
+  // tree-accumulated tolerance here can hide a local affine inconsistency and
+  // prevent the FP32 residual correction from running.
+  const Scalar multiplier_leaf_consistency_tolerance =
+      options.enforce_multiplier_consistency
+          ? std::max(multiplier_rank_tolerance,
+                     kMultiplierConsistencyTolerancePerTreeLevel)
+          : kScalarMax;
   auto &dual_params = workspace.dual_params;
   auto &dual_dimensions = workspace.dual_dimensions;
   auto &dual_scan_needed = workspace.dual_scan_needed;
@@ -4650,21 +4895,82 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &state_multipliers = workspace.state_multipliers;
   auto &terminal_multiplier = workspace.terminal_multiplier;
   int &host_dual_scan_needed = workspace.host_dual_scan_needed[0];
+  DualRelation *dual_relations = nullptr;
+  DualNodeValue *dual_leaf_values = nullptr;
   host_dual_scan_needed = 0;
   result.timings.multiplier_ms = 0.0;
   const std::size_t multiplier_output_entries = CheckedSum(
       {workspace.host_initial_multiplier.size(), workspace.host_dynamics.size(),
-       workspace.host_mixed.size(),
-       workspace.host_state_multipliers.size(),
+       workspace.host_mixed.size(), workspace.host_state_multipliers.size(),
        workspace.host_terminal_multiplier.size()},
       "CUDA multiplier output");
   const auto initialize_multiplier_outputs = [&] {
     if (multiplier_output_entries > 0) {
-      CudaCheck(cudaMemsetAsync(
-                    initial_multiplier.get(), 0,
-                    multiplier_output_entries * sizeof(Scalar)),
+      CudaCheck(cudaMemsetAsync(initial_multiplier.get(), 0,
+                                multiplier_output_entries * sizeof(Scalar)),
                 "initialize compact multipliers");
     }
+  };
+  const auto queue_dual_parameters = [&] {
+    BuildDualParametersKernel<<<stage_count, kThreads,
+                                scratch.dual_parameter>>>(
+        device_stages.get(), state_params.get(), value_suffix,
+        workspace.reduced_value_linear.get(), reduced_states.get(),
+        states.get(), controls.get(), reduced_state_offsets.get(),
+        state_offsets.get(), control_offsets.get(), stage_count,
+        multiplier_rank_tolerance, multiplier_consistency_tolerance,
+        dual_params.get(), dual_scan_needed.get(), dual_dimensions.get(),
+        device_status.get());
+  };
+  const auto queue_dual_recovery = [&](Scalar leaf_consistency_tolerance) {
+    BuildDualParameterRelationsKernel<<<stage_count, kThreads,
+                                        scratch.dual_relation_leaf>>>(
+        device_stages.get(), device_terminal.get(), dual_params.get(),
+        stage_count, states.get(), controls.get(), state_offsets.get(),
+        control_offsets.get(), multiplier_rank_tolerance,
+        leaf_consistency_tolerance, dual_relations, dual_scan_needed.get(),
+        state_dual_params.get(), device_status.get());
+    if (host_dual_scan_needed != 0) {
+      for (std::size_t level = 0; level + 1 < stage_level_counts.size();
+           ++level) {
+        ReduceDualTreeLevelKernel<<<stage_level_counts[level + 1], kThreads,
+                                    scratch.dual_relation>>>(
+            dual_tree.get(), stage_level_offsets[level],
+            stage_level_offsets[level + 1], stage_level_counts[level],
+            stage_level_counts[level + 1], multiplier_rank_tolerance,
+            multiplier_consistency_tolerance, dual_tree.get(),
+            dual_scan_needed.get(), device_status.get());
+      }
+      const int root_offset = stage_level_offsets.back();
+      SolveDualRootKernel<<<1, kThreads, scratch.dual_root>>>(
+          dual_tree.get() + root_offset, dual_values.get() + root_offset,
+          dual_scan_needed.get(), device_status.get(),
+          multiplier_rank_tolerance);
+      for (int level = static_cast<int>(stage_level_counts.size()) - 2;
+           level >= 0; --level) {
+        ExpandDualTreeLevelKernel<<<stage_level_counts[level + 1], kThreads,
+                                    scratch.dual_expand>>>(
+            dual_tree.get(), stage_level_offsets[level],
+            stage_level_offsets[level + 1], stage_level_counts[level],
+            stage_level_counts[level + 1], multiplier_rank_tolerance,
+            multiplier_consistency_tolerance, dual_values.get(),
+            dual_values.get(), dual_scan_needed.get(), device_status.get());
+      }
+    }
+    const int recovery_blocks = (stage_count + kThreads - 1) / kThreads;
+    RecoverParameterizedMultipliersKernel<<<recovery_blocks, kThreads>>>(
+        dual_params.get(), state_dual_params.get(), dual_leaf_values,
+        dynamics_offsets.get(), mixed_offsets.get(),
+        state_constraint_offsets.get(), stage_count, dynamics_multipliers.get(),
+        mixed_multipliers.get(), state_multipliers.get(),
+        terminal_multiplier.get(), device_status.get());
+    RecoverInitialMultiplierKernel<<<1, kThreads>>>(
+        device_stages.get(), device_terminal.get(), stage_count, states.get(),
+        controls.get(), dynamics_multipliers.get(), mixed_multipliers.get(),
+        state_offsets.get(), control_offsets.get(), dynamics_offsets.get(),
+        mixed_offsets.get(), state_constraint_offsets.get(),
+        initial_multiplier.get(), state_multipliers.get(),
+        terminal_multiplier.get(), device_status.get());
   };
   if (stage_count > 0) {
     QueueTimedKernels(
@@ -4677,17 +4983,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                         sizeof(int)),
                     "initialize dual dimensions");
         },
-        [&] {
-          BuildDualParametersKernel<<<stage_count, kThreads,
-                                      scratch.dual_parameter>>>(
-              device_stages.get(), state_params.get(), value_suffix,
-              reduced_states.get(), states.get(), controls.get(),
-              reduced_state_offsets.get(), state_offsets.get(),
-              control_offsets.get(), stage_count, multiplier_rank_tolerance,
-              multiplier_consistency_tolerance, dual_params.get(),
-              dual_scan_needed.get(), dual_dimensions.get(),
-              device_status.get());
-        },
+        queue_dual_parameters,
         [&] {
           CudaCheck(cudaMemcpyAsync(&host_dual_scan_needed,
                                     dual_scan_needed.get(), sizeof(int),
@@ -4727,10 +5023,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - dual_layout_start)
             .count();
-    DualRelation *dual_relations =
-        host_dual_scan_needed != 0 ? dual_tree.get() : nullptr;
-    DualNodeValue *dual_leaf_values =
-        host_dual_scan_needed != 0 ? dual_values.get() : nullptr;
+    dual_relations = host_dual_scan_needed != 0 ? dual_tree.get() : nullptr;
+    dual_leaf_values = host_dual_scan_needed != 0 ? dual_values.get() : nullptr;
     QueueTimedKernels(
         workspace, TimingSlot::kMultiplierRecovery,
         [&] {
@@ -4751,58 +5045,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
           }
         },
         [&] {
-          BuildDualParameterRelationsKernel<<<stage_count, kThreads,
-                                              scratch.dual_relation_leaf>>>(
-              device_stages.get(), device_terminal.get(), dual_params.get(),
-              stage_count, states.get(), controls.get(), state_offsets.get(),
-              control_offsets.get(), multiplier_rank_tolerance,
-              multiplier_consistency_tolerance, dual_relations,
-              dual_scan_needed.get(), state_dual_params.get(),
-              device_status.get());
-          if (host_dual_scan_needed != 0) {
-            for (std::size_t level = 0; level + 1 < stage_level_counts.size();
-                 ++level) {
-              ReduceDualTreeLevelKernel<<<stage_level_counts[level + 1],
-                                          kThreads, scratch.dual_relation>>>(
-                  dual_tree.get(), stage_level_offsets[level],
-                  stage_level_offsets[level + 1], stage_level_counts[level],
-                  stage_level_counts[level + 1], multiplier_rank_tolerance,
-                  multiplier_consistency_tolerance, dual_tree.get(),
-                  dual_scan_needed.get(), device_status.get());
-            }
-            const int root_offset = stage_level_offsets.back();
-            SolveDualRootKernel<<<1, kThreads, scratch.dual_root>>>(
-                dual_tree.get() + root_offset, dual_values.get() + root_offset,
-                dual_scan_needed.get(), device_status.get(),
-                multiplier_rank_tolerance);
-            for (int level = static_cast<int>(stage_level_counts.size()) - 2;
-                 level >= 0; --level) {
-              ExpandDualTreeLevelKernel<<<stage_level_counts[level + 1],
-                                          kThreads, scratch.dual_expand>>>(
-                  dual_tree.get(), stage_level_offsets[level],
-                  stage_level_offsets[level + 1], stage_level_counts[level],
-                  stage_level_counts[level + 1], multiplier_rank_tolerance,
-                  multiplier_consistency_tolerance, dual_values.get(),
-                  dual_values.get(), dual_scan_needed.get(),
-                  device_status.get());
-            }
-          }
-          const int recovery_blocks = (stage_count + kThreads - 1) / kThreads;
-          RecoverParameterizedMultipliersKernel<<<recovery_blocks, kThreads>>>(
-              dual_params.get(), state_dual_params.get(), dual_leaf_values,
-              dynamics_offsets.get(), mixed_offsets.get(),
-              state_constraint_offsets.get(), stage_count,
-              dynamics_multipliers.get(), mixed_multipliers.get(),
-              state_multipliers.get(), terminal_multiplier.get(),
-              device_status.get());
-          RecoverInitialMultiplierKernel<<<1, kThreads>>>(
-              device_stages.get(), device_terminal.get(), stage_count,
-              states.get(), controls.get(), dynamics_multipliers.get(),
-              mixed_multipliers.get(), state_offsets.get(),
-              control_offsets.get(), dynamics_offsets.get(),
-              mixed_offsets.get(), state_constraint_offsets.get(),
-              initial_multiplier.get(), state_multipliers.get(),
-              terminal_multiplier.get(), device_status.get());
+          queue_dual_recovery(multiplier_leaf_consistency_tolerance);
         },
         [] {});
   }
@@ -4854,9 +5097,9 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &host_state_multipliers = workspace.host_state_multipliers;
   auto &host_terminal_multiplier = workspace.host_terminal_multiplier;
   const std::size_t solution_output_entries = CheckedSum(
-      {host_states.size(), host_controls.size(),
-       host_initial_multiplier.size(), host_dynamics.size(), host_mixed.size(),
-       host_state_multipliers.size(), host_terminal_multiplier.size()},
+      {host_states.size(), host_controls.size(), host_initial_multiplier.size(),
+       host_dynamics.size(), host_mixed.size(), host_state_multipliers.size(),
+       host_terminal_multiplier.size()},
       "CUDA compact output");
   result.timings.download_ms = TimeGpu(workspace, [&] {
     CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
@@ -4868,10 +5111,9 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                 cudaMemcpyDeviceToHost),
                 "download compact primal-dual solution");
     }
-    CudaCheck(cudaMemcpyAsync(
-                  workspace.host_objective.data(),
-                  objective_tree.get() + level_offsets.back(), sizeof(Scalar),
-                  cudaMemcpyDeviceToHost),
+    CudaCheck(cudaMemcpyAsync(workspace.host_objective.data(),
+                              objective_tree.get() + level_offsets.back(),
+                              sizeof(Scalar), cudaMemcpyDeviceToHost),
               "download objective");
   });
   result.timings.riccati_ms = ElapsedTiming(workspace, TimingSlot::kRiccati);
@@ -4882,6 +5124,110 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   result.timings.objective_ms =
       ElapsedTiming(workspace, TimingSlot::kObjective);
   status = workspace.host_status[0];
+#ifdef CLQR_USE_FLOAT
+  bool affine_refined = false;
+  // Keep the fast matrix-only path unchanged unless its separately recovered
+  // FP32 affine terms fail the final multiplier-consistency gate. One
+  // residual correction reuses the retained Riccati factors and scan storage.
+  if (stage_count > 0 && options.enforce_multiplier_consistency &&
+      status.code == kDeviceNumericalFailure && status.detail == 17) {
+    affine_refined = true;
+    CudaCheck(cudaMemsetAsync(device_status.get(), 0, sizeof(DeviceStatus)),
+              "reset status for FP32 affine refinement");
+
+    InitializeCostateRefinementMapsKernel<<<stage_count, kThreads>>>(
+        reduced_stages.get(), reduced_states.get(),
+        workspace.reduced_controls.get(), reduced_state_offsets.get(),
+        control_offsets.get(), stage_count, map_a.get(), device_status.get());
+    queue_affine_prefix_scan();
+    const int terminal_dimension =
+        workspace.host_state_dimensions[2 * stage_count + 1];
+    if (terminal_dimension > 0) {
+      const int terminal_blocks =
+          (terminal_dimension + kThreads - 1) / kThreads;
+      InitializeTerminalCostateKernel<<<terminal_blocks, kThreads>>>(
+          reduced_terminal.get(), reduced_states.get(),
+          reduced_state_offsets.get(), stage_count,
+          workspace.reduced_value_linear.get(), device_status.get());
+    }
+    const int costate_blocks = (stage_count + kThreads - 1) / kThreads;
+    RecoverCostatesFromTerminalKernel<<<costate_blocks, kThreads>>>(
+        map_a.get(),
+        workspace.reduced_value_linear.get() +
+            workspace.host_reduced_state_offsets[stage_count],
+        reduced_state_offsets.get(), stage_count,
+        workspace.reduced_value_linear.get(), device_status.get());
+    const int value_blocks = (node_count + kThreads - 1) / kThreads;
+    ConvertCostatesToValueLinearKernel<<<value_blocks, kThreads>>>(
+        value_suffix, reduced_states.get(), reduced_state_offsets.get(),
+        stage_count, workspace.reduced_value_linear.get(), device_status.get());
+    FinalizeFeedbackKernel<<<stage_count, kThreads, scratch.affine_terms>>>(
+        reduced_stages.get(), value_suffix,
+        workspace.reduced_value_linear.get(), reduced_state_offsets.get(),
+        stage_count, feedback.get(), device_status.get());
+
+    InitializeAffineMapsKernel<<<stage_count, kThreads>>>(
+        feedback.get(), stage_count, map_a.get(), device_status.get());
+    queue_affine_prefix_scan();
+    const int state_blocks = (node_count + kThreads - 1) / kThreads;
+    ReconstructPrimalKernel<<<state_blocks, kThreads>>>(
+        map_a.get(), state_params.get(), control_params.get(), feedback.get(),
+        reduced_initial.get(), reduced_state_offsets.get(), state_offsets.get(),
+        control_offsets.get(), stage_count, reduced_states.get(),
+        workspace.reduced_controls.get(), states.get(), controls.get(),
+        device_status.get());
+
+    CudaCheck(cudaMemsetAsync(dual_scan_needed.get(), 0, sizeof(int)),
+              "reset dual scan flag for FP32 affine refinement");
+    queue_dual_parameters();
+    initialize_multiplier_outputs();
+    // Use the tree-accumulated relation tolerance to recover a candidate, then
+    // validate the complete refined primal-dual point below. A correction is
+    // never accepted on this relaxed local gate alone.
+    queue_dual_recovery(multiplier_consistency_tolerance);
+
+    CudaCheck(cudaMemsetAsync(objective_tree.get(), 0,
+                              objective_tree.count() * sizeof(Scalar)),
+              "reset objective after FP32 affine refinement");
+    BuildObjectiveTermsKernel<<<node_count, kThreads>>>(
+        device_stages.get(), stage_count, device_terminal.get(), states.get(),
+        controls.get(), state_offsets.get(), control_offsets.get(),
+        objective_tree.get(), device_status.get());
+    for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
+      const int parent_count = level_counts[level + 1];
+      const int blocks = (parent_count + kThreads - 1) / kThreads;
+      ReduceObjectiveTreeLevelKernel<<<blocks, kThreads>>>(
+          objective_tree.get(), level_offsets[level], level_counts[level],
+          level_offsets[level + 1], device_status.get());
+    }
+    CudaCheck(cudaGetLastError(), "FP32 affine refinement kernel launch");
+
+    result.timings.download_ms += TimeGpu(workspace, [&] {
+      CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
+                                device_status.get(), sizeof(DeviceStatus),
+                                cudaMemcpyDeviceToHost),
+                "read refined multiplier status");
+      if (solution_output_entries > 0) {
+        CudaCheck(cudaMemcpyAsync(host_states.data(), states.get(),
+                                  solution_output_entries * sizeof(Scalar),
+                                  cudaMemcpyDeviceToHost),
+                  "download refined compact primal-dual solution");
+      }
+      CudaCheck(cudaMemcpyAsync(workspace.host_objective.data(),
+                                objective_tree.get() + level_offsets.back(),
+                                sizeof(Scalar), cudaMemcpyDeviceToHost),
+                "download refined objective");
+    });
+    status = workspace.host_status[0];
+    if (status.code == kDeviceOk &&
+        MaximumRefinedKktResidual(problem, workspace) >
+            kMaximumRefinedKktResidual) {
+      status = {kDeviceNumericalFailure, -1, 25};
+    }
+  }
+#else
+  constexpr bool affine_refined = false;
+#endif
   if (ApplyDeviceFailure(status, &result)) {
     result.timings.total_ms =
         std::chrono::duration<double, std::milli>(
@@ -4893,6 +5239,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   result.objective = workspace.host_objective[0];
   result.status = SolveStatus::kOptimal;
   result.message = "optimal (parallel CUDA conditional-value scan)";
+  if (affine_refined)
+    result.message += "; FP32 affine residual refined";
   if (!options.enforce_multiplier_consistency)
     result.message += "; multiplier consistency unchecked";
   result.timings.synchronization_count = workspace.synchronization_count;
@@ -5411,8 +5759,8 @@ __global__ void ReconstructPrimalKernel(
 
 __global__ void BuildDualParametersKernel(
     const PackedStage *stages, const StateParam *state_params,
-    const ValueElement *value_suffix, const Scalar *reduced_states,
-    const Scalar *states, const Scalar *controls,
+    const ValueElement *value_suffix, const Scalar *reduced_value_linear,
+    const Scalar *reduced_states, const Scalar *states, const Scalar *controls,
     const int *reduced_state_offsets, const int *state_offsets,
     const int *control_offsets, int stage_count, Scalar rank_tolerance,
     Scalar consistency_tolerance, DualParam *params, int *scan_needed,
@@ -5472,7 +5820,8 @@ __global__ void BuildDualParametersKernel(
   const Scalar *next_reduced_state =
       reduced_states + reduced_state_offsets[index + 1];
   for (int row = threadIdx.x; row < next.reduced_dim; row += blockDim.x) {
-    Scalar costate = -next_value.eta[row];
+    Scalar costate =
+        -reduced_value_linear[reduced_state_offsets[index + 1] + row];
     for (int col = 0; col < next.reduced_dim; ++col)
       costate -= next_value.J[row * next_value.left_dim + col] *
                  next_reduced_state[col];
@@ -6092,9 +6441,6 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
       elements[index].J[row * terminal.n + col] =
           terminal.Q[row * terminal.n + col];
     }
-    for (int row = threadIdx.x; row < terminal.n; row += blockDim.x) {
-      elements[index].eta[row] = terminal.q[row];
-    }
     return;
   }
 
@@ -6111,28 +6457,23 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
       const int col = linear % s.n;
       out.A[row * s.n + col] = s.A[row * s.n + col];
     }
-    for (int row = threadIdx.x; row < s.next_n; row += blockDim.x)
-      out.b[row] = s.c[row];
     for (int linear = threadIdx.x; linear < s.n * s.n; linear += blockDim.x) {
       const int row = linear / s.n;
       const int col = linear % s.n;
       out.J[row * s.n + col] = s.Q[row * s.n + col];
     }
-    for (int row = threadIdx.x; row < s.n; row += blockDim.x)
-      out.eta[row] = s.q[row];
     for (int linear = threadIdx.x; linear < s.next_n * s.next_n;
          linear += blockDim.x)
       out.C[linear] = Scalar{0};
     return;
   }
 
-  const int rhs_count = s.n + 1 + s.next_n;
+  const int rhs_count = s.n + s.next_n;
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(s.m) * s.m);
   scratch_size.Add<Scalar>(static_cast<std::size_t>(s.m) * rhs_count);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
-  Scalar *cholesky =
-      scratch.Take<Scalar>(static_cast<std::size_t>(s.m) * s.m);
+  Scalar *cholesky = scratch.Take<Scalar>(static_cast<std::size_t>(s.m) * s.m);
   Scalar *right_hand_sides =
       scratch.Take<Scalar>(static_cast<std::size_t>(s.m) * rhs_count);
   __shared__ int positive_definite;
@@ -6142,10 +6483,8 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
     const int col = linear % rhs_count;
     if (col < s.n) {
       right_hand_sides[linear] = s.M[col * s.m + row];
-    } else if (col == s.n) {
-      right_hand_sides[linear] = s.r[row];
     } else {
-      right_hand_sides[linear] = s.B[(col - s.n - 1) * s.m + row];
+      right_hand_sides[linear] = s.B[(col - s.n) * s.m + row];
     }
   }
   WarpSynchronize();
@@ -6158,7 +6497,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
   SolvePositiveDefiniteMultipleRhsBlock(cholesky, s.m, right_hand_sides,
                                         rhs_count, rhs_count);
 
-  // The solved columns are R^{-1}*M^T, R^{-1}*r, and R^{-1}*B^T.
+  // The solved columns are R^{-1}*M^T and R^{-1}*B^T.
   for (int linear = threadIdx.x; linear < s.n * s.n; linear += blockDim.x) {
     const int a = linear / s.n;
     const int b = linear % s.n;
@@ -6167,13 +6506,6 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
       value -= s.M[a * s.m + u] * right_hand_sides[u * rhs_count + b];
     }
     out.J[a * s.n + b] = value;
-  }
-  for (int a = threadIdx.x; a < s.n; a += blockDim.x) {
-    Scalar value = s.q[a];
-    for (int u = 0; u < s.m; ++u) {
-      value -= s.M[a * s.m + u] * right_hand_sides[u * rhs_count + s.n];
-    }
-    out.eta[a] = value;
   }
   for (int linear = threadIdx.x; linear < s.next_n * s.n;
        linear += blockDim.x) {
@@ -6185,20 +6517,13 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
     }
     out.A[row * s.n + col] = value;
   }
-  for (int row = threadIdx.x; row < s.next_n; row += blockDim.x) {
-    Scalar value = s.c[row];
-    for (int u = 0; u < s.m; ++u) {
-      value -= s.B[row * s.m + u] * right_hand_sides[u * rhs_count + s.n];
-    }
-    out.b[row] = value;
-  }
   for (int linear = threadIdx.x; linear < s.next_n * s.next_n;
        linear += blockDim.x) {
     const int a = linear / s.next_n;
     const int b = linear % s.next_n;
     Scalar value = Scalar{0};
     for (int u = 0; u < s.m; ++u) {
-      value += s.B[a * s.m + u] * right_hand_sides[u * rhs_count + s.n + 1 + b];
+      value += s.B[a * s.m + u] * right_hand_sides[u * rhs_count + s.n + b];
     }
     out.C[a * s.next_n + b] = value;
   }
@@ -6226,28 +6551,30 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     // composed cross map is therefore the right-by-left zero matrix.  Compact
     // scan storage is intentionally uninitialized, so publish those zeros
     // explicitly rather than relying on allocator contents.
-    for (int linear = threadIdx.x; linear < right * left;
-         linear += blockDim.x)
+    for (int linear = threadIdx.x; linear < right * left; linear += blockDim.x)
       output->A[linear] = Scalar{0};
     for (int linear = threadIdx.x; linear < left * left; linear += blockDim.x) {
       const int row = linear / left;
       const int col = linear % left;
       output->J[row * left + col] = first.J[row * first.left_dim + col];
     }
-    for (int row = threadIdx.x; row < left; row += blockDim.x)
-      output->eta[row] = first.eta[row];
     for (int linear = threadIdx.x; linear < right * right;
          linear += blockDim.x) {
       const int row = linear / right;
       const int col = linear % right;
       output->C[row * right + col] = second.C[row * second.right_dim + col];
     }
-    for (int row = threadIdx.x; row < right; row += blockDim.x)
-      output->b[row] = second.b[row];
     return;
   }
 
-  const int rhs_columns = left + 1 + shared;
+#ifdef CLQR_CUDA_EMULATION
+  if (threadIdx.x == 0)
+    ++g_value_matrix_combinations;
+#endif
+
+  // Factor S = I + C1*J2 exactly once, sharing its pivoted LU factors across
+  // all right-hand sides required for A, C, and J.
+  const int rhs_columns = left + shared;
   const int columns = shared + rhs_columns;
   for (int linear = threadIdx.x; linear < shared * columns;
        linear += blockDim.x) {
@@ -6262,17 +6589,16 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
       }
     } else if (col < shared + left) {
       value = first.A[row * first.left_dim + col - shared];
-    } else if (col == shared + left) {
-      value = first.b[row];
-      for (int k = 0; k < shared; ++k) {
-        value -= first.C[row * first.right_dim + k] * second.eta[k];
-      }
     } else {
-      value = first.C[row * first.right_dim + col - shared - left - 1];
+      value = first.C[row * first.right_dim + col - shared - left];
     }
     augmented[linear] = value;
   }
   WarpSynchronize();
+#ifdef CLQR_CUDA_EMULATION
+  if (threadIdx.x == 0)
+    ++g_value_matrix_factorizations;
+#endif
   if (!SolveGeneralMultipleRhsBlock(augmented, shared, columns, tolerance,
                                     factors, best_row)) {
     if (threadIdx.x == 0)
@@ -6280,7 +6606,7 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     return;
   }
 
-  // A = A2*S^{-1}*A1 and b = A2*S^{-1}(b1+C1*eta2)+b2.
+  // A = A2*S^{-1}*A1.
   for (int linear = threadIdx.x; linear < right * left; linear += blockDim.x) {
     const int row = linear / left;
     const int col = linear % left;
@@ -6291,14 +6617,6 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     }
     output->A[row * left + col] = value;
   }
-  for (int row = threadIdx.x; row < right; row += blockDim.x) {
-    Scalar value = second.b[row];
-    for (int k = 0; k < shared; ++k) {
-      value += second.A[row * second.left_dim + k] *
-               augmented[k * columns + shared + left];
-    }
-    output->b[row] = value;
-  }
   for (int linear = threadIdx.x; linear < right * right; linear += blockDim.x) {
     const int row = linear / right;
     const int col = linear % right;
@@ -6306,7 +6624,7 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     for (int p = 0; p < shared; ++p) {
       for (int q = 0; q < shared; ++q) {
         value += second.A[row * second.left_dim + p] *
-                 augmented[p * columns + shared + left + 1 + q] *
+                 augmented[p * columns + shared + left + q] *
                  second.A[col * second.left_dim + q];
       }
     }
@@ -6324,18 +6642,6 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
       }
     }
     output->J[row * left + col] = value;
-  }
-  for (int row = threadIdx.x; row < left; row += blockDim.x) {
-    Scalar value = first.eta[row];
-    for (int p = 0; p < shared; ++p) {
-      Scalar dual = second.eta[p];
-      for (int q = 0; q < shared; ++q) {
-        dual += second.J[p * second.left_dim + q] *
-                augmented[q * columns + shared + left];
-      }
-      value += first.A[p * first.left_dim + row] * dual;
-    }
-    output->eta[row] = value;
   }
   WarpSynchronize();
   for (int linear = threadIdx.x; linear < left * left; linear += blockDim.x) {
@@ -6387,8 +6693,6 @@ __device__ void CopyValueElementBlock(const ValueElement &input,
     const int col = linear % input.left_dim;
     output->A[row * input.left_dim + col] = input.A[row * input.left_dim + col];
   }
-  for (int row = threadIdx.x; row < input.right_dim; row += blockDim.x)
-    output->b[row] = input.b[row];
   for (int linear = threadIdx.x; linear < input.right_dim * input.right_dim;
        linear += blockDim.x) {
     const int row = linear / input.right_dim;
@@ -6396,8 +6700,6 @@ __device__ void CopyValueElementBlock(const ValueElement &input,
     output->C[row * input.right_dim + col] =
         input.C[row * input.right_dim + col];
   }
-  for (int row = threadIdx.x; row < input.left_dim; row += blockDim.x)
-    output->eta[row] = input.eta[row];
   for (int linear = threadIdx.x; linear < input.left_dim * input.left_dim;
        linear += blockDim.x) {
     const int row = linear / input.left_dim;
@@ -6445,7 +6747,7 @@ __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
   const ValueElement &first = leaves[left];
   const ValueElement &second = leaves[left + 1];
   const int shared = first.right_dim;
-  const int columns = 2 * shared + first.left_dim + 1;
+  const int columns = 2 * shared + first.left_dim;
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) * columns);
   scratch_size.Add<Scalar>(shared);
@@ -6476,7 +6778,7 @@ __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
   const ValueElement &first = tree[left];
   const ValueElement &second = tree[right];
   const int shared = first.right_dim;
-  const int columns = 2 * shared + first.left_dim + 1;
+  const int columns = 2 * shared + first.left_dim;
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) * columns);
   scratch_size.Add<Scalar>(shared);
@@ -6513,7 +6815,7 @@ __global__ void ExpandValueContextLevelKernel(
   const int right = left + 1;
   const ValueElement &first = tree[right];
   const int shared = first.right_dim;
-  const int columns = 2 * shared + first.left_dim + 1;
+  const int columns = 2 * shared + first.left_dim;
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) * columns);
   scratch_size.Add<Scalar>(shared);
@@ -6542,27 +6844,25 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   int left_capacity = leaves[left].left_dim;
   int right_capacity = leaves[left].right_dim;
   int shared_capacity = leaves[left].right_dim;
-  int columns_capacity = 2 * leaves[left].right_dim + leaves[left].left_dim + 1;
+  int columns_capacity = 2 * leaves[left].right_dim + leaves[left].left_dim;
   if (left + 1 < count) {
     left_capacity = DeviceMax(left_capacity, leaves[right].left_dim);
     right_capacity = DeviceMax(right_capacity, leaves[right].right_dim);
     shared_capacity = DeviceMax(shared_capacity, leaves[right].right_dim);
-    columns_capacity =
-        DeviceMax(columns_capacity,
-                  2 * leaves[left].right_dim + leaves[left].left_dim + 1);
+    columns_capacity = DeviceMax(columns_capacity, 2 * leaves[left].right_dim +
+                                                       leaves[left].left_dim);
   }
   if (!InvalidScanValueElement(parent)) {
     right_capacity = DeviceMax(right_capacity, parent.right_dim);
     const ValueElement &child = left + 1 < count ? leaves[right] : leaves[left];
     shared_capacity = DeviceMax(shared_capacity, child.right_dim);
     columns_capacity =
-        DeviceMax(columns_capacity, 2 * child.right_dim + child.left_dim + 1);
+        DeviceMax(columns_capacity, 2 * child.right_dim + child.left_dim);
   }
   const std::size_t composed_entries =
       static_cast<std::size_t>(right_capacity) * left_capacity +
-      right_capacity +
       static_cast<std::size_t>(right_capacity) * right_capacity +
-      left_capacity + static_cast<std::size_t>(left_capacity) * left_capacity;
+      static_cast<std::size_t>(left_capacity) * left_capacity;
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared_capacity) *
                            columns_capacity);
@@ -6603,9 +6903,9 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   CopyValueElementBlock(composed, &leaves[left]);
 }
 
-__device__ void BuildFeedbackSystem(const ReducedStage &s,
-                                    const ValueElement &next, Scalar *augmented,
-                                    int columns) {
+__device__ void BuildMatrixFeedbackSystem(const ReducedStage &s,
+                                          const ValueElement &next,
+                                          Scalar *augmented, int columns) {
   for (int linear = threadIdx.x; linear < s.m * columns; linear += blockDim.x) {
     const int row = linear / columns;
     const int col = linear % columns;
@@ -6618,7 +6918,7 @@ __device__ void BuildFeedbackSystem(const ReducedStage &s,
                    s.B[b * s.m + col];
         }
       }
-    } else if (col < s.m + s.n) {
+    } else {
       const int x = col - s.m;
       value = -s.M[x * s.m + row];
       for (int a = 0; a < s.next_n; ++a) {
@@ -6627,22 +6927,14 @@ __device__ void BuildFeedbackSystem(const ReducedStage &s,
                    s.A[b * s.n + x];
         }
       }
-    } else {
-      value = -s.r[row];
-      for (int a = 0; a < s.next_n; ++a) {
-        Scalar future = next.eta[a];
-        for (int b = 0; b < s.next_n; ++b) {
-          future += next.J[a * next.left_dim + b] * s.c[b];
-        }
-        value -= s.B[a * s.m + row] * future;
-      }
     }
     augmented[linear] = value;
   }
 }
 
-__device__ void ExtractFeedback(const ReducedStage &s, const Scalar *augmented,
-                                int columns, Feedback *feedback) {
+__device__ void ExtractMatrixFeedback(const ReducedStage &s,
+                                      const Scalar *augmented, int columns,
+                                      Feedback *feedback) {
   if (threadIdx.x == 0) {
     feedback->state_dim = s.n;
     feedback->next_state_dim = s.next_n;
@@ -6652,9 +6944,6 @@ __device__ void ExtractFeedback(const ReducedStage &s, const Scalar *augmented,
     const int row = linear / s.n;
     const int col = linear % s.n;
     feedback->K[row * s.n + col] = augmented[row * columns + s.m + col];
-  }
-  for (int row = threadIdx.x; row < s.m; row += blockDim.x) {
-    feedback->k[row] = augmented[row * columns + s.m + s.n];
   }
   WarpSynchronize();
   for (int linear = threadIdx.x; linear < s.next_n * s.n;
@@ -6667,21 +6956,12 @@ __device__ void ExtractFeedback(const ReducedStage &s, const Scalar *augmented,
     }
     feedback->transition[row * s.n + col] = value;
   }
-  for (int row = threadIdx.x; row < s.next_n; row += blockDim.x) {
-    Scalar value = s.c[row];
-    for (int u = 0; u < s.m; ++u) {
-      value += s.B[row * s.m + u] * feedback->k[u];
-    }
-    feedback->offset[row] = value;
-  }
 }
 
-__device__ bool SolveFeedbackBlock(const ReducedStage &stage,
-                                   const ValueElement &next, Scalar tolerance,
-                                   Feedback *feedback, Scalar *augmented,
-                                   Scalar *cholesky, int *positive_definite,
-                                   DeviceStatus *status, int stage_index,
-                                   int diagnostic) {
+__device__ bool SolveMatrixFeedbackBlock(
+    const ReducedStage &stage, const ValueElement &next, Scalar tolerance,
+    Feedback *feedback, Scalar *augmented, int *positive_definite,
+    DeviceStatus *status, int stage_index, int diagnostic) {
   if (stage.m == 0) {
     if (threadIdx.x == 0) {
       feedback->state_dim = stage.n;
@@ -6694,30 +6974,29 @@ __device__ bool SolveFeedbackBlock(const ReducedStage &stage,
       const int col = linear % stage.n;
       feedback->transition[row * stage.n + col] = stage.A[row * stage.n + col];
     }
-    for (int row = threadIdx.x; row < stage.next_n; row += blockDim.x)
-      feedback->offset[row] = stage.c[row];
     return true;
   }
 
-  const int columns = stage.m + stage.n + 1;
-  BuildFeedbackSystem(stage, next, augmented, columns);
+  const int columns = stage.m + stage.n;
+  BuildMatrixFeedbackSystem(stage, next, augmented, columns);
   WarpSynchronize();
   if (!FactorPositiveDefiniteBlock(augmented, columns, stage.m, tolerance,
-                                   cholesky, positive_definite)) {
+                                   feedback->control_factor,
+                                   positive_definite)) {
     if (threadIdx.x == 0)
       SetFailure(status, kDeviceNumericalFailure, stage_index, diagnostic);
     return false;
   }
-  SolvePositiveDefiniteMultipleRhsBlock(cholesky, stage.m, augmented + stage.m,
-                                        columns, stage.n + 1);
-  ExtractFeedback(stage, augmented, columns, feedback);
+  SolvePositiveDefiniteMultipleRhsBlock(feedback->control_factor, stage.m,
+                                        augmented + stage.m, columns, stage.n);
+  ExtractMatrixFeedback(stage, augmented, columns, feedback);
   return true;
 }
 
-__global__ void FeedbackKernel(const ReducedStage *stages,
-                               const ValueElement *suffix, int stage_count,
-                               Scalar tolerance, Feedback *feedback,
-                               DeviceStatus *status) {
+__global__ void MatrixFeedbackKernel(const ReducedStage *stages,
+                                     const ValueElement *suffix,
+                                     int stage_count, Scalar tolerance,
+                                     Feedback *feedback, DeviceStatus *status) {
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
@@ -6726,18 +7005,235 @@ __global__ void FeedbackKernel(const ReducedStage *stages,
   const ReducedStage &s = stages[index];
   const ValueElement &next = suffix[index + 1];
   Feedback &out = feedback[index];
-  const int columns = s.m + s.n + 1;
+  const int columns = s.m + s.n;
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(s.m) * columns);
-  scratch_size.Add<Scalar>(static_cast<std::size_t>(s.m) * s.m);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *augmented =
       scratch.Take<Scalar>(static_cast<std::size_t>(s.m) * columns);
-  Scalar *cholesky =
-      scratch.Take<Scalar>(static_cast<std::size_t>(s.m) * s.m);
   __shared__ int positive_definite;
-  SolveFeedbackBlock(s, next, tolerance, &out, augmented, cholesky,
-                     &positive_definite, status, index, 9);
+  SolveMatrixFeedbackBlock(s, next, tolerance, &out, augmented,
+                           &positive_definite, status, index, 9);
+}
+
+// With no dual regularization, the affine Riccati term satisfies
+//   p_i = q_i + K_i^T r_i
+//       + (A_i+B_i K_i)^T (p_{i+1}+P_{i+1}c_i).
+// Store f_i:p_{i+1}->p_i in reverse stage order so the same affine-prefix
+// kernels used for state reconstruction compute every costate suffix.
+__global__ void InitializeCostateMapsKernel(const ReducedStage *stages,
+                                            const ValueElement *suffix,
+                                            const Feedback *feedback,
+                                            int stage_count, AffineMap *maps,
+                                            DeviceStatus *status) {
+  const int index = blockIdx.x;
+  if (index >= stage_count)
+    return;
+  if (!BlockEnabled(status))
+    return;
+  const ReducedStage &stage = stages[index];
+  const ValueElement &next = suffix[index + 1];
+  const Feedback &fb = feedback[index];
+  AffineMap &map = maps[stage_count - 1 - index];
+  const int shared_entries =
+      static_cast<int>(SharedScalarEntries(stage.next_n));
+  CLQR_BLOCK_SCRATCH(scratch, AffineTermsScratchBytes(stage.next_n));
+  Scalar *future_offset = scratch.Take<Scalar>(shared_entries);
+  if (threadIdx.x == 0) {
+    map.left_dim = stage.next_n;
+    map.right_dim = stage.n;
+  }
+  for (int linear = threadIdx.x; linear < stage.n * stage.next_n;
+       linear += blockDim.x) {
+    const int row = linear / stage.next_n;
+    const int col = linear % stage.next_n;
+    map.linear[row * stage.next_n + col] = fb.transition[col * stage.n + row];
+  }
+  for (int row = threadIdx.x; row < shared_entries; row += blockDim.x) {
+    Scalar value = Scalar{0};
+    if (row < stage.next_n) {
+      for (int col = 0; col < stage.next_n; ++col)
+        value += next.J[row * next.left_dim + col] * stage.c[col];
+    }
+    future_offset[row] = value;
+  }
+  WarpSynchronize();
+  for (int row = threadIdx.x; row < stage.n; row += blockDim.x) {
+    Scalar value = stage.q[row];
+    for (int next_row = 0; next_row < stage.next_n; ++next_row)
+      value += stage.A[next_row * stage.n + row] * future_offset[next_row];
+    for (int control = 0; control < stage.m; ++control) {
+      Scalar control_gradient = stage.r[control];
+      for (int next_row = 0; next_row < stage.next_n; ++next_row) {
+        control_gradient +=
+            stage.B[next_row * stage.m + control] * future_offset[next_row];
+      }
+      value += fb.K[control * stage.n + row] * control_gradient;
+    }
+    map.offset[row] = value;
+  }
+}
+
+__global__ void RecoverCostatesKernel(const AffineMap *prefix_maps,
+                                      const ReducedTerminal *terminal,
+                                      const int *reduced_state_offsets,
+                                      int stage_count, Scalar *costates,
+                                      DeviceStatus *status) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index > stage_count)
+    return;
+  if (!BlockEnabled(status))
+    return;
+  if (index == stage_count) {
+    for (int row = 0; row < terminal->n; ++row)
+      costates[reduced_state_offsets[index] + row] = terminal->q[row];
+    return;
+  }
+  const AffineMap &map = prefix_maps[stage_count - 1 - index];
+  for (int row = 0; row < map.right_dim; ++row) {
+    Scalar value = map.offset[row];
+    for (int col = 0; col < map.left_dim; ++col)
+      value += map.linear[row * map.left_dim + col] * terminal->q[col];
+    costates[reduced_state_offsets[index] + row] = value;
+  }
+}
+
+#ifdef CLQR_USE_FLOAT
+// One residual-correction solve can reuse the matrix Riccati factors when the
+// separately recovered affine terms lose too much FP32 consistency. Recover
+// the actual reduced costates from
+//   y_i = Q_i z_i + M_i v_i + q_i + A_i^T y_{i+1},
+// then convert them back to value-function linear terms p_i = y_i - P_i z_i.
+// Both the reverse costate pass and the subsequent primal rollout remain
+// balanced affine scans; no matrix factorization is repeated.
+__global__ void InitializeCostateRefinementMapsKernel(
+    const ReducedStage *stages, const Scalar *reduced_states,
+    const Scalar *reduced_controls, const int *reduced_state_offsets,
+    const int *control_offsets, int stage_count, AffineMap *maps,
+    DeviceStatus *status) {
+  const int index = blockIdx.x;
+  if (index >= stage_count || !BlockEnabled(status))
+    return;
+  const ReducedStage &stage = stages[index];
+  AffineMap &map = maps[stage_count - 1 - index];
+  if (threadIdx.x == 0) {
+    map.left_dim = stage.next_n;
+    map.right_dim = stage.n;
+  }
+  for (int linear = threadIdx.x; linear < stage.n * stage.next_n;
+       linear += blockDim.x) {
+    const int row = linear / stage.next_n;
+    const int col = linear % stage.next_n;
+    map.linear[row * stage.next_n + col] = stage.A[col * stage.n + row];
+  }
+  const Scalar *state = reduced_states + reduced_state_offsets[index];
+  const Scalar *control = reduced_controls + control_offsets[index];
+  for (int row = threadIdx.x; row < stage.n; row += blockDim.x) {
+    Scalar value = stage.q[row];
+    for (int col = 0; col < stage.n; ++col)
+      value += stage.Q[row * stage.n + col] * state[col];
+    for (int col = 0; col < stage.m; ++col)
+      value += stage.M[row * stage.m + col] * control[col];
+    map.offset[row] = value;
+  }
+}
+
+__global__ void InitializeTerminalCostateKernel(
+    const ReducedTerminal *terminal, const Scalar *reduced_states,
+    const int *reduced_state_offsets, int stage_count, Scalar *costates,
+    DeviceStatus *status) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= terminal->n || !BlockEnabled(status))
+    return;
+  const Scalar *state = reduced_states + reduced_state_offsets[stage_count];
+  Scalar value = terminal->q[row];
+  for (int col = 0; col < terminal->n; ++col)
+    value += terminal->Q[row * terminal->n + col] * state[col];
+  costates[reduced_state_offsets[stage_count] + row] = value;
+}
+
+__global__ void RecoverCostatesFromTerminalKernel(
+    const AffineMap *prefix_maps, const Scalar *terminal_costate,
+    const int *reduced_state_offsets, int stage_count, Scalar *costates,
+    DeviceStatus *status) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= stage_count || !BlockEnabled(status))
+    return;
+  const AffineMap &map = prefix_maps[stage_count - 1 - index];
+  for (int row = 0; row < map.right_dim; ++row) {
+    Scalar value = map.offset[row];
+    for (int col = 0; col < map.left_dim; ++col)
+      value += map.linear[row * map.left_dim + col] * terminal_costate[col];
+    costates[reduced_state_offsets[index] + row] = value;
+  }
+}
+
+__global__ void ConvertCostatesToValueLinearKernel(
+    const ValueElement *suffix, const Scalar *reduced_states,
+    const int *reduced_state_offsets, int stage_count, Scalar *costates,
+    DeviceStatus *status) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index > stage_count || !BlockEnabled(status))
+    return;
+  const ValueElement &value = suffix[index];
+  const Scalar *state = reduced_states + reduced_state_offsets[index];
+  Scalar *costate = costates + reduced_state_offsets[index];
+  for (int row = 0; row < value.left_dim; ++row) {
+    Scalar linear = costate[row];
+    for (int col = 0; col < value.left_dim; ++col)
+      linear -= value.J[row * value.left_dim + col] * state[col];
+    costate[row] = linear;
+  }
+}
+#endif
+
+__global__ void FinalizeFeedbackKernel(const ReducedStage *stages,
+                                       const ValueElement *suffix,
+                                       const Scalar *costates,
+                                       const int *reduced_state_offsets,
+                                       int stage_count, Feedback *feedback,
+                                       DeviceStatus *status) {
+  const int index = blockIdx.x;
+  if (index >= stage_count)
+    return;
+  if (!BlockEnabled(status))
+    return;
+  const ReducedStage &stage = stages[index];
+  const ValueElement &next = suffix[index + 1];
+  Feedback &fb = feedback[index];
+  const Scalar *next_costate =
+      stage.next_n > 0 ? costates + reduced_state_offsets[index + 1] : nullptr;
+  const int shared_entries =
+      static_cast<int>(SharedScalarEntries(stage.next_n));
+  CLQR_BLOCK_SCRATCH(scratch, AffineTermsScratchBytes(stage.next_n));
+  Scalar *future = scratch.Take<Scalar>(shared_entries);
+  for (int row = threadIdx.x; row < shared_entries; row += blockDim.x) {
+    Scalar value = Scalar{0};
+    if (row < stage.next_n) {
+      value = next_costate[row];
+      for (int col = 0; col < stage.next_n; ++col)
+        value += next.J[row * next.left_dim + col] * stage.c[col];
+    }
+    future[row] = value;
+  }
+  WarpSynchronize();
+  for (int control = threadIdx.x; control < stage.m; control += blockDim.x) {
+    Scalar value = -stage.r[control];
+    for (int next_row = 0; next_row < stage.next_n; ++next_row)
+      value -= stage.B[next_row * stage.m + control] * future[next_row];
+    fb.k[control] = value;
+  }
+  WarpSynchronize();
+  if (stage.m > 0) {
+    SolvePositiveDefiniteMultipleRhsBlock(fb.control_factor, stage.m, fb.k, 1,
+                                          1);
+  }
+  for (int row = threadIdx.x; row < stage.next_n; row += blockDim.x) {
+    Scalar value = stage.c[row];
+    for (int control = 0; control < stage.m; ++control)
+      value += stage.B[row * stage.m + control] * fb.k[control];
+    fb.offset[row] = value;
+  }
 }
 
 } // namespace
@@ -7172,12 +7668,12 @@ __global__ void InitialReducedStateKernel(const StateParam *state_params,
   }
 }
 
-__global__ void BuildObjectiveTermsKernel(
-    const PackedStage *stages, int stage_count,
-    const PackedTerminal *terminal_ptr, const Scalar *states,
-    const Scalar *controls, const int *state_offsets,
-    const int *control_offsets, Scalar *objective_tree,
-    DeviceStatus *status) {
+__global__ void
+BuildObjectiveTermsKernel(const PackedStage *stages, int stage_count,
+                          const PackedTerminal *terminal_ptr,
+                          const Scalar *states, const Scalar *controls,
+                          const int *state_offsets, const int *control_offsets,
+                          Scalar *objective_tree, DeviceStatus *status) {
   const int node = blockIdx.x;
   if (node > stage_count || !BlockEnabled(status))
     return;
