@@ -223,29 +223,29 @@ Pass an integer scale factor to increase the per-case iteration counts:
 bazel run -c opt //:clqr_benchmark -- 10
 ```
 
-Sample workspace-API results from `bazel-bin/clqr_benchmark 5` after building
-`//:clqr_benchmark -c opt` on arm64 macOS with clang 22.1.1. The benchmark reserves
-workspace once per problem and times repeated solves. It also reports `max_us`; local
-scheduler spikes can make maxima unrepresentative, so median and p90 are usually
-better summary statistics.
+Sample workspace-API results from `bazel-bin/clqr_benchmark 5` at `6dc4b2d`,
+after building `//:clqr_benchmark -c opt` on arm64 macOS with Apple clang
+21.0.0. The benchmark reserves workspace once per problem and times repeated
+solves. It also reports `max_us`; local scheduler spikes can make maxima
+unrepresentative, so median and p90 are usually better summary statistics.
 
 | Case | Iterations | Mean | Median | P90 | Min | Max |
 |---|---:|---:|---:|---:|---:|---:|
-| `N=16 n=4 m=2 p=0` | 1000 | `13.8 us` | `14.2 us` | `16.5 us` | `8.88 us` | `104 us` |
-| `N=16 n=4 m=2 p=1` | 1000 | `22.6 us` | `20.3 us` | `23.6 us` | `18.6 us` | `160 us` |
-| `N=16 n=4 m=2 p=2` | 1000 | `18.7 us` | `18.1 us` | `19.7 us` | `16.7 us` | `91.1 us` |
-| `N=16 n=6 m=3 p=0` | 500 | `24.0 us` | `23.1 us` | `24.3 us` | `22.3 us` | `93.9 us` |
-| `N=16 n=6 m=3 p=1` | 500 | `37.5 us` | `35.7 us` | `38.3 us` | `35.1 us` | `112 us` |
-| `N=16 n=6 m=3 p=2` | 500 | `37.6 us` | `35.9 us` | `38.1 us` | `34.9 us` | `124 us` |
-| `N=32 n=6 m=3 p=0` | 250 | `47.6 us` | `46.2 us` | `50.0 us` | `44.5 us` | `86.6 us` |
-| `N=32 n=6 m=3 p=1` | 250 | `77.7 us` | `74.8 us` | `78.6 us` | `71.9 us` | `227 us` |
-| `N=32 n=6 m=3 p=2` | 250 | `78.3 us` | `73.9 us` | `88.7 us` | `71.1 us` | `180 us` |
-| `N=64 n=6 m=3 p=0` | 100 | `91.5 us` | `90.0 us` | `94.6 us` | `88.9 us` | `116 us` |
-| `N=64 n=6 m=3 p=1` | 100 | `159 us` | `151 us` | `178 us` | `143 us` | `295 us` |
-| `N=64 n=6 m=3 p=2` | 100 | `151 us` | `144 us` | `158 us` | `140 us` | `406 us` |
-| `N=128 n=8 m=4 p=0` | 50 | `400 us` | `382 us` | `482 us` | `363 us` | `585 us` |
-| `N=128 n=8 m=4 p=1` | 50 | `521 us` | `513 us` | `566 us` | `497 us` | `643 us` |
-| `N=128 n=8 m=4 p=2` | 50 | `524 us` | `511 us` | `574 us` | `481 us` | `752 us` |
+| `N=16 n=4 m=2 p=0` | 1000 | `3.573 us` | `3.459 us` | `3.875 us` | `3.208 us` | `4.750 us` |
+| `N=16 n=4 m=2 p=1` | 1000 | `9.746 us` | `9.750 us` | `10.083 us` | `9.042 us` | `24.208 us` |
+| `N=16 n=4 m=2 p=2` | 1000 | `9.797 us` | `9.500 us` | `10.541 us` | `9.084 us` | `54.500 us` |
+| `N=16 n=6 m=3 p=0` | 500 | `7.758 us` | `7.500 us` | `8.334 us` | `7.292 us` | `14.250 us` |
+| `N=16 n=6 m=3 p=1` | 500 | `16.260 us` | `16.083 us` | `17.375 us` | `15.416 us` | `21.042 us` |
+| `N=16 n=6 m=3 p=2` | 500 | `16.057 us` | `15.875 us` | `16.958 us` | `15.250 us` | `22.291 us` |
+| `N=32 n=6 m=3 p=0` | 250 | `15.514 us` | `15.375 us` | `15.833 us` | `14.583 us` | `27.583 us` |
+| `N=32 n=6 m=3 p=1` | 250 | `33.641 us` | `32.750 us` | `35.958 us` | `31.708 us` | `53.500 us` |
+| `N=32 n=6 m=3 p=2` | 250 | `33.187 us` | `32.417 us` | `35.500 us` | `31.542 us` | `40.916 us` |
+| `N=64 n=6 m=3 p=0` | 100 | `30.585 us` | `30.084 us` | `32.625 us` | `29.250 us` | `33.250 us` |
+| `N=64 n=6 m=3 p=1` | 100 | `66.710 us` | `65.667 us` | `68.667 us` | `63.125 us` | `115.125 us` |
+| `N=64 n=6 m=3 p=2` | 100 | `65.599 us` | `65.417 us` | `66.333 us` | `63.500 us` | `76.000 us` |
+| `N=128 n=8 m=4 p=0` | 50 | `111.271 us` | `110.708 us` | `113.125 us` | `108.334 us` | `122.166 us` |
+| `N=128 n=8 m=4 p=1` | 50 | `209.742 us` | `209.417 us` | `213.625 us` | `207.125 us` | `217.583 us` |
+| `N=128 n=8 m=4 p=2` | 50 | `204.350 us` | `203.708 us` | `205.208 us` | `201.458 us` | `223.750 us` |
 
 All sample cases reported `singular_count=0` and `wrong_inertia_count=0`.
 
