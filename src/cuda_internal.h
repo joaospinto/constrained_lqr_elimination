@@ -100,15 +100,14 @@ struct ReducedTerminal {
   Scalar *q;
 };
 
-// Associative conditional-value element for an interval. J and eta live at
-// the left endpoint; C and b live at the right endpoint; A maps left to right.
+// Matrix-only associative conditional-value element for an interval. J lives
+// at the left endpoint, C lives at the right endpoint, and A maps left to
+// right. The affine terms are recovered after the matrix scan.
 struct ValueElement {
   int left_dim;
   int right_dim;
   Scalar *A;
-  Scalar *b;
   Scalar *C;
-  Scalar *eta;
   Scalar *J;
 };
 
@@ -118,6 +117,9 @@ struct Feedback {
   int control_dim;
   Scalar *K;
   Scalar *k;
+  // Cholesky factor of R + B^T P B. The same factorization used to compute K
+  // is retained and reused to recover k after the affine costate scan.
+  Scalar *control_factor;
   Scalar *transition;
   Scalar *offset;
 };
@@ -150,8 +152,8 @@ struct DualParam {
 };
 
 // State-only multiplier at node i as an affine function of the free dual
-// coordinates on the adjacent stages.  It is obtained from the same RREF that
-// emits the residual relation, so recovery does not refactor E_i^T.
+// coordinates on the adjacent stages. It is obtained from the same pivoted QR
+// that eliminates E_i^T, so recovery does not refactor that matrix.
 struct StateDualParam {
   int constraint_dim;
   int left_dim;

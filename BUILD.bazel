@@ -217,6 +217,7 @@ cc_library(
     name = "cuda_kernel_emulation_sources",
     hdrs = [
         "include/clqr/cuda.h",
+        "src/cuda_device_io.h",
         "src/cuda_internal.h",
         "tests/emulated_cuda/cuda_runtime.h",
     ],

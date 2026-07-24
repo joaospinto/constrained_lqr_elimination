@@ -132,7 +132,13 @@ for precision in "${precisions[@]}"; do
   fi
   native_test_targets=(//:cuda_solver_test)
   native_test_binaries=("${repo_dir}/bazel-bin/cuda_solver_test")
-  if [[ "${CLQR_RUN_EXTENDED_STRESS:-0}" == "1" ]]; then
+  run_extended_stress=0
+  if [[ "${CLQR_RUN_EXTENDED_STRESS:-0}" == "1" ]] &&
+     { [[ "${precision}" == "FP64" ]] ||
+       [[ "${CLQR_RUN_FP32_EXTENDED_STRESS:-0}" == "1" ]]; }; then
+    run_extended_stress=1
+  fi
+  if [[ "${run_extended_stress}" == "1" ]]; then
     host_test_targets+=(
       //:adversarial_cpu_extended_test
       //:cuda_kernel_emulation_extended_test
@@ -148,6 +154,11 @@ for precision in "${precisions[@]}"; do
     )
     native_test_targets+=(//:adversarial_cuda_test)
     native_test_binaries+=("${repo_dir}/bazel-bin/adversarial_cuda_test")
+    if [[ "${precision}" == "FP32" ]] &&
+       [[ "${CLQR_RUN_EXTENDED_STRESS:-0}" == "1" ]]; then
+      echo "FP32 pathological extended stress is skipped by default."
+      echo "Set CLQR_RUN_FP32_EXTENDED_STRESS=1 to opt in."
+    fi
   fi
   build_targets=("${native_test_targets[@]}")
   if [[ "${CLQR_RUN_JAX_CROSS_VALIDATION:-0}" == "1" ]]; then

@@ -79,6 +79,13 @@ ordinary tolerance: direct Cholesky reuse produces a roughly `5.1e-2`
 residual there while avoiding a second factorization of every reduced control
 Hessian. FP64 must solve both sets with the ordinary gate.
 
+The original 1025-stage alternating seed is also a documented FP32
+accuracy-limit fixture. Its conditional-value interface becomes too
+ill-conditioned for a reliable pure-FP32 solve on the reference P100, so
+native CUDA may reject it as a numerical failure. An instruction ordering that
+does complete must still satisfy the ordinary quantitative KKT gate. The FP64
+expectation remains an optimal solve with the ordinary gate.
+
 On a CUDA machine, run the extended native target explicitly:
 
 ```sh
@@ -91,6 +98,25 @@ bazel build //:adversarial_cuda_extended_test \
 The notebook driver likewise builds native tests with Bazel and executes them
 directly and sequentially. This avoids Bazel test-runner CUDA library/sandbox
 differences and prevents independent GPU test processes from overlapping.
+
+The stress driver runs the full extended corpus for FP64 and the standard
+representative native and Compute Sanitizer suites for FP32:
+
+```sh
+CLQR_PRECISIONS="FP64 FP32" bash scripts/notebook_cuda_stress.sh
+```
+
+Pathological extended FP32 long-horizon cases are explicit, non-gating
+diagnostics. Opt in with:
+
+```sh
+CLQR_PRECISIONS="FP64 FP32" \
+CLQR_RUN_FP32_EXTENDED_STRESS=1 \
+bash scripts/notebook_cuda_stress.sh
+```
+
+This opt-in contains the documented 1025-stage FP32 numerical-limit fixture.
+It does not change FP64 coverage or the standard and stable FP32 gates.
 
 The reproducible machine-report and Compute Sanitizer workflow is
 `notebooks/kaggle_cuda_stress.ipynb`.

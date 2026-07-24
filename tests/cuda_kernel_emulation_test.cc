@@ -23,6 +23,15 @@ using clqr::Vector;
 using namespace clqr::cuda;
 using namespace clqr::cuda::detail;
 
+template <typename T>
+concept HasAffineRightEndpoint = requires(T value) { value.b; };
+
+template <typename T>
+concept HasAffineLeftEndpoint = requires(T value) { value.eta; };
+
+static_assert(!HasAffineRightEndpoint<ValueElement>);
+static_assert(!HasAffineLeftEndpoint<ValueElement>);
+
 // Test-only backing strides deliberately exceed the former production
 // capacities (8/8/8/8). They are not solver limits.
 constexpr int kTestStateCapacity = 24;
@@ -33,8 +42,7 @@ constexpr int kTestDualCapacity = kTestStateCapacity + kTestMixedCapacity;
 constexpr int kTestRelationRows = 2 * kTestStateCapacity;
 constexpr int kTestRelationEntries =
     kTestRelationRows * (2 * kTestStateCapacity) + kTestRelationRows;
-constexpr int kTestValueEntries =
-    3 * kTestStateCapacity * kTestStateCapacity + 2 * kTestStateCapacity;
+constexpr int kTestValueEntries = 3 * kTestStateCapacity * kTestStateCapacity;
 constexpr int kTestMapEntries =
     kTestStateCapacity * kTestStateCapacity + kTestStateCapacity;
 constexpr int kTestDualRelationEntries =
@@ -62,8 +70,7 @@ struct AllowedDeviceFailure {
   int detail;
 };
 
-const AllowedDeviceFailure *
-AllowedFailureForCase(const std::string &name) {
+const AllowedDeviceFailure *AllowedFailureForCase(const std::string &name) {
 #ifdef CLQR_USE_FLOAT
   static const std::pair<const char *, AllowedDeviceFailure> failures[]{
       {"shared-ill-conditioned-horizon-17",
@@ -101,17 +108,18 @@ void Expect(bool condition, const std::string &message) {
 }
 
 bool FinishAllowedDeviceFailure(const DeviceStatus &status,
-                                const std::string &name,
-                                const char *phase,
+                                const std::string &name, const char *phase,
                                 const AllowedDeviceFailure *allowed) {
   if (status.code == kDeviceOk)
     return false;
-  Expect(allowed != nullptr, name + " unexpected " + phase + " failure");
-  Expect(status.code == allowed->code &&
-             std::string(phase) == allowed->phase &&
-             status.detail == allowed->detail,
-         name + " unexpected device rejection during " + phase + " (stage=" +
+  Expect(allowed != nullptr,
+         name + " unexpected " + phase + " failure (stage=" +
              std::to_string(status.stage) +
+             ", detail=" + std::to_string(status.detail) + ")");
+  Expect(status.code == allowed->code && std::string(phase) == allowed->phase &&
+             status.detail == allowed->detail,
+         name + " unexpected device rejection during " + phase +
+             " (stage=" + std::to_string(status.stage) +
              ", detail=" + std::to_string(status.detail) + ")");
   std::cout << name
             << " CUDA kernel emulation passed (expected FP32 device rejection "
@@ -252,6 +260,119 @@ void OrthogonalEchelonCase() {
   }
 }
 
+void DualResidualOrthogonalEchelonCase() {
+#ifdef CLQR_USE_FLOAT
+  constexpr Scalar comparison_tolerance = 2e-4f;
+#else
+  constexpr Scalar comparison_tolerance = 2e-11;
+#endif
+  constexpr int rows = 4;
+  constexpr int eliminated = 2;
+  constexpr int left_dim = 2;
+  constexpr int right_dim = 1;
+  constexpr int variables = eliminated + left_dim + right_dim;
+  constexpr int columns = variables + 1;
+  Scalar matrix[rows * columns]{
+      Scalar{0}, Scalar{0}, Scalar{1e6}, Scalar{2e6},  Scalar{0},
+      Scalar{5e6},
+      Scalar{0}, Scalar{0}, Scalar{0},   Scalar{1e-6}, Scalar{1e-6},
+      Scalar{4e-6},
+      Scalar{0}, Scalar{0}, Scalar{3},   Scalar{9},    Scalar{3},
+      Scalar{27},
+      Scalar{0}, Scalar{0}, Scalar{0},   Scalar{0},    Scalar{0},
+      Scalar{0}};
+  int pivot_columns[rows]{};
+  int permutation[variables]{};
+  int rank = -1;
+  int best_column = -1;
+  Scalar reflector[rows]{};
+  Scalar matrix_scale = Scalar{0};
+  threadIdx.x = 0;
+  blockDim.x = 1;
+
+  OrthogonalEchelonBlock(
+      matrix, rows, columns, variables, variables, kTolerance, pivot_columns,
+      permutation, &rank, &best_column, reflector, &matrix_scale,
+      kMinimumDualRelationRowScale);
+
+  Expect(rank == 2, "dual residual QR detects the outer relation rank");
+  for (int row = 0; row < rank; ++row) {
+    Expect(pivot_columns[row] >= eliminated,
+           "dual residual QR does not pivot eliminated zero columns");
+  }
+  constexpr int relation_capacity = left_dim + right_dim;
+  constexpr int relation_entries =
+      relation_capacity * left_dim + relation_capacity * right_dim +
+      relation_capacity;
+  Scalar relation_storage[relation_entries]{};
+  DualRelation relation{};
+  BindDualRelationScratch(&relation, relation_storage, left_dim, right_dim);
+  ExtractResidualRelation(matrix, columns, rank, pivot_columns, eliminated,
+                          left_dim, right_dim, &relation);
+  Expect(relation.rows == 2 && relation.left_dim == left_dim &&
+             relation.right_dim == right_dim,
+         "dual residual QR extracts the expected relation shape");
+  const Scalar solution[left_dim + right_dim]{Scalar{1}, Scalar{2}, Scalar{2}};
+  for (int row = 0; row < relation.rows; ++row) {
+    Scalar residual = -relation.rhs[row];
+    for (int col = 0; col < left_dim; ++col)
+      residual += relation.left[row * left_dim + col] * solution[col];
+    for (int col = 0; col < right_dim; ++col) {
+      residual +=
+          relation.right[row * right_dim + col] * solution[left_dim + col];
+    }
+    Expect(std::abs(residual) < comparison_tolerance,
+           "dual residual QR preserves the affine outer relation");
+  }
+
+  constexpr int inconsistent_rows = 2;
+  constexpr int inconsistent_variables = 3;
+  constexpr int inconsistent_columns = inconsistent_variables + 1;
+  Scalar inconsistent[inconsistent_rows * inconsistent_columns]{
+      Scalar{0}, Scalar{1}, Scalar{0}, Scalar{1},
+      Scalar{0}, Scalar{1}, Scalar{0}, Scalar{2}};
+  int inconsistent_pivots[inconsistent_rows]{};
+  int inconsistent_permutation[inconsistent_variables]{};
+  int inconsistent_rank = -1;
+  Scalar inconsistent_reflector[inconsistent_rows]{};
+  OrthogonalEchelonBlock(
+      inconsistent, inconsistent_rows, inconsistent_columns,
+      inconsistent_variables, inconsistent_variables, kTolerance,
+      inconsistent_pivots, inconsistent_permutation, &inconsistent_rank,
+      &best_column, inconsistent_reflector, &matrix_scale,
+      kMinimumDualRelationRowScale);
+  Expect(inconsistent_rank == 1,
+         "dual residual QR identifies a repeated coefficient row");
+  Expect(InconsistentRref(inconsistent, inconsistent_rows,
+                          inconsistent_columns, inconsistent_variables,
+                          kTolerance, kTolerance),
+         "dual residual QR retains the orthogonal consistency residual");
+
+#ifdef CLQR_USE_FLOAT
+  constexpr Scalar marginal_residual = 8e-2f;
+#else
+  constexpr Scalar marginal_residual = 4e-6;
+#endif
+  Scalar marginal[4]{Scalar{1}, Scalar{0}, Scalar{1}, marginal_residual};
+  int marginal_pivots[1]{};
+  int marginal_permutation[1]{};
+  int marginal_rank = -1;
+  Scalar marginal_reflector[2]{};
+  OrthogonalEchelonBlock(
+      marginal, 2, 2, 1, 1, kMinimumMultiplierRankTolerance,
+      marginal_pivots, marginal_permutation, &marginal_rank, &best_column,
+      marginal_reflector, &matrix_scale, kMinimumDualRelationRowScale);
+  const Scalar tree_tolerance =
+      kMultiplierConsistencyTolerancePerTreeLevel * Scalar{7};
+  const Scalar leaf_tolerance = kMultiplierConsistencyTolerancePerTreeLevel;
+  Expect(!InconsistentRref(marginal, 2, 2, 1,
+                           kMinimumMultiplierRankTolerance, tree_tolerance),
+         "tree-accumulated tolerance admits a marginal leaf residual");
+  Expect(InconsistentRref(marginal, 2, 2, 1,
+                          kMinimumMultiplierRankTolerance, leaf_tolerance),
+         "per-leaf tolerance rejects a marginal leaf residual");
+}
+
 void IllConditionedPositiveDefiniteMultiRhsCase() {
 #ifdef CLQR_USE_FLOAT
   constexpr Scalar small_eigenvalue = 5e-4f;
@@ -338,34 +459,26 @@ void InvalidValueElementCopyCase() {
 
 void FreeFixedFreeValueCompositionCase() {
   Scalar first_j[]{2, Scalar{0.1}, Scalar{0.1}, 3};
-  Scalar first_eta[]{Scalar{0.4}, Scalar{-0.2}};
-  Scalar second_c[]{4, Scalar{0.2}, Scalar{-0.1},
-                    Scalar{0.2}, 5, Scalar{0.3},
-                    Scalar{-0.1}, Scalar{0.3}, 6};
-  Scalar second_b[]{Scalar{0.7}, Scalar{-0.5}, Scalar{0.25}};
+  Scalar second_c[]{4, Scalar{0.2}, Scalar{-0.1}, Scalar{0.2},
+                    5, Scalar{0.3}, Scalar{-0.1}, Scalar{0.3},
+                    6};
   ValueElement first{};
   first.left_dim = 2;
   first.right_dim = 0;
   first.J = first_j;
-  first.eta = first_eta;
   ValueElement second{};
   second.left_dim = 0;
   second.right_dim = 3;
   second.C = second_c;
-  second.b = second_b;
 
   Scalar output_a[6];
   Scalar output_j[4]{};
-  Scalar output_eta[2]{};
   Scalar output_c[9]{};
-  Scalar output_b[3]{};
   std::fill(std::begin(output_a), std::end(output_a), Scalar{17});
   ValueElement output{};
   output.A = output_a;
   output.J = output_j;
-  output.eta = output_eta;
   output.C = output_c;
-  output.b = output_b;
   DeviceStatus status{kDeviceOk, -1, 0};
   Scalar augmented[1]{};
   Scalar factors[1]{};
@@ -376,8 +489,7 @@ void FreeFixedFreeValueCompositionCase() {
   ComposeValueElementsBlock(first, second, kTolerance, &output, &status, 0,
                             augmented, factors, &best_row);
 
-  Expect(status.code == kDeviceOk,
-         "free-fixed-free value composition status");
+  Expect(status.code == kDeviceOk, "free-fixed-free value composition status");
   Expect(output.left_dim == 2 && output.right_dim == 3,
          "free-fixed-free value composition dimensions");
   for (Scalar value : output_a)
@@ -386,36 +498,30 @@ void FreeFixedFreeValueCompositionCase() {
   for (std::size_t i = 0; i < std::size(first_j); ++i)
     Expect(output_j[i] == first_j[i],
            "free-fixed-free value composition preserves the left Hessian");
-  for (std::size_t i = 0; i < std::size(first_eta); ++i)
-    Expect(output_eta[i] == first_eta[i],
-           "free-fixed-free value composition preserves the left gradient");
   for (std::size_t i = 0; i < std::size(second_c); ++i)
     Expect(output_c[i] == second_c[i],
            "free-fixed-free value composition preserves the right curvature");
-  for (std::size_t i = 0; i < std::size(second_b); ++i)
-    Expect(output_b[i] == second_b[i],
-           "free-fixed-free value composition preserves the right offset");
 }
 
 void DualRelationLeafScratchSizeCase() {
   ScratchSize without_constraint_scales;
-  without_constraint_scales.Add<Scalar>(4);
+  without_constraint_scales.Add<Scalar>(2);
   without_constraint_scales.Add<Scalar>(1);
   without_constraint_scales.Add<int>(1);
   without_constraint_scales.Add<int>(1);
-  Expect(DualRelationLeafScratchBytes(4, 1, 1) ==
+  Expect(DualRelationLeafScratchBytes(2, 1, 1, 1) ==
              without_constraint_scales.bytes + sizeof(Scalar),
          "dual-relation leaf scratch includes state-constraint scales");
 
-  ScratchSize more_constraints_than_rows;
-  more_constraints_than_rows.Add<Scalar>(6);
-  more_constraints_than_rows.Add<Scalar>(1);
-  more_constraints_than_rows.Add<Scalar>(3);
-  more_constraints_than_rows.Add<int>(1);
-  more_constraints_than_rows.Add<int>(3);
-  Expect(DualRelationLeafScratchBytes(6, 1, 3) ==
-             more_constraints_than_rows.bytes,
-         "dual-relation leaf scratch sizes the QR permutation at runtime");
+  ScratchSize more_columns_than_rows;
+  more_columns_than_rows.Add<Scalar>(6);
+  more_columns_than_rows.Add<Scalar>(1);
+  more_columns_than_rows.Add<Scalar>(1);
+  more_columns_than_rows.Add<int>(1);
+  more_columns_than_rows.Add<int>(5);
+  Expect(DualRelationLeafScratchBytes(6, 1, 1, 5) ==
+             more_columns_than_rows.bytes,
+         "dual-relation leaf scratch sizes the full QR permutation at runtime");
 }
 
 Problem PathologicalScratchProblem() {
@@ -464,10 +570,9 @@ void ScratchPlannerTopologyCase() {
   const ScanShape terminal_relation = MakeScanShape(n, 0);
   ScratchSize value_leaf;
   value_leaf.Add<Scalar>(4 * 4);
-  value_leaf.Add<Scalar>(4 * (2 * n + 1));
+  value_leaf.Add<Scalar>(4 * (2 * n));
   ScratchSize feedback;
-  feedback.Add<Scalar>(4 * (4 + n + 1));
-  feedback.Add<Scalar>(4 * 4);
+  feedback.Add<Scalar>(4 * (4 + n));
   ScratchSize dual_parameter;
   dual_parameter.Add<Scalar>(12 * 9);
   dual_parameter.Add<Scalar>(0);
@@ -491,25 +596,32 @@ void ScratchPlannerTopologyCase() {
                      8, 13, "uniform stage-reduction workspace"),
          "uniform n=8 feasibility launch scratch is unchanged");
   Expect(uniform.value_compose ==
-             GeneralSolveScratchBytes(n, 3 * n + 1, "uniform value workspace"),
+             GeneralSolveScratchBytes(n, 3 * n, "uniform value workspace"),
          "uniform n=8 value-composition launch scratch uses LU workspace");
   Expect(uniform.value_leaf == value_leaf.bytes &&
              uniform.value_finalize ==
                  ValueFinalizeScratchBytes(uniform_relation, &uniform_relation,
                                            terminal_relation) &&
              uniform.feedback == feedback.bytes &&
+             uniform.affine_terms == n * sizeof(Scalar) &&
              uniform.affine_finalize ==
                  AffineFinalizeScratchBytes(uniform_relation, &uniform_relation,
                                             uniform_relation),
          "uniform n=8 Riccati/reconstruction launch scratch matches active "
          "dimensions");
+  const ScratchRequirements odd =
+      PlanScratch(clqr::benchmark::StateOnlyProblem(7, 5, 3, 1));
+  Expect(odd.affine_terms == AffineTermsScratchBytes(5) &&
+             odd.affine_terms >= 5 * sizeof(Scalar),
+         "odd affine scratch dimensions include a complete shared-memory "
+         "transaction");
   Expect(uniform.dual_relation ==
              DenseEliminationScratchBytes(4 * n, 3 * n + 1,
                                           "uniform dual workspace"),
          "uniform n=8 dual-relation launch scratch is unchanged");
   Expect(uniform.dual_parameter == dual_parameter.bytes &&
              uniform.dual_relation_leaf ==
-                 DualRelationLeafScratchBytes(8 * 19, 8, 2) &&
+                 DualRelationLeafScratchBytes(8 * 19, 8, 2, 18) &&
              uniform.dual_root == DualRootScratchBytes(terminal_relation) &&
              uniform.dual_expand ==
                  DualExpandScratchBytes(uniform_relation, uniform_relation),
@@ -660,6 +772,26 @@ Problem UniformProblem(int seed, std::size_t horizon, std::size_t n,
   problem.terminal_q = GeneratedVector(n, seed + 1100, 0.15);
   problem.terminal_E = Matrix(0, n);
   problem.terminal_e = Vector(0);
+  return problem;
+}
+
+enum class AffineSource { kStateCost, kControlCost, kDynamics };
+
+Problem SingleAffineSourceProblem(AffineSource source) {
+  Problem problem = UniformProblem(1550 + static_cast<int>(source), 7, 4, 3);
+  for (Stage &stage : problem.stages) {
+    const Vector dynamics_offset = stage.c;
+    const Vector state_gradient = stage.q;
+    const Vector control_gradient = stage.r;
+    stage.c = source == AffineSource::kDynamics ? dynamics_offset
+                                                : Vector(stage.c.size());
+    stage.q = source == AffineSource::kStateCost ? state_gradient
+                                                 : Vector(stage.q.size());
+    stage.r = source == AffineSource::kControlCost ? control_gradient
+                                                   : Vector(stage.r.size());
+  }
+  if (source != AffineSource::kStateCost)
+    problem.terminal_q = Vector(problem.terminal_q.size());
   return problem;
 }
 
@@ -894,8 +1026,7 @@ template <typename Function> void Launch(int blocks, Function function) {
 }
 
 void FiniteInputValidationCase() {
-  Scalar problem_data[]{Scalar{1},
-                        std::numeric_limits<Scalar>::quiet_NaN()};
+  Scalar problem_data[]{Scalar{1}, std::numeric_limits<Scalar>::quiet_NaN()};
   Scalar initial_state[]{Scalar{2}};
   DeviceStatus status{};
   Launch(2, [&] {
@@ -1350,6 +1481,9 @@ void RunEmulation(const Problem &problem, const std::string &name,
                                  kTestControlCapacity * kTestStateCapacity);
   std::vector<Scalar> feedback_k(static_cast<std::size_t>(horizon) *
                                  kTestControlCapacity);
+  std::vector<Scalar> feedback_control_factor(
+      static_cast<std::size_t>(horizon) * kTestControlCapacity *
+      kTestControlCapacity);
   std::vector<Scalar> feedback_transition(static_cast<std::size_t>(horizon) *
                                           kTestStateCapacity *
                                           kTestStateCapacity);
@@ -1360,6 +1494,9 @@ void RunEmulation(const Problem &problem, const std::string &name,
     feedback[stage].K =
         feedback_K.data() + index * kTestControlCapacity * kTestStateCapacity;
     feedback[stage].k = feedback_k.data() + index * kTestControlCapacity;
+    feedback[stage].control_factor =
+        feedback_control_factor.data() +
+        index * kTestControlCapacity * kTestControlCapacity;
     feedback[stage].transition =
         feedback_transition.data() +
         index * kTestStateCapacity * kTestStateCapacity;
@@ -1370,10 +1507,11 @@ void RunEmulation(const Problem &problem, const std::string &name,
     BuildValueElementsKernel(reduced.data(), &reduced_terminal, horizon,
                              kTolerance, value_a.data(), &status);
   });
-  if (FinishAllowedDeviceFailure(status, name, "value base",
-                                 allowed_failure))
+  if (FinishAllowedDeviceFailure(status, name, "value base", allowed_failure))
     return;
   ValueElement *value_suffix = value_a.data();
+  g_value_matrix_combinations = 0;
+  g_value_matrix_factorizations = 0;
   if (nodes > 1) {
     const int first_parent_count = node_level_counts[1];
     Launch(first_parent_count, [&] {
@@ -1407,12 +1545,13 @@ void RunEmulation(const Problem &problem, const std::string &name,
                                            kTolerance, &status);
     });
   }
-  if (FinishAllowedDeviceFailure(status, name, "value scan",
-                                 allowed_failure))
+  if (FinishAllowedDeviceFailure(status, name, "value scan", allowed_failure))
     return;
+  Expect(g_value_matrix_factorizations == g_value_matrix_combinations,
+         name + " uses exactly one LU factorization per matrix composition");
   Launch(horizon, [&] {
-    FeedbackKernel(reduced.data(), value_suffix, horizon, kTolerance,
-                   feedback.data(), &status);
+    MatrixFeedbackKernel(reduced.data(), value_suffix, horizon, kTolerance,
+                         feedback.data(), &status);
   });
   if (FinishAllowedDeviceFailure(status, name, "feedback solve",
                                  allowed_failure))
@@ -1442,11 +1581,9 @@ void RunEmulation(const Problem &problem, const std::string &name,
                          map_b_storage.data() + node * kTestMapEntries,
                          kTestStateCapacity, kTestStateCapacity);
   }
-  Launch(horizon, [&] {
-    InitializeAffineMapsKernel(feedback.data(), horizon, map_a.data(), &status);
-  });
-  AffineMap *prefix = map_a.data();
-  if (horizon > 1) {
+  const auto run_affine_prefix_scan = [&] {
+    if (horizon <= 1)
+      return;
     const int first_parent_count = stage_level_counts[1];
     Launch(first_parent_count, [&] {
       ReduceAffineLeavesKernel(map_a.data(), horizon, first_parent_count,
@@ -1478,7 +1615,8 @@ void RunEmulation(const Problem &problem, const std::string &name,
       FinalizeAffinePrefixFromParentsKernel(map_a.data(), horizon, map_b.data(),
                                             first_parent_count, &status);
     });
-  }
+  };
+
   std::vector<int> reduced_state_offsets(nodes + 1);
   std::vector<int> state_offsets(nodes + 1);
   std::vector<int> control_offsets(horizon + 1);
@@ -1490,6 +1628,32 @@ void RunEmulation(const Problem &problem, const std::string &name,
   state_offsets[nodes] = nodes * kTestStateCapacity;
   for (int index = 0; index <= horizon; ++index)
     control_offsets[index] = index * kTestControlCapacity;
+
+  std::vector<Scalar> reduced_value_linear(reduced_state_offsets.back());
+  Launch(horizon, [&] {
+    InitializeCostateMapsKernel(reduced.data(), value_suffix, feedback.data(),
+                                horizon, map_a.data(), &status);
+  });
+  run_affine_prefix_scan();
+  Launch(nodes, [&] {
+    RecoverCostatesKernel(map_a.data(), &reduced_terminal,
+                          reduced_state_offsets.data(), horizon,
+                          reduced_value_linear.data(), &status);
+  });
+  Launch(horizon, [&] {
+    FinalizeFeedbackKernel(
+        reduced.data(), value_suffix, reduced_value_linear.data(),
+        reduced_state_offsets.data(), horizon, feedback.data(), &status);
+  });
+  if (FinishAllowedDeviceFailure(status, name, "affine Riccati recovery",
+                                 allowed_failure))
+    return;
+
+  Launch(horizon, [&] {
+    InitializeAffineMapsKernel(feedback.data(), horizon, map_a.data(), &status);
+  });
+  AffineMap *prefix = map_a.data();
+  run_affine_prefix_scan();
   std::vector<Scalar> reduced_states(reduced_state_offsets.back());
   std::vector<Scalar> reduced_controls(static_cast<std::size_t>(horizon) *
                                        kTestControlCapacity);
@@ -1557,6 +1721,9 @@ void RunEmulation(const Problem &problem, const std::string &name,
       std::max(multiplier_rank_tolerance,
                kMultiplierConsistencyTolerancePerTreeLevel *
                    static_cast<Scalar>(stage_level_counts.size()));
+  const Scalar multiplier_leaf_consistency_tolerance =
+      std::max(multiplier_rank_tolerance,
+               kMultiplierConsistencyTolerancePerTreeLevel);
   std::vector<DualParam> dual_params(horizon);
   std::vector<StateDualParam> state_dual_params(horizon);
   std::vector<int> dual_free_columns(static_cast<std::size_t>(horizon) *
@@ -1612,8 +1779,8 @@ void RunEmulation(const Problem &problem, const std::string &name,
     Launch(horizon, [&] {
       BuildDualParametersKernel(
           stages.data(), state_params.data(), value_suffix,
-          reduced_states.data(), states.data(), controls.data(),
-          reduced_state_offsets.data(), state_offsets.data(),
+          reduced_value_linear.data(), reduced_states.data(), states.data(),
+          controls.data(), reduced_state_offsets.data(), state_offsets.data(),
           control_offsets.data(), horizon, multiplier_rank_tolerance,
           multiplier_consistency_tolerance, dual_params.data(),
           &dual_scan_needed, nullptr, &status);
@@ -1622,7 +1789,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
       BuildDualParameterRelationsKernel(
           stages.data(), &terminal, dual_params.data(), horizon, states.data(),
           controls.data(), state_offsets.data(), control_offsets.data(),
-          multiplier_rank_tolerance, multiplier_consistency_tolerance,
+          multiplier_rank_tolerance, multiplier_leaf_consistency_tolerance,
           dual_tree.data(), &dual_scan_needed, state_dual_params.data(),
           &status);
     });
@@ -1687,12 +1854,13 @@ void RunEmulation(const Problem &problem, const std::string &name,
          name + " emulated full KKT residual: " + std::to_string(residual) +
              " in " + worst_residual);
   const char *validation = compare_cpu ? "matched CPU" : "completed";
-  std::cout << name << " CUDA kernel emulation "
-            << validation << "; KKT residual=" << residual << '\n';
+  std::cout << name << " CUDA kernel emulation " << validation
+            << "; KKT residual=" << residual << '\n';
 }
 
 bool FitsAdversarialEmulationStorage(const Problem &problem) {
-  if (problem.terminal_Q.rows() > static_cast<std::size_t>(kTestStateCapacity) ||
+  if (problem.terminal_Q.rows() >
+          static_cast<std::size_t>(kTestStateCapacity) ||
       problem.terminal_E.rows() >
           static_cast<std::size_t>(kTestStateConstraintCapacity)) {
     return false;
@@ -1727,6 +1895,7 @@ int main(int argc, char **argv) {
   DeviceObjectiveCase();
   PivotedLuMultiRhsCase();
   OrthogonalEchelonCase();
+  DualResidualOrthogonalEchelonCase();
   IllConditionedPositiveDefiniteMultiRhsCase();
   InvalidValueElementCopyCase();
   FreeFixedFreeValueCompositionCase();
@@ -1734,6 +1903,12 @@ int main(int argc, char **argv) {
   ScratchPlannerTopologyCase();
   NonPositiveDefiniteReducedControlCostCase();
   RunEmulation(MakeProblem(), "rank-deficient constrained", true, true);
+  RunEmulation(SingleAffineSourceProblem(AffineSource::kStateCost),
+               "state-gradient-only", false, false);
+  RunEmulation(SingleAffineSourceProblem(AffineSource::kControlCost),
+               "control-gradient-only", false, false);
+  RunEmulation(SingleAffineSourceProblem(AffineSource::kDynamics),
+               "dynamics-offset-only", false, false);
   RunEmulation(ZeroHorizonProblem(), "zero-horizon", false, false);
   RunEmulation(
       UniformProblem(1800, 3, kTestStateCapacity, kTestControlCapacity),
@@ -1776,8 +1951,8 @@ int main(int argc, char **argv) {
       continue;
     }
     RunEmulation(test_case.problem, "shared-" + test_case.name, false, false,
-                 true, test_case.tolerance_scale *
-                           test_case.kkt_tolerance_scale);
+                 true,
+                 test_case.tolerance_scale * test_case.kkt_tolerance_scale);
     ++executed;
   }
   std::cout << "all " << executed

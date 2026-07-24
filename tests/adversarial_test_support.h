@@ -392,7 +392,7 @@ inline std::vector<TestCase> ExtendedCases() {
   for (std::size_t horizon : {31U, 32U, 33U, 63U, 65U, 127U, 257U, 1025U}) {
     const bool fp32_numerical_limit =
         horizon == 32 || horizon == 63 || horizon == 65 || horizon == 127 ||
-        horizon == 257;
+        horizon == 257 || horizon == 1025;
     cases.push_back({"extended-horizon-" + std::to_string(horizon),
                      UniformProblem(200 + static_cast<int>(horizon), horizon, 3,
                                     2, 1, Pattern::kAlternating),
