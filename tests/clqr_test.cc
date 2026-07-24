@@ -833,6 +833,26 @@ void WrongInertiaReportedWithCandidate() {
   p.terminal_e = Vector(0);
 
   CheckAgainstKkt(p, "wrong inertia", false, true);
+  clqr::Factorization factorization = clqr::Factor(p);
+  Expect(factorization.status() == SolveStatus::kOptimal,
+         "wrong-inertia reusable factorization status");
+  Problem changed = p;
+  changed.initial_state = Vector{Scalar{0.25}};
+  changed.stages[0].c = Vector{Scalar{-0.5}};
+  changed.stages[0].q = Vector{Scalar{0.75}};
+  changed.stages[0].r = Vector{Scalar{1.25}};
+  changed.terminal_q = Vector{Scalar{-0.4}};
+  Workspace workspace;
+  workspace.Reserve(factorization);
+  const Solution factored = CopySolutionView(
+      clqr::Solve(factorization, clqr::ExtractRhs(changed), workspace));
+  const Solution reference = SolveWithWorkspace(changed);
+  Expect(factored.status == SolveStatus::kOptimal,
+         "wrong-inertia factored solve status");
+  ExpectVectorNear(factored.controls[0], reference.controls[0], kTol,
+                   "wrong-inertia factored control");
+  ExpectNear(MaxKktResidual(changed, factored), Scalar{0}, kKktTol,
+             "wrong-inertia factored KKT residual");
 }
 
 void SingularReducedHessianReported() {
@@ -861,6 +881,8 @@ void SingularReducedHessianReported() {
   Expect(sol.status == SolveStatus::kNumericalFailure,
          "singular reduced Hessian status");
   ExpectDiagnostics(sol, true, false, "singular reduced Hessian");
+  Expect(clqr::Factor(p).status() == SolveStatus::kNumericalFailure,
+         "singular reusable factorization status");
 }
 
 void InfeasibleConstraintDetected() {

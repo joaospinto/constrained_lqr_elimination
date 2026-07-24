@@ -19,8 +19,9 @@ struct Factorization::Impl {
     Matrix M;
     Matrix P;
     Matrix K;
-    Matrix lower;
+    Matrix control_factor;
     Matrix Hxu;
+    bool control_factor_is_cholesky = true;
   };
 
   SolveStatus status = SolveStatus::kInvalidInput;
@@ -34,6 +35,7 @@ struct Factorization::Impl {
   std::size_t total_control = 0;
   std::size_t total_dynamics = 0;
   std::size_t initial_state_size = 0;
+  std::size_t max_control = 0;
   std::size_t required_solve_bytes = 0;
 };
 
@@ -1290,8 +1292,6 @@ struct RiccatiWorkspace {
   Scalar* solve_hxu = nullptr;
   Scalar* solve_hu = nullptr;
   Matrix fallback_Huu;
-  Matrix fallback_Hxu;
-  Vector fallback_hu;
 
   struct Sizes {
     std::size_t max_state = 0;
@@ -1474,17 +1474,15 @@ void MirrorLowerTriangleRaw(Scalar* CLQR_RESTRICT a, std::size_t n) {
   }
 }
 
-void SolveWithCholeskyRaw(const Scalar* CLQR_RESTRICT lower,
-                          const Scalar* CLQR_RESTRICT Hxu,
-                          const Scalar* CLQR_RESTRICT hu, std::size_t n,
-                          std::size_t m, Scalar* CLQR_RESTRICT solve_hxu,
-                          Scalar* CLQR_RESTRICT solve_hu) {
+void SolveMatrixWithCholeskyRaw(const Scalar* CLQR_RESTRICT lower,
+                                const Scalar* CLQR_RESTRICT Hxu,
+                                std::size_t n, std::size_t m,
+                                Scalar* CLQR_RESTRICT solve_hxu) {
   for (std::size_t control = 0; control < m; ++control) {
     CLQR_UNROLL
     for (std::size_t state = 0; state < n; ++state) {
       solve_hxu[control * n + state] = Hxu[state * m + control];
     }
-    solve_hu[control] = hu[control];
   }
   for (std::size_t row = 0; row < m; ++row) {
     CLQR_UNROLL
@@ -1496,12 +1494,6 @@ void SolveWithCholeskyRaw(const Scalar* CLQR_RESTRICT lower,
       }
       solve_hxu[row * n + col] = value / lower[row * m + row];
     }
-    Scalar value = solve_hu[row];
-    CLQR_UNROLL
-    for (std::size_t k = 0; k < row; ++k) {
-      value -= lower[row * m + k] * solve_hu[k];
-    }
-    solve_hu[row] = value / lower[row * m + row];
   }
   for (std::size_t rev = 0; rev < m; ++rev) {
     const std::size_t row = m - 1 - rev;
@@ -1514,84 +1506,172 @@ void SolveWithCholeskyRaw(const Scalar* CLQR_RESTRICT lower,
       }
       solve_hxu[row * n + col] = value / lower[row * m + row];
     }
-    Scalar value = solve_hu[row];
-    CLQR_UNROLL
-    for (std::size_t k = row + 1; k < m; ++k) {
-      value -= lower[k * m + row] * solve_hu[k];
-    }
-    solve_hu[row] = value / lower[row * m + row];
   }
 }
 
-bool BuildMatrixFactors(const Problem& problem, Scalar tolerance,
-                        Factorization::Impl* factorization) {
-  const std::size_t N = problem.stages.size();
-  factorization->stages.resize(N);
-  factorization->terminal_Q = problem.terminal_Q;
-  for (std::size_t rev = 0; rev < N; ++rev) {
-    const std::size_t i = N - 1 - rev;
-    const Stage& source = problem.stages[i];
-    Factorization::Impl::StageData& stage = factorization->stages[i];
-    stage.A = source.A;
-    stage.B = source.B;
-    stage.Q = source.Q;
-    stage.R = source.R;
-    stage.M = source.M;
-
-    const Matrix& P_next =
-        i + 1 == N ? factorization->terminal_Q
-                   : factorization->stages[i + 1].P;
-    const Matrix A_T_P = Transpose(stage.A) * P_next;
-    const Matrix B_T_P = Transpose(stage.B) * P_next;
-    const Matrix Hxx = stage.Q + A_T_P * stage.A;
-    const Matrix Huu = stage.R + B_T_P * stage.B;
-    stage.Hxu = stage.M + A_T_P * stage.B;
-
-    const std::size_t n = stage.A.cols();
-    const std::size_t m = stage.B.cols();
-    stage.lower = Matrix(m, m);
-    if (!CholeskyFactorizeRaw(Huu.data().data(), m, tolerance,
-                              stage.lower.data().data())) {
-      factorization->status = SolveStatus::kNumericalFailure;
-      factorization->message =
-          "reduced control Hessian is not positive definite";
-      return false;
-    }
-
-    Matrix solved(m, n);
-    Vector zero_rhs(m);
-    Vector solved_zero(m);
-    SolveWithCholeskyRaw(stage.lower.data().data(),
-                         stage.Hxu.data().data(), zero_rhs.data().data(), n, m,
-                         solved.data().data(), solved_zero.data().data());
-    stage.K = Matrix(m, n);
+void SolveControlVectorRaw(const Scalar* CLQR_RESTRICT control_factor,
+                           bool factor_is_cholesky,
+                           const Scalar* CLQR_RESTRICT rhs, std::size_t m,
+                           Scalar* CLQR_RESTRICT scratch,
+                           Scalar* CLQR_RESTRICT out) {
+  if (!factor_is_cholesky) {
     for (std::size_t row = 0; row < m; ++row) {
-      for (std::size_t col = 0; col < n; ++col) {
-        stage.K(row, col) = -solved(row, col);
+      Scalar value = Scalar{0};
+      CLQR_UNROLL
+      for (std::size_t col = 0; col < m; ++col) {
+        value += control_factor[row * m + col] * rhs[col];
       }
+      scratch[row] = value;
     }
-    stage.P = Hxx - stage.Hxu * solved;
-    for (std::size_t row = 0; row < n; ++row) {
+  } else {
+    for (std::size_t row = 0; row < m; ++row) {
+      Scalar value = rhs[row];
+      CLQR_UNROLL
       for (std::size_t col = 0; col < row; ++col) {
-        const Scalar value =
-            Scalar{0.5} * (stage.P(row, col) + stage.P(col, row));
-        stage.P(row, col) = value;
-        stage.P(col, row) = value;
+        value -= control_factor[row * m + col] * scratch[col];
       }
+      scratch[row] = value / control_factor[row * m + row];
+    }
+    for (std::size_t reverse_row = 0; reverse_row < m; ++reverse_row) {
+      const std::size_t row = m - 1 - reverse_row;
+      Scalar value = scratch[row];
+      CLQR_UNROLL
+      for (std::size_t col = row + 1; col < m; ++col) {
+        value -= control_factor[col * m + row] * scratch[col];
+      }
+      scratch[row] = value / control_factor[row * m + row];
     }
   }
-  return true;
+  for (std::size_t row = 0; row < m; ++row) out[row] = -scratch[row];
+}
+
+void ComputeUnconstrainedAffineStageRaw(
+    const Scalar* CLQR_RESTRICT A, const Scalar* CLQR_RESTRICT B,
+    const Scalar* CLQR_RESTRICT P_next,
+    const Scalar* CLQR_RESTRICT p_next, const Scalar* CLQR_RESTRICT c,
+    const Scalar* CLQR_RESTRICT q, const Scalar* CLQR_RESTRICT r,
+    const Scalar* CLQR_RESTRICT Hxu,
+    const Scalar* CLQR_RESTRICT control_factor, bool factor_is_cholesky,
+    std::size_t n, std::size_t next_n, std::size_t m,
+    Scalar* CLQR_RESTRICT p, Scalar* CLQR_RESTRICT k,
+    Scalar* CLQR_RESTRICT control_scratch) {
+  for (std::size_t row = 0; row < n; ++row) p[row] = q[row];
+  for (std::size_t row = 0; row < m; ++row) k[row] = r[row];
+  for (std::size_t shared = 0; shared < next_n; ++shared) {
+    Scalar pc = p_next[shared];
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < next_n; ++col) {
+      pc += P_next[shared * next_n + col] * c[col];
+    }
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < n; ++col) {
+      p[col] += A[shared * n + col] * pc;
+    }
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < m; ++col) {
+      k[col] += B[shared * m + col] * pc;
+    }
+  }
+  SolveControlVectorRaw(control_factor, factor_is_cholesky, k, m,
+                        control_scratch, k);
+  for (std::size_t row = 0; row < n; ++row) {
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < m; ++col) {
+      p[row] += Hxu[row * m + col] * k[col];
+    }
+  }
+}
+
+void RollOutUnconstrainedStageRaw(
+    const Scalar* CLQR_RESTRICT A, const Scalar* CLQR_RESTRICT B,
+    const Scalar* CLQR_RESTRICT c, const Scalar* CLQR_RESTRICT K,
+    const Scalar* CLQR_RESTRICT k, std::size_t n, std::size_t next_n,
+    std::size_t m, VectorView x, VectorView u, VectorView next_x) {
+  for (std::size_t row = 0; row < m; ++row) {
+    Scalar value = k[row];
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < n; ++col) {
+      value += K[row * n + col] * x[col];
+    }
+    u[row] = value;
+  }
+  for (std::size_t row = 0; row < next_n; ++row) {
+    Scalar value = c[row];
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < n; ++col) {
+      value += A[row * n + col] * x[col];
+    }
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < m; ++col) {
+      value += B[row * m + col] * u[col];
+    }
+    next_x[row] = value;
+  }
+}
+
+Scalar UnconstrainedStageObjectiveRaw(
+    const Scalar* CLQR_RESTRICT Q, const Scalar* CLQR_RESTRICT R,
+    const Scalar* CLQR_RESTRICT M, const Scalar* CLQR_RESTRICT q,
+    const Scalar* CLQR_RESTRICT r, std::size_t n, std::size_t m, VectorView x,
+    VectorView u) {
+  Scalar objective = Scalar{0};
+  for (std::size_t row = 0; row < n; ++row) {
+    Scalar Qx = Scalar{0};
+    Scalar Mu = Scalar{0};
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < n; ++col) {
+      Qx += Q[row * n + col] * x[col];
+    }
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < m; ++col) {
+      Mu += M[row * m + col] * u[col];
+    }
+    objective +=
+        Scalar{0.5} * x[row] * Qx + x[row] * Mu + q[row] * x[row];
+  }
+  for (std::size_t row = 0; row < m; ++row) {
+    Scalar Ru = Scalar{0};
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < m; ++col) {
+      Ru += R[row * m + col] * u[col];
+    }
+    objective += Scalar{0.5} * u[row] * Ru + r[row] * u[row];
+  }
+  return objective;
+}
+
+Scalar UnconstrainedTerminalObjectiveRaw(
+    const Scalar* CLQR_RESTRICT Q, const Scalar* CLQR_RESTRICT q,
+    std::size_t n, VectorView x) {
+  Scalar objective = Scalar{0};
+  for (std::size_t row = 0; row < n; ++row) {
+    Scalar Qx = Scalar{0};
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < n; ++col) {
+      Qx += Q[row * n + col] * x[col];
+    }
+    objective += Scalar{0.5} * x[row] * Qx + q[row] * x[row];
+  }
+  return objective;
+}
+
+void RecoverUnconstrainedNodeMultiplierRaw(
+    const Scalar* CLQR_RESTRICT P, const Scalar* CLQR_RESTRICT p,
+    std::size_t n, VectorView x, VectorView multiplier) {
+  for (std::size_t row = 0; row < n; ++row) {
+    Scalar value = p[row];
+    CLQR_UNROLL
+    for (std::size_t col = 0; col < n; ++col) {
+      value += P[row * n + col] * x[col];
+    }
+    multiplier[row] = -value;
+  }
 }
 
 void CopyRawToMatrix(const Scalar* data, std::size_t rows, std::size_t cols,
                      Matrix* out) {
   out->resize(rows, cols);
   for (std::size_t i = 0; i < rows * cols; ++i) out->data()[i] = data[i];
-}
-
-void CopyRawToVector(const Scalar* data, std::size_t size, Vector* out) {
-  out->resize(size);
-  for (std::size_t i = 0; i < size; ++i) (*out)[i] = data[i];
 }
 
 template <typename T>
@@ -1679,6 +1759,7 @@ std::size_t FactoredSolveRequiredBytes(
   AddScalars(&offset, factorization.total_dynamics);
   AddScalars(&offset, factorization.total_state);
   AddScalars(&offset, factorization.total_control);
+  AddScalars(&offset, factorization.max_control);
   return offset;
 }
 
@@ -1686,6 +1767,7 @@ struct FactoredSolveWorkspaceLayout {
   SolutionView view;
   Scalar* p = nullptr;
   Scalar* k = nullptr;
+  Scalar* control_scratch = nullptr;
 };
 
 FactoredSolveWorkspaceLayout BindFactoredSolveWorkspace(
@@ -1718,6 +1800,8 @@ FactoredSolveWorkspaceLayout BindFactoredSolveWorkspace(
                                     factorization.total_state);
   layout.k = WorkspaceSlice<Scalar>(workspace.data(), &offset,
                                     factorization.total_control);
+  layout.control_scratch = WorkspaceSlice<Scalar>(
+      workspace.data(), &offset, factorization.max_control);
 
   layout.view.state_count = N + 1;
   layout.view.control_count = N;
@@ -2092,7 +2176,9 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
                                      const Matrix& terminal_Q,
                                      const Vector& terminal_q, Scalar tolerance,
                                      RiccatiWorkspace* workspace,
-                                     NewtonKktDiagnostics* diagnostics) {
+                                     NewtonKktDiagnostics* diagnostics,
+                                     Factorization::Impl* factorization = nullptr,
+                                     bool compute_affine = true) {
   const std::size_t N = stages.size();
   if (N == 0) return true;
   {
@@ -2100,9 +2186,11 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
     for (std::size_t i = 0; i < terminal_Q.data().size(); ++i) {
       terminal_P[i] = terminal_Q.data()[i];
     }
-    Scalar* terminal_p = workspace->pPtr(N);
-    for (std::size_t i = 0; i < terminal_q.size(); ++i)
-      terminal_p[i] = terminal_q[i];
+    if (compute_affine) {
+      Scalar* terminal_p = workspace->pPtr(N);
+      for (std::size_t i = 0; i < terminal_q.size(); ++i)
+        terminal_p[i] = terminal_q[i];
+    }
   }
   for (std::size_t rev = 0; rev < N; ++rev) {
     const std::size_t i = N - 1 - rev;
@@ -2111,24 +2199,11 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
     const std::size_t next_n = workspace->state_dim[i + 1];
     const std::size_t m = workspace->control_dim[i];
     const Scalar* CLQR_RESTRICT P_next = workspace->PPtr(i + 1);
-    const Scalar* CLQR_RESTRICT p_next = workspace->pPtr(i + 1);
     const Scalar* CLQR_RESTRICT A_data = s.A.data().data();
     const Scalar* CLQR_RESTRICT B_data = s.B.data().data();
     const Scalar* CLQR_RESTRICT Q_data = s.Q.data().data();
     const Scalar* CLQR_RESTRICT R_data = s.R.data().data();
     const Scalar* CLQR_RESTRICT M_data = s.M.data().data();
-    const Scalar* CLQR_RESTRICT c_data = s.c.data().data();
-    const Scalar* CLQR_RESTRICT q_data = s.q.data().data();
-    const Scalar* CLQR_RESTRICT r_data = s.r.data().data();
-
-    for (std::size_t row = 0; row < next_n; ++row) {
-      Scalar value = p_next[row];
-      CLQR_UNROLL
-      for (std::size_t col = 0; col < next_n; ++col) {
-        value += P_next[row * next_n + col] * c_data[col];
-      }
-      workspace->pc[row] = value;
-    }
 
     for (std::size_t row = 0; row < n; ++row) {
       Scalar* CLQR_RESTRICT out = workspace->A_T_P + row * next_n;
@@ -2190,60 +2265,42 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
       }
     }
 
-    for (std::size_t row = 0; row < n; ++row) {
-      workspace->hx[row] = q_data[row];
-    }
-    for (std::size_t row = 0; row < m; ++row) {
-      workspace->hu[row] = r_data[row];
-    }
-    for (std::size_t shared = 0; shared < next_n; ++shared) {
-      const Scalar pc = workspace->pc[shared];
-      const Scalar* CLQR_RESTRICT A_row = A_data + shared * n;
-      CLQR_UNROLL
-      for (std::size_t col = 0; col < n; ++col) {
-        workspace->hx[col] += A_row[col] * pc;
-      }
-      const Scalar* CLQR_RESTRICT B_row = B_data + shared * m;
-      CLQR_UNROLL
-      for (std::size_t col = 0; col < m; ++col) {
-        workspace->hu[col] += B_row[col] * pc;
-      }
-    }
-
-    if (!CholeskyFactorizeRaw(workspace->Huu, m, tolerance, workspace->lower)) {
+    const bool factor_is_cholesky =
+        CholeskyFactorizeRaw(workspace->Huu, m, tolerance, workspace->lower);
+    const Scalar* control_factor = workspace->lower;
+    if (!factor_is_cholesky) {
       MirrorLowerTriangleRaw(workspace->Huu, m);
       CopyRawToMatrix(workspace->Huu, m, m, &workspace->fallback_Huu);
-      CopyRawToMatrix(workspace->Hxu, n, m, &workspace->fallback_Hxu);
-      CopyRawToVector(workspace->hu, m, &workspace->fallback_hu);
       if (diagnostics != nullptr) {
         AnalyzeReducedControlHessian(workspace->fallback_Huu, false, i,
                                      tolerance, diagnostics);
       }
       if (diagnostics != nullptr && diagnostics->singular) return false;
-      Matrix solve_hxu =
-          SolveLinearSystem(workspace->fallback_Huu,
-                            Transpose(workspace->fallback_Hxu), tolerance);
-      Vector solve_hu = SolveLinearSystem(workspace->fallback_Huu,
-                                          workspace->fallback_hu, tolerance);
+      workspace->fallback_Huu = SolveLinearSystem(
+          workspace->fallback_Huu, Identity(m), tolerance);
+      control_factor = workspace->fallback_Huu.data().data();
       for (std::size_t row = 0; row < m; ++row) {
         for (std::size_t col = 0; col < n; ++col) {
-          workspace->solve_hxu[row * n + col] = solve_hxu(row, col);
+          Scalar value = Scalar{0};
+          CLQR_UNROLL
+          for (std::size_t shared = 0; shared < m; ++shared) {
+            value += control_factor[row * m + shared] *
+                     workspace->Hxu[col * m + shared];
+          }
+          workspace->solve_hxu[row * n + col] = value;
         }
-        workspace->solve_hu[row] = solve_hu[row];
       }
     } else {
-      SolveWithCholeskyRaw(workspace->lower, workspace->Hxu, workspace->hu, n,
-                           m, workspace->solve_hxu, workspace->solve_hu);
+      SolveMatrixWithCholeskyRaw(workspace->lower, workspace->Hxu, n, m,
+                                 workspace->solve_hxu);
     }
 
     Scalar* CLQR_RESTRICT K = workspace->KPtr(i);
-    Scalar* CLQR_RESTRICT k = workspace->kPtr(i);
     for (std::size_t row = 0; row < m; ++row) {
       CLQR_UNROLL
       for (std::size_t col = 0; col < n; ++col) {
         K[row * n + col] = -workspace->solve_hxu[row * n + col];
       }
-      k[row] = -workspace->solve_hu[row];
     }
 
     Scalar* CLQR_RESTRICT P = workspace->PPtr(i);
@@ -2260,16 +2317,45 @@ bool ComputeUnconstrainedRiccatiInto(const WorkspaceVector<Stage>& stages,
       }
     }
 
-    Scalar* CLQR_RESTRICT p = workspace->pPtr(i);
-    for (std::size_t row = 0; row < n; ++row) {
-      Scalar value = workspace->hx[row];
-      CLQR_UNROLL
-      for (std::size_t control = 0; control < m; ++control) {
-        value -=
-            workspace->Hxu[row * m + control] * workspace->solve_hu[control];
-      }
-      p[row] = value;
+    if (factorization != nullptr) {
+      Factorization::Impl::StageData& stage = factorization->stages[i];
+      stage.A = s.A;
+      stage.B = s.B;
+      stage.Q = s.Q;
+      stage.R = s.R;
+      stage.M = s.M;
+      CopyRawToMatrix(P, n, n, &stage.P);
+      CopyRawToMatrix(K, m, n, &stage.K);
+      CopyRawToMatrix(workspace->Hxu, n, m, &stage.Hxu);
+      CopyRawToMatrix(control_factor, m, m, &stage.control_factor);
+      stage.control_factor_is_cholesky = factor_is_cholesky;
     }
+
+    if (compute_affine) {
+      ComputeUnconstrainedAffineStageRaw(
+          A_data, B_data, P_next, workspace->pPtr(i + 1),
+          s.c.data().data(), s.q.data().data(), s.r.data().data(),
+          workspace->Hxu, control_factor, factor_is_cholesky, n, next_n, m,
+          workspace->pPtr(i), workspace->kPtr(i), workspace->solve_hu);
+    }
+  }
+  return true;
+}
+
+bool BuildMatrixFactors(const Problem& problem, Scalar tolerance,
+                        Factorization::Impl* factorization) {
+  factorization->stages.resize(problem.stages.size());
+  factorization->terminal_Q = problem.terminal_Q;
+  RiccatiWorkspace workspace;
+  workspace.Reserve(problem.stages);
+  NewtonKktDiagnostics diagnostics;
+  if (!ComputeUnconstrainedRiccatiInto(
+          problem.stages, problem.terminal_Q, problem.terminal_q, tolerance,
+          &workspace, &diagnostics, factorization, false)) {
+    factorization->status = SolveStatus::kNumericalFailure;
+    factorization->message =
+        "reduced control Hessian is not positive definite";
+    return false;
   }
   return true;
 }
@@ -2279,13 +2365,10 @@ void RecoverUnconstrainedMultipliersInto(const Problem& original,
                                          SolutionView* out) {
   const std::size_t N = original.stages.size();
   if (N == 0) {
-    for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
-      Scalar value = original.terminal_q[row];
-      for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
-        value += original.terminal_Q(row, col) * out->states[0][col];
-      }
-      out->initial_multiplier[row] = -value;
-    }
+    RecoverUnconstrainedNodeMultiplierRaw(
+        original.terminal_Q.data().data(), original.terminal_q.data().data(),
+        original.terminal_Q.rows(), out->states[0],
+        out->initial_multiplier);
     return;
   }
   for (std::size_t node = 0; node <= N; ++node) {
@@ -2295,14 +2378,7 @@ void RecoverUnconstrainedMultipliersInto(const Problem& original,
     const VectorView x = out->states[node];
     VectorView multiplier = node == 0 ? out->initial_multiplier
                                       : out->dynamics_multipliers[node - 1];
-    for (std::size_t row = 0; row < n; ++row) {
-      Scalar value = p[row];
-      CLQR_UNROLL
-      for (std::size_t col = 0; col < n; ++col) {
-        value += P[row * n + col] * x[col];
-      }
-      multiplier[row] = -value;
-    }
+    RecoverUnconstrainedNodeMultiplierRaw(P, p, n, x, multiplier);
   }
 }
 
@@ -2328,72 +2404,23 @@ bool SolveUnconstrainedIntoView(const Problem& problem, Scalar tolerance,
   for (std::size_t i = 0; i < problem.stages.size(); ++i) {
     const Stage& s = problem.stages[i];
     const std::size_t n = layout->riccati.state_dim[i];
+    const std::size_t next_n = layout->riccati.state_dim[i + 1];
     const std::size_t m = layout->riccati.control_dim[i];
     const Scalar* K = layout->riccati.KPtr(i);
     const Scalar* k = layout->riccati.kPtr(i);
-    for (std::size_t row = 0; row < m; ++row) {
-      Scalar value = k[row];
-      CLQR_UNROLL
-      for (std::size_t col = 0; col < n; ++col)
-        value += K[row * n + col] * out->states[i][col];
-      out->controls[i][row] = value;
-    }
-    for (std::size_t row = 0; row < s.A.rows(); ++row) {
-      Scalar value = s.c[row];
-      CLQR_UNROLL
-      for (std::size_t col = 0; col < s.A.cols(); ++col) {
-        value += s.A(row, col) * out->states[i][col];
-      }
-      CLQR_UNROLL
-      for (std::size_t col = 0; col < s.B.cols(); ++col) {
-        value += s.B(row, col) * out->controls[i][col];
-      }
-      out->states[i + 1][row] = value;
-    }
-    const VectorView& x = out->states[i];
-    const VectorView& u = out->controls[i];
-    for (std::size_t row = 0; row < s.Q.rows(); ++row) {
-      Scalar value = Scalar{0};
-      CLQR_UNROLL
-      for (std::size_t col = 0; col < s.Q.cols(); ++col) {
-        value += s.Q(row, col) * x[col];
-      }
-      objective += Scalar{0.5} * x[row] * value;
-    }
-    for (std::size_t row = 0; row < s.R.rows(); ++row) {
-      Scalar value = Scalar{0};
-      CLQR_UNROLL
-      for (std::size_t col = 0; col < s.R.cols(); ++col) {
-        value += s.R(row, col) * u[col];
-      }
-      objective += Scalar{0.5} * u[row] * value;
-    }
-    for (std::size_t row = 0; row < s.M.rows(); ++row) {
-      Scalar value = Scalar{0};
-      CLQR_UNROLL
-      for (std::size_t col = 0; col < s.M.cols(); ++col) {
-        value += s.M(row, col) * u[col];
-      }
-      objective += x[row] * value;
-    }
-    for (std::size_t row = 0; row < s.q.size(); ++row)
-      objective += s.q[row] * x[row];
-    for (std::size_t row = 0; row < s.r.size(); ++row)
-      objective += s.r[row] * u[row];
+    RollOutUnconstrainedStageRaw(
+        s.A.data().data(), s.B.data().data(), s.c.data().data(), K, k, n,
+        next_n, m, out->states[i], out->controls[i], out->states[i + 1]);
+    objective += UnconstrainedStageObjectiveRaw(
+        s.Q.data().data(), s.R.data().data(), s.M.data().data(),
+        s.q.data().data(), s.r.data().data(), n, m, out->states[i],
+        out->controls[i]);
   }
   RecoverUnconstrainedMultipliersInto(problem, layout->riccati, out);
   const VectorView& terminal = out->states[problem.stages.size()];
-  for (std::size_t row = 0; row < problem.terminal_Q.rows(); ++row) {
-    Scalar value = Scalar{0};
-    CLQR_UNROLL
-    for (std::size_t col = 0; col < problem.terminal_Q.cols(); ++col) {
-      value += problem.terminal_Q(row, col) * terminal[col];
-    }
-    objective += Scalar{0.5} * terminal[row] * value;
-  }
-  for (std::size_t row = 0; row < problem.terminal_q.size(); ++row) {
-    objective += problem.terminal_q[row] * terminal[row];
-  }
+  objective += UnconstrainedTerminalObjectiveRaw(
+      problem.terminal_Q.data().data(), problem.terminal_q.data().data(),
+      terminal.size, terminal);
   out->objective = objective;
   out->status = SolveStatus::kOptimal;
   out->message = "optimal";
@@ -3230,9 +3257,12 @@ Factorization Factor(const Problem& problem, const SolveOptions& options) {
     out.impl_->state_offsets[0] = 0;
     out.impl_->total_control = 0;
     out.impl_->total_dynamics = 0;
+    out.impl_->max_control = 0;
     for (std::size_t i = 0; i < N; ++i) {
       out.impl_->control_offsets[i] = out.impl_->total_control;
       out.impl_->total_control += problem.stages[i].B.cols();
+      out.impl_->max_control =
+          std::max(out.impl_->max_control, problem.stages[i].B.cols());
       out.impl_->total_dynamics += problem.stages[i].A.rows();
       out.impl_->state_offsets[i + 1] = out.impl_->total_state;
       out.impl_->total_state += problem.stages[i].A.rows();
@@ -3390,41 +3420,13 @@ SolutionView Solve(const Factorization& factorization, const SolveRhs& rhs,
       const Scalar* p_next = layout.p + factors.state_offsets[i + 1];
       Scalar* p = layout.p + factors.state_offsets[i];
       Scalar* k = layout.k + factors.control_offsets[i];
-      for (std::size_t row = 0; row < n; ++row) p[row] = stage_rhs.q[row];
-      for (std::size_t row = 0; row < m; ++row) k[row] = stage_rhs.r[row];
-      for (std::size_t shared = 0; shared < next_n; ++shared) {
-        Scalar pc = p_next[shared];
-        for (std::size_t col = 0; col < next_n; ++col) {
-          pc += P_next(shared, col) * stage_rhs.c[col];
-        }
-        for (std::size_t col = 0; col < n; ++col) {
-          p[col] += stage.A(shared, col) * pc;
-        }
-        for (std::size_t col = 0; col < m; ++col) {
-          k[col] += stage.B(shared, col) * pc;
-        }
-      }
-      for (std::size_t row = 0; row < m; ++row) {
-        Scalar value = k[row];
-        for (std::size_t col = 0; col < row; ++col) {
-          value -= stage.lower(row, col) * k[col];
-        }
-        k[row] = value / stage.lower(row, row);
-      }
-      for (std::size_t reverse_row = 0; reverse_row < m; ++reverse_row) {
-        const std::size_t row = m - 1 - reverse_row;
-        Scalar value = k[row];
-        for (std::size_t col = row + 1; col < m; ++col) {
-          value -= stage.lower(col, row) * k[col];
-        }
-        k[row] = value / stage.lower(row, row);
-      }
-      for (std::size_t row = 0; row < m; ++row) k[row] = -k[row];
-      for (std::size_t row = 0; row < n; ++row) {
-        for (std::size_t col = 0; col < m; ++col) {
-          p[row] += stage.Hxu(row, col) * k[col];
-        }
-      }
+      ComputeUnconstrainedAffineStageRaw(
+          stage.A.data().data(), stage.B.data().data(), P_next.data().data(),
+          p_next, stage_rhs.c.data().data(), stage_rhs.q.data().data(),
+          stage_rhs.r.data().data(), stage.Hxu.data().data(),
+          stage.control_factor.data().data(),
+          stage.control_factor_is_cholesky, n, next_n, m, p, k,
+          layout.control_scratch);
     }
 
     for (std::size_t row = 0; row < rhs.initial_state.size(); ++row) {
@@ -3435,54 +3437,23 @@ SolutionView Solve(const Factorization& factorization, const SolveRhs& rhs,
       const Factorization::Impl::StageData& stage = factors.stages[i];
       const StageRhs& stage_rhs = rhs.stages[i];
       const std::size_t n = stage.A.cols();
+      const std::size_t next_n = stage.A.rows();
       const std::size_t m = stage.B.cols();
       const Scalar* k = layout.k + factors.control_offsets[i];
       VectorView x = layout.view.states[i];
       VectorView u = layout.view.controls[i];
-      for (std::size_t row = 0; row < m; ++row) {
-        Scalar value = k[row];
-        for (std::size_t col = 0; col < n; ++col) {
-          value += stage.K(row, col) * x[col];
-        }
-        u[row] = value;
-      }
-      for (std::size_t row = 0; row < stage.A.rows(); ++row) {
-        Scalar value = stage_rhs.c[row];
-        for (std::size_t col = 0; col < stage.A.cols(); ++col) {
-          value += stage.A(row, col) * x[col];
-        }
-        for (std::size_t col = 0; col < stage.B.cols(); ++col) {
-          value += stage.B(row, col) * u[col];
-        }
-        layout.view.states[i + 1][row] = value;
-      }
-      for (std::size_t row = 0; row < n; ++row) {
-        Scalar Qx = Scalar{0};
-        Scalar Mu = Scalar{0};
-        for (std::size_t col = 0; col < n; ++col)
-          Qx += stage.Q(row, col) * x[col];
-        for (std::size_t col = 0; col < m; ++col)
-          Mu += stage.M(row, col) * u[col];
-        objective += Scalar{0.5} * x[row] * Qx + x[row] * Mu +
-                     stage_rhs.q[row] * x[row];
-      }
-      for (std::size_t row = 0; row < m; ++row) {
-        Scalar Ru = Scalar{0};
-        for (std::size_t col = 0; col < m; ++col)
-          Ru += stage.R(row, col) * u[col];
-        objective += Scalar{0.5} * u[row] * Ru +
-                     stage_rhs.r[row] * u[row];
-      }
+      RollOutUnconstrainedStageRaw(
+          stage.A.data().data(), stage.B.data().data(),
+          stage_rhs.c.data().data(), stage.K.data().data(), k, n, next_n, m,
+          x, u, layout.view.states[i + 1]);
+      objective += UnconstrainedStageObjectiveRaw(
+          stage.Q.data().data(), stage.R.data().data(), stage.M.data().data(),
+          stage_rhs.q.data().data(), stage_rhs.r.data().data(), n, m, x, u);
     }
     const VectorView terminal = layout.view.states[N];
-    for (std::size_t row = 0; row < factors.terminal_Q.rows(); ++row) {
-      Scalar Qx = Scalar{0};
-      for (std::size_t col = 0; col < factors.terminal_Q.cols(); ++col) {
-        Qx += factors.terminal_Q(row, col) * terminal[col];
-      }
-      objective += Scalar{0.5} * terminal[row] * Qx +
-                   rhs.terminal_q[row] * terminal[row];
-    }
+    objective += UnconstrainedTerminalObjectiveRaw(
+        factors.terminal_Q.data().data(), rhs.terminal_q.data().data(),
+        terminal.size, terminal);
 
     for (std::size_t node = 0; node <= N; ++node) {
       const Matrix& P =
@@ -3492,13 +3463,8 @@ SolutionView Solve(const Factorization& factorization, const SolveRhs& rhs,
       VectorView multiplier =
           node == 0 ? layout.view.initial_multiplier
                     : layout.view.dynamics_multipliers[node - 1];
-      for (std::size_t row = 0; row < x.size; ++row) {
-        Scalar value = p[row];
-        for (std::size_t col = 0; col < x.size; ++col) {
-          value += P(row, col) * x[col];
-        }
-        multiplier[row] = -value;
-      }
+      RecoverUnconstrainedNodeMultiplierRaw(P.data().data(), p, x.size, x,
+                                            multiplier);
     }
     layout.view.status = SolveStatus::kOptimal;
     layout.view.message = workspace.StoreMessage("optimal");
