@@ -387,10 +387,10 @@ RectangularSolve SolveMixedMultiplierOrthogonally(
 
   // A constraint-row rescaling becomes a column rescaling in D^T lambda.
   // Normalize those columns by the complete (C,D) row relation, matching the
-  // equilibration used during control elimination. Solve for the correspondingly
-  // scaled multiplier and undo the scaling below. Without this step, a harmless
-  // independently scaled constraint can be classified as rank deficient
-  // relative to another column even in FP64.
+  // equilibration used during control elimination. Solve for the
+  // correspondingly scaled multiplier and undo the scaling below. Without this
+  // step, a harmless independently scaled constraint can be classified as rank
+  // deficient relative to another column even in FP64.
   Vector constraint_scales(constraints);
   for (std::size_t constraint = 0; constraint < constraints; ++constraint) {
     Scalar scale = Scalar{0};
