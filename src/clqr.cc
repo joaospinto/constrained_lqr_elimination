@@ -385,6 +385,23 @@ RectangularSolve SolveMixedMultiplierOrthogonally(
   out.x = Vector(constraints);
   if (constraints == 0) return out;
 
+  // A constraint-row rescaling becomes a column rescaling in D^T lambda.
+  // Normalize those columns by the complete (C,D) row relation, matching the
+  // equilibration used during control elimination. Solve for the
+  // correspondingly scaled multiplier and undo the scaling below. Without this
+  // step, a harmless independently scaled constraint can be classified as rank
+  // deficient relative to another column even in FP64.
+  Vector constraint_scales(constraints);
+  for (std::size_t constraint = 0; constraint < constraints; ++constraint) {
+    Scalar scale = Scalar{0};
+    for (std::size_t state = 0; state < stage.C.cols(); ++state)
+      scale = std::max(scale, std::abs(stage.C(constraint, state)));
+    for (std::size_t control = 0; control < stage.D.cols(); ++control)
+      scale = std::max(scale, std::abs(stage.D(constraint, control)));
+    constraint_scales[constraint] =
+        scale > Scalar{0} ? scale : Scalar{1};
+  }
+
   Matrix augmented(controls, constraints + 1);
   for (std::size_t control = 0; control < controls; ++control) {
     Scalar value = -stage.r[control];
@@ -402,7 +419,8 @@ RectangularSolve SolveMixedMultiplierOrthogonally(
     }
     augmented(control, constraints) = value;
     for (std::size_t constraint = 0; constraint < constraints; ++constraint) {
-      augmented(control, constraint) = stage.D(constraint, control);
+      augmented(control, constraint) =
+          stage.D(constraint, control) / constraint_scales[constraint];
     }
   }
 
@@ -410,7 +428,13 @@ RectangularSolve SolveMixedMultiplierOrthogonally(
       std::move(augmented), constraints, constraints, rank_tolerance);
   out.rank = echelon.pivot_columns.size();
   for (std::size_t i = 0; i < echelon.pivot_columns.size(); ++i) {
-    out.x[echelon.pivot_columns[i]] = echelon.matrix(i, constraints);
+    const std::size_t constraint = echelon.pivot_columns[i];
+    out.x[constraint] =
+        echelon.matrix(i, constraints) / constraint_scales[constraint];
+    if (!std::isfinite(out.x[constraint])) {
+      throw NumericalFailureError(
+          "constraint multiplier is not representable");
+    }
   }
   for (std::size_t row = out.rank; row < echelon.matrix.rows(); ++row) {
     bool zero_lhs = true;

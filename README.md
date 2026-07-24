@@ -234,6 +234,21 @@ better summary statistics.
 
 All sample cases reported `singular_count=0` and `wrong_inertia_count=0`.
 
+For revision-to-revision evidence on the constrained CPU path, including
+adversarial row scaling, redundant rows, primal/KKT residuals, and alternating
+benchmark order, run:
+
+```sh
+CLQR_BASE_REVISION=<baseline> \
+CLQR_CANDIDATE_REVISION=<candidate> \
+scripts/compare_cpu_constraint_revisions.sh
+```
+
+The focused comparison defaults to FP64 and FP32, 101 timed solves per process,
+and seven alternating-order rounds. See
+[`benchmarks/CPU_QR_EVIDENCE.md`](benchmarks/CPU_QR_EVIDENCE.md) for the
+RREF-versus-QR methodology and recorded results.
+
 C++ users include `clqr/clqr.h` and call `clqr::Solve` with a workspace:
 
 ```cpp

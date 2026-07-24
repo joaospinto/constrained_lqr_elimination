@@ -432,3 +432,14 @@ cc_binary(
     copts = ["-DNDEBUG"],
     deps = [":clqr"],
 )
+
+cc_binary(
+    name = "clqr_cpu_constraint_benchmark",
+    srcs = ["benchmarks/cpu_constraint_revision_benchmark.cc"],
+    tags = ["manual"],
+    testonly = True,
+    deps = [
+        ":adversarial_test_support",
+        ":clqr",
+    ],
+)
