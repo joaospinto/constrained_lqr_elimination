@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Build two revisions in isolation, alternate benchmark order, and report
-# median phase timings. Run correctness and sanitizer validation first.
+# median phase timings. Run this after correctness and sanitizer validation.
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -d /kaggle/working ]]; then
@@ -20,6 +20,11 @@ cuda_arch="${CLQR_CUDA_ARCH:-60}"
 repeats="${CLQR_BENCHMARK_REPEATS:-11}"
 rounds="${CLQR_COMPARISON_ROUNDS:-3}"
 keep_output="${CLQR_KEEP_COMPARE_OUTPUT:-0}"
+base_extra_bazel_args_text="${CLQR_BASE_EXTRA_BAZEL_ARGS:-}"
+candidate_extra_bazel_args_text="${CLQR_CANDIDATE_EXTRA_BAZEL_ARGS:-}"
+read -r -a base_extra_bazel_args <<< "${base_extra_bazel_args_text}"
+read -r -a candidate_extra_bazel_args <<< \
+  "${candidate_extra_bazel_args_text}"
 
 case "${precision}" in
   FP64|FP32) ;;
@@ -80,6 +85,15 @@ fi
 mkdir -p "${run_root}"
 
 cleanup() {
+  local label
+  local output_base
+  for label in baseline candidate; do
+    output_base="${run_root}/${label}-bazel"
+    if [[ -d "${output_base}" ]]; then
+      "${bazel_command}" "--output_base=${output_base}" shutdown \
+        >/dev/null 2>&1 || true
+    fi
+  done
   if [[ "${keep_output}" == "0" && -d "${run_root}" ]]; then
     chmod -R u+w "${run_root}" 2>/dev/null || true
     rm -rf -- "${run_root}"
@@ -97,6 +111,12 @@ bazel_args=(
 build_revision() {
   local label="$1"
   local commit="$2"
+  local -a extra_bazel_args=()
+  if [[ "${label}" == "baseline" ]]; then
+    extra_bazel_args=("${base_extra_bazel_args[@]}")
+  else
+    extra_bazel_args=("${candidate_extra_bazel_args[@]}")
+  fi
   local source_dir="${run_root}/${label}-source"
   local archive="${run_root}/${label}.tar"
   local output_base="${run_root}/${label}-bazel"
@@ -110,7 +130,7 @@ build_revision() {
   if ! (
     cd "${source_dir}"
     "${bazel_command}" "--output_base=${output_base}" build \
-      "${bazel_args[@]}" //:clqr_cuda_benchmark
+      "${bazel_args[@]}" "${extra_bazel_args[@]}" //:clqr_cuda_benchmark
   ) >"${build_log}" 2>&1; then
     echo "${label} build failed:" >&2
     tail -n 80 "${build_log}" >&2
@@ -141,7 +161,8 @@ for ((round = 1; round <= rounds; ++round)); do
   fi
 done
 
-python3 - "${run_root}" "${base_commit}" "${candidate_commit}" <<'PY'
+python3 - "${run_root}" "${base_commit}" "${candidate_commit}" \
+  "${base_extra_bazel_args_text}" "${candidate_extra_bazel_args_text}" <<'PY'
 import csv
 import glob
 import statistics
@@ -173,11 +194,13 @@ def aggregate(root, label):
     return result
 
 
-root, base_commit, candidate_commit = sys.argv[1:]
+root, base_commit, candidate_commit, base_args, candidate_args = sys.argv[1:]
 baseline = aggregate(root, "baseline")
 candidate = aggregate(root, "candidate")
 print(f"# baseline={base_commit}")
 print(f"# candidate={candidate_commit}")
+print(f"# baseline_bazel_args={base_args}")
+print(f"# candidate_bazel_args={candidate_args}")
 print("# ratios are baseline/candidate; values above one favor the candidate")
 print(
     "N,base_cpp_ms,candidate_cpp_ms,cpp_ratio,"
@@ -196,6 +219,9 @@ for horizon in sorted(baseline.keys() & candidate.keys()):
 
     def ratio(field):
         return base[field] / cand[field]
+
+    def value(report, field):
+        return report.get(field, float("nan"))
 
     pack_transfer = (
         cand["input_pack_ms"] + cand["upload_ms"] + cand["download_ms"]
@@ -219,8 +245,8 @@ for horizon in sorted(baseline.keys() & candidate.keys()):
         f"{ratio('feasibility_ms'):.4f},{ratio('reduction_ms'):.4f},"
         f"{ratio('riccati_ms'):.4f},{ratio('reconstruction_ms'):.4f},"
         f"{ratio('multiplier_ms'):.4f},"
-        f"{base['cpp_kkt_residual']:.6e},"
-        f"{cand['cpp_kkt_residual']:.6e},"
+        f"{value(base, 'cpp_kkt_residual'):.6e},"
+        f"{value(cand, 'cpp_kkt_residual'):.6e},"
         f"{base['cuda_kkt_residual']:.6e},"
         f"{cand['cuda_kkt_residual']:.6e}"
     )
