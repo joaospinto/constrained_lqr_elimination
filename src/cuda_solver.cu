@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "clqr/cuda.h"
+#include "cuda_device_io.h"
 #include "cuda_internal.h"
 
 namespace clqr {
@@ -39,6 +40,145 @@ constexpr Scalar kMultiplierConsistencyTolerancePerTreeLevel = 1e-6;
 constexpr Scalar kMinimumDualRelationRowScale = 1e-14;
 #endif
 constexpr Scalar kScalarMax = std::numeric_limits<Scalar>::max();
+
+#ifndef CLQR_CUDA_EMULATION
+template <typename T>
+__device__ T *DeviceOffset(T *pointer, std::size_t offset) {
+  return offset == 0 ? pointer : pointer + offset;
+}
+
+__device__ void CopyPaddedMatrix(const Scalar *source,
+                                 std::size_t source_stride, Scalar *target,
+                                 int rows, int columns) {
+  const std::size_t entries =
+      static_cast<std::size_t>(rows) * static_cast<std::size_t>(columns);
+  for (std::size_t index = threadIdx.x; index < entries; index += blockDim.x) {
+    const std::size_t row = index / static_cast<std::size_t>(columns);
+    const std::size_t column = index % static_cast<std::size_t>(columns);
+    target[index] = source[row * source_stride + column];
+  }
+}
+
+__device__ void CopyPaddedVector(const Scalar *source, Scalar *target,
+                                 int entries) {
+  for (int index = threadIdx.x; index < entries; index += blockDim.x)
+    target[index] = source[index];
+}
+
+__global__ void PackPaddedProblemKernel(PaddedDeviceProblem input,
+                                        PackedStage *stages, int stage_count,
+                                        PackedTerminal *terminal,
+                                        Scalar *initial_state) {
+  const int index = blockIdx.x;
+  const std::size_t nx = input.state_capacity;
+  const std::size_t nu = input.control_capacity;
+  const std::size_t nc = input.mixed_capacity;
+  const std::size_t ne = input.state_constraint_capacity;
+  if (index < stage_count) {
+    const PackedStage &stage = stages[index];
+    const std::size_t stage_index = static_cast<std::size_t>(index);
+    CopyPaddedMatrix(DeviceOffset(input.A, stage_index * nx * nx), nx,
+                     const_cast<Scalar *>(stage.A), stage.next_n, stage.n);
+    CopyPaddedMatrix(DeviceOffset(input.B, stage_index * nx * nu), nu,
+                     const_cast<Scalar *>(stage.B), stage.next_n, stage.m);
+    CopyPaddedVector(DeviceOffset(input.c, stage_index * nx),
+                     const_cast<Scalar *>(stage.c), stage.next_n);
+    CopyPaddedMatrix(DeviceOffset(input.Q, stage_index * nx * nx), nx,
+                     const_cast<Scalar *>(stage.Q), stage.n, stage.n);
+    CopyPaddedMatrix(DeviceOffset(input.R, stage_index * nu * nu), nu,
+                     const_cast<Scalar *>(stage.R), stage.m, stage.m);
+    CopyPaddedMatrix(DeviceOffset(input.M, stage_index * nx * nu), nu,
+                     const_cast<Scalar *>(stage.M), stage.n, stage.m);
+    CopyPaddedVector(DeviceOffset(input.q, stage_index * nx),
+                     const_cast<Scalar *>(stage.q), stage.n);
+    CopyPaddedVector(DeviceOffset(input.r, stage_index * nu),
+                     const_cast<Scalar *>(stage.r), stage.m);
+    CopyPaddedMatrix(DeviceOffset(input.C, stage_index * nc * nx), nx,
+                     const_cast<Scalar *>(stage.C), stage.mixed, stage.n);
+    CopyPaddedMatrix(DeviceOffset(input.D, stage_index * nc * nu), nu,
+                     const_cast<Scalar *>(stage.D), stage.mixed, stage.m);
+    CopyPaddedVector(DeviceOffset(input.d, stage_index * nc),
+                     const_cast<Scalar *>(stage.d), stage.mixed);
+    CopyPaddedMatrix(DeviceOffset(input.E, stage_index * ne * nx), nx,
+                     const_cast<Scalar *>(stage.E), stage.state, stage.n);
+    CopyPaddedVector(DeviceOffset(input.e, stage_index * ne),
+                     const_cast<Scalar *>(stage.e), stage.state);
+    if (index == 0) {
+      CopyPaddedVector(input.initial_state, initial_state, stage.n);
+    }
+    return;
+  }
+  if (index != stage_count)
+    return;
+  const PackedTerminal &terminal_value = terminal[0];
+  const std::size_t terminal_index = static_cast<std::size_t>(stage_count);
+  CopyPaddedMatrix(DeviceOffset(input.Q, terminal_index * nx * nx), nx,
+                   const_cast<Scalar *>(terminal_value.Q), terminal_value.n,
+                   terminal_value.n);
+  CopyPaddedVector(DeviceOffset(input.q, terminal_index * nx),
+                   const_cast<Scalar *>(terminal_value.q), terminal_value.n);
+  CopyPaddedMatrix(input.terminal_E, nx, const_cast<Scalar *>(terminal_value.E),
+                   terminal_value.state, terminal_value.n);
+  CopyPaddedVector(input.terminal_e, const_cast<Scalar *>(terminal_value.e),
+                   terminal_value.state);
+  if (stage_count == 0) {
+    CopyPaddedVector(input.initial_state, initial_state, terminal_value.n);
+  }
+}
+
+__global__ void ScatterPaddedSolutionKernel(
+    const PackedStage *stages, int stage_count, const PackedTerminal *terminal,
+    const int *state_offsets, const int *control_offsets,
+    const int *dynamics_offsets, const int *mixed_offsets,
+    const int *state_constraint_offsets, const Scalar *states,
+    const Scalar *controls, const Scalar *initial_multiplier,
+    const Scalar *dynamics_multipliers, const Scalar *mixed_multipliers,
+    const Scalar *state_multipliers, const Scalar *terminal_multiplier,
+    std::size_t nx, std::size_t nu, std::size_t nc, std::size_t ne,
+    PaddedDeviceSolution output) {
+  const int node = blockIdx.x;
+  if (node > stage_count)
+    return;
+  const int state_dimension =
+      node == stage_count ? terminal[0].n : stages[node].n;
+  CopyPaddedVector(
+      DeviceOffset(states, state_offsets[node]),
+      DeviceOffset(output.states, static_cast<std::size_t>(node) * nx),
+      state_dimension);
+  if (node == 0) {
+    CopyPaddedVector(initial_multiplier, output.initial_multiplier,
+                     state_dimension);
+  }
+  if (node < stage_count) {
+    const PackedStage &stage = stages[node];
+    const std::size_t stage_index = static_cast<std::size_t>(node);
+    CopyPaddedVector(DeviceOffset(controls, control_offsets[node]),
+                     DeviceOffset(output.controls, stage_index * nu), stage.m);
+    CopyPaddedVector(
+        DeviceOffset(dynamics_multipliers, dynamics_offsets[node]),
+        DeviceOffset(output.dynamics_multipliers, stage_index * nx),
+        stage.next_n);
+    CopyPaddedVector(DeviceOffset(mixed_multipliers, mixed_offsets[node]),
+                     DeviceOffset(output.mixed_multipliers, stage_index * nc),
+                     stage.mixed);
+    CopyPaddedVector(
+        DeviceOffset(state_multipliers, state_constraint_offsets[node]),
+        DeviceOffset(output.state_multipliers, stage_index * ne), stage.state);
+  } else {
+    CopyPaddedVector(terminal_multiplier, output.terminal_state_multiplier,
+                     terminal[0].state);
+  }
+}
+
+__global__ void WritePackedDiagnosticsKernel(SolveStatus status,
+                                             std::int32_t *diagnostics) {
+  if (threadIdx.x == 0) {
+    diagnostics[0] = static_cast<std::int32_t>(status);
+    diagnostics[1] = 0;
+    diagnostics[2] = 0;
+  }
+}
+#endif
 
 #ifdef CLQR_CUDA_EMULATION
 // White-box instrumentation: every nontrivial matrix-value composition shares
@@ -2882,13 +3022,15 @@ std::size_t TimingIndex(TimingSlot slot) {
   return static_cast<std::size_t>(slot);
 }
 
-void StartTiming(WorkspaceStorage &workspace, TimingSlot slot) {
-  CudaCheck(cudaEventRecord(workspace.event_start[TimingIndex(slot)]),
+void StartTiming(WorkspaceStorage &workspace, TimingSlot slot,
+                 cudaStream_t stream) {
+  CudaCheck(cudaEventRecord(workspace.event_start[TimingIndex(slot)], stream),
             "cudaEventRecord(start)");
 }
 
-void StopTiming(WorkspaceStorage &workspace, TimingSlot slot) {
-  CudaCheck(cudaEventRecord(workspace.event_stop[TimingIndex(slot)]),
+void StopTiming(WorkspaceStorage &workspace, TimingSlot slot,
+                cudaStream_t stream) {
+  CudaCheck(cudaEventRecord(workspace.event_stop[TimingIndex(slot)], stream),
             "cudaEventRecord(stop)");
 }
 
@@ -2903,16 +3045,18 @@ double ElapsedTiming(WorkspaceStorage &workspace, TimingSlot slot) {
 
 template <typename Function>
 void QueueTimed(WorkspaceStorage &workspace, TimingSlot slot,
-                Function &&function) {
-  StartTiming(workspace, slot);
+                cudaStream_t stream, Function &&function) {
+  StartTiming(workspace, slot, stream);
   function();
   CudaCheck(cudaGetLastError(), "CUDA kernel launch");
-  StopTiming(workspace, slot);
+  StopTiming(workspace, slot, stream);
 }
 
 template <typename Function>
-double TimeGpu(WorkspaceStorage &workspace, Function &&function) {
-  QueueTimed(workspace, TimingSlot::kPrimary, std::forward<Function>(function));
+double TimeGpu(WorkspaceStorage &workspace, cudaStream_t stream,
+               Function &&function) {
+  QueueTimed(workspace, TimingSlot::kPrimary, stream,
+             std::forward<Function>(function));
   CudaCheck(cudaEventSynchronize(
                 workspace.event_stop[TimingIndex(TimingSlot::kPrimary)]),
             "cudaEventSynchronize");
@@ -2921,35 +3065,36 @@ double TimeGpu(WorkspaceStorage &workspace, Function &&function) {
 }
 
 // Queue setup transfers before the start event and result/control transfers
-// after the stop event, then synchronize the whole default stream once.  The
+// after the stop event, then synchronize the supplied stream once.  The
 // returned duration therefore measures only the kernels in `function`, while
 // preserving the same single synchronization needed before the host consumes
 // `after`'s results.
 template <typename Before, typename Function, typename After>
-double TimeGpuKernels(WorkspaceStorage &workspace, Before &&before,
-                      Function &&function, After &&after) {
+double TimeGpuKernels(WorkspaceStorage &workspace, cudaStream_t stream,
+                      Before &&before, Function &&function, After &&after) {
   before();
   CudaCheck(cudaGetLastError(), "CUDA phase setup");
-  StartTiming(workspace, TimingSlot::kPrimary);
+  StartTiming(workspace, TimingSlot::kPrimary, stream);
   function();
   CudaCheck(cudaGetLastError(), "CUDA kernel launch");
-  StopTiming(workspace, TimingSlot::kPrimary);
+  StopTiming(workspace, TimingSlot::kPrimary, stream);
   after();
   CudaCheck(cudaGetLastError(), "CUDA phase result transfer");
-  CudaCheck(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize");
+  CudaCheck(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
   ++workspace.synchronization_count;
   return ElapsedTiming(workspace, TimingSlot::kPrimary);
 }
 
 template <typename Before, typename Function, typename After>
 void QueueTimedKernels(WorkspaceStorage &workspace, TimingSlot slot,
-                       Before &&before, Function &&function, After &&after) {
+                       cudaStream_t stream, Before &&before,
+                       Function &&function, After &&after) {
   before();
   CudaCheck(cudaGetLastError(), "CUDA phase setup");
-  StartTiming(workspace, slot);
+  StartTiming(workspace, slot, stream);
   function();
   CudaCheck(cudaGetLastError(), "CUDA kernel launch");
-  StopTiming(workspace, slot);
+  StopTiming(workspace, slot, stream);
   after();
   CudaCheck(cudaGetLastError(), "CUDA phase result transfer");
 }
@@ -3153,9 +3298,8 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
 }
 
 bool PackScalars(const Scalar *source, std::size_t entries,
-                 Scalar **host_cursor, Scalar *host_end,
-                 Scalar **device_cursor, const Scalar **target,
-                 bool validate_values) {
+                 Scalar **host_cursor, Scalar *host_end, Scalar **device_cursor,
+                 const Scalar **target, bool validate_values) {
   if (entries > 0) {
     Require(*host_cursor != nullptr && host_end != nullptr &&
                 entries <= static_cast<std::size_t>(host_end - *host_cursor),
@@ -3197,8 +3341,8 @@ bool PackVector(const Vector &source, Scalar **host_cursor, Scalar *host_end,
 }
 
 bool PackStage(const Stage &source, Scalar **host_cursor, Scalar *host_end,
-               Scalar **device_cursor, PackedStage *out,
-               bool validate_values, bool bind_metadata) {
+               Scalar **device_cursor, PackedStage *out, bool validate_values,
+               bool bind_metadata) {
   if (bind_metadata) {
     out->n = static_cast<int>(source.A.cols());
     out->next_n = static_cast<int>(source.A.rows());
@@ -3250,16 +3394,14 @@ bool PackTerminal(const Problem &problem, Scalar **host_cursor,
     return bind_metadata ? field : nullptr;
   };
   bool finite = true;
-  finite &=
-      PackMatrix(problem.terminal_Q, host_cursor, host_end, device_cursor,
-                 target(&out->Q), validate_values);
-  finite &= PackVector(problem.terminal_q, host_cursor, host_end,
-                       device_cursor, target(&out->q), validate_values);
-  finite &=
-      PackMatrix(problem.terminal_E, host_cursor, host_end, device_cursor,
-                 target(&out->E), validate_values);
-  finite &= PackVector(problem.terminal_e, host_cursor, host_end,
-                       device_cursor, target(&out->e), validate_values);
+  finite &= PackMatrix(problem.terminal_Q, host_cursor, host_end, device_cursor,
+                       target(&out->Q), validate_values);
+  finite &= PackVector(problem.terminal_q, host_cursor, host_end, device_cursor,
+                       target(&out->q), validate_values);
+  finite &= PackMatrix(problem.terminal_E, host_cursor, host_end, device_cursor,
+                       target(&out->E), validate_values);
+  finite &= PackVector(problem.terminal_e, host_cursor, host_end, device_cursor,
+                       target(&out->e), validate_values);
   return finite;
 }
 
@@ -4185,7 +4327,10 @@ void PrepareProblemStructure(const Problem &problem, int device,
 
 SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                          SolveMetadata &result, const Options &options,
-                         bool prepared) {
+                         bool prepared, cudaStream_t stream,
+                         const PaddedDeviceProblem *device_input) {
+  Require(device_input == nullptr || prepared,
+          "device-resident CUDA input requires a prepared workspace");
   bool structure_matches = true;
   if (prepared) {
     Require(std::isfinite(options.tolerance) && options.tolerance > Scalar{0},
@@ -4227,8 +4372,10 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &host_stages = workspace.host_stages;
   const auto input_pack_start = std::chrono::steady_clock::now();
   const bool validate_values_on_host = !prepared;
-  const bool finite =
-      PackProblemData(problem, &workspace, validate_values_on_host, false);
+  const bool finite = device_input != nullptr
+                          ? true
+                          : PackProblemData(problem, &workspace,
+                                            validate_values_on_host, false);
   PackedTerminal &terminal = workspace.host_terminal[0];
   auto &host_initial = workspace.host_initial;
   Require(finite, "problem contains a non-finite value");
@@ -4262,18 +4409,18 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       CheckedSum({workspace.host_problem_data.size(), host_initial.size()},
                  "CUDA compact input");
 
-  QueueTimed(workspace, TimingSlot::kUpload, [&] {
+  QueueTimed(workspace, TimingSlot::kUpload, stream, [&] {
     if (relation_layout_upload) {
       CudaCheck(cudaMemcpyAsync(
                     relation_a.get(), workspace.host_relation_leaves.data(),
                     workspace.host_relation_leaves.size() * sizeof(Relation),
-                    cudaMemcpyHostToDevice),
+                    cudaMemcpyHostToDevice, stream),
                 "upload compact relation leaves");
       if (workspace.host_relation_scan.size() > 0) {
         CudaCheck(cudaMemcpyAsync(
                       relation_b.get(), workspace.host_relation_scan.data(),
                       workspace.host_relation_scan.size() * sizeof(Relation),
-                      cudaMemcpyHostToDevice),
+                      cudaMemcpyHostToDevice, stream),
                   "upload compact relation tree");
       }
     }
@@ -4281,89 +4428,95 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       if (stage_count > 0) {
         CudaCheck(cudaMemcpyAsync(device_stages.get(), host_stages.data(),
                                   host_stages.size() * sizeof(PackedStage),
-                                  cudaMemcpyHostToDevice),
+                                  cudaMemcpyHostToDevice, stream),
                   "upload stage metadata");
         CudaCheck(cudaMemcpyAsync(control_params.get(),
                                   workspace.host_control_params.data(),
                                   workspace.host_control_params.size() *
                                       sizeof(ControlParam),
-                                  cudaMemcpyHostToDevice),
+                                  cudaMemcpyHostToDevice, stream),
                   "upload control-parameter layouts");
         CudaCheck(cudaMemcpyAsync(reduced_stages.get(),
                                   workspace.host_reduced_stages.data(),
                                   workspace.host_reduced_stages.size() *
                                       sizeof(ReducedStage),
-                                  cudaMemcpyHostToDevice),
+                                  cudaMemcpyHostToDevice, stream),
                   "upload reduced-stage layouts");
         CudaCheck(cudaMemcpyAsync(
                       workspace.feedback.get(), workspace.host_feedback.data(),
                       workspace.host_feedback.size() * sizeof(Feedback),
-                      cudaMemcpyHostToDevice),
+                      cudaMemcpyHostToDevice, stream),
                   "upload feedback layouts");
         CudaCheck(cudaMemcpyAsync(workspace.dual_params.get(),
                                   workspace.host_dual_params.data(),
                                   workspace.host_dual_params.size() *
                                       sizeof(DualParam),
-                                  cudaMemcpyHostToDevice),
+                                  cudaMemcpyHostToDevice, stream),
                   "upload dual-parameter layouts");
         CudaCheck(cudaMemcpyAsync(workspace.state_dual_params.get(),
                                   workspace.host_state_dual_params.data(),
                                   workspace.host_state_dual_params.size() *
                                       sizeof(StateDualParam),
-                                  cudaMemcpyHostToDevice),
+                                  cudaMemcpyHostToDevice, stream),
                   "upload state-dual layouts");
       }
       CudaCheck(cudaMemcpyAsync(
                     state_params.get(), workspace.host_state_params.data(),
                     workspace.host_state_params.size() * sizeof(StateParam),
-                    cudaMemcpyHostToDevice),
+                    cudaMemcpyHostToDevice, stream),
                 "upload state-parameter layouts");
       CudaCheck(cudaMemcpyAsync(reduced_terminal.get(),
                                 workspace.host_reduced_terminal.data(),
-                                sizeof(ReducedTerminal),
-                                cudaMemcpyHostToDevice),
+                                sizeof(ReducedTerminal), cudaMemcpyHostToDevice,
+                                stream),
                 "upload reduced-terminal layout");
       CudaCheck(cudaMemcpyAsync(device_terminal.get(), &terminal,
-                                sizeof(PackedTerminal), cudaMemcpyHostToDevice),
+                                sizeof(PackedTerminal), cudaMemcpyHostToDevice,
+                                stream),
                 "upload terminal metadata");
       CudaCheck(cudaMemcpyAsync(
                     state_offsets.get(), workspace.host_state_offsets.data(),
                     workspace.host_state_offsets.size() * sizeof(int),
-                    cudaMemcpyHostToDevice),
+                    cudaMemcpyHostToDevice, stream),
                 "upload state offsets");
       CudaCheck(
           cudaMemcpyAsync(control_offsets.get(),
                           workspace.host_control_offsets.data(),
                           workspace.host_control_offsets.size() * sizeof(int),
-                          cudaMemcpyHostToDevice),
+                          cudaMemcpyHostToDevice, stream),
           "upload control offsets");
       CudaCheck(
           cudaMemcpyAsync(dynamics_offsets.get(),
                           workspace.host_dynamics_offsets.data(),
                           workspace.host_dynamics_offsets.size() * sizeof(int),
-                          cudaMemcpyHostToDevice),
+                          cudaMemcpyHostToDevice, stream),
           "upload dynamics-multiplier offsets");
       CudaCheck(cudaMemcpyAsync(
                     mixed_offsets.get(), workspace.host_mixed_offsets.data(),
                     workspace.host_mixed_offsets.size() * sizeof(int),
-                    cudaMemcpyHostToDevice),
+                    cudaMemcpyHostToDevice, stream),
                 "upload mixed offsets");
       CudaCheck(cudaMemcpyAsync(state_constraint_offsets.get(),
                                 workspace.host_state_constraint_offsets.data(),
                                 workspace.host_state_constraint_offsets.size() *
                                     sizeof(int),
-                                cudaMemcpyHostToDevice),
+                                cudaMemcpyHostToDevice, stream),
                 "upload state-constraint offsets");
     }
-    if (packed_input_entries > 0) {
+    if (device_input != nullptr) {
+      PackPaddedProblemKernel<<<node_count, kThreads, 0, stream>>>(
+          *device_input, device_stages.get(), stage_count,
+          device_terminal.get(), device_initial.get());
+    } else if (packed_input_entries > 0) {
       CudaCheck(cudaMemcpyAsync(workspace.device_problem_data.get(),
                                 workspace.host_problem_data.data(),
                                 packed_input_entries * sizeof(Scalar),
-                                cudaMemcpyHostToDevice),
+                                cudaMemcpyHostToDevice, stream),
                 "upload compact problem and initial state");
     }
-    CudaCheck(cudaMemsetAsync(device_status.get(), 0, sizeof(DeviceStatus)),
-              "clear CUDA status");
+    CudaCheck(
+        cudaMemsetAsync(device_status.get(), 0, sizeof(DeviceStatus), stream),
+        "clear CUDA status");
   });
   workspace.stage_layout_uploaded = true;
   workspace.relation_layout_uploaded = true;
@@ -4377,74 +4530,78 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                 (packed_input_entries - 1) / kThreads + 1, 65535))
           : 0;
   result.timings.feasibility_ms = TimeGpuKernels(
-      workspace,
+      workspace, stream,
       [&] {
         // A failing block may cause other blocks to stop before publishing
         // their dimensions. The host downloads status and dimensions in one
         // synchronization, so keep the ignored-on-failure entries initialized.
         CudaCheck(cudaMemsetAsync(state_dimensions.get(), 0,
                                   workspace.host_state_dimensions.size() *
-                                      sizeof(int)),
+                                      sizeof(int),
+                                  stream),
                   "initialize reduced state dimensions");
       },
       [&] {
         if (finite_input_blocks > 0) {
-          CheckFiniteInputsKernel<<<finite_input_blocks, kThreads>>>(
+          CheckFiniteInputsKernel<<<finite_input_blocks, kThreads, 0, stream>>>(
               workspace.device_problem_data.get(),
               workspace.host_problem_data.size(), device_initial.get(),
               host_initial.size(), device_status.get());
         }
-        BuildPrimalLeavesKernel<<<node_count, kThreads, scratch.primal_leaf>>>(
+        BuildPrimalLeavesKernel<<<node_count, kThreads, scratch.primal_leaf,
+                                  stream>>>(
             device_stages.get(), stage_count, device_terminal.get(),
             options.tolerance, feasibility_consistency_tolerance,
             relation_a.get(), device_status.get());
         if (node_count > 1) {
           const int first_parent_count = level_counts[1];
           ReduceRelationLeavesKernel<<<first_parent_count, kThreads,
-                                       scratch.primal_relation>>>(
+                                       scratch.primal_relation, stream>>>(
               relation_a.get(), node_count, first_parent_count,
               options.tolerance, feasibility_consistency_tolerance,
               relation_b.get(), device_status.get());
           for (std::size_t level = 1; level + 1 < level_counts.size();
                ++level) {
             ReduceRelationTreeLevelKernel<<<level_counts[level + 1], kThreads,
-                                            scratch.primal_relation>>>(
+                                            scratch.primal_relation, stream>>>(
                 relation_b.get(), level_offsets[level] - node_count,
                 level_offsets[level + 1] - node_count, level_counts[level],
                 level_counts[level + 1], options.tolerance,
                 feasibility_consistency_tolerance, device_status.get());
           }
-          InitializeRelationContextRootKernel<<<1, kThreads>>>(
+          InitializeRelationContextRootKernel<<<1, kThreads, 0, stream>>>(
               relation_b.get(), level_offsets.back() - node_count);
           for (int level = static_cast<int>(level_counts.size()) - 2;
                level >= 1; --level) {
             ExpandRelationContextLevelKernel<<<
-                level_counts[level + 1], kThreads, scratch.primal_relation>>>(
-                relation_b.get(), level_offsets[level] - node_count,
-                level_offsets[level + 1] - node_count, level_counts[level],
-                level_counts[level + 1], options.tolerance,
-                feasibility_consistency_tolerance, device_status.get());
+                level_counts[level + 1], kThreads, scratch.primal_relation,
+                stream>>>(relation_b.get(), level_offsets[level] - node_count,
+                          level_offsets[level + 1] - node_count,
+                          level_counts[level], level_counts[level + 1],
+                          options.tolerance, feasibility_consistency_tolerance,
+                          device_status.get());
           }
           FinalizeRelationSuffixFromParentsKernel<<<
-              first_parent_count, kThreads, scratch.primal_relation_final>>>(
-              relation_a.get(), node_count, relation_b.get(),
-              first_parent_count, options.tolerance,
-              feasibility_consistency_tolerance, device_status.get());
+              first_parent_count, kThreads, scratch.primal_relation_final,
+              stream>>>(relation_a.get(), node_count, relation_b.get(),
+                        first_parent_count, options.tolerance,
+                        feasibility_consistency_tolerance, device_status.get());
         }
-        StateParamKernel<<<node_count, kThreads, scratch.state_parameter>>>(
-            relation_a.get(), node_count, state_params.get(),
-            state_dimensions.get(), device_status.get(), options.tolerance);
+        StateParamKernel<<<node_count, kThreads, scratch.state_parameter,
+                           stream>>>(relation_a.get(), node_count,
+                                     state_params.get(), state_dimensions.get(),
+                                     device_status.get(), options.tolerance);
       },
       [&] {
         CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
                                   device_status.get(), sizeof(DeviceStatus),
-                                  cudaMemcpyDeviceToHost),
+                                  cudaMemcpyDeviceToHost, stream),
                   "read feasibility status");
         CudaCheck(cudaMemcpyAsync(workspace.host_state_dimensions.data(),
                                   state_dimensions.get(),
                                   workspace.host_state_dimensions.size() *
                                       sizeof(int),
-                                  cudaMemcpyDeviceToHost),
+                                  cudaMemcpyDeviceToHost, stream),
                   "download reduced state dimensions");
       });
   result.timings.upload_ms = ElapsedTiming(workspace, TimingSlot::kUpload);
@@ -4488,7 +4645,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
           .count();
 
   result.timings.reduction_ms = TimeGpuKernels(
-      workspace,
+      workspace, stream,
       [&] {
         if (primal_layout_changed) {
           CudaCheck(
@@ -4496,29 +4653,30 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                               workspace.host_reduced_state_offsets.data(),
                               workspace.host_reduced_state_offsets.size() *
                                   sizeof(int),
-                              cudaMemcpyHostToDevice),
+                              cudaMemcpyHostToDevice, stream),
               "upload reduced-state offsets");
         }
         if (stage_count > 0) {
           CudaCheck(cudaMemsetAsync(control_dimensions.get(), 0,
                                     workspace.host_control_dimensions.size() *
-                                        sizeof(int)),
+                                        sizeof(int),
+                                    stream),
                     "initialize reduced control dimensions");
         }
       },
       [&] {
         if (stage_count > 0) {
-          ReduceStagesKernel<<<stage_count, kThreads,
-                               scratch.stage_reduction>>>(
+          ReduceStagesKernel<<<stage_count, kThreads, scratch.stage_reduction,
+                               stream>>>(
               device_stages.get(), suffix, state_params.get(), stage_count,
               options.tolerance, feasibility_consistency_tolerance,
               control_params.get(), reduced_stages.get(),
               control_dimensions.get(), device_status.get());
         }
-        ReduceTerminalKernel<<<1, kThreads>>>(device_terminal.get(),
-                                              state_params.get(), stage_count,
-                                              reduced_terminal.get());
-        InitialReducedStateKernel<<<1, kThreads>>>(
+        ReduceTerminalKernel<<<1, kThreads, 0, stream>>>(
+            device_terminal.get(), state_params.get(), stage_count,
+            reduced_terminal.get());
+        InitialReducedStateKernel<<<1, kThreads, 0, stream>>>(
             state_params.get(), device_initial.get(), reduced_initial.get(),
             options.tolerance, device_status.get());
       },
@@ -4528,12 +4686,12 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                     control_dimensions.get(),
                                     workspace.host_control_dimensions.size() *
                                         sizeof(int),
-                                    cudaMemcpyDeviceToHost),
+                                    cudaMemcpyDeviceToHost, stream),
                     "download reduced control dimensions");
         }
         CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
                                   device_status.get(), sizeof(DeviceStatus),
-                                  cudaMemcpyDeviceToHost),
+                                  cudaMemcpyDeviceToHost, stream),
                   "read reduction status");
       });
   status = workspace.host_status[0];
@@ -4565,49 +4723,50 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     if (stage_count <= 1)
       return;
     const int first_parent_count = stage_level_counts[1];
-    ReduceAffineLeavesKernel<<<first_parent_count, kThreads>>>(
+    ReduceAffineLeavesKernel<<<first_parent_count, kThreads, 0, stream>>>(
         map_a.get(), stage_count, first_parent_count, map_b.get(),
         device_status.get());
     for (std::size_t level = 1; level + 1 < stage_level_counts.size();
          ++level) {
-      ReduceAffineTreeLevelKernel<<<stage_level_counts[level + 1], kThreads>>>(
+      ReduceAffineTreeLevelKernel<<<stage_level_counts[level + 1], kThreads, 0,
+                                    stream>>>(
           map_b.get(), stage_level_offsets[level] - stage_count,
           stage_level_offsets[level + 1] - stage_count,
           stage_level_counts[level], stage_level_counts[level + 1],
           device_status.get());
     }
-    InitializeAffineContextRootKernel<<<1, kThreads>>>(
+    InitializeAffineContextRootKernel<<<1, kThreads, 0, stream>>>(
         map_b.get(), stage_level_offsets.back() - stage_count);
     for (int level = static_cast<int>(stage_level_counts.size()) - 2;
          level >= 1; --level) {
       ExpandAffineContextLevelKernel<<<stage_level_counts[level + 1],
-                                       kThreads>>>(
+                                       kThreads, 0, stream>>>(
           map_b.get(), stage_level_offsets[level] - stage_count,
           stage_level_offsets[level + 1] - stage_count,
           stage_level_counts[level], stage_level_counts[level + 1],
           device_status.get());
     }
     FinalizeAffinePrefixFromParentsKernel<<<first_parent_count, kThreads,
-                                            scratch.affine_finalize>>>(
+                                            scratch.affine_finalize, stream>>>(
         map_a.get(), stage_count, map_b.get(), first_parent_count,
         device_status.get());
   };
   QueueTimedKernels(
-      workspace, TimingSlot::kRiccati,
+      workspace, TimingSlot::kRiccati, stream,
       [&] {
         if (value_layout_changed) {
           CudaCheck(cudaMemcpyAsync(value_a.get(),
                                     workspace.host_value_leaves.data(),
                                     workspace.host_value_leaves.size() *
                                         sizeof(ValueElement),
-                                    cudaMemcpyHostToDevice),
+                                    cudaMemcpyHostToDevice, stream),
                     "upload compact value leaves");
           if (workspace.host_value_scan.size() > 0) {
             CudaCheck(cudaMemcpyAsync(value_b.get(),
                                       workspace.host_value_scan.data(),
                                       workspace.host_value_scan.size() *
                                           sizeof(ValueElement),
-                                      cudaMemcpyHostToDevice),
+                                      cudaMemcpyHostToDevice, stream),
                       "upload compact value tree");
           }
         }
@@ -4615,68 +4774,70 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
           CudaCheck(cudaMemcpyAsync(
                         map_a.get(), workspace.host_map_leaves.data(),
                         workspace.host_map_leaves.size() * sizeof(AffineMap),
-                        cudaMemcpyHostToDevice),
+                        cudaMemcpyHostToDevice, stream),
                     "upload compact affine leaves");
           if (workspace.host_map_scan.size() > 0) {
             CudaCheck(cudaMemcpyAsync(
                           map_b.get(), workspace.host_map_scan.data(),
                           workspace.host_map_scan.size() * sizeof(AffineMap),
-                          cudaMemcpyHostToDevice),
+                          cudaMemcpyHostToDevice, stream),
                       "upload compact affine tree");
           }
         }
       },
       [&] {
-        BuildValueElementsKernel<<<node_count, kThreads, scratch.value_leaf>>>(
+        BuildValueElementsKernel<<<node_count, kThreads, scratch.value_leaf,
+                                   stream>>>(
             reduced_stages.get(), reduced_terminal.get(), stage_count,
             options.tolerance, value_a.get(), device_status.get());
         if (node_count > 1) {
           const int first_parent_count = level_counts[1];
           ReduceValueLeavesKernel<<<first_parent_count, kThreads,
-                                    scratch.value_compose>>>(
+                                    scratch.value_compose, stream>>>(
               value_a.get(), node_count, first_parent_count, options.tolerance,
               device_status.get(), value_b.get());
           for (std::size_t level = 1; level + 1 < level_counts.size();
                ++level) {
             ReduceValueTreeLevelKernel<<<level_counts[level + 1], kThreads,
-                                         scratch.value_compose>>>(
+                                         scratch.value_compose, stream>>>(
                 value_b.get(), level_offsets[level] - node_count,
                 level_offsets[level + 1] - node_count, level_counts[level],
                 level_counts[level + 1], options.tolerance,
                 device_status.get());
           }
-          InitializeValueContextRootKernel<<<1, kThreads>>>(
+          InitializeValueContextRootKernel<<<1, kThreads, 0, stream>>>(
               value_b.get(), level_offsets.back() - node_count);
           for (int level = static_cast<int>(level_counts.size()) - 2;
                level >= 1; --level) {
             ExpandValueContextLevelKernel<<<level_counts[level + 1], kThreads,
-                                            scratch.value_compose>>>(
+                                            scratch.value_compose, stream>>>(
                 value_b.get(), level_offsets[level] - node_count,
                 level_offsets[level + 1] - node_count, level_counts[level],
                 level_counts[level + 1], options.tolerance,
                 device_status.get());
           }
-          FinalizeValueSuffixFromParentsKernel<<<first_parent_count, kThreads,
-                                                 scratch.value_finalize>>>(
+          FinalizeValueSuffixFromParentsKernel<<<
+              first_parent_count, kThreads, scratch.value_finalize, stream>>>(
               value_a.get(), node_count, value_b.get(), first_parent_count,
               options.tolerance, device_status.get());
         }
         if (stage_count > 0) {
-          MatrixFeedbackKernel<<<stage_count, kThreads, scratch.feedback>>>(
+          MatrixFeedbackKernel<<<stage_count, kThreads, scratch.feedback,
+                                 stream>>>(
               reduced_stages.get(), value_suffix, stage_count,
               options.tolerance, feedback.get(), device_status.get());
           InitializeCostateMapsKernel<<<stage_count, kThreads,
-                                        scratch.affine_terms>>>(
+                                        scratch.affine_terms, stream>>>(
               reduced_stages.get(), value_suffix, feedback.get(), stage_count,
               map_a.get(), device_status.get());
           queue_affine_prefix_scan();
           const int costate_blocks = (node_count + kThreads - 1) / kThreads;
-          RecoverCostatesKernel<<<costate_blocks, kThreads>>>(
+          RecoverCostatesKernel<<<costate_blocks, kThreads, 0, stream>>>(
               map_a.get(), reduced_terminal.get(), reduced_state_offsets.get(),
               stage_count, workspace.reduced_value_linear.get(),
               device_status.get());
           FinalizeFeedbackKernel<<<stage_count, kThreads,
-                                   scratch.affine_terms>>>(
+                                   scratch.affine_terms, stream>>>(
               reduced_stages.get(), value_suffix,
               workspace.reduced_value_linear.get(), reduced_state_offsets.get(),
               stage_count, feedback.get(), device_status.get());
@@ -4689,16 +4850,17 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &controls = workspace.controls;
   AffineMap *prefix = map_a.get();
   QueueTimedKernels(
-      workspace, TimingSlot::kReconstruction, [] {},
+      workspace, TimingSlot::kReconstruction, stream,
+      [] {},
       [&] {
         if (stage_count > 0) {
-          InitializeAffineMapsKernel<<<stage_count, kThreads>>>(
+          InitializeAffineMapsKernel<<<stage_count, kThreads, 0, stream>>>(
               feedback.get(), stage_count, map_a.get(), device_status.get());
           queue_affine_prefix_scan();
           prefix = map_a.get();
         }
         const int state_blocks = (node_count + kThreads - 1) / kThreads;
-        ReconstructPrimalKernel<<<state_blocks, kThreads>>>(
+        ReconstructPrimalKernel<<<state_blocks, kThreads, 0, stream>>>(
             prefix, state_params.get(), control_params.get(), feedback.get(),
             reduced_initial.get(), reduced_state_offsets.get(),
             state_offsets.get(), control_offsets.get(), stage_count,
@@ -4749,24 +4911,27 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   const auto initialize_multiplier_outputs = [&] {
     if (multiplier_output_entries > 0) {
       CudaCheck(cudaMemsetAsync(initial_multiplier.get(), 0,
-                                multiplier_output_entries * sizeof(Scalar)),
+                                multiplier_output_entries * sizeof(Scalar),
+                                stream),
                 "initialize compact multipliers");
     }
   };
   if (stage_count > 0) {
     QueueTimedKernels(
-        workspace, TimingSlot::kDualParameters,
+        workspace, TimingSlot::kDualParameters, stream,
         [&] {
-          CudaCheck(cudaMemsetAsync(dual_scan_needed.get(), 0, sizeof(int)),
-                    "initialize dual scan flag");
+          CudaCheck(
+              cudaMemsetAsync(dual_scan_needed.get(), 0, sizeof(int), stream),
+              "initialize dual scan flag");
           CudaCheck(cudaMemsetAsync(dual_dimensions.get(), 0,
                                     workspace.host_dual_dimensions.size() *
-                                        sizeof(int)),
+                                        sizeof(int),
+                                    stream),
                     "initialize dual dimensions");
         },
         [&] {
           BuildDualParametersKernel<<<stage_count, kThreads,
-                                      scratch.dual_parameter>>>(
+                                      scratch.dual_parameter, stream>>>(
               device_stages.get(), state_params.get(), value_suffix,
               workspace.reduced_value_linear.get(), reduced_states.get(),
               states.get(), controls.get(), reduced_state_offsets.get(),
@@ -4778,20 +4943,20 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         [&] {
           CudaCheck(cudaMemcpyAsync(&host_dual_scan_needed,
                                     dual_scan_needed.get(), sizeof(int),
-                                    cudaMemcpyDeviceToHost),
+                                    cudaMemcpyDeviceToHost, stream),
                     "read dual scan flag");
           CudaCheck(cudaMemcpyAsync(workspace.host_dual_dimensions.data(),
                                     dual_dimensions.get(),
                                     workspace.host_dual_dimensions.size() *
                                         sizeof(int),
-                                    cudaMemcpyDeviceToHost),
+                                    cudaMemcpyDeviceToHost, stream),
                     "read dual dimensions");
           CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
                                     device_status.get(), sizeof(DeviceStatus),
-                                    cudaMemcpyDeviceToHost),
+                                    cudaMemcpyDeviceToHost, stream),
                     "read dual parameter status");
         });
-    CudaCheck(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize");
+    CudaCheck(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
     ++workspace.synchronization_count;
     result.timings.riccati_ms = ElapsedTiming(workspace, TimingSlot::kRiccati);
     result.timings.reconstruction_ms =
@@ -4819,7 +4984,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     DualNodeValue *dual_leaf_values =
         host_dual_scan_needed != 0 ? dual_values.get() : nullptr;
     QueueTimedKernels(
-        workspace, TimingSlot::kMultiplierRecovery,
+        workspace, TimingSlot::kMultiplierRecovery, stream,
         [&] {
           initialize_multiplier_outputs();
           if (dual_layout_changed) {
@@ -4827,19 +4992,19 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                       workspace.host_dual_tree.data(),
                                       workspace.host_dual_tree.size() *
                                           sizeof(DualRelation),
-                                      cudaMemcpyHostToDevice),
+                                      cudaMemcpyHostToDevice, stream),
                       "upload compact dual relation tree");
             CudaCheck(cudaMemcpyAsync(dual_values.get(),
                                       workspace.host_dual_values.data(),
                                       workspace.host_dual_values.size() *
                                           sizeof(DualNodeValue),
-                                      cudaMemcpyHostToDevice),
+                                      cudaMemcpyHostToDevice, stream),
                       "upload compact dual value tree");
           }
         },
         [&] {
-          BuildDualParameterRelationsKernel<<<stage_count, kThreads,
-                                              scratch.dual_relation_leaf>>>(
+          BuildDualParameterRelationsKernel<<<
+              stage_count, kThreads, scratch.dual_relation_leaf, stream>>>(
               device_stages.get(), device_terminal.get(), dual_params.get(),
               stage_count, states.get(), controls.get(), state_offsets.get(),
               control_offsets.get(), multiplier_rank_tolerance,
@@ -4850,7 +5015,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
             for (std::size_t level = 0; level + 1 < stage_level_counts.size();
                  ++level) {
               ReduceDualTreeLevelKernel<<<stage_level_counts[level + 1],
-                                          kThreads, scratch.dual_relation>>>(
+                                          kThreads, scratch.dual_relation,
+                                          stream>>>(
                   dual_tree.get(), stage_level_offsets[level],
                   stage_level_offsets[level + 1], stage_level_counts[level],
                   stage_level_counts[level + 1], multiplier_rank_tolerance,
@@ -4858,14 +5024,15 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                   dual_scan_needed.get(), device_status.get());
             }
             const int root_offset = stage_level_offsets.back();
-            SolveDualRootKernel<<<1, kThreads, scratch.dual_root>>>(
+            SolveDualRootKernel<<<1, kThreads, scratch.dual_root, stream>>>(
                 dual_tree.get() + root_offset, dual_values.get() + root_offset,
                 dual_scan_needed.get(), device_status.get(),
                 multiplier_rank_tolerance);
             for (int level = static_cast<int>(stage_level_counts.size()) - 2;
                  level >= 0; --level) {
               ExpandDualTreeLevelKernel<<<stage_level_counts[level + 1],
-                                          kThreads, scratch.dual_expand>>>(
+                                          kThreads, scratch.dual_expand,
+                                          stream>>>(
                   dual_tree.get(), stage_level_offsets[level],
                   stage_level_offsets[level + 1], stage_level_counts[level],
                   stage_level_counts[level + 1], multiplier_rank_tolerance,
@@ -4875,14 +5042,15 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
             }
           }
           const int recovery_blocks = (stage_count + kThreads - 1) / kThreads;
-          RecoverParameterizedMultipliersKernel<<<recovery_blocks, kThreads>>>(
+          RecoverParameterizedMultipliersKernel<<<recovery_blocks, kThreads, 0,
+                                                  stream>>>(
               dual_params.get(), state_dual_params.get(), dual_leaf_values,
               dynamics_offsets.get(), mixed_offsets.get(),
               state_constraint_offsets.get(), stage_count,
               dynamics_multipliers.get(), mixed_multipliers.get(),
               state_multipliers.get(), terminal_multiplier.get(),
               device_status.get());
-          RecoverInitialMultiplierKernel<<<1, kThreads>>>(
+          RecoverInitialMultiplierKernel<<<1, kThreads, 0, stream>>>(
               device_stages.get(), device_terminal.get(), stage_count,
               states.get(), controls.get(), dynamics_multipliers.get(),
               mixed_multipliers.get(), state_offsets.get(),
@@ -4895,10 +5063,10 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   }
   if (stage_count == 0) {
     QueueTimedKernels(
-        workspace, TimingSlot::kMultiplierRecovery,
+        workspace, TimingSlot::kMultiplierRecovery, stream,
         initialize_multiplier_outputs,
         [&] {
-          RecoverInitialMultiplierKernel<<<1, kThreads>>>(
+          RecoverInitialMultiplierKernel<<<1, kThreads, 0, stream>>>(
               device_stages.get(), device_terminal.get(), stage_count,
               states.get(), controls.get(), dynamics_multipliers.get(),
               mixed_multipliers.get(), state_offsets.get(),
@@ -4912,21 +5080,22 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
 
   auto &objective_tree = workspace.objective_tree;
   QueueTimedKernels(
-      workspace, TimingSlot::kObjective,
+      workspace, TimingSlot::kObjective, stream,
       [&] {
         CudaCheck(cudaMemsetAsync(objective_tree.get(), 0,
-                                  objective_tree.count() * sizeof(Scalar)),
+                                  objective_tree.count() * sizeof(Scalar),
+                                  stream),
                   "initialize objective tree");
       },
       [&] {
-        BuildObjectiveTermsKernel<<<node_count, kThreads>>>(
+        BuildObjectiveTermsKernel<<<node_count, kThreads, 0, stream>>>(
             device_stages.get(), stage_count, device_terminal.get(),
             states.get(), controls.get(), state_offsets.get(),
             control_offsets.get(), objective_tree.get(), device_status.get());
         for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
           const int parent_count = level_counts[level + 1];
           const int blocks = (parent_count + kThreads - 1) / kThreads;
-          ReduceObjectiveTreeLevelKernel<<<blocks, kThreads>>>(
+          ReduceObjectiveTreeLevelKernel<<<blocks, kThreads, 0, stream>>>(
               objective_tree.get(), level_offsets[level], level_counts[level],
               level_offsets[level + 1], device_status.get());
         }
@@ -4945,20 +5114,23 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
        host_dynamics.size(), host_mixed.size(), host_state_multipliers.size(),
        host_terminal_multiplier.size()},
       "CUDA compact output");
-  result.timings.download_ms = TimeGpu(workspace, [&] {
+  result.timings.download_ms = TimeGpu(workspace, stream, [&] {
     CudaCheck(cudaMemcpyAsync(workspace.host_status.data(), device_status.get(),
-                              sizeof(DeviceStatus), cudaMemcpyDeviceToHost),
+                              sizeof(DeviceStatus), cudaMemcpyDeviceToHost,
+                              stream),
               "read multiplier status");
-    if (solution_output_entries > 0) {
+    if (device_input == nullptr && solution_output_entries > 0) {
       CudaCheck(cudaMemcpyAsync(host_states.data(), states.get(),
                                 solution_output_entries * sizeof(Scalar),
-                                cudaMemcpyDeviceToHost),
+                                cudaMemcpyDeviceToHost, stream),
                 "download compact primal-dual solution");
     }
-    CudaCheck(cudaMemcpyAsync(workspace.host_objective.data(),
-                              objective_tree.get() + level_offsets.back(),
-                              sizeof(Scalar), cudaMemcpyDeviceToHost),
-              "download objective");
+    if (device_input == nullptr) {
+      CudaCheck(cudaMemcpyAsync(workspace.host_objective.data(),
+                                objective_tree.get() + level_offsets.back(),
+                                sizeof(Scalar), cudaMemcpyDeviceToHost, stream),
+                "download objective");
+    }
   });
   result.timings.riccati_ms = ElapsedTiming(workspace, TimingSlot::kRiccati);
   result.timings.reconstruction_ms =
@@ -4976,7 +5148,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     return result;
   }
 
-  result.objective = workspace.host_objective[0];
+  result.objective =
+      device_input == nullptr ? workspace.host_objective[0] : Scalar{0};
   result.status = SolveStatus::kOptimal;
   result.message = "optimal (parallel CUDA conditional-value scan)";
   if (!options.enforce_multiplier_consistency)
@@ -5093,7 +5266,8 @@ namespace {
 
 SolutionView RunSolveView(const Problem &problem,
                           detail::WorkspaceStorage &storage,
-                          const Options &options, bool prepared) {
+                          const Options &options, bool prepared,
+                          cudaStream_t stream) {
   detail::SolveMetadata &result = storage.result;
   result.status = SolveStatus::kInvalidInput;
   result.message.clear();
@@ -5101,7 +5275,8 @@ SolutionView RunSolveView(const Problem &problem,
   result.timings = Timings{};
   storage.synchronization_count = 0;
   try {
-    detail::SolveImpl(problem, storage, result, options, prepared);
+    detail::SolveImpl(problem, storage, result, options, prepared, stream,
+                      nullptr);
   } catch (const std::invalid_argument &error) {
     result.status = SolveStatus::kInvalidInput;
     result.message = error.what();
@@ -5119,15 +5294,216 @@ SolutionView SolveView(const Problem &problem, Workspace &workspace,
                        const Options &options) {
   if (!workspace.impl_)
     workspace.impl_ = std::make_unique<Workspace::Impl>();
-  return RunSolveView(problem, workspace.impl_->storage, options, false);
+  return RunSolveView(problem, workspace.impl_->storage, options, false,
+                      nullptr);
 }
 
 SolutionView SolvePreparedView(const Problem &problem, Workspace &workspace,
                                const Options &options) {
   if (!workspace.impl_)
     workspace.impl_ = std::make_unique<Workspace::Impl>();
-  return RunSolveView(problem, workspace.impl_->storage, options, true);
+  return RunSolveView(problem, workspace.impl_->storage, options, true,
+                      nullptr);
 }
+
+namespace detail {
+namespace {
+
+void RequireDeviceBuffer(const Scalar *pointer, std::size_t entries,
+                         const char *description) {
+  if (entries > 0)
+    Require(pointer != nullptr, description);
+}
+
+void ValidatePaddedDeviceIo(const Problem &problem,
+                            const PaddedDeviceProblem &input,
+                            const PaddedDeviceSolution &output) {
+  const std::size_t stage_count = problem.stages.size();
+  const std::size_t node_count = stage_count + 1;
+  Require(output.diagnostics != nullptr,
+          "device diagnostics output must not be null");
+  Require(output.objective != nullptr,
+          "device objective output must not be null");
+  std::size_t maximum_state = problem.terminal_Q.rows();
+  std::size_t maximum_control = 0;
+  std::size_t maximum_mixed = 0;
+  std::size_t maximum_state_constraints = 0;
+  for (const Stage &stage : problem.stages) {
+    maximum_state = std::max({maximum_state, stage.A.cols(), stage.A.rows()});
+    maximum_control = std::max(maximum_control, stage.B.cols());
+    maximum_mixed = std::max(maximum_mixed, stage.C.rows());
+    maximum_state_constraints =
+        std::max(maximum_state_constraints, stage.E.rows());
+  }
+  Require(input.state_capacity >= maximum_state,
+          "padded state capacity is smaller than an active dimension");
+  Require(input.control_capacity >= maximum_control,
+          "padded control capacity is smaller than an active dimension");
+  Require(input.mixed_capacity >= maximum_mixed,
+          "padded mixed capacity is smaller than an active dimension");
+  Require(input.state_constraint_capacity >= maximum_state_constraints,
+          "padded state-constraint capacity is smaller than an active "
+          "dimension");
+  Require(input.terminal_constraint_capacity >= problem.terminal_E.rows(),
+          "padded terminal-constraint capacity is smaller than its active "
+          "dimension");
+
+  const std::size_t nx = input.state_capacity;
+  const std::size_t nu = input.control_capacity;
+  const std::size_t nc = input.mixed_capacity;
+  const std::size_t ne = input.state_constraint_capacity;
+  const std::size_t nt = input.terminal_constraint_capacity;
+  RequireDeviceBuffer(input.A, stage_count * nx * nx,
+                      "device A input must not be null");
+  RequireDeviceBuffer(input.B, stage_count * nx * nu,
+                      "device B input must not be null");
+  RequireDeviceBuffer(input.c, stage_count * nx,
+                      "device c input must not be null");
+  RequireDeviceBuffer(input.Q, node_count * nx * nx,
+                      "device Q input must not be null");
+  RequireDeviceBuffer(input.R, stage_count * nu * nu,
+                      "device R input must not be null");
+  RequireDeviceBuffer(input.M, stage_count * nx * nu,
+                      "device M input must not be null");
+  RequireDeviceBuffer(input.q, node_count * nx,
+                      "device q input must not be null");
+  RequireDeviceBuffer(input.r, stage_count * nu,
+                      "device r input must not be null");
+  RequireDeviceBuffer(input.C, stage_count * nc * nx,
+                      "device C input must not be null");
+  RequireDeviceBuffer(input.D, stage_count * nc * nu,
+                      "device D input must not be null");
+  RequireDeviceBuffer(input.d, stage_count * nc,
+                      "device d input must not be null");
+  RequireDeviceBuffer(input.E, stage_count * ne * nx,
+                      "device E input must not be null");
+  RequireDeviceBuffer(input.e, stage_count * ne,
+                      "device e input must not be null");
+  RequireDeviceBuffer(input.terminal_E, nt * nx,
+                      "device terminal_E input must not be null");
+  RequireDeviceBuffer(input.terminal_e, nt,
+                      "device terminal_e input must not be null");
+  RequireDeviceBuffer(input.initial_state, nx,
+                      "device initial_state input must not be null");
+
+  RequireDeviceBuffer(output.states, node_count * nx,
+                      "device states output must not be null");
+  RequireDeviceBuffer(output.controls, stage_count * nu,
+                      "device controls output must not be null");
+  RequireDeviceBuffer(output.initial_multiplier, nx,
+                      "device initial multiplier output must not be null");
+  RequireDeviceBuffer(output.dynamics_multipliers, stage_count * nx,
+                      "device dynamics multipliers output must not be null");
+  RequireDeviceBuffer(output.mixed_multipliers, stage_count * nc,
+                      "device mixed multipliers output must not be null");
+  RequireDeviceBuffer(output.state_multipliers, stage_count * ne,
+                      "device state multipliers output must not be null");
+  RequireDeviceBuffer(output.terminal_state_multiplier, nt,
+                      "device terminal multiplier output must not be null");
+}
+
+void ClearPaddedDeviceSolution(const Problem &problem,
+                               const PaddedDeviceProblem &input,
+                               const PaddedDeviceSolution &output,
+                               cudaStream_t stream) {
+  const std::size_t stage_count = problem.stages.size();
+  const std::size_t node_count = stage_count + 1;
+  const auto clear = [stream](Scalar *pointer, std::size_t entries,
+                              const char *description) {
+    if (entries == 0)
+      return;
+    CudaCheck(cudaMemsetAsync(pointer, 0, entries * sizeof(Scalar), stream),
+              description);
+  };
+  clear(output.objective, 1, "clear padded objective");
+  clear(output.states, node_count * input.state_capacity,
+        "clear padded states");
+  clear(output.controls, stage_count * input.control_capacity,
+        "clear padded controls");
+  clear(output.initial_multiplier, input.state_capacity,
+        "clear padded initial multiplier");
+  clear(output.dynamics_multipliers, stage_count * input.state_capacity,
+        "clear padded dynamics multipliers");
+  clear(output.mixed_multipliers, stage_count * input.mixed_capacity,
+        "clear padded mixed multipliers");
+  clear(output.state_multipliers, stage_count * input.state_constraint_capacity,
+        "clear padded state multipliers");
+  clear(output.terminal_state_multiplier, input.terminal_constraint_capacity,
+        "clear padded terminal multiplier");
+}
+
+void ExportPaddedDeviceSolution(const Problem &problem,
+                                WorkspaceStorage &storage,
+                                const PaddedDeviceProblem &input,
+                                const PaddedDeviceSolution &output,
+                                SolveStatus status, cudaStream_t stream) {
+  ClearPaddedDeviceSolution(problem, input, output, stream);
+  WritePackedDiagnosticsKernel<<<1, 1, 0, stream>>>(status, output.diagnostics);
+  if (status != SolveStatus::kOptimal)
+    return;
+  const int stage_count = static_cast<int>(problem.stages.size());
+  const int node_count = stage_count + 1;
+  ScatterPaddedSolutionKernel<<<node_count, kThreads, 0, stream>>>(
+      storage.device_stages.get(), stage_count, storage.device_terminal.get(),
+      storage.state_offsets.get(), storage.control_offsets.get(),
+      storage.dynamics_offsets.get(), storage.mixed_offsets.get(),
+      storage.state_constraint_offsets.get(), storage.states.get(),
+      storage.controls.get(), storage.initial_multiplier.get(),
+      storage.dynamics_multipliers.get(), storage.mixed_multipliers.get(),
+      storage.state_multipliers.get(), storage.terminal_multiplier.get(),
+      input.state_capacity, input.control_capacity, input.mixed_capacity,
+      input.state_constraint_capacity, output);
+  CudaCheck(cudaMemcpyAsync(output.objective,
+                            storage.objective_tree.get() +
+                                storage.node_level_offsets.back(),
+                            sizeof(Scalar), cudaMemcpyDeviceToDevice, stream),
+            "export device objective");
+  CudaCheck(cudaGetLastError(), "export padded CUDA solution");
+}
+
+} // namespace
+
+SolveStatus SolvePackedDevice(const Problem &structure, Workspace &workspace,
+                              const PaddedDeviceProblem &input,
+                              const PaddedDeviceSolution &output,
+                              void *cuda_stream, const Options &options,
+                              DeviceTransferAudit *audit) {
+  if (!workspace.impl_)
+    workspace.impl_ = std::make_unique<Workspace::Impl>();
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  SolveMetadata &result = workspace.impl_->storage.result;
+  result.status = SolveStatus::kInvalidInput;
+  result.message.clear();
+  result.objective = Scalar{0};
+  result.timings = Timings{};
+  workspace.impl_->storage.synchronization_count = 0;
+  if (audit != nullptr)
+    *audit = DeviceTransferAudit{};
+  bool output_validated = false;
+  try {
+    ValidatePaddedDeviceIo(structure, input, output);
+    output_validated = true;
+    if (!workspace.impl_->storage.structure_ready)
+      workspace.Reserve(structure, options);
+    SolveImpl(structure, workspace.impl_->storage, result, options, true,
+              stream, &input);
+  } catch (const std::invalid_argument &error) {
+    result.status = SolveStatus::kInvalidInput;
+    result.message = error.what();
+  } catch (const std::exception &error) {
+    result.status = SolveStatus::kNumericalFailure;
+    result.message = error.what();
+  }
+  if (output_validated) {
+    ExportPaddedDeviceSolution(structure, workspace.impl_->storage, input,
+                               output, result.status, stream);
+  }
+  result.timings.synchronization_count =
+      workspace.impl_->storage.synchronization_count;
+  return result.status;
+}
+
+} // namespace detail
 
 namespace {
 

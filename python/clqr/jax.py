@@ -4,7 +4,9 @@ Problems are padded once into fixed-shape arrays. Active dimensions are stored
 separately, so the same compiled call supports heterogeneous stage dimensions.
 The factor matrices and right-hand sides are separate pytrees in preparation
 for a future numerical factor/solve API; the current ``solve`` call performs
-both operations.
+both operations. On CUDA, scalar inputs and outputs remain device-resident;
+only the compact active-dimension vector is read by the host to prepare and
+reuse the native solver workspace.
 
 Automatic differentiation is not implemented yet.
 """
