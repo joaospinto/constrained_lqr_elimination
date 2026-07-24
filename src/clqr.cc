@@ -1599,15 +1599,14 @@ void SolveMatrixWithPivotedLuRaw(const Scalar* CLQR_RESTRICT factor,
   }
 }
 
-void SolveControlVectorRaw(const Scalar* CLQR_RESTRICT control_factor,
-                           const std::size_t* CLQR_RESTRICT control_pivots,
-                           bool factor_is_cholesky,
-                           const Scalar* CLQR_RESTRICT rhs, std::size_t m,
-                           Scalar* CLQR_RESTRICT scratch,
-                           Scalar* CLQR_RESTRICT out) {
+void SolveControlVectorInPlaceRaw(
+    const Scalar* CLQR_RESTRICT control_factor,
+    const std::size_t* CLQR_RESTRICT control_pivots,
+    bool factor_is_cholesky, Scalar* CLQR_RESTRICT values, std::size_t m,
+    Scalar* CLQR_RESTRICT scratch) {
   if (!factor_is_cholesky) {
     for (std::size_t row = 0; row < m; ++row) {
-      scratch[row] = rhs[row];
+      scratch[row] = values[row];
     }
     for (std::size_t row = 0; row < m; ++row) {
       const std::size_t pivot = control_pivots[row];
@@ -1632,7 +1631,7 @@ void SolveControlVectorRaw(const Scalar* CLQR_RESTRICT control_factor,
     }
   } else {
     for (std::size_t row = 0; row < m; ++row) {
-      Scalar value = rhs[row];
+      Scalar value = values[row];
       CLQR_UNROLL
       for (std::size_t col = 0; col < row; ++col) {
         value -= control_factor[row * m + col] * scratch[col];
@@ -1649,7 +1648,7 @@ void SolveControlVectorRaw(const Scalar* CLQR_RESTRICT control_factor,
       scratch[row] = value / control_factor[row * m + row];
     }
   }
-  for (std::size_t row = 0; row < m; ++row) out[row] = -scratch[row];
+  for (std::size_t row = 0; row < m; ++row) values[row] = -scratch[row];
 }
 
 void ComputeUnconstrainedAffineStageRaw(
@@ -1678,8 +1677,8 @@ void ComputeUnconstrainedAffineStageRaw(
       k[col] += B[shared * m + col] * pc;
     }
   }
-  SolveControlVectorRaw(control_factor, control_pivots, factor_is_cholesky, k,
-                        m, control_scratch, k);
+  SolveControlVectorInPlaceRaw(control_factor, control_pivots,
+                               factor_is_cholesky, k, m, control_scratch);
   for (std::size_t row = 0; row < n; ++row) {
     CLQR_UNROLL
     for (std::size_t col = 0; col < m; ++col) {
