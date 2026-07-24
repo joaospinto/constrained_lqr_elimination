@@ -159,9 +159,10 @@ CLQR_CUDA_ARCH=60 bash scripts/compare_cuda_revisions.sh
 ```
 
 The comparison defaults to three rounds of eleven warmed FP64 solves and
-reports wall, kernel, phase, and CPU/CUDA KKT-residual comparisons. Temporary
-build trees are removed automatically; set `CLQR_KEEP_COMPARE_OUTPUT=1` to
-retain them.
+reports CPU, wall, kernel, phase, packing/transfer, and CPU/CUDA KKT-residual
+comparisons. The default CSV includes absolute candidate packing/transfer time
+and its share of the wall--kernel gap. Temporary build trees are removed
+automatically; set `CLQR_KEEP_COMPARE_OUTPUT=1` to retain them.
 
 The benchmark does not install or time the JAX implementation. To run the
 additional solution-level JAX cross-validation diagnostic, set
