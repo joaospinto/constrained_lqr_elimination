@@ -164,6 +164,20 @@ comparisons. The default CSV includes absolute candidate packing/transfer time
 and its share of the wall--kernel gap. Temporary build trees are removed
 automatically; set `CLQR_KEEP_COMPARE_OUTPUT=1` to retain them.
 
+Revision-specific build flags can be supplied without shell evaluation. For a
+fair comparison against the tuned compile-time-capacity implementation, use:
+
+```sh
+CLQR_BASE_REVISION=b3b66cc4f71c72464c5c15a1ac38edd8068f3b71 \
+CLQR_BASE_EXTRA_BAZEL_ARGS="--cuda_max_state_dimension=8 --cuda_max_control_dimension=4 --cuda_max_mixed_constraints=2 --cuda_max_state_constraints=2" \
+CLQR_CANDIDATE_REVISION=HEAD \
+CLQR_CUDA_ARCH=60 bash scripts/compare_cuda_revisions.sh
+```
+
+The emitted report records both revisions and both revision-specific build
+argument strings. Fields unavailable from a historical benchmark schema are
+reported as `nan`.
+
 The benchmark does not install or time the JAX implementation. To run the
 additional solution-level JAX cross-validation diagnostic, set
 `CLQR_RUN_JAX_CROSS_VALIDATION=1`; `CLQR_JAX_REVISION` can override its pinned
