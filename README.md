@@ -159,9 +159,10 @@ CLQR_CUDA_ARCH=60 bash scripts/compare_cuda_revisions.sh
 ```
 
 The comparison defaults to three rounds of eleven warmed FP64 solves and
-reports wall, kernel, phase, and CPU/CUDA KKT-residual comparisons. Temporary
-build trees are removed automatically; set `CLQR_KEEP_COMPARE_OUTPUT=1` to
-retain them.
+reports CPU, wall, kernel, phase, packing/transfer, and CPU/CUDA KKT-residual
+comparisons. The default CSV includes absolute candidate packing/transfer time
+and its share of the wall--kernel gap. Temporary build trees are removed
+automatically; set `CLQR_KEEP_COMPARE_OUTPUT=1` to retain them.
 
 The benchmark does not install or time the JAX implementation. To run the
 additional solution-level JAX cross-validation diagnostic, set
@@ -233,6 +234,21 @@ better summary statistics.
 
 All sample cases reported `singular_count=0` and `wrong_inertia_count=0`.
 
+For revision-to-revision evidence on the constrained CPU path, including
+adversarial row scaling, redundant rows, primal/KKT residuals, and alternating
+benchmark order, run:
+
+```sh
+CLQR_BASE_REVISION=<baseline> \
+CLQR_CANDIDATE_REVISION=<candidate> \
+scripts/compare_cpu_constraint_revisions.sh
+```
+
+The focused comparison defaults to FP64 and FP32, 101 timed solves per process,
+and seven alternating-order rounds. See
+[`benchmarks/CPU_QR_EVIDENCE.md`](benchmarks/CPU_QR_EVIDENCE.md) for the
+RREF-versus-QR methodology and recorded results.
+
 C++ users include `clqr/clqr.h` and call `clqr::Solve` with a workspace:
 
 ```cpp
@@ -261,6 +277,36 @@ The workspace API covers constrained and unconstrained problems. Unconstrained p
 the raw Riccati path directly. Constrained problems activate the workspace arena and run the
 constraint-elimination algorithm, including the reduced Riccati solve and multiplier recovery.
 
+For repeated unconstrained solves with fixed matrices and new right-hand
+sides, factor the matrix-dependent Riccati recursion once:
+
+```cpp
+clqr::Factorization factors = clqr::Factor(problem);
+clqr::SolveRhs rhs = clqr::ExtractRhs(problem);
+clqr::Workspace solve_workspace;
+solve_workspace.Reserve(factors);
+
+clqr::SolutionView first = clqr::Solve(factors, rhs, solve_workspace);
+rhs.initial_state = next_initial_state;
+rhs.stages[0].q = next_state_gradient;
+clqr::SolutionView second = clqr::Solve(factors, rhs, solve_workspace);
+```
+
+`Factor` owns the fixed `A`, `B`, `Q`, `R`, `M`, and terminal `Q` data.
+Each factored `Solve` accepts new `c`, `q`, `r`, terminal `q`, and initial
+state values with unchanged dimensions, and performs no heap allocation when
+given a reserved workspace. The first API slice deliberately rejects equality
+constraints; CUDA, JAX, and constrained factorization remain follow-up work.
+As with the ordinary workspace API, every buffer and string referenced by the
+returned `SolutionView` is workspace-backed and remains valid only until that
+workspace is reused or destroyed. Copy any values that must survive the next
+solve.
+
+The native C++ `Problem`, `SolveRhs`, and NumPy dictionary APIs keep
+`terminal_Q` and `terminal_q` as separate fields. The padded JAX representation
+alone folds them into `factors.Q[-1]` and `rhs.q[-1]`; `pack_problem` performs
+that conversion from the native dictionary schema.
+
 The Python extension is built by the Bazel target `//:_clqr`; the shared-object output is
 addressable as `//:_clqr.so`. It exposes the `_clqr` module directly:
 
@@ -284,8 +330,29 @@ result = _clqr.solve({
 })
 ```
 
+For repeated unconstrained solves, the Python extension exposes the same
+matrix/RHS split as C++:
+
+```python
+factors = _clqr.factor(problem)
+solve_rhs = _clqr.rhs(problem)
+
+first = factors.solve(solve_rhs)
+solve_rhs.initial_state = next_initial_state
+solve_rhs.stage(0).c = next_dynamics_offset
+solve_rhs.stage(0).q = next_state_gradient
+solve_rhs.stage(0).r = next_control_gradient
+solve_rhs.terminal_q = next_terminal_gradient
+second = factors.solve(solve_rhs)
+```
+
+`Factorization` owns the matrices and internally reuses its native solve
+workspace. Assigning an RHS property copies that array into owned native
+storage; result arrays are newly owned NumPy arrays. This factorized Python
+path currently rejects equality-constrained problems.
+
 The lightweight package wrapper in `python/clqr/__init__.py` re-exports the same `solve`
-function once `_clqr` is on `PYTHONPATH`.
+function, as well as `factor` and `rhs`, once `_clqr` is on `PYTHONPATH`.
 
 The Python boundary accepts and returns NumPy-compatible `float64` arrays; an
 FP32 extension converts them to and from `clqr::Scalar` internally. The result
@@ -319,9 +386,11 @@ result = jax.jit(solve)(jax.device_put(packed, jax.devices()[0]))
 only at the interface, while each C++/CUDA stage still operates on its active
 runtime dimensions. `factors.Q` and `rhs.q` have `N + 1` entries, with their
 last entries holding the terminal cost; the other stage arrays have `N`
-entries. The split lets callers replace any RHS vector without changing the
-compiled JAX shape. It is not yet a numerical factor/solve split: the current
-call refactors after either part changes.
+entries. `pack_problem` still accepts `terminal_Q` and `terminal_q` as separate
+input-dictionary fields and folds them into those last entries. The split lets
+callers replace any RHS vector without changing the compiled JAX shape. It is
+not yet a numerical factor/solve split: the current call refactors after either
+part changes.
 
 CPU arrays dispatch to the sequential C++ solver. When `//:_clqr_cuda` is
 installed, CUDA arrays dispatch to the CUDA solver on the device selected by

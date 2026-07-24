@@ -180,8 +180,12 @@ print(f"# baseline={base_commit}")
 print(f"# candidate={candidate_commit}")
 print("# ratios are baseline/candidate; values above one favor the candidate")
 print(
-    "N,base_wall_ms,candidate_wall_ms,wall_ratio,"
+    "N,base_cpp_ms,candidate_cpp_ms,cpp_ratio,"
+    "base_wall_ms,candidate_wall_ms,wall_ratio,"
     "base_kernel_ms,candidate_kernel_ms,kernel_ratio,"
+    "candidate_input_pack_ms,candidate_upload_ms,candidate_download_ms,"
+    "candidate_pack_transfer_ms,candidate_non_kernel_ms,"
+    "candidate_pack_transfer_share,"
     "feasibility_ratio,reduction_ratio,riccati_ratio,"
     "reconstruction_ratio,multiplier_ratio,"
     "base_cpp_kkt,candidate_cpp_kkt,base_cuda_kkt,candidate_cuda_kkt"
@@ -193,12 +197,25 @@ for horizon in sorted(baseline.keys() & candidate.keys()):
     def ratio(field):
         return base[field] / cand[field]
 
+    pack_transfer = (
+        cand["input_pack_ms"] + cand["upload_ms"] + cand["download_ms"]
+    )
+    non_kernel = cand["cuda_wall_ms"] - cand["cuda_kernel_ms"]
+    pack_transfer_share = (
+        pack_transfer / non_kernel if non_kernel > 0.0 else float("nan")
+    )
+
     print(
         f"{horizon},"
+        f"{base['cpp_cpu_ms']:.6f},{cand['cpp_cpu_ms']:.6f},"
+        f"{ratio('cpp_cpu_ms'):.4f},"
         f"{base['cuda_wall_ms']:.6f},{cand['cuda_wall_ms']:.6f},"
         f"{ratio('cuda_wall_ms'):.4f},"
         f"{base['cuda_kernel_ms']:.6f},{cand['cuda_kernel_ms']:.6f},"
         f"{ratio('cuda_kernel_ms'):.4f},"
+        f"{cand['input_pack_ms']:.6f},{cand['upload_ms']:.6f},"
+        f"{cand['download_ms']:.6f},{pack_transfer:.6f},"
+        f"{non_kernel:.6f},{pack_transfer_share:.4f},"
         f"{ratio('feasibility_ms'):.4f},{ratio('reduction_ms'):.4f},"
         f"{ratio('riccati_ms'):.4f},{ratio('reconstruction_ms'):.4f},"
         f"{ratio('multiplier_ms'):.4f},"

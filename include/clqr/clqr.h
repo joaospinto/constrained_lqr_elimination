@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,23 @@ struct Problem {
   Vector terminal_e;
   Vector initial_state;
 };
+
+struct StageRhs {
+  Vector c;
+  Vector q;
+  Vector r;
+  Vector d;
+  Vector e;
+};
+
+struct SolveRhs {
+  WorkspaceVector<StageRhs> stages;
+  Vector terminal_q;
+  Vector terminal_e;
+  Vector initial_state;
+};
+
+SolveRhs ExtractRhs(const Problem& problem);
 
 enum class SolveStatus {
   kOptimal,
@@ -83,6 +101,34 @@ struct SolutionView {
   Scalar objective = Scalar{0};
 };
 
+class Workspace;
+
+class Factorization {
+ public:
+  struct Impl;
+
+  Factorization();
+  ~Factorization();
+  Factorization(Factorization&&) noexcept;
+  Factorization& operator=(Factorization&&) noexcept;
+  Factorization(const Factorization&) = delete;
+  Factorization& operator=(const Factorization&) = delete;
+
+  SolveStatus status() const;
+  const char* message() const;
+  std::size_t stage_count() const;
+  std::size_t RequiredSolveBytes() const;
+
+ private:
+  std::unique_ptr<Impl> impl_;
+
+  friend Factorization Factor(const Problem&, const SolveOptions&);
+  friend SolutionView Solve(const Factorization&, const SolveRhs&, Workspace&);
+};
+
+Factorization Factor(const Problem& problem,
+                     const SolveOptions& options = SolveOptions{});
+
 class Workspace {
  public:
   Workspace() = default;
@@ -93,6 +139,7 @@ class Workspace {
   static std::size_t RequiredBytes(const Problem& problem);
   static std::size_t RequiredBytes(const Problem& problem,
                                    const SolveOptions& options);
+  static std::size_t RequiredBytes(const Factorization& factorization);
   static constexpr std::size_t RequiredBytesUniform(std::size_t stages,
                                                     std::size_t state_dim,
                                                     std::size_t control_dim) {
@@ -155,6 +202,8 @@ class Workspace {
     bytes = AddAligned(bytes, alignof(Scalar),
                        sizeof(Scalar) * max_control * max_state);
     bytes = AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * max_control);
+    bytes = AddAligned(bytes, alignof(std::size_t),
+                       sizeof(std::size_t) * max_control);
 
     bytes = AddAligned(bytes, alignof(VectorView),
                        sizeof(VectorView) * (stages + 1));
@@ -178,8 +227,7 @@ class Workspace {
       std::size_t terminal_constraints = 0) {
     const std::size_t largest_dimension =
         Max(Max(state_dim, control_dim),
-            Max(Max(mixed_constraints_per_stage,
-                    state_constraints_per_stage),
+            Max(Max(mixed_constraints_per_stage, state_constraints_per_stage),
                 terminal_constraints));
     if (!WorkspaceBoundInputsSafe(stages, largest_dimension))
       return std::numeric_limits<std::size_t>::max();
@@ -214,8 +262,8 @@ class Workspace {
     const std::size_t state_stage_scalars =
         2 * state_rows_bound * (state_dim + 1 + state_rows_bound) +
         state_dim * state_dim + state_dim + state_dim * state_rows_bound +
-        3 * state_dim * state_dim + 3 * state_dim * control_dim + 4 * state_dim +
-        8 * state_dim * state_dim +
+        3 * state_dim * state_dim + 3 * state_dim * control_dim +
+        4 * state_dim + 8 * state_dim * state_dim +
         4 * state_dim * control_dim + 2 * control_dim * state_dim +
         4 * state_dim + 2 * control_dim +
         (state_pivot_bound + mixed_constraints_per_stage) *
@@ -293,14 +341,14 @@ class Workspace {
                        sizeof(Scalar) * total_state_multiplier_scalars);
     bytes = AddAligned(bytes, alignof(Scalar),
                        sizeof(Scalar) * terminal_constraints);
-    bytes = AddAligned(bytes, alignof(Vector),
-                       sizeof(Vector) * (2 * stages + 1));
-    bytes = AddAligned(bytes, alignof(Scalar),
-                       sizeof(Scalar) *
-                           (total_dynamics_scalars + total_state_scalars +
-                            stages * pullback_stage_scalars +
-                            4 * state_dim *
-                                (state_dim + terminal_constraints + 1)));
+    bytes =
+        AddAligned(bytes, alignof(Vector), sizeof(Vector) * (2 * stages + 1));
+    bytes = AddAligned(
+        bytes, alignof(Scalar),
+        sizeof(Scalar) *
+            (total_dynamics_scalars + total_state_scalars +
+             stages * pullback_stage_scalars +
+             4 * state_dim * (state_dim + terminal_constraints + 1)));
     if (stages == 0) {
       // Match the runtime constrained-workspace bound for the terminal-only
       // recovery path.  With no stage-proportional scratch, its dense affine
@@ -311,19 +359,20 @@ class Workspace {
           bytes, alignof(Scalar),
           sizeof(Scalar) * 8 * local_dimension * local_dimension);
     }
-    bytes = AddAligned(bytes, alignof(Vector),
-                       sizeof(Vector) * (5 * stages + 1));
-    bytes = AddAligned(bytes, alignof(Scalar),
-                       sizeof(Scalar) *
-                           (total_state_scalars + total_control_scalars +
-                            total_dynamics_scalars + total_mixed_scalars +
-                            total_state_multiplier_scalars +
-                            terminal_constraints + state_dim));
+    bytes =
+        AddAligned(bytes, alignof(Vector), sizeof(Vector) * (5 * stages + 1));
+    bytes = AddAligned(
+        bytes, alignof(Scalar),
+        sizeof(Scalar) * (total_state_scalars + total_control_scalars +
+                          total_dynamics_scalars + total_mixed_scalars +
+                          total_state_multiplier_scalars +
+                          terminal_constraints + state_dim));
     return bytes;
   }
 
   void Reserve(const Problem& problem);
   void Reserve(const Problem& problem, const SolveOptions& options);
+  void Reserve(const Factorization& factorization);
   void UseExternalMemory(void* memory, std::size_t bytes);
   unsigned char* data() { return data_; }
   const unsigned char* data() const { return data_; }
@@ -334,11 +383,11 @@ class Workspace {
 
  private:
   const char* StoreMessage(const char* message);
+  const char* StoreDiagnostic(const char* diagnostic);
 
   static constexpr std::size_t Align(std::size_t offset,
                                      std::size_t alignment) {
-    if (offset >
-        std::numeric_limits<std::size_t>::max() - (alignment - 1))
+    if (offset > std::numeric_limits<std::size_t>::max() - (alignment - 1))
       return std::numeric_limits<std::size_t>::max();
     return (offset + alignment - 1) & ~(alignment - 1);
   }
@@ -377,12 +426,16 @@ class Workspace {
   std::size_t size_ = 0;
   WorkspaceArena arena_;
   std::array<char, 128> message_{};
+  std::array<char, 256> diagnostic_{};
 
   friend SolutionView Solve(const Problem&, Workspace&, const SolveOptions&);
+  friend SolutionView Solve(const Factorization&, const SolveRhs&, Workspace&);
 };
 
 SolutionView Solve(const Problem& problem, Workspace& workspace,
                    const SolveOptions& options = SolveOptions{});
+SolutionView Solve(const Factorization& factorization, const SolveRhs& rhs,
+                   Workspace& workspace);
 const char* StatusName(SolveStatus status);
 
 }  // namespace clqr
