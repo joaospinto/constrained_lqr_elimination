@@ -171,12 +171,13 @@ reference revision.
 For correctness stress testing rather than timing, use
 [`notebooks/kaggle_cuda_stress.ipynb`](notebooks/kaggle_cuda_stress.ipynb).
 Its shell driver, [`scripts/notebook_cuda_stress.sh`](scripts/notebook_cuda_stress.sh),
-runs the extended fixed-seed and long-horizon corpus in FP64 and FP32 through
-the sequential C++ solver and native CUDA, runs the shared standard and
-selected extended corpus through CUDA kernel emulation, and applies Compute
-Sanitizer memcheck, initcheck, racecheck, and synccheck to both native suites.
-The report includes the exact revision, host, compiler, CUDA toolkit, driver,
-and GPU descriptions.
+runs the extended fixed-seed and long-horizon corpus in FP64 and the standard
+representative corpus in FP32 through the sequential C++ solver, kernel
+emulation, and native CUDA. It applies Compute Sanitizer memcheck, initcheck,
+racecheck, and synccheck to both native suites. Set
+`CLQR_RUN_FP32_EXTENDED_STRESS=1` to add the explicitly non-gating,
+pathological long-horizon FP32 corpus. The report includes the exact revision,
+host, compiler, CUDA toolkit, driver, and GPU descriptions.
 The normal CI-sized adversarial suite is `//:adversarial_cpu_test`; opt into the
 broader host and emulation suites with:
 
@@ -294,3 +295,47 @@ dict contains `status`, `message`,
 `state_multipliers`, and `terminal_state_multiplier`. The multiplier signs correspond to the
 constraints exactly as written above. The Newton-KKT diagnostic fields are reported separately
 from `status`; when the reduced solve can proceed, a candidate solution is still returned.
+
+### JAX
+
+`python/clqr/jax.py` exposes the solver through JAX's typed FFI:
+
+```bash
+bazel build //:_clqr //:_clqr_jax_cpu //:_clqr_cuda --config=cuda
+PYTHONPATH="$PWD/python:$PWD/bazel-bin" python your_program.py
+```
+
+```python
+import jax
+
+from clqr.jax import pack_problem, solve
+
+packed = pack_problem(problem)
+result = jax.jit(solve)(jax.device_put(packed, jax.devices()[0]))
+```
+
+`PackedProblem.factors` contains the matrices and active dimensions;
+`PackedProblem.rhs` contains the vectors and initial state. Arrays are padded
+only at the interface, while each C++/CUDA stage still operates on its active
+runtime dimensions. `factors.Q` and `rhs.q` have `N + 1` entries, with their
+last entries holding the terminal cost; the other stage arrays have `N`
+entries. The split lets callers replace any RHS vector without changing the
+compiled JAX shape. It is not yet a numerical factor/solve split: the current
+call refactors after either part changes.
+
+CPU arrays dispatch to the sequential C++ solver. When `//:_clqr_cuda` is
+installed, CUDA arrays dispatch to the CUDA solver on the device selected by
+JAX. The CUDA bridge preserves JAX stream ordering and reuses pinned staging
+buffers and the native CUDA workspace for unchanged dimensions. It currently
+stages the padded FFI inputs through host memory because the public CUDA solver
+accepts a host `Problem`; a future device-packed entry point can remove that
+round trip.
+
+The typed FFI lives in optional `_clqr_jax_cpu` and `_clqr_cuda` extensions;
+the existing `_clqr` Python binding remains independent of JAX.
+
+The raw FFI call supports eager execution, `jax.jit`, and sequential `jax.vmap`.
+Automatic differentiation and sharded-problem rules are not implemented.
+Build/test the CPU binding with `//:jax_binding_test`. On a CUDA 12 machine,
+`//:jax_cuda_binding_test --config=cuda` exercises GPU dispatch; the notebook
+driver includes it when `CLQR_RUN_JAX_FFI_TEST=1`.
