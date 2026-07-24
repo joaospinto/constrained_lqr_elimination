@@ -65,13 +65,15 @@ struct ScratchSize {
 
 __host__ __device__ std::size_t
 DualRelationLeafScratchBytes(std::size_t matrix_entries, std::size_t rows,
-                             std::size_t state_constraints) {
+                             std::size_t state_constraints,
+                             std::size_t coefficient_columns) {
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(matrix_entries);
   scratch_size.Add<Scalar>(rows);
   scratch_size.Add<Scalar>(state_constraints);
   scratch_size.Add<int>(rows);
-  scratch_size.Add<int>(rows > state_constraints ? rows : state_constraints);
+  scratch_size.Add<int>(
+      rows > coefficient_columns ? rows : coefficient_columns);
   return scratch_size.bytes;
 }
 
@@ -581,7 +583,7 @@ ScratchRequirements PlanScratch(const Problem &problem) {
                    DualRelationLeafScratchBytes(
                        ScratchCheckedProduct(state_dim, columns,
                                              "dual-relation leaf workspace"),
-                       state_dim, state_constraints));
+                       state_dim, state_constraints, columns - 1));
       dual_leaves[index] = MakeScanShape(dual_bounds[index], right);
     }
     const ScanPlan dual_tree = BuildScanPlan(dual_leaves);
@@ -4638,6 +4640,13 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                      kMultiplierConsistencyTolerancePerTreeLevel *
                          stage_level_counts.size())
           : kScalarMax;
+  // A leaf QR residual has not crossed the relation tree yet; applying the
+  // tree-accumulated tolerance here can accept a visibly inconsistent KKT row.
+  const Scalar multiplier_leaf_consistency_tolerance =
+      options.enforce_multiplier_consistency
+          ? std::max(multiplier_rank_tolerance,
+                     kMultiplierConsistencyTolerancePerTreeLevel)
+          : kScalarMax;
   auto &dual_params = workspace.dual_params;
   auto &dual_dimensions = workspace.dual_dimensions;
   auto &dual_scan_needed = workspace.dual_scan_needed;
@@ -4756,7 +4765,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               device_stages.get(), device_terminal.get(), dual_params.get(),
               stage_count, states.get(), controls.get(), state_offsets.get(),
               control_offsets.get(), multiplier_rank_tolerance,
-              multiplier_consistency_tolerance, dual_relations,
+              multiplier_leaf_consistency_tolerance, dual_relations,
               dual_scan_needed.get(), state_dual_params.get(),
               device_status.get());
           if (host_dual_scan_needed != 0) {
@@ -5587,14 +5596,15 @@ __global__ void BuildDualParameterRelationsKernel(
   const int rows = state_dim;
   const int columns = state_constraints + left.free_dim + right_dim + 1;
   const std::size_t scratch_bytes = DualRelationLeafScratchBytes(
-      static_cast<std::size_t>(rows) * columns, rows, state_constraints);
+      static_cast<std::size_t>(rows) * columns, rows, state_constraints,
+      columns - 1);
   CLQR_BLOCK_SCRATCH(scratch, scratch_bytes);
   Scalar *matrix =
       scratch.Take<Scalar>(static_cast<std::size_t>(rows) * columns);
   Scalar *factors = scratch.Take<Scalar>(rows);
   Scalar *constraint_scales = scratch.Take<Scalar>(state_constraints);
   int *pivot_columns = scratch.Take<int>(rows);
-  int *integer_scratch = scratch.Take<int>(DeviceMax(rows, state_constraints));
+  int *integer_scratch = scratch.Take<int>(DeviceMax(rows, columns - 1));
   __shared__ Scalar matrix_scale;
   __shared__ int rank;
   __shared__ int constraint_rank;
@@ -5717,13 +5727,15 @@ __global__ void BuildDualParameterRelationsKernel(
   WarpSynchronize();
 
   // Only the rows left after eliminating the state multipliers constrain the
-  // free dynamics/mixed-multiplier parameters. Canonicalize this residual
-  // relation with RREF; the multiplier solve itself remains QR.
+  // free dynamics/mixed-multiplier parameters. Use the same rank-revealing
+  // orthogonal echelon form for that residual relation instead of normalizing
+  // individual entries through RREF.
   Scalar *residual_matrix = matrix + constraint_rank * columns;
   const int residual_rows = rows - constraint_rank;
-  RrefBlock(residual_matrix, residual_rows, columns, columns - 1,
-            rank_tolerance, pivot_columns, integer_scratch, &rank, &best_row,
-            factors, kMinimumDualRelationRowScale);
+  OrthogonalEchelonBlock(
+      residual_matrix, residual_rows, columns, columns - 1, columns - 1,
+      rank_tolerance, pivot_columns, integer_scratch, &rank, &best_row, factors,
+      &matrix_scale, kMinimumDualRelationRowScale);
   if (threadIdx.x == 0) {
     local_ok =
         !InconsistentRref(residual_matrix, residual_rows, columns, columns - 1,

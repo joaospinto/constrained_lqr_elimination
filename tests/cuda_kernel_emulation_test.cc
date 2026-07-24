@@ -252,6 +252,119 @@ void OrthogonalEchelonCase() {
   }
 }
 
+void DualResidualOrthogonalEchelonCase() {
+#ifdef CLQR_USE_FLOAT
+  constexpr Scalar comparison_tolerance = 2e-4f;
+#else
+  constexpr Scalar comparison_tolerance = 2e-11;
+#endif
+  constexpr int rows = 4;
+  constexpr int eliminated = 2;
+  constexpr int left_dim = 2;
+  constexpr int right_dim = 1;
+  constexpr int variables = eliminated + left_dim + right_dim;
+  constexpr int columns = variables + 1;
+  Scalar matrix[rows * columns]{
+      Scalar{0}, Scalar{0}, Scalar{1e6}, Scalar{2e6},  Scalar{0},
+      Scalar{5e6},
+      Scalar{0}, Scalar{0}, Scalar{0},   Scalar{1e-6}, Scalar{1e-6},
+      Scalar{4e-6},
+      Scalar{0}, Scalar{0}, Scalar{3},   Scalar{9},    Scalar{3},
+      Scalar{27},
+      Scalar{0}, Scalar{0}, Scalar{0},   Scalar{0},    Scalar{0},
+      Scalar{0}};
+  int pivot_columns[rows]{};
+  int permutation[variables]{};
+  int rank = -1;
+  int best_column = -1;
+  Scalar reflector[rows]{};
+  Scalar matrix_scale = Scalar{0};
+  threadIdx.x = 0;
+  blockDim.x = 1;
+
+  OrthogonalEchelonBlock(
+      matrix, rows, columns, variables, variables, kTolerance, pivot_columns,
+      permutation, &rank, &best_column, reflector, &matrix_scale,
+      kMinimumDualRelationRowScale);
+
+  Expect(rank == 2, "dual residual QR detects the outer relation rank");
+  for (int row = 0; row < rank; ++row) {
+    Expect(pivot_columns[row] >= eliminated,
+           "dual residual QR does not pivot eliminated zero columns");
+  }
+  constexpr int relation_capacity = left_dim + right_dim;
+  constexpr int relation_entries =
+      relation_capacity * left_dim + relation_capacity * right_dim +
+      relation_capacity;
+  Scalar relation_storage[relation_entries]{};
+  DualRelation relation{};
+  BindDualRelationScratch(&relation, relation_storage, left_dim, right_dim);
+  ExtractResidualRelation(matrix, columns, rank, pivot_columns, eliminated,
+                          left_dim, right_dim, &relation);
+  Expect(relation.rows == 2 && relation.left_dim == left_dim &&
+             relation.right_dim == right_dim,
+         "dual residual QR extracts the expected relation shape");
+  const Scalar solution[left_dim + right_dim]{Scalar{1}, Scalar{2}, Scalar{2}};
+  for (int row = 0; row < relation.rows; ++row) {
+    Scalar residual = -relation.rhs[row];
+    for (int col = 0; col < left_dim; ++col)
+      residual += relation.left[row * left_dim + col] * solution[col];
+    for (int col = 0; col < right_dim; ++col) {
+      residual +=
+          relation.right[row * right_dim + col] * solution[left_dim + col];
+    }
+    Expect(std::abs(residual) < comparison_tolerance,
+           "dual residual QR preserves the affine outer relation");
+  }
+
+  constexpr int inconsistent_rows = 2;
+  constexpr int inconsistent_variables = 3;
+  constexpr int inconsistent_columns = inconsistent_variables + 1;
+  Scalar inconsistent[inconsistent_rows * inconsistent_columns]{
+      Scalar{0}, Scalar{1}, Scalar{0}, Scalar{1},
+      Scalar{0}, Scalar{1}, Scalar{0}, Scalar{2}};
+  int inconsistent_pivots[inconsistent_rows]{};
+  int inconsistent_permutation[inconsistent_variables]{};
+  int inconsistent_rank = -1;
+  Scalar inconsistent_reflector[inconsistent_rows]{};
+  OrthogonalEchelonBlock(
+      inconsistent, inconsistent_rows, inconsistent_columns,
+      inconsistent_variables, inconsistent_variables, kTolerance,
+      inconsistent_pivots, inconsistent_permutation, &inconsistent_rank,
+      &best_column, inconsistent_reflector, &matrix_scale,
+      kMinimumDualRelationRowScale);
+  Expect(inconsistent_rank == 1,
+         "dual residual QR identifies a repeated coefficient row");
+  Expect(InconsistentRref(inconsistent, inconsistent_rows,
+                          inconsistent_columns, inconsistent_variables,
+                          kTolerance, kTolerance),
+         "dual residual QR retains the orthogonal consistency residual");
+
+#ifdef CLQR_USE_FLOAT
+  constexpr Scalar marginal_residual = 8e-2f;
+#else
+  constexpr Scalar marginal_residual = 4e-6;
+#endif
+  Scalar marginal[4]{Scalar{1}, Scalar{0}, Scalar{1}, marginal_residual};
+  int marginal_pivots[1]{};
+  int marginal_permutation[1]{};
+  int marginal_rank = -1;
+  Scalar marginal_reflector[2]{};
+  OrthogonalEchelonBlock(
+      marginal, 2, 2, 1, 1, kMinimumMultiplierRankTolerance,
+      marginal_pivots, marginal_permutation, &marginal_rank, &best_column,
+      marginal_reflector, &matrix_scale, kMinimumDualRelationRowScale);
+  const Scalar tree_tolerance =
+      kMultiplierConsistencyTolerancePerTreeLevel * Scalar{7};
+  const Scalar leaf_tolerance = kMultiplierConsistencyTolerancePerTreeLevel;
+  Expect(!InconsistentRref(marginal, 2, 2, 1,
+                           kMinimumMultiplierRankTolerance, tree_tolerance),
+         "tree-accumulated tolerance admits a marginal leaf residual");
+  Expect(InconsistentRref(marginal, 2, 2, 1,
+                          kMinimumMultiplierRankTolerance, leaf_tolerance),
+         "per-leaf tolerance rejects a marginal leaf residual");
+}
+
 void IllConditionedPositiveDefiniteMultiRhsCase() {
 #ifdef CLQR_USE_FLOAT
   constexpr Scalar small_eigenvalue = 5e-4f;
@@ -399,23 +512,23 @@ void FreeFixedFreeValueCompositionCase() {
 
 void DualRelationLeafScratchSizeCase() {
   ScratchSize without_constraint_scales;
-  without_constraint_scales.Add<Scalar>(4);
+  without_constraint_scales.Add<Scalar>(2);
   without_constraint_scales.Add<Scalar>(1);
   without_constraint_scales.Add<int>(1);
   without_constraint_scales.Add<int>(1);
-  Expect(DualRelationLeafScratchBytes(4, 1, 1) ==
+  Expect(DualRelationLeafScratchBytes(2, 1, 1, 1) ==
              without_constraint_scales.bytes + sizeof(Scalar),
          "dual-relation leaf scratch includes state-constraint scales");
 
-  ScratchSize more_constraints_than_rows;
-  more_constraints_than_rows.Add<Scalar>(6);
-  more_constraints_than_rows.Add<Scalar>(1);
-  more_constraints_than_rows.Add<Scalar>(3);
-  more_constraints_than_rows.Add<int>(1);
-  more_constraints_than_rows.Add<int>(3);
-  Expect(DualRelationLeafScratchBytes(6, 1, 3) ==
-             more_constraints_than_rows.bytes,
-         "dual-relation leaf scratch sizes the QR permutation at runtime");
+  ScratchSize more_columns_than_rows;
+  more_columns_than_rows.Add<Scalar>(6);
+  more_columns_than_rows.Add<Scalar>(1);
+  more_columns_than_rows.Add<Scalar>(1);
+  more_columns_than_rows.Add<int>(1);
+  more_columns_than_rows.Add<int>(5);
+  Expect(DualRelationLeafScratchBytes(6, 1, 1, 5) ==
+             more_columns_than_rows.bytes,
+         "dual-relation leaf scratch sizes the full QR permutation at runtime");
 }
 
 Problem PathologicalScratchProblem() {
@@ -509,7 +622,7 @@ void ScratchPlannerTopologyCase() {
          "uniform n=8 dual-relation launch scratch is unchanged");
   Expect(uniform.dual_parameter == dual_parameter.bytes &&
              uniform.dual_relation_leaf ==
-                 DualRelationLeafScratchBytes(8 * 19, 8, 2) &&
+                 DualRelationLeafScratchBytes(8 * 19, 8, 2, 18) &&
              uniform.dual_root == DualRootScratchBytes(terminal_relation) &&
              uniform.dual_expand ==
                  DualExpandScratchBytes(uniform_relation, uniform_relation),
@@ -1557,6 +1670,9 @@ void RunEmulation(const Problem &problem, const std::string &name,
       std::max(multiplier_rank_tolerance,
                kMultiplierConsistencyTolerancePerTreeLevel *
                    static_cast<Scalar>(stage_level_counts.size()));
+  const Scalar multiplier_leaf_consistency_tolerance =
+      std::max(multiplier_rank_tolerance,
+               kMultiplierConsistencyTolerancePerTreeLevel);
   std::vector<DualParam> dual_params(horizon);
   std::vector<StateDualParam> state_dual_params(horizon);
   std::vector<int> dual_free_columns(static_cast<std::size_t>(horizon) *
@@ -1622,7 +1738,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
       BuildDualParameterRelationsKernel(
           stages.data(), &terminal, dual_params.data(), horizon, states.data(),
           controls.data(), state_offsets.data(), control_offsets.data(),
-          multiplier_rank_tolerance, multiplier_consistency_tolerance,
+          multiplier_rank_tolerance, multiplier_leaf_consistency_tolerance,
           dual_tree.data(), &dual_scan_needed, state_dual_params.data(),
           &status);
     });
@@ -1727,6 +1843,7 @@ int main(int argc, char **argv) {
   DeviceObjectiveCase();
   PivotedLuMultiRhsCase();
   OrthogonalEchelonCase();
+  DualResidualOrthogonalEchelonCase();
   IllConditionedPositiveDefiniteMultiRhsCase();
   InvalidValueElementCopyCase();
   FreeFixedFreeValueCompositionCase();
