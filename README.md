@@ -177,7 +177,8 @@ CLQR_CUDA_ARCH=60 bash scripts/compare_cuda_revisions.sh
 
 The emitted report records both revisions and both revision-specific build
 argument strings. Fields unavailable from a historical benchmark schema are
-reported as `nan`.
+reported as `nan`. The recorded P100 comparison for this exact transition is
+in [`benchmarks/CUDA_RUNTIME_DIMENSION_EVIDENCE.md`](benchmarks/CUDA_RUNTIME_DIMENSION_EVIDENCE.md).
 
 The benchmark does not install or time the JAX implementation. To run the
 additional solution-level JAX cross-validation diagnostic, set
