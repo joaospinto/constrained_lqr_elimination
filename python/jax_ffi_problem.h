@@ -52,6 +52,13 @@ struct PackedSolutionBuffers {
 
 bool BuildProblem(const PackedProblemBuffers &packed, Problem *problem,
                   std::string *error);
+// Validates the packed dimensions and materializes only the owning shape
+// metadata required by CUDA Workspace::Reserve. Numerical buffers may be null;
+// all owning values are initialized to zero. This is the host-side half of the
+// device-resident JAX CUDA path: scalar inputs remain on the device while the
+// small dimension vector defines the reusable solver layout.
+bool BuildProblemStructure(const PackedProblemBuffers &packed, Problem *problem,
+                           std::string *error);
 void WriteSolution(const PackedProblemBuffers &packed,
                    const SolutionView &solution,
                    const PackedSolutionBuffers &output);

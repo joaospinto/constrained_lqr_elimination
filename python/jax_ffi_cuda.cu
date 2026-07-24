@@ -1,6 +1,6 @@
 #include <cuda_runtime.h>
 
-#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <exception>
 #include <initializer_list>
@@ -15,6 +15,7 @@
 #include "clqr/cuda.h"
 #include "python/jax_ffi_cuda.h"
 #include "python/jax_ffi_problem.h"
+#include "src/cuda_device_io.h"
 #include "xla/ffi/api/ffi.h"
 
 namespace ffi = xla::ffi;
@@ -38,19 +39,6 @@ void CudaCheck(cudaError_t status, const char *operation) {
     throw std::runtime_error(std::string(operation) + ": " +
                              cudaGetErrorString(status));
   }
-}
-
-std::size_t CheckedSum(std::initializer_list<std::size_t> values,
-                       const char *description) {
-  std::size_t total = 0;
-  for (std::size_t value : values) {
-    if (value > std::numeric_limits<std::size_t>::max() - total) {
-      throw std::invalid_argument(std::string(description) +
-                                  " element count overflows");
-    }
-    total += value;
-  }
-  return total;
 }
 
 template <typename Buffer>
@@ -109,9 +97,6 @@ private:
 
 struct Staging {
   PinnedBuffer<std::int32_t> input_dimensions;
-  PinnedBuffer<clqr::Scalar> input_scalars;
-  PinnedBuffer<std::int32_t> output_diagnostics;
-  PinnedBuffer<clqr::Scalar> output_scalars;
   cudaEvent_t output_ready = nullptr;
   bool output_pending = false;
 
@@ -122,21 +107,24 @@ struct Staging {
       cudaEventDestroy(output_ready);
   }
 
+  // A workspace owns the compact device buffers read by the asynchronous
+  // padded-output scatter. A later invocation on another XLA stream must not
+  // repack or reallocate those buffers until that export has completed.
   void WaitForPreviousOutput() {
     if (!output_pending)
       return;
     CudaCheck(cudaEventSynchronize(output_ready),
-              "wait for prior JAX output staging");
+              "wait for prior device-resident JAX output");
     output_pending = false;
   }
 
   void RecordOutput(cudaStream_t stream) {
     if (output_ready == nullptr) {
       CudaCheck(cudaEventCreateWithFlags(&output_ready, cudaEventDisableTiming),
-                "create JAX output staging event");
+                "create device-resident JAX output event");
     }
     CudaCheck(cudaEventRecord(output_ready, stream),
-              "record JAX output staging event");
+              "record device-resident JAX output event");
     output_pending = true;
   }
 };
@@ -157,106 +145,9 @@ struct ThreadState {
 
 thread_local ThreadState thread_state;
 
-template <typename Buffer>
-const clqr::Scalar *EnqueueInput(const Buffer &source,
-                                 clqr::Scalar **destination,
-                                 cudaStream_t stream) {
-  const std::size_t count = source.element_count();
-  clqr::Scalar *result = *destination;
-  if (count > 0) {
-    CudaCheck(cudaMemcpyAsync(result, source.typed_data(),
-                              count * sizeof(clqr::Scalar),
-                              cudaMemcpyDeviceToHost, stream),
-              "copy JAX input to pinned host staging");
-    *destination += count;
-  }
-  return result;
-}
-
-template <typename Result>
-void EnqueueOutput(const clqr::Scalar **source, Result &destination,
-                   cudaStream_t stream) {
-  const std::size_t count = destination->element_count();
-  if (count > 0) {
-    CudaCheck(cudaMemcpyAsync(destination->typed_data(), *source,
-                              count * sizeof(clqr::Scalar),
-                              cudaMemcpyHostToDevice, stream),
-              "copy pinned CLQR result to JAX output");
-    *source += count;
-  }
-}
-
-template <typename T> T *Offset(T *pointer, std::size_t offset) {
-  return offset == 0 ? pointer : pointer + offset;
-}
-
-void CopyVector(const clqr::VectorView &source, clqr::Scalar *destination) {
-  if (source.size == 0)
-    return;
-  std::copy_n(source.data, source.size, destination);
-}
-
-void WriteCudaSolution(const clqr::python::PackedProblemBuffers &packed,
-                       const clqr::cuda::SolutionView &solution,
-                       const clqr::python::PackedSolutionBuffers &output) {
-  output.diagnostics[0] = static_cast<std::int32_t>(solution.status);
-  output.diagnostics[1] = 0;
-  output.diagnostics[2] = 0;
-  output.objective[0] = solution.objective;
-
-  const std::size_t nx = packed.state_capacity;
-  const std::size_t nu = packed.control_capacity;
-  const std::size_t nc = packed.mixed_capacity;
-  const std::size_t ne = packed.state_constraint_capacity;
-  if ((packed.stage_count + 1) * nx > 0) {
-    std::fill_n(output.states, (packed.stage_count + 1) * nx, clqr::Scalar{0});
-  }
-  if (packed.stage_count * nu > 0) {
-    std::fill_n(output.controls, packed.stage_count * nu, clqr::Scalar{0});
-  }
-  if (nx > 0) {
-    std::fill_n(output.initial_multiplier, nx, clqr::Scalar{0});
-    std::fill_n(output.dynamics_multipliers, packed.stage_count * nx,
-                clqr::Scalar{0});
-  }
-  if (packed.stage_count * nc > 0) {
-    std::fill_n(output.mixed_multipliers, packed.stage_count * nc,
-                clqr::Scalar{0});
-  }
-  if (packed.stage_count * ne > 0) {
-    std::fill_n(output.state_multipliers, packed.stage_count * ne,
-                clqr::Scalar{0});
-  }
-  if (packed.terminal_constraint_capacity > 0) {
-    std::fill_n(output.terminal_state_multiplier,
-                packed.terminal_constraint_capacity, clqr::Scalar{0});
-  }
-
-  for (std::size_t node = 0; node < solution.state_count; ++node) {
-    CopyVector(solution.states[node], Offset(output.states, node * nx));
-  }
-  for (std::size_t stage = 0; stage < solution.control_count; ++stage) {
-    CopyVector(solution.controls[stage], Offset(output.controls, stage * nu));
-  }
-  CopyVector(solution.initial_multiplier, output.initial_multiplier);
-  for (std::size_t stage = 0; stage < solution.dynamics_multiplier_count;
-       ++stage) {
-    CopyVector(solution.dynamics_multipliers[stage],
-               Offset(output.dynamics_multipliers, stage * nx));
-  }
-  for (std::size_t stage = 0; stage < solution.mixed_multiplier_count;
-       ++stage) {
-    CopyVector(solution.mixed_multipliers[stage],
-               Offset(output.mixed_multipliers, stage * nc));
-  }
-  for (std::size_t stage = 0; stage < solution.state_multiplier_count;
-       ++stage) {
-    CopyVector(solution.state_multipliers[stage],
-               Offset(output.state_multipliers, stage * ne));
-  }
-  CopyVector(solution.terminal_state_multiplier,
-             output.terminal_state_multiplier);
-}
+std::atomic<std::uint64_t> last_scalar_device_to_host_bytes{0};
+std::atomic<std::uint64_t> last_scalar_host_to_device_bytes{0};
+std::atomic<std::uint64_t> last_metadata_device_to_host_bytes{0};
 
 ffi::Error SolveCudaImpl(
     cudaStream_t stream, clqr::Scalar tolerance,
@@ -346,16 +237,7 @@ ffi::Error SolveCudaImpl(
     DeviceState &device_state = *device_pointer;
     Staging &staging = device_state.staging;
     staging.WaitForPreviousOutput();
-    const std::size_t input_scalar_count =
-        CheckedSum({A.element_count(), B.element_count(), c.element_count(),
-                    Q.element_count(), R.element_count(), M.element_count(),
-                    q.element_count(), r.element_count(), C.element_count(),
-                    D.element_count(), d.element_count(), E.element_count(),
-                    e.element_count(), terminal_E.element_count(),
-                    terminal_e.element_count(), initial_state.element_count()},
-                   "JAX CLQR input");
     staging.input_dimensions.Reserve(dimensions.element_count());
-    staging.input_scalars.Reserve(input_scalar_count);
     if (dimensions.element_count() > 0) {
       CudaCheck(cudaMemcpyAsync(
                     staging.input_dimensions.data(), dimensions.typed_data(),
@@ -375,92 +257,73 @@ ffi::Error SolveCudaImpl(
         static_cast<std::size_t>(terminal_constraint_capacity);
     packed.dimensions = staging.input_dimensions.data();
     packed.dimension_count = dimensions.element_count();
-    clqr::Scalar *input_cursor = staging.input_scalars.data();
-    packed.A = EnqueueInput(A, &input_cursor, stream);
-    packed.B = EnqueueInput(B, &input_cursor, stream);
-    packed.c = EnqueueInput(c, &input_cursor, stream);
-    packed.Q = EnqueueInput(Q, &input_cursor, stream);
-    packed.R = EnqueueInput(R, &input_cursor, stream);
-    packed.M = EnqueueInput(M, &input_cursor, stream);
-    packed.q = EnqueueInput(q, &input_cursor, stream);
-    packed.r = EnqueueInput(r, &input_cursor, stream);
-    packed.C = EnqueueInput(C, &input_cursor, stream);
-    packed.D = EnqueueInput(D, &input_cursor, stream);
-    packed.d = EnqueueInput(d, &input_cursor, stream);
-    packed.E = EnqueueInput(E, &input_cursor, stream);
-    packed.e = EnqueueInput(e, &input_cursor, stream);
-    packed.terminal_E = EnqueueInput(terminal_E, &input_cursor, stream);
-    packed.terminal_e = EnqueueInput(terminal_e, &input_cursor, stream);
-    packed.initial_state = EnqueueInput(initial_state, &input_cursor, stream);
-    CudaCheck(cudaStreamSynchronize(stream), "wait for JAX CLQR input staging");
+    CudaCheck(cudaStreamSynchronize(stream),
+              "wait for JAX CLQR dimension metadata");
+    last_metadata_device_to_host_bytes.store(dimensions.element_count() *
+                                                 sizeof(std::int32_t),
+                                             std::memory_order_relaxed);
+    last_scalar_device_to_host_bytes.store(0, std::memory_order_relaxed);
+    last_scalar_host_to_device_bytes.store(0, std::memory_order_relaxed);
 
-    std::string error;
-    if (!clqr::python::BuildProblem(packed, &device_state.problem, &error)) {
-      return ffi::Error::InvalidArgument(std::move(error));
+    const std::vector<std::int32_t> structure_key(
+        packed.dimensions, packed.dimensions + packed.dimension_count);
+    if (device_state.structure_key != structure_key) {
+      std::string error;
+      if (!clqr::python::BuildProblemStructure(packed, &device_state.problem,
+                                               &error)) {
+        return ffi::Error::InvalidArgument(std::move(error));
+      }
+      device_state.workspace = clqr::cuda::Workspace{};
+      device_state.structure_key = structure_key;
     }
+
+    clqr::cuda::detail::PaddedDeviceProblem device_input;
+    device_input.state_capacity = packed.state_capacity;
+    device_input.control_capacity = packed.control_capacity;
+    device_input.mixed_capacity = packed.mixed_capacity;
+    device_input.state_constraint_capacity = packed.state_constraint_capacity;
+    device_input.terminal_constraint_capacity =
+        packed.terminal_constraint_capacity;
+    device_input.A = A.typed_data();
+    device_input.B = B.typed_data();
+    device_input.c = c.typed_data();
+    device_input.Q = Q.typed_data();
+    device_input.R = R.typed_data();
+    device_input.M = M.typed_data();
+    device_input.q = q.typed_data();
+    device_input.r = r.typed_data();
+    device_input.C = C.typed_data();
+    device_input.D = D.typed_data();
+    device_input.d = d.typed_data();
+    device_input.E = E.typed_data();
+    device_input.e = e.typed_data();
+    device_input.terminal_E = terminal_E.typed_data();
+    device_input.terminal_e = terminal_e.typed_data();
+    device_input.initial_state = initial_state.typed_data();
+
+    clqr::cuda::detail::PaddedDeviceSolution device_output;
+    device_output.diagnostics = diagnostics->typed_data();
+    device_output.objective = objective->typed_data();
+    device_output.states = states->typed_data();
+    device_output.controls = controls->typed_data();
+    device_output.initial_multiplier = initial_multiplier->typed_data();
+    device_output.dynamics_multipliers = dynamics_multipliers->typed_data();
+    device_output.mixed_multipliers = mixed_multipliers->typed_data();
+    device_output.state_multipliers = state_multipliers->typed_data();
+    device_output.terminal_state_multiplier =
+        terminal_state_multiplier->typed_data();
+
     clqr::cuda::Options options;
     options.device = device;
     options.tolerance = tolerance;
-    const std::vector<std::int32_t> structure_key(
-        packed.dimensions, packed.dimensions + packed.dimension_count);
-    clqr::cuda::SolutionView solution;
-    if (device_state.structure_key == structure_key) {
-      solution = clqr::cuda::SolvePreparedView(device_state.problem,
-                                               device_state.workspace, options);
-    } else {
-      solution = clqr::cuda::SolveView(device_state.problem,
-                                       device_state.workspace, options);
-      if (solution.state_count == packed.stage_count + 1 &&
-          solution.control_count == packed.stage_count) {
-        device_state.structure_key = structure_key;
-      } else {
-        device_state.structure_key.clear();
-      }
-    }
-
-    const std::size_t output_scalar_count = CheckedSum(
-        {objective->element_count(), states->element_count(),
-         controls->element_count(), initial_multiplier->element_count(),
-         dynamics_multipliers->element_count(),
-         mixed_multipliers->element_count(), state_multipliers->element_count(),
-         terminal_state_multiplier->element_count()},
-        "JAX CLQR output");
-    staging.output_diagnostics.Reserve(diagnostics->element_count());
-    staging.output_scalars.Reserve(output_scalar_count);
-    clqr::python::PackedSolutionBuffers host_output;
-    host_output.diagnostics = staging.output_diagnostics.data();
-    clqr::Scalar *output_cursor = staging.output_scalars.data();
-    host_output.objective = output_cursor;
-    output_cursor += objective->element_count();
-    host_output.states = output_cursor;
-    output_cursor += states->element_count();
-    host_output.controls = output_cursor;
-    output_cursor += controls->element_count();
-    host_output.initial_multiplier = output_cursor;
-    output_cursor += initial_multiplier->element_count();
-    host_output.dynamics_multipliers = output_cursor;
-    output_cursor += dynamics_multipliers->element_count();
-    host_output.mixed_multipliers = output_cursor;
-    output_cursor += mixed_multipliers->element_count();
-    host_output.state_multipliers = output_cursor;
-    output_cursor += state_multipliers->element_count();
-    host_output.terminal_state_multiplier = output_cursor;
-    WriteCudaSolution(packed, solution, host_output);
-
-    CudaCheck(cudaMemcpyAsync(
-                  diagnostics->typed_data(), staging.output_diagnostics.data(),
-                  diagnostics->element_count() * sizeof(std::int32_t),
-                  cudaMemcpyHostToDevice, stream),
-              "copy CLQR diagnostics to JAX output");
-    const clqr::Scalar *copy_cursor = staging.output_scalars.data();
-    EnqueueOutput(&copy_cursor, objective, stream);
-    EnqueueOutput(&copy_cursor, states, stream);
-    EnqueueOutput(&copy_cursor, controls, stream);
-    EnqueueOutput(&copy_cursor, initial_multiplier, stream);
-    EnqueueOutput(&copy_cursor, dynamics_multipliers, stream);
-    EnqueueOutput(&copy_cursor, mixed_multipliers, stream);
-    EnqueueOutput(&copy_cursor, state_multipliers, stream);
-    EnqueueOutput(&copy_cursor, terminal_state_multiplier, stream);
+    clqr::cuda::detail::DeviceTransferAudit audit;
+    clqr::cuda::detail::SolvePackedDevice(
+        device_state.problem, device_state.workspace, device_input,
+        device_output, reinterpret_cast<void *>(stream), options, &audit);
+    last_scalar_device_to_host_bytes.store(audit.scalar_device_to_host_bytes,
+                                           std::memory_order_relaxed);
+    last_scalar_host_to_device_bytes.store(audit.scalar_host_to_device_bytes,
+                                           std::memory_order_relaxed);
     staging.RecordOutput(stream);
     return ffi::Error::Success();
   } catch (const std::exception &exception) {
@@ -470,6 +333,24 @@ ffi::Error SolveCudaImpl(
 }
 
 } // namespace
+
+void ClqrCudaGetLastTransferAudit(
+    std::uint64_t *scalar_device_to_host_bytes,
+    std::uint64_t *scalar_host_to_device_bytes,
+    std::uint64_t *metadata_device_to_host_bytes) {
+  if (scalar_device_to_host_bytes != nullptr) {
+    *scalar_device_to_host_bytes =
+        last_scalar_device_to_host_bytes.load(std::memory_order_relaxed);
+  }
+  if (scalar_host_to_device_bytes != nullptr) {
+    *scalar_host_to_device_bytes =
+        last_scalar_host_to_device_bytes.load(std::memory_order_relaxed);
+  }
+  if (metadata_device_to_host_bytes != nullptr) {
+    *metadata_device_to_host_bytes =
+        last_metadata_device_to_host_bytes.load(std::memory_order_relaxed);
+  }
+}
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(ClqrCudaFfi, SolveCudaImpl,
                               ffi::Ffi::Bind()

@@ -166,6 +166,95 @@ bool BuildProblem(const PackedProblemBuffers &packed, Problem *problem,
   return true;
 }
 
+bool BuildProblemStructure(const PackedProblemBuffers &packed, Problem *problem,
+                           std::string *error) {
+  if (problem == nullptr)
+    return Fail("problem output is null", error);
+  if (packed.stage_count > (std::numeric_limits<std::size_t>::max() - 2) / 4) {
+    return Fail("stage count is too large", error);
+  }
+  const std::size_t expected_dimensions = 4 * packed.stage_count + 2;
+  if (packed.dimension_count != expected_dimensions) {
+    return Fail("dimension vector must contain 4 * stages + 2 entries", error);
+  }
+  if (packed.dimensions == nullptr) {
+    return Fail("dimension vector is null", error);
+  }
+
+  const std::size_t control_offset = packed.stage_count + 1;
+  const std::size_t mixed_offset = 2 * packed.stage_count + 1;
+  const std::size_t state_constraint_offset = 3 * packed.stage_count + 1;
+  const std::size_t terminal_constraint_offset = 4 * packed.stage_count + 1;
+  for (std::size_t node = 0; node <= packed.stage_count; ++node) {
+    if (!ValidDimension(packed.dimensions[node], packed.state_capacity)) {
+      return Fail("state dimension exceeds the padded state capacity", error);
+    }
+  }
+  for (std::size_t stage = 0; stage < packed.stage_count; ++stage) {
+    if (!ValidDimension(packed.dimensions[control_offset + stage],
+                        packed.control_capacity)) {
+      return Fail("control dimension exceeds the padded control capacity",
+                  error);
+    }
+    if (!ValidDimension(packed.dimensions[mixed_offset + stage],
+                        packed.mixed_capacity)) {
+      return Fail("mixed-constraint dimension exceeds its padded capacity",
+                  error);
+    }
+    if (!ValidDimension(packed.dimensions[state_constraint_offset + stage],
+                        packed.state_constraint_capacity)) {
+      return Fail("state-constraint dimension exceeds its padded capacity",
+                  error);
+    }
+  }
+  if (!ValidDimension(packed.dimensions[terminal_constraint_offset],
+                      packed.terminal_constraint_capacity)) {
+    return Fail("terminal-constraint dimension exceeds its padded capacity",
+                error);
+  }
+
+  problem->stages.resize(packed.stage_count);
+  for (std::size_t stage_index = 0; stage_index < packed.stage_count;
+       ++stage_index) {
+    const std::size_t n =
+        static_cast<std::size_t>(packed.dimensions[stage_index]);
+    const std::size_t next_n =
+        static_cast<std::size_t>(packed.dimensions[stage_index + 1]);
+    const std::size_t m = static_cast<std::size_t>(
+        packed.dimensions[control_offset + stage_index]);
+    const std::size_t mixed =
+        static_cast<std::size_t>(packed.dimensions[mixed_offset + stage_index]);
+    const std::size_t state_constraints = static_cast<std::size_t>(
+        packed.dimensions[state_constraint_offset + stage_index]);
+    Stage &stage = problem->stages[stage_index];
+    stage.A.resize(next_n, n);
+    stage.B.resize(next_n, m);
+    stage.c.resize(next_n);
+    stage.Q.resize(n, n);
+    stage.R.resize(m, m);
+    stage.M.resize(n, m);
+    stage.q.resize(n);
+    stage.r.resize(m);
+    stage.C.resize(mixed, n);
+    stage.D.resize(mixed, m);
+    stage.d.resize(mixed);
+    stage.E.resize(state_constraints, n);
+    stage.e.resize(state_constraints);
+  }
+
+  const std::size_t initial_n = static_cast<std::size_t>(packed.dimensions[0]);
+  const std::size_t terminal_n =
+      static_cast<std::size_t>(packed.dimensions[packed.stage_count]);
+  const std::size_t terminal_constraints =
+      static_cast<std::size_t>(packed.dimensions[terminal_constraint_offset]);
+  problem->initial_state.resize(initial_n);
+  problem->terminal_Q.resize(terminal_n, terminal_n);
+  problem->terminal_q.resize(terminal_n);
+  problem->terminal_E.resize(terminal_constraints, terminal_n);
+  problem->terminal_e.resize(terminal_constraints);
+  return true;
+}
+
 void WriteSolution(const PackedProblemBuffers &packed,
                    const SolutionView &solution,
                    const PackedSolutionBuffers &output) {

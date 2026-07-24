@@ -114,6 +114,13 @@ def test_cuda_eager_jit_and_new_rhs():
     assert int(first.diagnostics[0]) == 0
     np.testing.assert_allclose(first.states[:, 0], [1.0, 0.0], atol=atol)
     np.testing.assert_allclose(first.controls[:, 0], [-1.0], atol=atol)
+    audit = sys.modules["_clqr_cuda"].last_transfer_audit()
+    assert audit["scalar_device_to_host_bytes"] == 0
+    assert audit["scalar_host_to_device_bytes"] == 0
+    assert (
+        audit["metadata_device_to_host_bytes"]
+        == packed.factors.dimensions.size * np.dtype(np.int32).itemsize
+    )
 
     changed = packed._replace(
         rhs=packed.rhs._replace(

@@ -36,6 +36,12 @@ cc_library(
     deps = [":clqr"],
 )
 
+cc_test(
+    name = "jax_ffi_problem_test",
+    srcs = ["tests/jax_ffi_problem_test.cc"],
+    deps = [":jax_ffi_problem"],
+)
+
 config_setting(
     name = "linux",
     constraint_values = ["@platforms//os:linux"],
@@ -125,6 +131,7 @@ cuda_library(
     srcs = ["src/cuda_solver.cu"],
     hdrs = [
         "include/clqr/cuda.h",
+        "src/cuda_device_io.h",
         "src/cuda_internal.h",
     ],
     alwayslink = True,
@@ -424,6 +431,12 @@ py_test(
         requirement("jax-cuda12-pjrt"),
         requirement("numpy"),
     ],
+)
+
+py_test(
+    name = "jax_cuda_transfer_audit_test",
+    srcs = ["tests/jax_cuda_transfer_audit_test.py"],
+    data = ["python/jax_ffi_cuda.cu"],
 )
 
 cc_binary(

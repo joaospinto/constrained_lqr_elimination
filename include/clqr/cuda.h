@@ -10,6 +10,18 @@
 namespace clqr {
 namespace cuda {
 
+class Workspace;
+struct Options;
+namespace detail {
+struct PaddedDeviceProblem;
+struct PaddedDeviceSolution;
+struct DeviceTransferAudit;
+SolveStatus SolvePackedDevice(const Problem &, Workspace &,
+                              const PaddedDeviceProblem &,
+                              const PaddedDeviceSolution &, void *,
+                              const Options &, DeviceTransferAudit *);
+} // namespace detail
+
 struct Options {
 #ifdef CLQR_USE_FLOAT
   Scalar tolerance = 1e-5f;
@@ -121,6 +133,11 @@ private:
                                         const Options &);
   friend Solution &Solve(const Problem &, Workspace &, Solution &,
                          const Options &);
+  friend SolveStatus
+  detail::SolvePackedDevice(const Problem &, Workspace &,
+                            const detail::PaddedDeviceProblem &,
+                            const detail::PaddedDeviceSolution &, void *,
+                            const Options &, detail::DeviceTransferAudit *);
 };
 
 bool Available();
