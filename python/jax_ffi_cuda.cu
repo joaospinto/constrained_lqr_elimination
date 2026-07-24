@@ -110,11 +110,11 @@ struct Staging {
   // A workspace owns the compact device buffers read by the asynchronous
   // padded-output scatter. A later invocation on another XLA stream must not
   // repack or reallocate those buffers until that export has completed.
-  void WaitForPreviousOutput() {
+  void WaitForPreviousOutput(cudaStream_t stream) {
     if (!output_pending)
       return;
-    CudaCheck(cudaEventSynchronize(output_ready),
-              "wait for prior device-resident JAX output");
+    CudaCheck(cudaStreamWaitEvent(stream, output_ready, 0),
+              "order after prior device-resident JAX output");
     output_pending = false;
   }
 
@@ -236,7 +236,7 @@ ffi::Error SolveCudaImpl(
     }
     DeviceState &device_state = *device_pointer;
     Staging &staging = device_state.staging;
-    staging.WaitForPreviousOutput();
+    staging.WaitForPreviousOutput(stream);
     staging.input_dimensions.Reserve(dimensions.element_count());
     if (dimensions.element_count() > 0) {
       CudaCheck(cudaMemcpyAsync(

@@ -23,7 +23,8 @@ def test_cuda_ffi_has_no_bulk_scalar_host_staging():
         "SolvePreparedView",
     ):
         assert removed_staging_path not in source
-    assert "staging.WaitForPreviousOutput();" in source
+    assert "staging.WaitForPreviousOutput(stream);" in source
+    assert "cudaStreamWaitEvent(stream, output_ready, 0)" in source
     assert "staging.RecordOutput(stream);" in source
 
 
