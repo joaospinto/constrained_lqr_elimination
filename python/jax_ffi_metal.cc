@@ -42,6 +42,7 @@ using ScalarResultR2 = ffi::ResultBufferR2<kScalarType>;
 
 using clqr::metal::detail::CheckedSizeProduct;
 using clqr::metal::detail::CheckedSizeSum;
+using clqr::metal::detail::HasCooperativeThreadgroupOccupancy;
 using clqr::metal::detail::InvocationLayout;
 using clqr::metal::detail::KernelParams;
 using clqr::metal::detail::PlanInvocation;
@@ -153,10 +154,16 @@ public:
       build_value_leaves_ =
           Pipeline(value_affine_library_, "clqr_build_value_leaves");
       reduce_value_ = Pipeline(value_affine_library_, "clqr_reduce_value");
+      reduce_value_threadgroup_ =
+          Pipeline(value_affine_library_, "clqr_reduce_value_threadgroup");
       expand_value_context_ =
           Pipeline(value_affine_library_, "clqr_expand_value_context");
+      expand_value_context_threadgroup_ = Pipeline(
+          value_affine_library_, "clqr_expand_value_context_threadgroup");
       finalize_value_suffix_ =
           Pipeline(value_affine_library_, "clqr_finalize_value_suffix");
+      finalize_value_suffix_threadgroup_ = Pipeline(
+          value_affine_library_, "clqr_finalize_value_suffix_threadgroup");
       reduce_affine_ = Pipeline(value_affine_library_, "clqr_reduce_affine");
       expand_affine_context_ =
           Pipeline(value_affine_library_, "clqr_expand_affine_context");
@@ -257,11 +264,20 @@ public:
     return build_value_leaves_;
   }
   id<MTLComputePipelineState> reduce_value() const { return reduce_value_; }
+  id<MTLComputePipelineState> reduce_value_threadgroup() const {
+    return reduce_value_threadgroup_;
+  }
   id<MTLComputePipelineState> expand_value_context() const {
     return expand_value_context_;
   }
+  id<MTLComputePipelineState> expand_value_context_threadgroup() const {
+    return expand_value_context_threadgroup_;
+  }
   id<MTLComputePipelineState> finalize_value_suffix() const {
     return finalize_value_suffix_;
+  }
+  id<MTLComputePipelineState> finalize_value_suffix_threadgroup() const {
+    return finalize_value_suffix_threadgroup_;
   }
   id<MTLComputePipelineState> reduce_affine() const { return reduce_affine_; }
   id<MTLComputePipelineState> expand_affine_context() const {
@@ -348,8 +364,11 @@ private:
   id<MTLComputePipelineState> finalize_objective_ = nil;
   id<MTLComputePipelineState> build_value_leaves_ = nil;
   id<MTLComputePipelineState> reduce_value_ = nil;
+  id<MTLComputePipelineState> reduce_value_threadgroup_ = nil;
   id<MTLComputePipelineState> expand_value_context_ = nil;
+  id<MTLComputePipelineState> expand_value_context_threadgroup_ = nil;
   id<MTLComputePipelineState> finalize_value_suffix_ = nil;
+  id<MTLComputePipelineState> finalize_value_suffix_threadgroup_ = nil;
   id<MTLComputePipelineState> reduce_affine_ = nil;
   id<MTLComputePipelineState> expand_affine_context_ = nil;
   id<MTLComputePipelineState> finalize_affine_prefix_ = nil;
@@ -459,6 +478,31 @@ void EncodeCooperativeKernel(id<MTLComputeCommandEncoder> encoder,
   [encoder dispatchThreadgroups:MTLSizeMake(threadgroup_count, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
   [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+[[maybe_unused]] bool EncodeCooperativeKernelWithThreadgroupMemoryAtOccupancy(
+    id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> pipeline,
+    id<MTLDevice> device, const ThreadWorkspace &workspace,
+    const KernelParams &params, std::uint32_t threadgroup_count,
+    std::size_t float_bytes, std::size_t minimum_resident_groups) {
+  if (threadgroup_count == 0)
+    return true;
+  (void)workspace;
+  const NSUInteger group_size = pipeline.threadExecutionWidth;
+  if (group_size > pipeline.maxTotalThreadsPerThreadgroup ||
+      !HasCooperativeThreadgroupOccupancy(
+          std::size_t(pipeline.staticThreadgroupMemoryLength), float_bytes,
+          std::size_t(device.maxThreadgroupMemoryLength),
+          minimum_resident_groups)) {
+    return false;
+  }
+  [encoder setComputePipelineState:pipeline];
+  [encoder setBytes:&params length:sizeof(params) atIndex:5];
+  [encoder setThreadgroupMemoryLength:float_bytes atIndex:0];
+  [encoder dispatchThreadgroups:MTLSizeMake(threadgroup_count, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
+  [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  return true;
 }
 
 [[maybe_unused]] bool EncodeLaneSlicedKernelWithThreadgroupMemory(
@@ -574,6 +618,30 @@ EncodeCooperativeReductionTree(id<MTLComputeCommandEncoder> encoder,
   }
 }
 
+[[maybe_unused]] void EncodeCooperativeReductionTreeWithThreadgroupMemory(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLComputePipelineState> threadgroup_pipeline,
+    id<MTLComputePipelineState> global_pipeline, id<MTLDevice> device,
+    const ThreadWorkspace &workspace, const KernelParams &base,
+    const TreePlan &tree, std::size_t float_bytes) {
+  constexpr std::size_t kMinimumResidentThreadgroups = 4;
+  for (std::size_t level = 0; level + 1 < tree.counts.size(); ++level) {
+    KernelParams invocation = base;
+    invocation.child_offset = tree.offsets[level];
+    invocation.parent_offset = tree.offsets[level + 1];
+    invocation.child_count = tree.counts[level];
+    invocation.parent_count = tree.counts[level + 1];
+    invocation.phase_detail = static_cast<std::uint32_t>(level);
+    if (!EncodeCooperativeKernelWithThreadgroupMemoryAtOccupancy(
+            encoder, threadgroup_pipeline, device, workspace, invocation,
+            invocation.parent_count, float_bytes,
+            kMinimumResidentThreadgroups)) {
+      EncodeCooperativeKernel(encoder, global_pipeline, workspace, invocation,
+                              invocation.parent_count);
+    }
+  }
+}
+
 [[maybe_unused]] void EncodeCooperativeTreeContexts(
     id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> expand,
     id<MTLComputePipelineState> finalize, const ThreadWorkspace &workspace,
@@ -600,6 +668,48 @@ EncodeCooperativeReductionTree(id<MTLComputeCommandEncoder> encoder,
   invocation.temporary_offset = temporary_offset;
   EncodeCooperativeKernel(encoder, finalize, workspace, invocation,
                           invocation.parent_count);
+}
+
+[[maybe_unused]] void EncodeCooperativeTreeContextsWithThreadgroupMemory(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLComputePipelineState> expand_threadgroup,
+    id<MTLComputePipelineState> expand_global,
+    id<MTLComputePipelineState> finalize_threadgroup,
+    id<MTLComputePipelineState> finalize_global, id<MTLDevice> device,
+    const ThreadWorkspace &workspace, const KernelParams &base,
+    const TreePlan &tree, std::uint32_t temporary_offset,
+    std::size_t float_bytes) {
+  if (tree.counts.size() <= 1)
+    return;
+  constexpr std::size_t kMinimumResidentThreadgroups = 4;
+  KernelParams invocation = base;
+  for (std::size_t level = tree.counts.size() - 2; level > 0; --level) {
+    invocation = base;
+    invocation.child_offset = tree.offsets[level];
+    invocation.parent_offset = tree.offsets[level + 1];
+    invocation.child_count = tree.counts[level];
+    invocation.parent_count = tree.counts[level + 1];
+    invocation.phase_detail = static_cast<std::uint32_t>(level);
+    if (!EncodeCooperativeKernelWithThreadgroupMemoryAtOccupancy(
+            encoder, expand_threadgroup, device, workspace, invocation,
+            invocation.parent_count, float_bytes,
+            kMinimumResidentThreadgroups)) {
+      EncodeCooperativeKernel(encoder, expand_global, workspace, invocation,
+                              invocation.parent_count);
+    }
+  }
+  invocation = base;
+  invocation.child_offset = tree.offsets[0];
+  invocation.parent_offset = tree.offsets[1];
+  invocation.child_count = tree.counts[0];
+  invocation.parent_count = tree.counts[1];
+  invocation.temporary_offset = temporary_offset;
+  if (!EncodeCooperativeKernelWithThreadgroupMemoryAtOccupancy(
+          encoder, finalize_threadgroup, device, workspace, invocation,
+          invocation.parent_count, float_bytes, kMinimumResidentThreadgroups)) {
+    EncodeCooperativeKernel(encoder, finalize_global, workspace, invocation,
+                            invocation.parent_count);
+  }
 }
 
 template <typename Buffer>
@@ -842,12 +952,17 @@ ffi::Error SolveMetalImpl(
                  base, 1);
     EncodeCooperativeKernel(command_buffer, runtime.build_value_leaves(),
                             workspace, base, N + 1);
-    EncodeCooperativeReductionTree(command_buffer, runtime.reduce_value(),
-                                   workspace, base, layout.node_tree);
-    EncodeCooperativeTreeContexts(
-        command_buffer, runtime.expand_value_context(),
-        runtime.finalize_value_suffix(), workspace, base, layout.node_tree,
-        layout.node_tree.slots);
+    EncodeCooperativeReductionTreeWithThreadgroupMemory(
+        command_buffer, runtime.reduce_value_threadgroup(),
+        runtime.reduce_value(), runtime.device(), workspace, base,
+        layout.node_tree, layout.value_composition_float_bytes);
+    EncodeCooperativeTreeContextsWithThreadgroupMemory(
+        command_buffer, runtime.expand_value_context_threadgroup(),
+        runtime.expand_value_context(),
+        runtime.finalize_value_suffix_threadgroup(),
+        runtime.finalize_value_suffix(), runtime.device(), workspace, base,
+        layout.node_tree, layout.node_tree.slots,
+        layout.value_composition_float_bytes);
     EncodeCooperativeKernelWithThreadgroupMemory(
         command_buffer, runtime.matrix_feedback(), runtime.device(), workspace,
         base, N, layout.feedback_float_bytes, layout.feedback_integer_bytes);

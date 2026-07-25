@@ -260,6 +260,107 @@ inline bool solve_general_multiple_rhs_cooperative(
   return true;
 }
 
+inline bool solve_general_multiple_rhs_cooperative_threadgroup(
+    threadgroup float *augmented, int n, int columns, float tolerance,
+    threadgroup float *row_scales, uint lane, uint lane_count,
+    threadgroup int *solve_ok) {
+  if (lane == 0) {
+    *solve_ok = 1;
+    for (int row = 0; row < n; ++row) {
+      float scale = 0.0f;
+      for (int col = 0; col < n; ++col)
+        scale = max(scale, abs(augmented[row * columns + col]));
+      if (!(scale > 0.0f)) {
+        *solve_ok = 0;
+        break;
+      }
+      row_scales[row] = scale;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (*solve_ok == 0) return false;
+
+  for (uint index = lane; index < uint(n * columns); index += lane_count) {
+    int row = int(index) / columns;
+    augmented[index] /= row_scales[row];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int pivot_col = 0; pivot_col < n; ++pivot_col) {
+    if (lane == 0) {
+      int best_row = -1;
+      float best = tolerance;
+      for (int row = pivot_col; row < n; ++row) {
+        float candidate = abs(augmented[row * columns + pivot_col]);
+        if (candidate > best) {
+          best = candidate;
+          best_row = row;
+        }
+      }
+      *solve_ok = best_row + 1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (*solve_ok == 0) return false;
+
+    int best_row = *solve_ok - 1;
+    if (best_row != pivot_col) {
+      for (uint col = lane; col < uint(columns); col += lane_count) {
+        float temporary = augmented[pivot_col * columns + int(col)];
+        augmented[pivot_col * columns + int(col)] =
+            augmented[best_row * columns + int(col)];
+        augmented[best_row * columns + int(col)] = temporary;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float pivot = augmented[pivot_col * columns + pivot_col];
+    for (uint row = uint(pivot_col + 1) + lane; row < uint(n);
+         row += lane_count) {
+      float factor = augmented[int(row) * columns + pivot_col] / pivot;
+      augmented[int(row) * columns + pivot_col] = factor;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint remaining_rows = uint(n - pivot_col - 1);
+    uint remaining_columns = uint(columns - pivot_col - 1);
+    uint update_count = remaining_rows * remaining_columns;
+    for (uint index = lane; index < update_count; index += lane_count) {
+      int row = pivot_col + 1 + int(index / remaining_columns);
+      int col = pivot_col + 1 + int(index % remaining_columns);
+      float factor = augmented[row * columns + pivot_col];
+      augmented[row * columns + col] =
+          fma(-factor, augmented[pivot_col * columns + col],
+              augmented[row * columns + col]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  int rhs_count = columns - n;
+  for (uint rhs_index = lane; rhs_index < uint(rhs_count);
+       rhs_index += lane_count) {
+    for (int row = 0; row < n; ++row) {
+      float value = augmented[row * columns + n + int(rhs_index)];
+      for (int col = 0; col < row; ++col)
+        value =
+            fma(-augmented[row * columns + col],
+                augmented[col * columns + n + int(rhs_index)], value);
+      augmented[row * columns + n + int(rhs_index)] = value;
+    }
+    for (int reverse = 0; reverse < n; ++reverse) {
+      int row = n - 1 - reverse;
+      float value = augmented[row * columns + n + int(rhs_index)];
+      for (int col = row + 1; col < n; ++col)
+        value =
+            fma(-augmented[row * columns + col],
+                augmented[col * columns + n + int(rhs_index)], value);
+      augmented[row * columns + n + int(rhs_index)] =
+          value / augmented[row * columns + row];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return true;
+}
+
 inline void copy_value_cooperative(
     device float *w, device int *iw, constant KernelParams &p,
     uint input_slot, uint output_slot, uint lane, uint lane_count) {
@@ -480,6 +581,192 @@ inline bool compose_value_cooperative(
   return true;
 }
 
+inline bool compose_value_cooperative_threadgroup(
+    device float *w, device int *iw, constant KernelParams &p,
+    uint first_slot, uint second_slot, uint output_slot, int diagnostic_stage,
+    uint lane, uint lane_count, threadgroup int *solve_ok,
+    threadgroup float *local) {
+  bool first_invalid = invalid_value(iw, p, first_slot);
+  bool second_invalid = invalid_value(iw, p, second_slot);
+  if (first_invalid) {
+    if (second_invalid) {
+      if (lane == 0) set_invalid_value(iw, p, output_slot);
+      cooperative_barrier();
+    } else {
+      copy_value_cooperative(w, iw, p, second_slot, output_slot, lane,
+                             lane_count);
+    }
+    return true;
+  }
+  if (second_invalid) {
+    copy_value_cooperative(w, iw, p, first_slot, output_slot, lane,
+                           lane_count);
+    return true;
+  }
+
+  device int *first_meta = value_meta(iw, p, first_slot);
+  device int *second_meta = value_meta(iw, p, second_slot);
+  int left = first_meta[0];
+  int shared = first_meta[1];
+  int right = second_meta[1];
+  if (lane == 0) {
+    *solve_ok = shared == second_meta[0] ? 1 : 0;
+    if (*solve_ok == 0)
+      fail(iw, p, kNumericalFailure, diagnostic_stage, 20);
+    else {
+      device int *output_meta = value_meta(iw, p, output_slot);
+      output_meta[0] = left;
+      output_meta[1] = right;
+    }
+  }
+  cooperative_barrier();
+  if (*solve_ok == 0) return false;
+
+  device float *first_A = value_A(w, p, first_slot);
+  device float *first_C = value_C(w, p, first_slot);
+  device float *first_J = value_J(w, p, first_slot);
+  device float *second_A = value_A(w, p, second_slot);
+  device float *second_C = value_C(w, p, second_slot);
+  device float *second_J = value_J(w, p, second_slot);
+  device float *output_A = value_A(w, p, output_slot);
+  device float *output_C = value_C(w, p, output_slot);
+  device float *output_J = value_J(w, p, output_slot);
+  if (shared == 0) {
+    for (uint i = lane; i < uint(right * left); i += lane_count)
+      output_A[i] = 0.0f;
+    for (uint i = lane; i < uint(left * left); i += lane_count)
+      output_J[i] = first_J[i];
+    for (uint i = lane; i < uint(right * right); i += lane_count)
+      output_C[i] = second_C[i];
+    cooperative_barrier();
+    return true;
+  }
+
+  int rhs_columns = left + shared;
+  int columns = shared + rhs_columns;
+  threadgroup float *augmented = local;
+  threadgroup float *factors = augmented + shared * columns;
+  uint augmented_size = uint(shared * columns);
+  for (uint index = lane; index < augmented_size; index += lane_count) {
+    int row = int(index) / columns;
+    int col = int(index) - row * columns;
+    float value = 0.0f;
+    if (col < shared) {
+      value = row == col ? 1.0f : 0.0f;
+      for (int k = 0; k < shared; ++k)
+        value = fma(first_C[row * shared + k],
+                    second_J[k * shared + col], value);
+    } else if (col < shared + left) {
+      value = first_A[row * left + col - shared];
+    } else {
+      value = first_C[row * shared + col - shared - left];
+    }
+    augmented[index] = value;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  bool factored = solve_general_multiple_rhs_cooperative_threadgroup(
+      augmented, shared, columns, p.rank_tolerance, factors, lane,
+      lane_count, solve_ok);
+  if (!factored) {
+    if (lane == 0)
+      fail(iw, p, kNumericalFailure, diagnostic_stage, 20);
+    cooperative_barrier();
+    return false;
+  }
+
+  for (uint index = lane; index < uint(right * left);
+       index += lane_count) {
+    int row = int(index) / left;
+    int col = int(index) - row * left;
+    float value = 0.0f;
+    for (int k = 0; k < shared; ++k)
+      value = fma(second_A[row * shared + k],
+                  augmented[k * columns + shared + col], value);
+    output_A[index] = value;
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint index = lane; index < uint(right * shared);
+       index += lane_count) {
+    int row = int(index) / shared;
+    int col = int(index) - row * shared;
+    float value = 0.0f;
+    for (int a = 0; a < shared; ++a)
+      value = fma(second_A[row * shared + a],
+                  augmented[a * columns + shared + left + col], value);
+    output_C[index] = value;
+  }
+  cooperative_barrier();
+  for (uint index = lane; index < uint(right * right);
+       index += lane_count) {
+    int row = int(index) / right;
+    int col = int(index) - row * right;
+    float value = second_C[index];
+    for (int b = 0; b < shared; ++b)
+      value =
+          fma(output_C[row * shared + b],
+              second_A[col * shared + b], value);
+    output_J[index] = value;
+  }
+  cooperative_barrier();
+  for (uint index = lane; index < uint(right * right);
+       index += lane_count)
+    output_C[index] = output_J[index];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint index = lane; index < uint(shared * left);
+       index += lane_count) {
+    int row = int(index) / left;
+    int col = int(index) - row * left;
+    float value = 0.0f;
+    for (int b = 0; b < shared; ++b)
+      value = fma(second_J[row * shared + b],
+                  augmented[b * columns + shared + col], value);
+    output_J[index] = value;
+  }
+  cooperative_barrier();
+  for (uint index = lane; index < uint(left * left);
+       index += lane_count) {
+    int row = int(index) / left;
+    int col = int(index) - row * left;
+    float value = first_J[index];
+    for (int a = 0; a < shared; ++a)
+      value =
+          fma(first_A[a * left + row], output_J[a * left + col], value);
+    augmented[index] = value;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint index = lane; index < uint(left * left);
+       index += lane_count)
+    output_J[index] = augmented[index];
+  cooperative_barrier();
+
+  for (uint index = lane; index < uint(left * left);
+       index += lane_count) {
+    int row = int(index) / left;
+    int col = int(index) - row * left;
+    if (col > row) {
+      float value =
+          0.5f * (output_J[index] + output_J[col * left + row]);
+      output_J[index] = value;
+      output_J[col * left + row] = value;
+    }
+  }
+  for (uint index = lane; index < uint(right * right);
+       index += lane_count) {
+    int row = int(index) / right;
+    int col = int(index) - row * right;
+    if (col > row) {
+      float value =
+          0.5f * (output_C[index] + output_C[col * right + row]);
+      output_C[index] = value;
+      output_C[col * right + row] = value;
+    }
+  }
+  cooperative_barrier();
+  return true;
+}
+
 kernel void clqr_build_value_leaves(
     device const int *dims [[buffer(0)]], device const float *input [[buffer(1)]],
     device float *output [[buffer(2)]], device float *w [[buffer(3)]],
@@ -642,6 +929,32 @@ kernel void clqr_reduce_value(
                             &solve_ok);
 }
 
+kernel void clqr_reduce_value_threadgroup(
+    device const int *dims [[buffer(0)]], device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]], device float *w [[buffer(3)]],
+    device int *iw [[buffer(4)]], constant KernelParams &p [[buffer(5)]],
+    threadgroup float *local [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint3 group_size [[threads_per_threadgroup]]) {
+  (void)dims; (void)input; (void)output;
+  uint gid = group.x;
+  threadgroup int solve_ok;
+  if (gid >= p.parent_count) return;
+  if (lane == 0) solve_ok = enabled(iw, p) ? 1 : 0;
+  cooperative_barrier();
+  if (solve_ok == 0) return;
+  uint left = p.child_offset + 2 * gid;
+  uint parent = p.parent_offset + gid;
+  if (2 * gid + 1 >= p.child_count) {
+    copy_value_cooperative(w, iw, p, left, parent, lane, group_size.x);
+    return;
+  }
+  compose_value_cooperative_threadgroup(
+      w, iw, p, left, left + 1, parent, int(p.parent_offset + gid), lane,
+      group_size.x, &solve_ok, local);
+}
+
 kernel void clqr_expand_value_context(
     device const int *dims [[buffer(0)]], device const float *input [[buffer(1)]],
     device float *output [[buffer(2)]], device float *w [[buffer(3)]],
@@ -668,6 +981,37 @@ kernel void clqr_expand_value_context(
   }
   if (compose_value_cooperative(w, iw, p, left + 1, parent, left, gid,
                                 int(left), lane, group_size.x, &solve_ok))
+    copy_value_cooperative(w, iw, p, parent, left + 1, lane, group_size.x);
+}
+
+kernel void clqr_expand_value_context_threadgroup(
+    device const int *dims [[buffer(0)]], device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]], device float *w [[buffer(3)]],
+    device int *iw [[buffer(4)]], constant KernelParams &p [[buffer(5)]],
+    threadgroup float *local [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint3 group_size [[threads_per_threadgroup]]) {
+  (void)dims; (void)input; (void)output;
+  uint gid = group.x;
+  threadgroup int solve_ok;
+  if (gid >= p.parent_count) return;
+  if (lane == 0) {
+    if (p.parent_count == 1 && p.child_count <= 2)
+      set_invalid_value(iw, p, p.parent_offset);
+    solve_ok = enabled(iw, p) ? 1 : 0;
+  }
+  cooperative_barrier();
+  if (solve_ok == 0) return;
+  uint left = p.child_offset + 2 * gid;
+  uint parent = p.parent_offset + gid;
+  if (2 * gid + 1 >= p.child_count) {
+    copy_value_cooperative(w, iw, p, parent, left, lane, group_size.x);
+    return;
+  }
+  if (compose_value_cooperative_threadgroup(
+          w, iw, p, left + 1, parent, left, int(left), lane, group_size.x,
+          &solve_ok, local))
     copy_value_cooperative(w, iw, p, parent, left + 1, lane, group_size.x);
 }
 
@@ -710,6 +1054,52 @@ kernel void clqr_finalize_value_suffix(
   }
   if (compose_value_cooperative(w, iw, p, left, right, temporary, gid,
                                 int(left), lane, group_size.x, &solve_ok))
+    copy_value_cooperative(w, iw, p, temporary, left, lane, group_size.x);
+}
+
+kernel void clqr_finalize_value_suffix_threadgroup(
+    device const int *dims [[buffer(0)]], device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]], device float *w [[buffer(3)]],
+    device int *iw [[buffer(4)]], constant KernelParams &p [[buffer(5)]],
+    threadgroup float *local [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint3 group_size [[threads_per_threadgroup]]) {
+  (void)dims; (void)input; (void)output;
+  uint gid = group.x;
+  threadgroup int solve_ok;
+  if (gid >= p.parent_count) return;
+  if (lane == 0) {
+    if (p.parent_count == 1 && p.child_count <= 2)
+      set_invalid_value(iw, p, p.parent_offset);
+    solve_ok = enabled(iw, p) ? 1 : 0;
+  }
+  cooperative_barrier();
+  if (solve_ok == 0) return;
+  uint left = 2 * gid;
+  uint right = left + 1;
+  uint parent = p.parent_offset + gid;
+  uint temporary = p.temporary_offset + gid;
+  if (right >= p.child_count) {
+    if (!invalid_value(iw, p, parent)) {
+      if (compose_value_cooperative_threadgroup(
+              w, iw, p, left, parent, temporary, int(left), lane,
+              group_size.x, &solve_ok, local))
+        copy_value_cooperative(w, iw, p, temporary, left, lane,
+                               group_size.x);
+    }
+    return;
+  }
+  if (!invalid_value(iw, p, parent)) {
+    if (!compose_value_cooperative_threadgroup(
+            w, iw, p, right, parent, temporary, int(right), lane,
+            group_size.x, &solve_ok, local))
+      return;
+    copy_value_cooperative(w, iw, p, temporary, right, lane, group_size.x);
+  }
+  if (compose_value_cooperative_threadgroup(
+          w, iw, p, left, right, temporary, int(left), lane, group_size.x,
+          &solve_ok, local))
     copy_value_cooperative(w, iw, p, temporary, left, lane, group_size.x);
 }
 

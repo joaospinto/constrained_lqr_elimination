@@ -30,6 +30,7 @@ int main() {
   using clqr::metal::detail::CheckedSizeProduct;
   using clqr::metal::detail::CheckedSizeSum;
   using clqr::metal::detail::CheckedU32;
+  using clqr::metal::detail::HasCooperativeThreadgroupOccupancy;
   using clqr::metal::detail::PlanInvocation;
   using clqr::metal::detail::PlanLaneSlicedThreadgroupLanes;
 
@@ -51,6 +52,7 @@ int main() {
   Expect(normal.feedback_integer_bytes == 16);
   Expect(normal.primal_leaf_float_bytes == 1008);
   Expect(normal.primal_leaf_integer_bytes == 80);
+  Expect(normal.value_composition_float_bytes == 800);
   Expect(normal.dual_parameter_float_bytes == 1072);
   Expect(normal.dual_parameter_integer_bytes == 64);
   Expect(normal.dual_leaf_float_bytes == 816);
@@ -64,11 +66,11 @@ int main() {
         normal.reduced_terminal_float_bytes,
         normal.reduced_terminal_integer_bytes, normal.feedback_float_bytes,
         normal.feedback_integer_bytes, normal.primal_leaf_float_bytes,
-        normal.primal_leaf_integer_bytes, normal.dual_parameter_float_bytes,
-        normal.dual_parameter_integer_bytes, normal.dual_leaf_float_bytes,
-        normal.dual_leaf_integer_bytes, normal.dual_relation_float_bytes,
-        normal.dual_relation_integer_bytes, normal.dual_solve_float_bytes,
-        normal.dual_solve_integer_bytes}) {
+        normal.primal_leaf_integer_bytes, normal.value_composition_float_bytes,
+        normal.dual_parameter_float_bytes, normal.dual_parameter_integer_bytes,
+        normal.dual_leaf_float_bytes, normal.dual_leaf_integer_bytes,
+        normal.dual_relation_float_bytes, normal.dual_relation_integer_bytes,
+        normal.dual_solve_float_bytes, normal.dual_solve_integer_bytes}) {
     Expect(bytes % 16 == 0);
   }
 
@@ -86,6 +88,11 @@ int main() {
   Expect(PlanLaneSlicedThreadgroupLanes(0, 15360, 1024, 32, 32) == 0);
   Expect(PlanLaneSlicedThreadgroupLanes(1, 0, 1024, 32, 32) == 0);
   Expect(PlanLaneSlicedThreadgroupLanes(0, 32768, 0, 32, 32) == 0);
+  Expect(HasCooperativeThreadgroupOccupancy(0, 8192, 32768, 4));
+  Expect(HasCooperativeThreadgroupOccupancy(1, 8191, 32768, 4));
+  Expect(!HasCooperativeThreadgroupOccupancy(0, 8193, 32768, 4));
+  Expect(!HasCooperativeThreadgroupOccupancy(8193, 0, 32768, 4));
+  Expect(!HasCooperativeThreadgroupOccupancy(0, 0, 32768, 0));
   ExpectLengthError([=] { CheckedSizeSum({size_max, 1}, "test sum"); });
   ExpectLengthError([=] { CheckedSizeProduct({size_max, 2}, "test product"); });
   if constexpr (size_max > maximum) {

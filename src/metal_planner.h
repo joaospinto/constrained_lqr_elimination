@@ -116,6 +116,16 @@ inline std::size_t PlanLaneSlicedThreadgroupLanes(
   return lanes >= minimum_lanes ? lanes : 0;
 }
 
+inline bool HasCooperativeThreadgroupOccupancy(
+    std::size_t static_bytes, std::size_t dynamic_bytes,
+    std::size_t maximum_bytes, std::size_t minimum_resident_groups) {
+  if (minimum_resident_groups == 0)
+    return false;
+  const std::size_t per_group_limit = maximum_bytes / minimum_resident_groups;
+  return static_bytes <= per_group_limit &&
+         dynamic_bytes <= per_group_limit - static_bytes;
+}
+
 struct InvocationLayout {
   KernelParams params{};
   std::size_t input_floats = 0;
@@ -130,6 +140,7 @@ struct InvocationLayout {
   std::size_t feedback_integer_bytes = 0;
   std::size_t primal_leaf_float_bytes = 0;
   std::size_t primal_leaf_integer_bytes = 0;
+  std::size_t value_composition_float_bytes = 0;
   std::size_t dual_parameter_float_bytes = 0;
   std::size_t dual_parameter_integer_bytes = 0;
   std::size_t dual_leaf_float_bytes = 0;
@@ -300,6 +311,8 @@ PlanInvocation(std::uint32_t stage_count, std::uint32_t state_capacity,
       threadgroup_bytes(product({sizeof(std::int32_t), sum({nu, two_nx})}));
   const std::size_t value_composition_scratch =
       sum({product({nx, product({3, nx})}), nx});
+  layout.value_composition_float_bytes =
+      threadgroup_bytes(product({sizeof(float), value_composition_scratch}));
   const std::size_t value_leaf_scratch =
       sum({product({nu, nu}), product({2, nu, nx})});
   const std::size_t dual_parameter_scratch =

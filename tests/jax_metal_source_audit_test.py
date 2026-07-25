@@ -41,8 +41,8 @@ def test_metal_ffi_uses_one_precise_native_gpu_submission():
     assert source.count("setBuffer:workspace.outputs.get()") == 1
     assert source.count("setBuffer:workspace.float_workspace.get()") == 1
     assert "memoryBarrierWithScope:MTLBarrierScopeBuffers" in source
-    assert source.count("EncodeCooperativeReductionTree(") == 5
-    assert source.count("EncodeCooperativeTreeContexts(") == 5
+    assert source.count("EncodeCooperativeReductionTree(") == 4
+    assert source.count("EncodeCooperativeTreeContexts(") == 4
     assert source.count("EncodeCooperativeKernelWithThreadgroupMemory(") >= 3
 
     planner = _source("metal_planner.h")
@@ -57,6 +57,7 @@ def test_metal_ffi_uses_one_precise_native_gpu_submission():
     for scratch in (
         "primal_leaf_float_bytes",
         "primal_leaf_integer_bytes",
+        "value_composition_float_bytes",
         "dual_parameter_float_bytes",
         "dual_parameter_integer_bytes",
         "dual_leaf_float_bytes",
@@ -108,6 +109,39 @@ def test_metal_ffi_uses_one_precise_native_gpu_submission():
     assert "CLQR_METAL_THREADGROUP_SLICED_PRIMAL_LEAVES" not in source
     assert "CLQR_METAL_THREADGROUP_SLICED_DUAL_PARAMETERS" not in source
     assert "CLQR_METAL_THREADGROUP_SLICED_DUAL_LEAVES" not in source
+
+    value = _source("metal_value_affine_source.h")
+    solve_slice = value.split(
+        "inline bool solve_general_multiple_rhs_cooperative_threadgroup", 1
+    )[1].split("inline void copy_value_cooperative", 1)[0]
+    composition_slice = value.split(
+        "inline bool compose_value_cooperative_threadgroup", 1
+    )[1].split("kernel void clqr_build_value_leaves", 1)[0]
+    assert "threadgroup float *augmented = local;" in composition_slice
+    assert (
+        "solve_general_multiple_rhs_cooperative_threadgroup" in composition_slice
+    )
+    assert "scratch(w, p" not in composition_slice
+    assert "mem_flags::mem_device" not in solve_slice
+    assert "mem_flags::mem_threadgroup" in solve_slice
+    for kernel in (
+        "clqr_reduce_value_threadgroup",
+        "clqr_expand_value_context_threadgroup",
+        "clqr_finalize_value_suffix_threadgroup",
+    ):
+        assert f"kernel void {kernel}" in value
+        assert f'"{kernel}"' in source
+    assert "HasCooperativeThreadgroupOccupancy" in source
+    assert "kMinimumResidentThreadgroups = 4" in source
+    assert "runtime.reduce_value_threadgroup()" in source
+    assert "runtime.expand_value_context_threadgroup()" in source
+    assert "runtime.finalize_value_suffix_threadgroup()" in source
+    assert "layout.value_composition_float_bytes" in source
+    assert "CLQR_METAL_FORCE_GLOBAL_VALUE_COMPOSITION" not in source
+    assert "sum({product({nx, product({3, nx})}), nx})" in planner
+    assert (
+        "product({sizeof(float), value_composition_scratch})" in planner
+    )
 
 
 def test_metal_dense_products_remain_staged_and_cubic():
