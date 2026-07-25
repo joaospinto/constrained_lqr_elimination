@@ -93,6 +93,7 @@ class Solution(NamedTuple):
 
 _SCALAR_DTYPE = np.dtype(_clqr_jax_cpu.scalar_dtype)
 _TARGET_NAME = f"clqr_solve_f{_SCALAR_DTYPE.itemsize * 8}"
+_METAL_TARGET_NAME = f"clqr_metal_solve_f{_SCALAR_DTYPE.itemsize * 8}"
 scalar_dtype = _SCALAR_DTYPE
 
 for _name, _capsule in _clqr_jax_cpu.ffi_registrations().items():
@@ -113,6 +114,24 @@ else:
         jax.ffi.register_ffi_target(_name, _capsule, platform="CUDA")
     cuda_registered = True
 
+try:
+    import _clqr_metal
+except ModuleNotFoundError as error:
+    if error.name != "_clqr_metal":
+        raise
+    metal_registered = False
+    metal_unsupported_reason = "the optional _clqr_metal extension is absent"
+else:
+    if np.dtype(_clqr_metal.scalar_dtype) != _SCALAR_DTYPE:
+        raise ImportError(
+            "_clqr_jax_cpu and _clqr_metal use different scalar precisions"
+        )
+    metal_registered = bool(_clqr_metal.supported)
+    metal_unsupported_reason = _clqr_metal.unsupported_reason
+    if metal_registered:
+        for _name, _capsule in _clqr_metal.ffi_registrations().items():
+            jax.ffi.register_ffi_target(_name, _capsule, platform="cpu")
+
 
 def _array(value: Any, name: str, dtype: np.dtype, ndim: int) -> np.ndarray:
     array = np.asarray(value, dtype=dtype, order="C")
@@ -131,9 +150,7 @@ def _optional_matrix(
         return np.zeros(shape, dtype=dtype)
     array = _array(mapping[key], key, dtype, 2)
     if array.shape[1] != shape[1]:
-        raise ValueError(
-            f"{key} must have {shape[1]} columns; got shape {array.shape}"
-        )
+        raise ValueError(f"{key} must have {shape[1]} columns; got shape {array.shape}")
     return array
 
 
@@ -175,19 +192,13 @@ def pack_problem(
         raise TypeError("problem['stages'] must be a sequence")
     stages = list(stages_value)
 
-    terminal_Q = _array(
-        problem.get("terminal_Q"), "terminal_Q", scalar_dtype, 2
-    )
+    terminal_Q = _array(problem.get("terminal_Q"), "terminal_Q", scalar_dtype, 2)
     if terminal_Q.shape[0] != terminal_Q.shape[1]:
         raise ValueError("terminal_Q must be square")
     terminal_n = terminal_Q.shape[0]
-    terminal_q = _array(
-        problem.get("terminal_q"), "terminal_q", scalar_dtype, 1
-    )
+    terminal_q = _array(problem.get("terminal_q"), "terminal_q", scalar_dtype, 1)
     _expect_shape(terminal_q, (terminal_n,), "terminal_q")
-    terminal_E = _optional_matrix(
-        problem, "terminal_E", (0, terminal_n), scalar_dtype
-    )
+    terminal_E = _optional_matrix(problem, "terminal_E", (0, terminal_n), scalar_dtype)
     terminal_e = _optional_vector(
         problem, "terminal_e", terminal_E.shape[0], scalar_dtype
     )
@@ -358,16 +369,44 @@ def pack_problem(
     )
 
 
+def _require_mapping_dtype(value: Any, expected: np.dtype, path: str) -> None:
+    """Reject explicitly typed mapping leaves that Metal would silently cast."""
+
+    if isinstance(value, Mapping):
+        for name, child in value.items():
+            _require_mapping_dtype(child, expected, f"{path}.{name}")
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, np.ndarray)):
+        for index, child in enumerate(value):
+            _require_mapping_dtype(child, expected, f"{path}[{index}]")
+        return
+    dtype = getattr(value, "dtype", None)
+    if dtype is not None and np.dtype(dtype) != expected:
+        raise ValueError(
+            f"{path} uses {np.dtype(dtype)}; backend='metal' requires "
+            f"explicit {expected} inputs"
+        )
+
+
 def solve(
-    problem: PackedProblem | Mapping[str, Any], *, tolerance: float | None = None
+    problem: PackedProblem | Mapping[str, Any],
+    *,
+    tolerance: float | None = None,
+    backend: str | None = None,
 ) -> Solution:
     """Solve a packed CLQR problem using the backend of its JAX arrays.
 
-    CPU arrays call the sequential C++ implementation. CUDA registration is
-    supplied by the optional CUDA extension when it is installed.
+    CPU arrays call the sequential C++ implementation. CUDA arrays call the
+    optional CUDA extension. ``backend="metal"`` explicitly dispatches the
+    native FP32 Metal implementation from the CPU JAX platform.
     """
 
-    packed = pack_problem(problem) if isinstance(problem, Mapping) else problem
+    if isinstance(problem, Mapping):
+        if backend == "metal":
+            _require_mapping_dtype(problem, _SCALAR_DTYPE, "problem")
+        packed = pack_problem(problem)
+    else:
+        packed = problem
     if not isinstance(packed, PackedProblem):
         raise TypeError("problem must be a PackedProblem or problem mapping")
     factors = jax.tree.map(jnp.asarray, packed.factors)
@@ -399,9 +438,14 @@ def solve(
     scalar = np.float32 if dtype == np.dtype(np.float32) else np.float64
     if tolerance is None:
         tolerance = 1e-5 if dtype == np.dtype(np.float32) else 1e-9
-    call = jax.ffi.ffi_call(
-        _TARGET_NAME, result_shapes, vmap_method="sequential"
-    )
+    if backend not in (None, "metal"):
+        raise ValueError("backend must be None or 'metal'")
+    if backend == "metal" and not metal_registered:
+        raise RuntimeError(
+            f"the CLQR Metal backend is unavailable: {metal_unsupported_reason}"
+        )
+    target_name = _METAL_TARGET_NAME if backend == "metal" else _TARGET_NAME
+    call = jax.ffi.ffi_call(target_name, result_shapes, vmap_method="sequential")
     output = call(
         factors.dimensions,
         factors.A,
@@ -432,6 +476,8 @@ __all__ = [
     "SolveStatus",
     "SolveInputs",
     "cuda_registered",
+    "metal_registered",
+    "metal_unsupported_reason",
     "pack_problem",
     "scalar_dtype",
     "solve",

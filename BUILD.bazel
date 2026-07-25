@@ -381,6 +381,81 @@ nanobind_extension(
     visibility = ["//visibility:public"],
 )
 
+cc_library(
+    name = "jax_ffi_metal_handler",
+    srcs = ["python/jax_ffi_metal.cc"],
+    hdrs = [
+        "python/jax_ffi_metal.h",
+        "src/metal_dual_objective_source.h",
+        "src/metal_layout.h",
+        "src/metal_planner.h",
+        "src/metal_primal_scan_source.h",
+        "src/metal_reduction_recovery_source.h",
+        "src/metal_value_affine_source.h",
+    ],
+    copts = [
+        "-fobjc-arc",
+        "-std=c++20",
+        "-x",
+        "objective-c++",
+        "-Wno-gnu-zero-variadic-macro-arguments",
+        "-Wno-nested-anon-types",
+        "-Wno-sign-compare",
+        "-Wno-unused-parameter",
+        "-Wno-zero-length-array",
+    ],
+    defines = select({
+        ":fp32": ["CLQR_USE_FLOAT=1"],
+        "//conditions:default": [],
+    }),
+    linkopts = [
+        "-framework Foundation",
+        "-framework Metal",
+    ],
+    target_compatible_with = select({
+        ":macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":jaxlib_ffi_headers",
+    ],
+)
+
+cc_test(
+    name = "metal_planner_test",
+    srcs = [
+        "src/metal_layout.h",
+        "src/metal_planner.h",
+        "tests/metal_planner_test.cc",
+    ],
+)
+
+nanobind_extension(
+    name = "_clqr_metal",
+    srcs = ["python/jax_ffi_metal_module.cc"],
+    copts = [
+        "-Wno-gnu-zero-variadic-macro-arguments",
+        "-Wno-nested-anon-types",
+        "-Wno-sign-compare",
+        "-Wno-unused-parameter",
+        "-Wno-zero-length-array",
+    ],
+    linkopts = [
+        "-framework Foundation",
+        "-framework Metal",
+    ],
+    linkstatic = True,
+    target_compatible_with = select({
+        ":macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":jax_ffi_metal_handler",
+        ":jaxlib_ffi_headers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 py_test(
     name = "python_binding_test",
     srcs = ["tests/python_binding_test.py"],
@@ -444,6 +519,66 @@ py_test(
     name = "jax_cuda_transfer_audit_test",
     srcs = ["tests/jax_cuda_transfer_audit_test.py"],
     data = ["python/jax_ffi_cuda.cu"],
+)
+
+py_test(
+    name = "jax_metal_binding_test",
+    srcs = ["tests/jax_metal_binding_test.py"],
+    data = [
+        ":_clqr",
+        ":_clqr_jax_cpu",
+        ":_clqr_metal",
+    ],
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
+    main = "tests/jax_metal_binding_test.py",
+    tags = [
+        "local",
+        "manual",
+        "requires-metal",
+    ],
+    target_compatible_with = select({
+        ":macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":clqr_jax_python",
+        requirement("jax"),
+        requirement("numpy"),
+    ],
+)
+
+py_test(
+    name = "jax_metal_fp64_test",
+    srcs = ["tests/jax_metal_fp64_test.py"],
+    data = [
+        ":_clqr",
+        ":_clqr_jax_cpu",
+        ":_clqr_metal",
+    ],
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
+    main = "tests/jax_metal_fp64_test.py",
+    target_compatible_with = select({
+        ":macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":clqr_jax_python",
+        requirement("jax"),
+        requirement("numpy"),
+    ],
+)
+
+py_test(
+    name = "jax_metal_source_audit_test",
+    srcs = ["tests/jax_metal_source_audit_test.py"],
+    data = [
+        "python/jax_ffi_metal.cc",
+        "src/metal_dual_objective_source.h",
+        "src/metal_planner.h",
+        "src/metal_primal_scan_source.h",
+        "src/metal_reduction_recovery_source.h",
+        "src/metal_value_affine_source.h",
+    ],
 )
 
 cc_binary(
