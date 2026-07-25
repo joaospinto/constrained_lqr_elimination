@@ -274,11 +274,32 @@ std::size_t DenseEliminationScratchBytes(std::size_t rows, std::size_t columns,
   return size.bytes;
 }
 
-std::size_t GeneralSolveScratchBytes(std::size_t rows, std::size_t columns,
-                                     const char *description) {
+std::size_t StageRelationReductionScratchBytes(std::size_t rows,
+                                               std::size_t columns,
+                                               std::size_t next_state,
+                                               std::size_t reduced_state_bound,
+                                               const char *description) {
+  ScratchSize matrix;
+  matrix.Add<Scalar>(ScratchCheckedProduct(rows, columns, description));
+  ScratchSize elimination_tail;
+  elimination_tail.Add<Scalar>(rows);
+  elimination_tail.Add<int>(rows);
+  elimination_tail.Add<int>(rows);
+  ScratchSize dynamics_tail;
+  dynamics_tail.Add<Scalar>(
+      ScratchCheckedProduct(next_state, reduced_state_bound, description));
+  dynamics_tail.Add<Scalar>(next_state);
+  return ScratchCheckedSum(
+      {matrix.bytes, std::max(elimination_tail.bytes, dynamics_tail.bytes)},
+      description);
+}
+
+std::size_t StageHessianTransformScratchBytes(std::size_t physical_variables,
+                                              std::size_t reduced_variables,
+                                              const char *description) {
   ScratchSize size;
-  size.Add<Scalar>(ScratchCheckedProduct(rows, columns, description));
-  size.Add<Scalar>(rows);
+  size.Add<Scalar>(ScratchCheckedProduct(physical_variables, reduced_variables,
+                                         description));
   return size.bytes;
 }
 
@@ -421,12 +442,30 @@ std::size_t RelationFinalizeScratchBytes(const ScanShape &left,
   return size.bytes;
 }
 
+std::size_t ValueProductScratchEntries(const ScanShape &first,
+                                       const ScanShape &second,
+                                       const char *description) {
+  if (!first.valid || !second.valid)
+    return 0;
+  if (first.right != second.left) {
+    throw std::invalid_argument(
+        "internal CUDA value scratch scan has incompatible dimensions");
+  }
+  return ScratchCheckedProduct(first.right, std::max(first.left, second.right),
+                               description);
+}
+
 std::size_t ValueComposeScratchBytes(const ScanShape &first,
+                                     const ScanShape &second,
                                      const char *description) {
   const std::size_t columns = ScratchCheckedSum(
       {ScratchCheckedProduct(2, first.right, description), first.left},
       description);
-  return GeneralSolveScratchBytes(first.right, columns, description);
+  ScratchSize size;
+  size.Add<Scalar>(ScratchCheckedProduct(first.right, columns, description));
+  size.Add<Scalar>(first.right);
+  size.Add<Scalar>(ValueProductScratchEntries(first, second, description));
+  return size.bytes;
 }
 
 std::size_t ValueFinalizeScratchBytes(const ScanShape &left,
@@ -463,10 +502,27 @@ std::size_t ValueFinalizeScratchBytes(const ScanShape &left,
                          ScratchCheckedProduct(left_capacity, left_capacity,
                                                "value-scan final workspace")},
                         "value-scan final workspace");
+  std::size_t product_entries = 0;
+  if (right != nullptr) {
+    if (parent.valid) {
+      product_entries = std::max(
+          ValueProductScratchEntries(*right, parent,
+                                     "value-scan final workspace"),
+          ValueProductScratchEntries(left, ComposeScanShapes(*right, parent),
+                                     "value-scan final workspace"));
+    } else {
+      product_entries = ValueProductScratchEntries(
+          left, *right, "value-scan final workspace");
+    }
+  } else if (parent.valid) {
+    product_entries =
+        ValueProductScratchEntries(left, parent, "value-scan final workspace");
+  }
   ScratchSize size;
   size.Add<Scalar>(ScratchCheckedProduct(shared_capacity, columns_capacity,
                                          "value-scan final workspace"));
   size.Add<Scalar>(shared_capacity);
+  size.Add<Scalar>(product_entries);
   size.Add<ValueElement>(1);
   size.Add<Scalar>(composed_entries);
   return size.bytes;
@@ -530,6 +586,7 @@ struct ScratchRequirements {
   std::size_t primal_relation_final = 0;
   std::size_t state_parameter = 0;
   std::size_t stage_reduction = 0;
+  std::size_t terminal_reduction = 0;
   std::size_t value_leaf = 0;
   std::size_t value_compose = 0;
   std::size_t value_finalize = 0;
@@ -544,10 +601,11 @@ struct ScratchRequirements {
 
   std::size_t Maximum() const {
     return std::max({primal_leaf, primal_relation, primal_relation_final,
-                     state_parameter, stage_reduction, value_leaf,
-                     value_compose, value_finalize, feedback, affine_terms,
-                     affine_finalize, dual_parameter, dual_relation_leaf,
-                     dual_relation, dual_root, dual_expand});
+                     state_parameter, stage_reduction, terminal_reduction,
+                     value_leaf, value_compose, value_finalize, feedback,
+                     affine_terms, affine_finalize, dual_parameter,
+                     dual_relation_leaf, dual_relation, dual_root,
+                     dual_expand});
   }
 };
 
@@ -581,12 +639,20 @@ ScratchRequirements PlanScratch(const Problem &problem) {
                               "feasibility row workspace"),
             ScratchCheckedSum({m, n, next, 1}, "feasibility column workspace"),
             "feasibility kernel workspace"));
+    const std::size_t reduction_rows =
+        ScratchCheckedSum({mixed, next}, "reduction row workspace");
+    const std::size_t reduction_columns =
+        ScratchCheckedSum({m, n, 1}, "reduction column workspace");
+    const std::size_t stage_variables =
+        ScratchCheckedSum({n, m}, "stage Hessian workspace");
     result.stage_reduction = std::max(
         result.stage_reduction,
-        DenseEliminationScratchBytes(
-            ScratchCheckedSum({mixed, next}, "reduction row workspace"),
-            ScratchCheckedSum({m, n, 1}, "reduction column workspace"),
-            "reduction kernel workspace"));
+        std::max(
+            StageRelationReductionScratchBytes(reduction_rows,
+                                               reduction_columns, next, n,
+                                               "reduction kernel workspace"),
+            StageHessianTransformScratchBytes(stage_variables, stage_variables,
+                                              "stage Hessian workspace")));
     ScratchSize value_leaf;
     value_leaf.Add<Scalar>(ScratchCheckedProduct(m, m, "value-leaf workspace"));
     value_leaf.Add<Scalar>(ScratchCheckedProduct(
@@ -597,6 +663,11 @@ ScratchRequirements PlanScratch(const Problem &problem) {
     feedback.Add<Scalar>(ScratchCheckedProduct(
         m, ScratchCheckedSum({m, n}, "feedback workspace"),
         "feedback workspace"));
+    if (m > 0) {
+      feedback.Add<Scalar>(ScratchCheckedProduct(
+          next, ScratchCheckedSum({m, n}, "feedback workspace"),
+          "feedback workspace"));
+    }
     result.feedback = std::max(result.feedback, feedback.bytes);
     result.affine_terms =
         std::max(result.affine_terms, AffineTermsScratchBytes(next));
@@ -619,6 +690,8 @@ ScratchRequirements PlanScratch(const Problem &problem) {
   }
 
   const std::size_t terminal_n = problem.terminal_Q.rows();
+  result.terminal_reduction = StageHessianTransformScratchBytes(
+      terminal_n, terminal_n, "terminal Hessian workspace");
   state_bounds.back() = terminal_n;
   primal_leaves.back() = MakeScanShape(terminal_n, 0);
   value_leaves.back() = MakeScanShape(terminal_n, 0);
@@ -683,10 +756,10 @@ ScratchRequirements PlanScratch(const Problem &problem) {
            ++parent) {
         const std::size_t child = 2 * parent;
         if (child + 1 < children.size()) {
-          result.value_compose =
-              std::max(result.value_compose,
-                       ValueComposeScratchBytes(children[child],
-                                                "value-scan workspace"));
+          result.value_compose = std::max(
+              result.value_compose,
+              ValueComposeScratchBytes(children[child], children[child + 1],
+                                       "value-scan workspace"));
         }
       }
     }
@@ -697,10 +770,10 @@ ScratchRequirements PlanScratch(const Problem &problem) {
       for (std::size_t parent = 0; parent < parents.size(); ++parent) {
         const std::size_t child = 2 * parent;
         if (child + 1 < children.size()) {
-          result.value_compose =
-              std::max(result.value_compose,
-                       ValueComposeScratchBytes(children[child + 1],
-                                                "value-scan workspace"));
+          result.value_compose = std::max(
+              result.value_compose,
+              ValueComposeScratchBytes(children[child + 1], parents[parent],
+                                       "value-scan workspace"));
         }
       }
     }
@@ -4673,9 +4746,10 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               control_params.get(), reduced_stages.get(),
               control_dimensions.get(), device_status.get());
         }
-        ReduceTerminalKernel<<<1, kThreads, 0, stream>>>(
-            device_terminal.get(), state_params.get(), stage_count,
-            reduced_terminal.get());
+        ReduceTerminalKernel<<<1, kThreads, scratch.terminal_reduction,
+                               stream>>>(device_terminal.get(),
+                                         state_params.get(), stage_count,
+                                         reduced_terminal.get());
         InitialReducedStateKernel<<<1, kThreads, 0, stream>>>(
             state_params.get(), device_initial.get(), reduced_initial.get(),
             options.tolerance, device_status.get());
@@ -6650,7 +6724,7 @@ __device__ void
 ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
                           Scalar tolerance, ValueElement *output,
                           DeviceStatus *status, int node, Scalar *augmented,
-                          Scalar *factors, int *best_row) {
+                          Scalar *factors, Scalar *product, int *best_row) {
   const int shared = first.right_dim;
   if (shared != second.left_dim) {
     if (threadIdx.x == 0)
@@ -6734,29 +6808,51 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     }
     output->A[row * left + col] = value;
   }
+  // C = C2 + A2*(S^{-1}*C1)*A2^T. Stage the right product once so the
+  // contraction is an ordinary pair of matrix products rather than a
+  // shared-by-shared contraction for every output entry.
+  for (int linear = threadIdx.x; linear < shared * right;
+       linear += blockDim.x) {
+    const int row = linear / right;
+    const int col = linear % right;
+    Scalar value = Scalar{0};
+    for (int k = 0; k < shared; ++k) {
+      value += augmented[row * columns + shared + left + k] *
+               second.A[col * second.left_dim + k];
+    }
+    product[row * right + col] = value;
+  }
+  WarpSynchronize();
   for (int linear = threadIdx.x; linear < right * right; linear += blockDim.x) {
     const int row = linear / right;
     const int col = linear % right;
     Scalar value = second.C[row * second.right_dim + col];
-    for (int p = 0; p < shared; ++p) {
-      for (int q = 0; q < shared; ++q) {
-        value += second.A[row * second.left_dim + p] *
-                 augmented[p * columns + shared + left + q] *
-                 second.A[col * second.left_dim + q];
-      }
+    for (int k = 0; k < shared; ++k) {
+      value += second.A[row * second.left_dim + k] * product[k * right + col];
     }
     output->C[row * right + col] = value;
   }
+  WarpSynchronize();
+
+  // J = J1 + A1^T*J2*(S^{-1}*A1). Reuse the same exactly sized product
+  // workspace after C has consumed it.
+  for (int linear = threadIdx.x; linear < shared * left; linear += blockDim.x) {
+    const int row = linear / left;
+    const int col = linear % left;
+    Scalar value = Scalar{0};
+    for (int k = 0; k < shared; ++k) {
+      value += second.J[row * second.left_dim + k] *
+               augmented[k * columns + shared + col];
+    }
+    product[row * left + col] = value;
+  }
+  WarpSynchronize();
   for (int linear = threadIdx.x; linear < left * left; linear += blockDim.x) {
     const int row = linear / left;
     const int col = linear % left;
     Scalar value = first.J[row * first.left_dim + col];
-    for (int p = 0; p < shared; ++p) {
-      for (int q = 0; q < shared; ++q) {
-        value += first.A[p * first.left_dim + row] *
-                 second.J[p * second.left_dim + q] *
-                 augmented[q * columns + shared + col];
-      }
+    for (int k = 0; k < shared; ++k) {
+      value += first.A[k * first.left_dim + row] * product[k * left + col];
     }
     output->J[row * left + col] = value;
   }
@@ -6830,7 +6926,7 @@ __device__ void ComposeScanValueBlock(const ValueElement &first,
                                       Scalar tolerance, ValueElement *output,
                                       DeviceStatus *status, int node,
                                       Scalar *augmented, Scalar *factors,
-                                      int *best_row) {
+                                      Scalar *product, int *best_row) {
   if (InvalidScanValueElement(first)) {
     if (InvalidScanValueElement(second)) {
       SetInvalidScanValueElement(output);
@@ -6844,7 +6940,7 @@ __device__ void ComposeScanValueBlock(const ValueElement &first,
     return;
   }
   ComposeValueElementsBlock(first, second, tolerance, output, status, node,
-                            augmented, factors, best_row);
+                            augmented, factors, product, best_row);
 }
 
 __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
@@ -6868,13 +6964,18 @@ __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) * columns);
   scratch_size.Add<Scalar>(shared);
+  scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) *
+                           DeviceMax(first.left_dim, second.right_dim));
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *augmented =
       scratch.Take<Scalar>(static_cast<std::size_t>(shared) * columns);
   Scalar *factors = scratch.Take<Scalar>(shared);
+  Scalar *product =
+      scratch.Take<Scalar>(static_cast<std::size_t>(shared) *
+                           DeviceMax(first.left_dim, second.right_dim));
   __shared__ int best_row;
   ComposeValueElementsBlock(first, second, tolerance, &parents[index], status,
-                            index, augmented, factors, &best_row);
+                            index, augmented, factors, product, &best_row);
 }
 
 __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
@@ -6899,14 +7000,19 @@ __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) * columns);
   scratch_size.Add<Scalar>(shared);
+  scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) *
+                           DeviceMax(first.left_dim, second.right_dim));
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *augmented =
       scratch.Take<Scalar>(static_cast<std::size_t>(shared) * columns);
   Scalar *factors = scratch.Take<Scalar>(shared);
+  Scalar *product =
+      scratch.Take<Scalar>(static_cast<std::size_t>(shared) *
+                           DeviceMax(first.left_dim, second.right_dim));
   __shared__ int best_row;
   ComposeValueElementsBlock(
       first, second, tolerance, &tree[parent_offset + index], status,
-      parent_offset + index, augmented, factors, &best_row);
+      parent_offset + index, augmented, factors, product, &best_row);
 }
 
 __global__ void InitializeValueContextRootKernel(ValueElement *tree,
@@ -6936,13 +7042,20 @@ __global__ void ExpandValueContextLevelKernel(
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) * columns);
   scratch_size.Add<Scalar>(shared);
+  const int product_columns =
+      InvalidScanValueElement(parent_context)
+          ? 0
+          : DeviceMax(first.left_dim, parent_context.right_dim);
+  scratch_size.Add<Scalar>(static_cast<std::size_t>(shared) * product_columns);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *augmented =
       scratch.Take<Scalar>(static_cast<std::size_t>(shared) * columns);
   Scalar *factors = scratch.Take<Scalar>(shared);
+  Scalar *product =
+      scratch.Take<Scalar>(static_cast<std::size_t>(shared) * product_columns);
   __shared__ int best_row;
   ComposeScanValueBlock(tree[right], parent_context, tolerance, &tree[left],
-                        status, left, augmented, factors, &best_row);
+                        status, left, augmented, factors, product, &best_row);
   WarpSynchronize();
   CopyValueElementBlock(parent_context, &tree[right]);
 }
@@ -6980,16 +7093,39 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
       static_cast<std::size_t>(right_capacity) * left_capacity +
       static_cast<std::size_t>(right_capacity) * right_capacity +
       static_cast<std::size_t>(left_capacity) * left_capacity;
+  std::size_t product_entries = 0;
+  if (left + 1 < count) {
+    if (!InvalidScanValueElement(parent)) {
+      const std::size_t right_product_entries =
+          static_cast<std::size_t>(leaves[right].right_dim) *
+          DeviceMax(leaves[right].left_dim, parent.right_dim);
+      const std::size_t left_product_entries =
+          static_cast<std::size_t>(leaves[left].right_dim) *
+          DeviceMax(leaves[left].left_dim, parent.right_dim);
+      product_entries = right_product_entries > left_product_entries
+                            ? right_product_entries
+                            : left_product_entries;
+    } else {
+      product_entries =
+          static_cast<std::size_t>(leaves[left].right_dim) *
+          DeviceMax(leaves[left].left_dim, leaves[right].right_dim);
+    }
+  } else if (!InvalidScanValueElement(parent)) {
+    product_entries = static_cast<std::size_t>(leaves[left].right_dim) *
+                      DeviceMax(leaves[left].left_dim, parent.right_dim);
+  }
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(shared_capacity) *
                            columns_capacity);
   scratch_size.Add<Scalar>(shared_capacity);
+  scratch_size.Add<Scalar>(product_entries);
   scratch_size.Add<ValueElement>(1);
   scratch_size.Add<Scalar>(composed_entries);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *augmented = scratch.Take<Scalar>(
       static_cast<std::size_t>(shared_capacity) * columns_capacity);
   Scalar *factors = scratch.Take<Scalar>(shared_capacity);
+  Scalar *product = scratch.Take<Scalar>(product_entries);
   ValueElement *composed_ptr = scratch.Take<ValueElement>(1);
   Scalar *composed_storage = scratch.Take<Scalar>(composed_entries);
   ValueElement &composed = *composed_ptr;
@@ -7001,7 +7137,7 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   if (left + 1 >= count) {
     if (!InvalidScanValueElement(parent)) {
       ComposeScanValueBlock(leaves[left], parent, tolerance, &composed, status,
-                            left, augmented, factors, &best_row);
+                            left, augmented, factors, product, &best_row);
       WarpSynchronize();
       CopyValueElementBlock(composed, &leaves[left]);
     }
@@ -7009,41 +7145,45 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   }
   if (!InvalidScanValueElement(parent)) {
     ComposeScanValueBlock(leaves[right], parent, tolerance, &composed, status,
-                          right, augmented, factors, &best_row);
+                          right, augmented, factors, product, &best_row);
     WarpSynchronize();
     CopyValueElementBlock(composed, &leaves[right]);
     WarpSynchronize();
   }
   ComposeValueElementsBlock(leaves[left], leaves[right], tolerance, &composed,
-                            status, left, augmented, factors, &best_row);
+                            status, left, augmented, factors, product,
+                            &best_row);
   WarpSynchronize();
   CopyValueElementBlock(composed, &leaves[left]);
 }
 
 __device__ void BuildMatrixFeedbackSystem(const ReducedStage &s,
                                           const ValueElement &next,
-                                          Scalar *augmented, int columns) {
-  for (int linear = threadIdx.x; linear < s.m * columns; linear += blockDim.x) {
+                                          Scalar *augmented, Scalar *product,
+                                          int columns) {
+  // Form J*[B,A] once. Both feedback blocks then use B^T times the relevant
+  // columns, keeping the dense contraction cubic in the active dimensions.
+  for (int linear = threadIdx.x; linear < s.next_n * columns;
+       linear += blockDim.x) {
     const int row = linear / columns;
     const int col = linear % columns;
     Scalar value = Scalar{0};
-    if (col < s.m) {
-      value = s.R[row * s.m + col];
-      for (int a = 0; a < s.next_n; ++a) {
-        for (int b = 0; b < s.next_n; ++b) {
-          value += s.B[a * s.m + row] * next.J[a * next.left_dim + b] *
-                   s.B[b * s.m + col];
-        }
-      }
-    } else {
-      const int x = col - s.m;
-      value = -s.M[x * s.m + row];
-      for (int a = 0; a < s.next_n; ++a) {
-        for (int b = 0; b < s.next_n; ++b) {
-          value -= s.B[a * s.m + row] * next.J[a * next.left_dim + b] *
-                   s.A[b * s.n + x];
-        }
-      }
+    for (int k = 0; k < s.next_n; ++k) {
+      const Scalar operand =
+          col < s.m ? s.B[k * s.m + col] : s.A[k * s.n + col - s.m];
+      value += next.J[row * next.left_dim + k] * operand;
+    }
+    product[row * columns + col] = value;
+  }
+  WarpSynchronize();
+  for (int linear = threadIdx.x; linear < s.m * columns; linear += blockDim.x) {
+    const int row = linear / columns;
+    const int col = linear % columns;
+    Scalar value =
+        col < s.m ? s.R[row * s.m + col] : -s.M[(col - s.m) * s.m + row];
+    const Scalar sign = col < s.m ? Scalar{1} : Scalar{-1};
+    for (int k = 0; k < s.next_n; ++k) {
+      value += sign * s.B[k * s.m + row] * product[k * columns + col];
     }
     augmented[linear] = value;
   }
@@ -7075,10 +7215,13 @@ __device__ void ExtractMatrixFeedback(const ReducedStage &s,
   }
 }
 
-__device__ bool SolveMatrixFeedbackBlock(
-    const ReducedStage &stage, const ValueElement &next, Scalar tolerance,
-    Feedback *feedback, Scalar *augmented, int *positive_definite,
-    DeviceStatus *status, int stage_index, int diagnostic) {
+__device__ bool SolveMatrixFeedbackBlock(const ReducedStage &stage,
+                                         const ValueElement &next,
+                                         Scalar tolerance, Feedback *feedback,
+                                         Scalar *augmented, Scalar *product,
+                                         int *positive_definite,
+                                         DeviceStatus *status, int stage_index,
+                                         int diagnostic) {
   if (stage.m == 0) {
     if (threadIdx.x == 0) {
       feedback->state_dim = stage.n;
@@ -7095,7 +7238,7 @@ __device__ bool SolveMatrixFeedbackBlock(
   }
 
   const int columns = stage.m + stage.n;
-  BuildMatrixFeedbackSystem(stage, next, augmented, columns);
+  BuildMatrixFeedbackSystem(stage, next, augmented, product, columns);
   WarpSynchronize();
   if (!FactorPositiveDefiniteBlock(augmented, columns, stage.m, tolerance,
                                    feedback->control_factor,
@@ -7125,11 +7268,15 @@ __global__ void MatrixFeedbackKernel(const ReducedStage *stages,
   const int columns = s.m + s.n;
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(static_cast<std::size_t>(s.m) * columns);
+  scratch_size.Add<Scalar>(
+      s.m > 0 ? static_cast<std::size_t>(s.next_n) * columns : 0);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *augmented =
       scratch.Take<Scalar>(static_cast<std::size_t>(s.m) * columns);
+  Scalar *product = scratch.Take<Scalar>(
+      s.m > 0 ? static_cast<std::size_t>(s.next_n) * columns : 0);
   __shared__ int positive_definite;
-  SolveMatrixFeedbackBlock(s, next, tolerance, &out, augmented,
+  SolveMatrixFeedbackBlock(s, next, tolerance, &out, augmented, product,
                            &positive_definite, status, index, 9);
 }
 
@@ -7269,6 +7416,31 @@ namespace cuda {
 namespace detail {
 namespace {
 
+__device__ inline Scalar StageHessianEntry(const PackedStage &stage, int row,
+                                           int col) {
+  if (row < stage.n) {
+    return col < stage.n ? stage.Q[row * stage.n + col]
+                         : stage.M[row * stage.m + col - stage.n];
+  }
+  return col < stage.n ? stage.M[col * stage.m + row - stage.n]
+                       : stage.R[(row - stage.n) * stage.m + col - stage.n];
+}
+
+__device__ inline Scalar StageReductionMapEntry(const PackedStage &stage,
+                                                const StateParam &state,
+                                                const ControlParam &control,
+                                                int row, int col) {
+  if (row < stage.n) {
+    return col < state.reduced_dim ? state.T[row * state.reduced_dim + col]
+                                   : Scalar{0};
+  }
+  const int control_row = row - stage.n;
+  return col < state.reduced_dim
+             ? control.Y[control_row * control.state_dim + col]
+             : control.Z[control_row * control.reduced_dim + col -
+                         state.reduced_dim];
+}
+
 __global__ void
 ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
                    const StateParam *state_params, int stage_count,
@@ -7286,23 +7458,62 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
   const Relation &next_relation = suffix[index + 1];
   const int rows = s.mixed + next_relation.rows;
   const int columns = s.m + current.reduced_dim + 1;
+  ScratchSize matrix_size;
+  matrix_size.Add<Scalar>(static_cast<std::size_t>(rows) * columns);
+  ScratchSize elimination_tail_size;
+  elimination_tail_size.Add<Scalar>(rows);
+  elimination_tail_size.Add<int>(rows);
+  elimination_tail_size.Add<int>(rows);
+  ScratchSize dynamics_tail_size;
+  dynamics_tail_size.Add<Scalar>(static_cast<std::size_t>(s.next_n) *
+                                 current.reduced_dim);
+  dynamics_tail_size.Add<Scalar>(s.next_n);
+  ScratchSize relation_scratch_size;
+  relation_scratch_size.bytes =
+      matrix_size.bytes +
+      (elimination_tail_size.bytes > dynamics_tail_size.bytes
+           ? elimination_tail_size.bytes
+           : dynamics_tail_size.bytes);
+  ScratchSize transform_scratch_size;
+  transform_scratch_size.Add<Scalar>(static_cast<std::size_t>(s.n + s.m) *
+                                     (s.n + s.m));
   ScratchSize scratch_size;
-  scratch_size.Add<Scalar>(static_cast<std::size_t>(rows) * columns);
-  scratch_size.Add<Scalar>(rows);
-  scratch_size.Add<int>(rows);
-  scratch_size.Add<int>(rows);
+  scratch_size.bytes =
+      relation_scratch_size.bytes > transform_scratch_size.bytes
+          ? relation_scratch_size.bytes
+          : transform_scratch_size.bytes;
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
   Scalar *matrix =
       scratch.Take<Scalar>(static_cast<std::size_t>(rows) * columns);
-  Scalar *factors = scratch.Take<Scalar>(rows);
-  int *pivot_columns = scratch.Take<int>(rows);
-  int *pivot_rows = scratch.Take<int>(rows);
+  unsigned char *tail_storage = scratch.data + scratch.offset;
+  ScratchArena dynamics_scratch{tail_storage};
+  Scalar *dynamics_state = dynamics_scratch.Take<Scalar>(
+      static_cast<std::size_t>(s.next_n) * current.reduced_dim);
+  Scalar *dynamics_offset = dynamics_scratch.Take<Scalar>(s.next_n);
   __shared__ int rank;
   __shared__ int best_row;
   __shared__ int control_rank;
   __shared__ int local_ok;
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
     matrix[i] = Scalar{0};
+  WarpSynchronize();
+
+  for (int linear = threadIdx.x; linear < s.next_n * current.reduced_dim;
+       linear += blockDim.x) {
+    const int row = linear / current.reduced_dim;
+    const int col = linear % current.reduced_dim;
+    Scalar value = Scalar{0};
+    for (int x = 0; x < s.n; ++x) {
+      value += s.A[row * s.n + x] * current.T[x * current.reduced_dim + col];
+    }
+    dynamics_state[linear] = value;
+  }
+  for (int row = threadIdx.x; row < s.next_n; row += blockDim.x) {
+    Scalar value = s.c[row];
+    for (int x = 0; x < s.n; ++x)
+      value += s.A[row * s.n + x] * current.t[x];
+    dynamics_offset[row] = value;
+  }
   WarpSynchronize();
 
   // Original mixed equalities after x = T*z + t.
@@ -7348,26 +7559,25 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
     const int z = linear % current.reduced_dim;
     Scalar value = Scalar{0};
     for (int xp = 0; xp < s.next_n; ++xp) {
-      Scalar at = Scalar{0};
-      for (int x = 0; x < s.n; ++x) {
-        at += s.A[xp * s.n + x] * current.T[x * current.reduced_dim + z];
-      }
-      value += next_relation.left[row * next_relation.left_dim + xp] * at;
+      value += next_relation.left[row * next_relation.left_dim + xp] *
+               dynamics_state[xp * current.reduced_dim + z];
     }
     matrix[(s.mixed + row) * columns + s.m + z] = value;
   }
   for (int row = threadIdx.x; row < next_relation.rows; row += blockDim.x) {
     Scalar value = next_relation.rhs[row];
     for (int xp = 0; xp < s.next_n; ++xp) {
-      Scalar affine = s.c[xp];
-      for (int x = 0; x < s.n; ++x) {
-        affine += s.A[xp * s.n + x] * current.t[x];
-      }
-      value -= next_relation.left[row * next_relation.left_dim + xp] * affine;
+      value -= next_relation.left[row * next_relation.left_dim + xp] *
+               dynamics_offset[xp];
     }
     matrix[(s.mixed + row) * columns + columns - 1] = value;
   }
   WarpSynchronize();
+
+  ScratchArena elimination_scratch{tail_storage};
+  Scalar *factors = elimination_scratch.Take<Scalar>(rows);
+  int *pivot_columns = elimination_scratch.Take<int>(rows);
+  int *pivot_rows = elimination_scratch.Take<int>(rows);
 
   // Normalize raw mixed equations by their original scale, while treating a
   // successor equation produced entirely at the roundoff level as zero.  A
@@ -7538,93 +7748,88 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
     rs.c[row] = value;
   }
 
-  // Reduced quadratic and bilinear terms.
-  for (int linear = threadIdx.x; linear < rs.n * rs.n; linear += blockDim.x) {
-    const int a = linear / rs.n;
-    const int b = linear % rs.n;
-    Scalar value = Scalar{0};
-    for (int x = 0; x < s.n; ++x) {
-      for (int y = 0; y < s.n; ++y) {
-        value += current.T[x * current.reduced_dim + a] * s.Q[x * s.n + y] *
-                 current.T[y * current.reduced_dim + b];
+  // With w=[x;u], y=[z;v], and w=L*y+[t;y0], stage the dense Hessian
+  // transform as H*L followed by L^T*(H*L). This preserves the block
+  // elimination map while keeping every dense product cubic.
+  const int physical_variables = s.n + s.m;
+  const int reduced_variables = rs.n + rs.m;
+  if (reduced_variables > 0) {
+    ScratchArena transform_scratch{scratch.data};
+    Scalar *hessian_times_map = transform_scratch.Take<Scalar>(
+        static_cast<std::size_t>(physical_variables) * reduced_variables);
+    for (int linear = threadIdx.x;
+         linear < physical_variables * reduced_variables;
+         linear += blockDim.x) {
+      const int row = linear / reduced_variables;
+      const int col = linear % reduced_variables;
+      Scalar value = Scalar{0};
+      for (int inner = 0; inner < physical_variables; ++inner) {
+        value += StageHessianEntry(s, row, inner) *
+                 StageReductionMapEntry(s, current, cp, inner, col);
       }
-      for (int u = 0; u < s.m; ++u) {
-        value += current.T[x * current.reduced_dim + a] * s.M[x * s.m + u] *
-                 cp.Y[u * cp.state_dim + b];
-        value += cp.Y[u * cp.state_dim + a] * s.M[x * s.m + u] *
-                 current.T[x * current.reduced_dim + b];
-      }
+      hessian_times_map[linear] = value;
     }
-    for (int u = 0; u < s.m; ++u) {
-      for (int v = 0; v < s.m; ++v) {
-        value += cp.Y[u * cp.state_dim + a] * s.R[u * s.m + v] *
-                 cp.Y[v * cp.state_dim + b];
+    WarpSynchronize();
+    for (int linear = threadIdx.x; linear < rs.n * rs.n; linear += blockDim.x) {
+      const int row = linear / rs.n;
+      const int col = linear % rs.n;
+      Scalar value = Scalar{0};
+      for (int inner = 0; inner < physical_variables; ++inner) {
+        value += StageReductionMapEntry(s, current, cp, inner, row) *
+                 hessian_times_map[inner * reduced_variables + col];
       }
+      rs.Q[linear] = value;
     }
-    rs.Q[a * rs.n + b] = value;
-  }
-  for (int linear = threadIdx.x; linear < rs.m * rs.m; linear += blockDim.x) {
-    const int a = linear / rs.m;
-    const int b = linear % rs.m;
-    Scalar value = Scalar{0};
-    for (int u = 0; u < s.m; ++u) {
-      for (int v = 0; v < s.m; ++v) {
-        value += cp.Z[u * cp.reduced_dim + a] * s.R[u * s.m + v] *
-                 cp.Z[v * cp.reduced_dim + b];
+    for (int linear = threadIdx.x; linear < rs.m * rs.m; linear += blockDim.x) {
+      const int row = linear / rs.m;
+      const int col = linear % rs.m;
+      Scalar value = Scalar{0};
+      for (int inner = 0; inner < physical_variables; ++inner) {
+        value += StageReductionMapEntry(s, current, cp, inner, rs.n + row) *
+                 hessian_times_map[inner * reduced_variables + rs.n + col];
       }
+      rs.R[linear] = value;
     }
-    rs.R[a * rs.m + b] = value;
-  }
-  for (int linear = threadIdx.x; linear < rs.n * rs.m; linear += blockDim.x) {
-    const int z = linear / rs.m;
-    const int v = linear % rs.m;
-    Scalar value = Scalar{0};
-    for (int x = 0; x < s.n; ++x) {
-      for (int u = 0; u < s.m; ++u) {
-        value += current.T[x * current.reduced_dim + z] * s.M[x * s.m + u] *
-                 cp.Z[u * cp.reduced_dim + v];
+    for (int linear = threadIdx.x; linear < rs.n * rs.m; linear += blockDim.x) {
+      const int row = linear / rs.m;
+      const int col = linear % rs.m;
+      Scalar value = Scalar{0};
+      for (int inner = 0; inner < physical_variables; ++inner) {
+        value += StageReductionMapEntry(s, current, cp, inner, row) *
+                 hessian_times_map[inner * reduced_variables + rs.n + col];
       }
+      rs.M[linear] = value;
     }
-    for (int u = 0; u < s.m; ++u) {
-      for (int w = 0; w < s.m; ++w) {
-        value += cp.Y[u * cp.state_dim + z] * s.R[u * s.m + w] *
-                 cp.Z[w * cp.reduced_dim + v];
-      }
-    }
-    rs.M[z * rs.m + v] = value;
-  }
+    WarpSynchronize();
 
-  for (int z = threadIdx.x; z < rs.n; z += blockDim.x) {
-    Scalar value = Scalar{0};
-    for (int x = 0; x < s.n; ++x) {
-      Scalar gx = s.q[x];
-      for (int y = 0; y < s.n; ++y)
-        gx += s.Q[x * s.n + y] * current.t[y];
-      for (int u = 0; u < s.m; ++u)
-        gx += s.M[x * s.m + u] * cp.y[u];
-      value += current.T[x * current.reduced_dim + z] * gx;
+    // Reuse the product buffer after all Hessian blocks have consumed it.
+    Scalar *gradient = hessian_times_map;
+    for (int row = threadIdx.x; row < physical_variables; row += blockDim.x) {
+      Scalar value = row < s.n ? s.q[row] : s.r[row - s.n];
+      for (int inner = 0; inner < physical_variables; ++inner) {
+        const Scalar offset =
+            inner < s.n ? current.t[inner] : cp.y[inner - s.n];
+        value += StageHessianEntry(s, row, inner) * offset;
+      }
+      gradient[row] = value;
     }
-    for (int u = 0; u < s.m; ++u) {
-      Scalar gu = s.r[u];
-      for (int x = 0; x < s.n; ++x)
-        gu += s.M[x * s.m + u] * current.t[x];
-      for (int v = 0; v < s.m; ++v)
-        gu += s.R[u * s.m + v] * cp.y[v];
-      value += cp.Y[u * cp.state_dim + z] * gu;
+    WarpSynchronize();
+    for (int col = threadIdx.x; col < rs.n; col += blockDim.x) {
+      Scalar value = Scalar{0};
+      for (int row = 0; row < physical_variables; ++row) {
+        value +=
+            StageReductionMapEntry(s, current, cp, row, col) * gradient[row];
+      }
+      rs.q[col] = value;
     }
-    rs.q[z] = value;
-  }
-  for (int v = threadIdx.x; v < rs.m; v += blockDim.x) {
-    Scalar value = Scalar{0};
-    for (int u = 0; u < s.m; ++u) {
-      Scalar gu = s.r[u];
-      for (int x = 0; x < s.n; ++x)
-        gu += s.M[x * s.m + u] * current.t[x];
-      for (int w = 0; w < s.m; ++w)
-        gu += s.R[u * s.m + w] * cp.y[w];
-      value += cp.Z[u * cp.reduced_dim + v] * gu;
+    for (int col = threadIdx.x; col < rs.m; col += blockDim.x) {
+      Scalar value = Scalar{0};
+      for (int row = 0; row < physical_variables; ++row) {
+        value += StageReductionMapEntry(s, current, cp, row, rs.n + col) *
+                 gradient[row];
+      }
+      rs.r[col] = value;
     }
-    rs.r[v] = value;
   }
 }
 
@@ -7636,30 +7841,51 @@ __global__ void ReduceTerminalKernel(const PackedTerminal *terminal_ptr,
   const StateParam &param = state_params[terminal_index];
   if (threadIdx.x == 0)
     reduced->n = param.reduced_dim;
+  ScratchSize scratch_size;
+  scratch_size.Add<Scalar>(static_cast<std::size_t>(terminal.n) *
+                           param.reduced_dim);
+  CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
+  Scalar *hessian_times_map = scratch.Take<Scalar>(
+      static_cast<std::size_t>(terminal.n) * param.reduced_dim);
+  if (param.reduced_dim == 0)
+    return;
+  for (int linear = threadIdx.x; linear < terminal.n * param.reduced_dim;
+       linear += blockDim.x) {
+    const int row = linear / param.reduced_dim;
+    const int col = linear % param.reduced_dim;
+    Scalar value = Scalar{0};
+    for (int inner = 0; inner < terminal.n; ++inner) {
+      value += terminal.Q[row * terminal.n + inner] *
+               param.T[inner * param.reduced_dim + col];
+    }
+    hessian_times_map[linear] = value;
+  }
+  WarpSynchronize();
   for (int linear = threadIdx.x; linear < param.reduced_dim * param.reduced_dim;
        linear += blockDim.x) {
-    const int a = linear / param.reduced_dim;
-    const int b = linear % param.reduced_dim;
+    const int row = linear / param.reduced_dim;
+    const int col = linear % param.reduced_dim;
     Scalar value = Scalar{0};
-    for (int x = 0; x < terminal.n; ++x) {
-      for (int y = 0; y < terminal.n; ++y) {
-        value += param.T[x * param.reduced_dim + a] *
-                 terminal.Q[x * terminal.n + y] *
-                 param.T[y * param.reduced_dim + b];
-      }
+    for (int inner = 0; inner < terminal.n; ++inner) {
+      value += param.T[inner * param.reduced_dim + row] *
+               hessian_times_map[inner * param.reduced_dim + col];
     }
-    reduced->Q[a * reduced->n + b] = value;
+    reduced->Q[linear] = value;
   }
-  for (int a = threadIdx.x; a < param.reduced_dim; a += blockDim.x) {
+  WarpSynchronize();
+  Scalar *gradient = hessian_times_map;
+  for (int row = threadIdx.x; row < terminal.n; row += blockDim.x) {
+    Scalar value = terminal.q[row];
+    for (int inner = 0; inner < terminal.n; ++inner)
+      value += terminal.Q[row * terminal.n + inner] * param.t[inner];
+    gradient[row] = value;
+  }
+  WarpSynchronize();
+  for (int col = threadIdx.x; col < param.reduced_dim; col += blockDim.x) {
     Scalar value = Scalar{0};
-    for (int x = 0; x < terminal.n; ++x) {
-      Scalar gx = terminal.q[x];
-      for (int y = 0; y < terminal.n; ++y) {
-        gx += terminal.Q[x * terminal.n + y] * param.t[y];
-      }
-      value += param.T[x * param.reduced_dim + a] * gx;
-    }
-    reduced->q[a] = value;
+    for (int row = 0; row < terminal.n; ++row)
+      value += param.T[row * param.reduced_dim + col] * gradient[row];
+    reduced->q[col] = value;
   }
 }
 

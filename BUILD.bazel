@@ -440,6 +440,12 @@ py_test(
     data = ["python/jax_ffi_cuda.cu"],
 )
 
+py_test(
+    name = "cuda_dense_contraction_source_audit_test",
+    srcs = ["tests/cuda_dense_contraction_source_audit_test.py"],
+    data = ["src/cuda_solver.cu"],
+)
+
 cc_binary(
     name = "clqr_benchmark",
     srcs = ["benchmarks/clqr_benchmark.cc"],
