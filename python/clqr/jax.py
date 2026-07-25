@@ -176,12 +176,7 @@ def _expect_shape(array: np.ndarray, shape: tuple[int, ...], name: str) -> None:
 def pack_problem(
     problem: Mapping[str, Any], *, dtype: Any | None = None
 ) -> PackedProblem:
-    """Convert the native dictionary schema to a padded ``PackedProblem``.
-
-    The input schema is the same as :func:`clqr.solve`, with separate
-    ``terminal_Q`` and ``terminal_q`` fields. The returned JAX representation
-    folds them into ``factors.Q[-1]`` and ``rhs.q[-1]``.
-    """
+    """Validate and pad the canonical dictionary schema."""
 
     if not isinstance(problem, Mapping):
         raise TypeError("problem must be a mapping")
@@ -194,12 +189,24 @@ def pack_problem(
         raise TypeError("problem['stages'] must be a sequence")
     stages = list(stages_value)
 
-    terminal_Q = _array(problem.get("terminal_Q"), "terminal_Q", scalar_dtype, 2)
+    try:
+        Q_values = list(problem["Q"])
+        q_values = list(problem["q"])
+    except KeyError as error:
+        raise KeyError(f"missing required key {error.args[0]!r}") from error
+    except TypeError as error:
+        raise TypeError("problem['Q'] and problem['q'] must be sequences") from error
+    if len(Q_values) != len(stages) + 1:
+        raise ValueError("problem['Q'] must contain N + 1 entries")
+    if len(q_values) != len(stages) + 1:
+        raise ValueError("problem['q'] must contain N + 1 entries")
+
+    terminal_Q = _array(Q_values[-1], "Q[-1]", scalar_dtype, 2)
     if terminal_Q.shape[0] != terminal_Q.shape[1]:
-        raise ValueError("terminal_Q must be square")
+        raise ValueError("Q[-1] must be square")
     terminal_n = terminal_Q.shape[0]
-    terminal_q = _array(problem.get("terminal_q"), "terminal_q", scalar_dtype, 1)
-    _expect_shape(terminal_q, (terminal_n,), "terminal_q")
+    terminal_q = _array(q_values[-1], "q[-1]", scalar_dtype, 1)
+    _expect_shape(terminal_q, (terminal_n,), "q[-1]")
     terminal_E = _optional_matrix(problem, "terminal_E", (0, terminal_n), scalar_dtype)
     terminal_e = _optional_vector(
         problem, "terminal_e", terminal_E.shape[0], scalar_dtype
@@ -225,16 +232,16 @@ def pack_problem(
         next_n, n = A.shape
         m = B.shape[1]
         c = _array(stage.get("c"), f"{prefix}.c", scalar_dtype, 1)
-        Q = _array(stage.get("Q"), f"{prefix}.Q", scalar_dtype, 2)
+        Q = _array(Q_values[index], f"Q[{index}]", scalar_dtype, 2)
         R = _array(stage.get("R"), f"{prefix}.R", scalar_dtype, 2)
         M = _array(stage.get("M"), f"{prefix}.M", scalar_dtype, 2)
-        q = _array(stage.get("q"), f"{prefix}.q", scalar_dtype, 1)
+        q = _array(q_values[index], f"q[{index}]", scalar_dtype, 1)
         r = _array(stage.get("r"), f"{prefix}.r", scalar_dtype, 1)
         _expect_shape(c, (next_n,), f"{prefix}.c")
-        _expect_shape(Q, (n, n), f"{prefix}.Q")
+        _expect_shape(Q, (n, n), f"Q[{index}]")
         _expect_shape(R, (m, m), f"{prefix}.R")
         _expect_shape(M, (n, m), f"{prefix}.M")
-        _expect_shape(q, (n,), f"{prefix}.q")
+        _expect_shape(q, (n,), f"q[{index}]")
         _expect_shape(r, (m,), f"{prefix}.r")
 
         C = _optional_matrix(stage, "C", (0, n), scalar_dtype)
@@ -279,7 +286,7 @@ def pack_problem(
     if stages:
         if state_dimensions[-1] != terminal_n:
             raise ValueError(
-                "terminal_Q dimension must equal the final stage state dimension"
+                "Q[-1] dimension must equal the final stage state dimension"
             )
     else:
         state_dimensions = [terminal_n]

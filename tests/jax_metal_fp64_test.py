@@ -48,8 +48,8 @@ def test_metal_precision_contract():
     problem = {
         "initial_state": np.array([1.0], dtype=np.float64),
         "stages": [],
-        "terminal_Q": np.array([[1.0]], dtype=np.float64),
-        "terminal_q": np.array([0.0], dtype=np.float64),
+        "Q": [np.array([[1.0]], dtype=np.float64)],
+        "q": [np.array([0.0], dtype=np.float64)],
     }
     packed = clqr_jax.pack_problem(problem, dtype=np.float64)
     try:

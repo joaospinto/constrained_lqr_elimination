@@ -101,6 +101,8 @@ bool BuildProblem(const PackedProblemBuffers &packed, Problem *problem,
   }
 
   problem->stages.resize(packed.stage_count);
+  problem->Q.resize(packed.stage_count + 1);
+  problem->q.resize(packed.stage_count + 1);
   const std::size_t nx = packed.state_capacity;
   const std::size_t nu = packed.control_capacity;
   const std::size_t nc = packed.mixed_capacity;
@@ -134,10 +136,12 @@ bool BuildProblem(const PackedProblemBuffers &packed, Problem *problem,
     CopyMatrix(Offset(packed.B, matrix_control_offset), next_n, m, nu,
                &stage.B);
     CopyVector(Offset(packed.c, state_vector_offset), next_n, &stage.c);
-    CopyMatrix(Offset(packed.Q, matrix_state_offset), n, n, nx, &stage.Q);
+    CopyMatrix(Offset(packed.Q, matrix_state_offset), n, n, nx,
+               &problem->Q[stage_index]);
     CopyMatrix(Offset(packed.R, control_square_offset), m, m, nu, &stage.R);
     CopyMatrix(Offset(packed.M, matrix_control_offset), n, m, nu, &stage.M);
-    CopyVector(Offset(packed.q, state_vector_offset), n, &stage.q);
+    CopyVector(Offset(packed.q, state_vector_offset), n,
+               &problem->q[stage_index]);
     CopyVector(Offset(packed.r, control_vector_offset), m, &stage.r);
     CopyMatrix(Offset(packed.C, mixed_state_offset), mixed, n, nx, &stage.C);
     CopyMatrix(Offset(packed.D, mixed_control_offset), mixed, m, nu, &stage.D);
@@ -157,9 +161,9 @@ bool BuildProblem(const PackedProblemBuffers &packed, Problem *problem,
   const std::size_t terminal_vector_offset = packed.stage_count * nx;
   CopyVector(packed.initial_state, initial_n, &problem->initial_state);
   CopyMatrix(Offset(packed.Q, terminal_matrix_offset), terminal_n, terminal_n,
-             nx, &problem->terminal_Q);
+             nx, &problem->Q.back());
   CopyVector(Offset(packed.q, terminal_vector_offset), terminal_n,
-             &problem->terminal_q);
+             &problem->q.back());
   CopyMatrix(packed.terminal_E, terminal_constraints, terminal_n, nx,
              &problem->terminal_E);
   CopyVector(packed.terminal_e, terminal_constraints, &problem->terminal_e);
@@ -214,6 +218,8 @@ bool BuildProblemStructure(const PackedProblemBuffers &packed, Problem *problem,
   }
 
   problem->stages.resize(packed.stage_count);
+  problem->Q.resize(packed.stage_count + 1);
+  problem->q.resize(packed.stage_count + 1);
   for (std::size_t stage_index = 0; stage_index < packed.stage_count;
        ++stage_index) {
     const std::size_t n =
@@ -230,10 +236,10 @@ bool BuildProblemStructure(const PackedProblemBuffers &packed, Problem *problem,
     stage.A.resize(next_n, n);
     stage.B.resize(next_n, m);
     stage.c.resize(next_n);
-    stage.Q.resize(n, n);
+    problem->Q[stage_index].resize(n, n);
     stage.R.resize(m, m);
     stage.M.resize(n, m);
-    stage.q.resize(n);
+    problem->q[stage_index].resize(n);
     stage.r.resize(m);
     stage.C.resize(mixed, n);
     stage.D.resize(mixed, m);
@@ -248,8 +254,8 @@ bool BuildProblemStructure(const PackedProblemBuffers &packed, Problem *problem,
   const std::size_t terminal_constraints =
       static_cast<std::size_t>(packed.dimensions[terminal_constraint_offset]);
   problem->initial_state.resize(initial_n);
-  problem->terminal_Q.resize(terminal_n, terminal_n);
-  problem->terminal_q.resize(terminal_n);
+  problem->Q.back().resize(terminal_n, terminal_n);
+  problem->q.back().resize(terminal_n);
   problem->terminal_E.resize(terminal_constraints, terminal_n);
   problem->terminal_e.resize(terminal_constraints);
   return true;

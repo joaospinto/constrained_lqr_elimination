@@ -76,6 +76,36 @@ clqr::Vector ReadOptionalVector(nb::dict dict, const char* key,
   return ReadVector(value, key);
 }
 
+clqr::WorkspaceVector<clqr::Matrix> ReadMatrices(nb::handle object,
+                                                 const char* name) {
+  nb::sequence values;
+  try {
+    values = nb::cast<nb::sequence>(object);
+  } catch (const std::exception& e) {
+    throw std::runtime_error("failed to read matrix sequence '" +
+                             std::string(name) + "': " + e.what());
+  }
+  clqr::WorkspaceVector<clqr::Matrix> out;
+  out.reserve(static_cast<std::size_t>(nb::len(values)));
+  for (nb::handle value : values) out.push_back(ReadMatrix(value, name));
+  return out;
+}
+
+clqr::WorkspaceVector<clqr::Vector> ReadVectors(nb::handle object,
+                                                const char* name) {
+  nb::sequence values;
+  try {
+    values = nb::cast<nb::sequence>(object);
+  } catch (const std::exception& e) {
+    throw std::runtime_error("failed to read vector sequence '" +
+                             std::string(name) + "': " + e.what());
+  }
+  clqr::WorkspaceVector<clqr::Vector> out;
+  out.reserve(static_cast<std::size_t>(nb::len(values)));
+  for (nb::handle value : values) out.push_back(ReadVector(value, name));
+  return out;
+}
+
 clqr::Stage ReadStage(nb::handle object) {
   nb::dict dict;
   try {
@@ -88,10 +118,8 @@ clqr::Stage ReadStage(nb::handle object) {
   stage.A = ReadMatrix(Get(dict, "A"), "A");
   stage.B = ReadMatrix(Get(dict, "B"), "B");
   stage.c = ReadVector(Get(dict, "c"), "c");
-  stage.Q = ReadMatrix(Get(dict, "Q"), "Q");
   stage.R = ReadMatrix(Get(dict, "R"), "R");
   stage.M = ReadMatrix(Get(dict, "M"), "M");
-  stage.q = ReadVector(Get(dict, "q"), "q");
   stage.r = ReadVector(Get(dict, "r"), "r");
   stage.C = ReadOptionalMatrix(dict, "C", 0, stage.A.cols());
   stage.D = ReadOptionalMatrix(dict, "D", stage.C.rows(), stage.B.cols());
@@ -119,10 +147,10 @@ clqr::Problem ReadProblem(nb::handle object) {
   }
   out.stages.reserve(static_cast<std::size_t>(nb::len(stages)));
   for (nb::handle item : stages) out.stages.push_back(ReadStage(item));
-  out.terminal_Q = ReadMatrix(Get(problem, "terminal_Q"), "terminal_Q");
-  out.terminal_q = ReadVector(Get(problem, "terminal_q"), "terminal_q");
-  out.terminal_E =
-      ReadOptionalMatrix(problem, "terminal_E", 0, out.terminal_Q.rows());
+  out.Q = ReadMatrices(Get(problem, "Q"), "Q");
+  out.q = ReadVectors(Get(problem, "q"), "q");
+  const std::size_t terminal_n = out.Q.empty() ? 0 : out.Q.back().rows();
+  out.terminal_E = ReadOptionalMatrix(problem, "terminal_E", 0, terminal_n);
   out.terminal_e =
       ReadOptionalVector(problem, "terminal_e", out.terminal_E.rows());
   out.initial_state =
@@ -140,7 +168,6 @@ clqr::StageRhs ReadStageRhs(nb::handle object) {
   }
   clqr::StageRhs out;
   out.c = ReadVector(Get(stage, "c"), "c");
-  out.q = ReadVector(Get(stage, "q"), "q");
   out.r = ReadVector(Get(stage, "r"), "r");
   nb::object d = Get(stage, "d", false);
   out.d = d.is_none() ? clqr::Vector(0) : ReadVector(d, "d");
@@ -167,7 +194,7 @@ clqr::SolveRhs ReadSolveRhs(nb::handle object) {
   }
   out.stages.reserve(static_cast<std::size_t>(nb::len(stages)));
   for (nb::handle item : stages) out.stages.push_back(ReadStageRhs(item));
-  out.terminal_q = ReadVector(Get(rhs, "terminal_q"), "terminal_q");
+  out.q = ReadVectors(Get(rhs, "q"), "q");
   nb::object terminal_e = Get(rhs, "terminal_e", false);
   out.terminal_e = terminal_e.is_none() ? clqr::Vector(0)
                                         : ReadVector(terminal_e, "terminal_e");
@@ -295,11 +322,6 @@ NB_MODULE(_clqr, module) {
             rhs.c = ReadVector(value, "c");
           })
       .def_prop_rw(
-          "q", [](const clqr::StageRhs& rhs) { return VectorToNumpy(rhs.q); },
-          [](clqr::StageRhs& rhs, nb::handle value) {
-            rhs.q = ReadVector(value, "q");
-          })
-      .def_prop_rw(
           "r", [](const clqr::StageRhs& rhs) { return VectorToNumpy(rhs.r); },
           [](clqr::StageRhs& rhs, nb::handle value) {
             rhs.r = ReadVector(value, "r");
@@ -327,14 +349,26 @@ NB_MODULE(_clqr, module) {
             return rhs.stages[index];
           },
           nb::arg("index"), nb::rv_policy::reference_internal)
-      .def_prop_rw(
-          "terminal_q",
-          [](const clqr::SolveRhs& rhs) {
-            return VectorToNumpy(rhs.terminal_q);
+      .def_prop_ro("q_count",
+                   [](const clqr::SolveRhs& rhs) { return rhs.q.size(); })
+      .def(
+          "q",
+          [](const clqr::SolveRhs& rhs, std::size_t index) {
+            if (index >= rhs.q.size()) {
+              throw nb::index_error("RHS q index out of range");
+            }
+            return VectorToNumpy(rhs.q[index]);
           },
-          [](clqr::SolveRhs& rhs, nb::handle value) {
-            rhs.terminal_q = ReadVector(value, "terminal_q");
-          })
+          nb::arg("index"))
+      .def(
+          "set_q",
+          [](clqr::SolveRhs& rhs, std::size_t index, nb::handle value) {
+            if (index >= rhs.q.size()) {
+              throw nb::index_error("RHS q index out of range");
+            }
+            rhs.q[index] = ReadVector(value, "q");
+          },
+          nb::arg("index"), nb::arg("value"))
       .def_prop_rw(
           "terminal_e",
           [](const clqr::SolveRhs& rhs) {

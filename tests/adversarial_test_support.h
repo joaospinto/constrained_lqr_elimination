@@ -58,8 +58,7 @@ struct TestCase {
   Scalar kkt_tolerance_scale = Scalar{1};
 };
 
-inline SolveStatus
-CudaStatusForFp32Limitation(
+inline SolveStatus CudaStatusForFp32Limitation(
     bool affected,
     SolveStatus affected_status = SolveStatus::kNumericalFailure) {
 #ifdef CLQR_USE_FLOAT
@@ -165,6 +164,8 @@ inline Problem FeasibleProblem(int seed, std::vector<std::size_t> state_dims,
   Problem problem;
   problem.initial_state = nominal_states.front();
   problem.stages.resize(horizon);
+  problem.Q.resize(horizon + 1);
+  problem.q.resize(horizon + 1);
   for (std::size_t i = 0; i < horizon; ++i) {
     const std::size_t n = state_dims[i];
     const std::size_t next_n = state_dims[i + 1];
@@ -176,10 +177,10 @@ inline Problem FeasibleProblem(int seed, std::vector<std::size_t> state_dims,
     stage.B = GeneratedMatrix(next_n, m, seed + 400 + 13 * i, Scalar{0.19});
     stage.c = nominal_states[i + 1] - stage.A * nominal_states[i] -
               stage.B * nominal_controls[i];
-    stage.Q = PositiveDefinite(n, seed + 500 + i, Scalar{1});
+    problem.Q[i] = PositiveDefinite(n, seed + 500 + i, Scalar{1});
     stage.R = PositiveDefinite(m, seed + 600 + i, Scalar{1.3});
     stage.M = GeneratedMatrix(n, m, seed + 700 + i, Scalar{0.025});
-    stage.q =
+    problem.q[i] =
         GeneratedVector(n, seed + 800 + static_cast<int>(i), Scalar{0.12});
     stage.r =
         GeneratedVector(m, seed + 900 + static_cast<int>(i), Scalar{0.12});
@@ -225,8 +226,8 @@ inline Problem FeasibleProblem(int seed, std::vector<std::size_t> state_dims,
     }
   }
   const std::size_t terminal_n = state_dims.back();
-  problem.terminal_Q = PositiveDefinite(terminal_n, seed + 1300, Scalar{1.45});
-  problem.terminal_q = GeneratedVector(terminal_n, seed + 1400, Scalar{0.12});
+  problem.Q.back() = PositiveDefinite(terminal_n, seed + 1300, Scalar{1.45});
+  problem.q.back() = GeneratedVector(terminal_n, seed + 1400, Scalar{0.12});
   problem.terminal_E = Matrix(0, terminal_n);
   problem.terminal_e = Vector(0);
   if (rows > 0 && pattern == Pattern::kTerminal) {
@@ -263,13 +264,13 @@ inline Problem InfeasibleTerminalProblem() {
 
 inline Problem SingularReducedHessianProblem(Scalar control_diagonal) {
   Problem problem = UniformProblem(3020, 1, 1, 1, 0, Pattern::kNone);
-  problem.stages[0].Q = Matrix(1, 1, {0});
+  problem.Q[0] = Matrix(1, 1, {0});
   problem.stages[0].R = Matrix(1, 1, {control_diagonal});
   problem.stages[0].M = Matrix(1, 1, {0});
-  problem.stages[0].q = Vector{0};
+  problem.q[0] = Vector{0};
   problem.stages[0].r = Vector{control_diagonal < 0 ? Scalar{-0.2} : Scalar{0}};
-  problem.terminal_Q = Matrix(1, 1, {0});
-  problem.terminal_q = Vector{0};
+  problem.Q.back() = Matrix(1, 1, {0});
+  problem.q.back() = Vector{0};
   return problem;
 }
 
@@ -292,9 +293,9 @@ inline Problem FreeFixedFreeStateProblem() {
   constexpr int seed = 3035;
   Problem problem = UniformProblem(seed, 2, 1, 1, 0, Pattern::kNone);
   const Vector nominal_control = GeneratedVector(1, seed + 200, Scalar{0.35});
-  const Vector middle =
-      problem.stages[0].A * problem.initial_state +
-      problem.stages[0].B * nominal_control + problem.stages[0].c;
+  const Vector middle = problem.stages[0].A * problem.initial_state +
+                        problem.stages[0].B * nominal_control +
+                        problem.stages[0].c;
   problem.stages[1].E = Matrix(1, 1, {1});
   problem.stages[1].e = Vector{-middle[0]};
   return problem;
@@ -303,8 +304,8 @@ inline Problem FreeFixedFreeStateProblem() {
 inline Problem EmptyProblem() {
   Problem problem;
   problem.initial_state = Vector(0);
-  problem.terminal_Q = Matrix(0, 0);
-  problem.terminal_q = Vector(0);
+  problem.Q = {Matrix(0, 0)};
+  problem.q = {Vector(0)};
   problem.terminal_E = Matrix(0, 0);
   problem.terminal_e = Vector(0);
   return problem;
@@ -331,20 +332,19 @@ inline std::vector<TestCase> StandardCases() {
     // Keep the odd scan-boundary case well-conditioned in FP32.  Seed 27 is
     // retained separately below as an explicit numerical-limit fixture.
     const int seed = horizon == 17 ? 20 : 10 + static_cast<int>(horizon);
-    cases.push_back({"horizon-" + std::to_string(horizon),
-                     UniformProblem(seed, horizon, 3, 2, 1,
-                                    Pattern::kAlternating),
-                     SolveStatus::kOptimal, SolveStatus::kOptimal, true,
-                     horizon <= 9});
+    cases.push_back(
+        {"horizon-" + std::to_string(horizon),
+         UniformProblem(seed, horizon, 3, 2, 1, Pattern::kAlternating),
+         SolveStatus::kOptimal, SolveStatus::kOptimal, true, horizon <= 9});
   }
   // This intentionally accuracy-limited FP32 fixture uses three times the
   // ordinary KKT gate only; its primal and dense-reference gates are unchanged,
   // and stable fixtures at the same horizon retain the ordinary KKT gate.
-  cases.push_back(
-      {"ill-conditioned-horizon-17",
-       UniformProblem(27, 17, 3, 2, 1, Pattern::kAlternating),
-       SolveStatus::kOptimal, CudaStatusForFp32Limitation(true), true,
-       false, true, Scalar{1}, true, kAccuracyLimitKktToleranceScale});
+  cases.push_back({"ill-conditioned-horizon-17",
+                   UniformProblem(27, 17, 3, 2, 1, Pattern::kAlternating),
+                   SolveStatus::kOptimal, CudaStatusForFp32Limitation(true),
+                   true, false, true, Scalar{1}, true,
+                   kAccuracyLimitKktToleranceScale});
   cases.push_back(
       {"nonuniform-zero-control",
        FeasibleProblem(40, {1, 4, 2, 3}, {0, 3, 1}, 1, Pattern::kAlternating)});
@@ -364,9 +364,9 @@ inline std::vector<TestCase> StandardCases() {
   cases.push_back({"fully-constrained-nonunique-multipliers",
                    FullyConstrainedWithNonuniqueMultipliers(),
                    SolveStatus::kOptimal, SolveStatus::kOptimal, true, false});
-  cases.push_back(
-      {"free-fixed-free-state", FreeFixedFreeStateProblem(),
-       SolveStatus::kOptimal, SolveStatus::kOptimal, true, true, true});
+  cases.push_back({"free-fixed-free-state", FreeFixedFreeStateProblem(),
+                   SolveStatus::kOptimal, SolveStatus::kOptimal, true, true,
+                   true});
   cases.push_back({"infeasible-initial", InfeasibleInitialProblem(),
                    SolveStatus::kInfeasible, SolveStatus::kInfeasible, false,
                    false, false});
@@ -390,9 +390,9 @@ inline std::vector<TestCase> StandardCases() {
 inline std::vector<TestCase> ExtendedCases() {
   std::vector<TestCase> cases;
   for (std::size_t horizon : {31U, 32U, 33U, 63U, 65U, 127U, 257U, 1025U}) {
-    const bool fp32_numerical_limit =
-        horizon == 32 || horizon == 63 || horizon == 65 || horizon == 127 ||
-        horizon == 257 || horizon == 1025;
+    const bool fp32_numerical_limit = horizon == 32 || horizon == 63 ||
+                                      horizon == 65 || horizon == 127 ||
+                                      horizon == 257 || horizon == 1025;
     cases.push_back({"extended-horizon-" + std::to_string(horizon),
                      UniformProblem(200 + static_cast<int>(horizon), horizon, 3,
                                     2, 1, Pattern::kAlternating),
@@ -404,20 +404,22 @@ inline std::vector<TestCase> ExtendedCases() {
   // Retain the original generated horizons above, including their explicit
   // FP32 numerical failures, and add well-conditioned versions that must
   // complete the same scan boundaries quantitatively.
-  for (const auto& [horizon, seed] :
-       {std::pair<std::size_t, int>{32, 200}, {63, 200}, {65, 200},
-        {127, 207}, {257, 214}}) {
+  for (const auto &[horizon, seed] : {std::pair<std::size_t, int>{32, 200},
+                                      {63, 200},
+                                      {65, 200},
+                                      {127, 207},
+                                      {257, 214}}) {
     const Scalar fp32_kkt_scale =
 #ifdef CLQR_USE_FLOAT
         horizon == 257 ? Scalar{2} : Scalar{1};
 #else
         Scalar{1};
 #endif
-    cases.push_back({"stable-extended-horizon-" + std::to_string(horizon),
-                     UniformProblem(seed, horizon, 3, 2, 1,
-                                    Pattern::kAlternating),
-                     SolveStatus::kOptimal, SolveStatus::kOptimal,
-                     true, false, false, Scalar{1}, false, fp32_kkt_scale});
+    cases.push_back(
+        {"stable-extended-horizon-" + std::to_string(horizon),
+         UniformProblem(seed, horizon, 3, 2, 1, Pattern::kAlternating),
+         SolveStatus::kOptimal, SolveStatus::kOptimal, true, false, false,
+         Scalar{1}, false, fp32_kkt_scale});
   }
   // Fixed seeds make these property cases exactly reproducible.
   for (int seed = 0; seed < 32; ++seed) {
@@ -429,16 +431,15 @@ inline std::vector<TestCase> ExtendedCases() {
     const Pattern pattern =
         static_cast<Pattern>(1 + static_cast<unsigned>(seed) % 5);
     const bool fp32_numerical_limit = seed == 1 || seed == 5;
-    cases.push_back({"property-seed-" + std::to_string(seed),
-                     UniformProblem(5000 + seed, horizon, n, m, rows, pattern),
-                     SolveStatus::kOptimal,
-                     CudaStatusForFp32Limitation(
-                         fp32_numerical_limit,
-                         seed == 5 ? SolveStatus::kInfeasible
-                                   : SolveStatus::kNumericalFailure),
-                     seed < 8,
-                     horizon * (n + m) <= 30 && pattern != Pattern::kScaled,
-                     seed < 10, Scalar{1}, fp32_numerical_limit});
+    cases.push_back(
+        {"property-seed-" + std::to_string(seed),
+         UniformProblem(5000 + seed, horizon, n, m, rows, pattern),
+         SolveStatus::kOptimal,
+         CudaStatusForFp32Limitation(
+             fp32_numerical_limit, seed == 5 ? SolveStatus::kInfeasible
+                                             : SolveStatus::kNumericalFailure),
+         seed < 8, horizon * (n + m) <= 30 && pattern != Pattern::kScaled,
+         seed < 10, Scalar{1}, fp32_numerical_limit});
   }
   cases.push_back({"stable-property-seed-1",
                    UniformProblem(5003, 18, 4, 1, 2, Pattern::kMixed),
@@ -575,8 +576,8 @@ inline Scalar MaxKktResidual(const Problem &problem, const KktPoint &point,
       update(ScaledResidual(stage.E, point.states[i], stage.e),
              "state feasibility " + std::to_string(i));
     }
-    Vector state_gradient = stage.Q * point.states[i] +
-                            stage.M * point.controls[i] + stage.q -
+    Vector state_gradient = problem.Q[i] * point.states[i] +
+                            stage.M * point.controls[i] + problem.q[i] -
                             Transpose(stage.A) * point.dynamics_multipliers[i];
     state_gradient =
         state_gradient +
@@ -598,8 +599,8 @@ inline Scalar MaxKktResidual(const Problem &problem, const KktPoint &point,
                           problem.terminal_e),
            "terminal feasibility");
   }
-  Vector terminal_gradient = problem.terminal_Q * point.states.back() +
-                             problem.terminal_q +
+  Vector terminal_gradient = problem.Q.back() * point.states.back() +
+                             problem.q.back() +
                              (horizon == 0 ? point.initial_multiplier
                                            : point.dynamics_multipliers.back());
   AddTranspose(problem.terminal_E, point.terminal_state_multiplier,
@@ -662,7 +663,7 @@ inline DensePrimal SolveDenseKkt(const Problem &problem) {
   const std::size_t horizon = problem.stages.size();
   const std::vector<std::size_t> state_offsets = StateOffsets(problem);
   const std::size_t state_variables =
-      state_offsets.back() + problem.terminal_Q.rows();
+      state_offsets.back() + problem.Q.back().rows();
   std::vector<std::size_t> control_offsets(horizon);
   std::size_t variables = state_variables;
   for (std::size_t i = 0; i < horizon; ++i) {
@@ -673,11 +674,11 @@ inline DensePrimal SolveDenseKkt(const Problem &problem) {
   Vector linear(variables);
   for (std::size_t i = 0; i < horizon; ++i) {
     const Stage &stage = problem.stages[i];
-    for (std::size_t row = 0; row < stage.Q.rows(); ++row) {
-      linear[state_offsets[i] + row] += stage.q[row];
-      for (std::size_t col = 0; col < stage.Q.cols(); ++col)
+    for (std::size_t row = 0; row < problem.Q[i].rows(); ++row) {
+      linear[state_offsets[i] + row] += problem.q[i][row];
+      for (std::size_t col = 0; col < problem.Q[i].cols(); ++col)
         hessian(state_offsets[i] + row, state_offsets[i] + col) +=
-            stage.Q(row, col);
+            problem.Q[i](row, col);
     }
     for (std::size_t row = 0; row < stage.R.rows(); ++row) {
       linear[control_offsets[i] + row] += stage.r[row];
@@ -694,11 +695,11 @@ inline DensePrimal SolveDenseKkt(const Problem &problem) {
       }
     }
   }
-  for (std::size_t row = 0; row < problem.terminal_Q.rows(); ++row) {
-    linear[state_offsets.back() + row] += problem.terminal_q[row];
-    for (std::size_t col = 0; col < problem.terminal_Q.cols(); ++col)
+  for (std::size_t row = 0; row < problem.Q.back().rows(); ++row) {
+    linear[state_offsets.back() + row] += problem.q.back()[row];
+    for (std::size_t col = 0; col < problem.Q.back().cols(); ++col)
       hessian(state_offsets.back() + row, state_offsets.back() + col) +=
-          problem.terminal_Q(row, col);
+          problem.Q.back()(row, col);
   }
 
   std::vector<Vector> rows;
@@ -781,7 +782,7 @@ inline DensePrimal SolveDenseKkt(const Problem &problem) {
     for (std::size_t row = 0; row < result.controls[i].size(); ++row)
       result.controls[i][row] = solution[control_offsets[i] + row];
   }
-  result.states.back() = Vector(problem.terminal_Q.rows());
+  result.states.back() = Vector(problem.Q.back().rows());
   for (std::size_t row = 0; row < result.states.back().size(); ++row)
     result.states.back()[row] = solution[state_offsets.back() + row];
   return result;

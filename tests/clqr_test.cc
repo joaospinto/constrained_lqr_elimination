@@ -180,13 +180,13 @@ Scalar MaxKktStationarityResidual(const Problem& p, const Solution& sol) {
   Scalar residual = 0.0;
   if (N == 0) {
     Vector grad =
-        p.terminal_Q * sol.states[0] + p.terminal_q + sol.initial_multiplier;
+        p.Q.back() * sol.states[0] + p.q.back() + sol.initial_multiplier;
     Accumulate(p.terminal_E, sol.terminal_state_multiplier, &grad);
     return MaxAbsVector(grad);
   }
   for (std::size_t i = 0; i < N; ++i) {
     const Stage& s = p.stages[i];
-    Vector x_grad = s.Q * sol.states[i] + s.M * sol.controls[i] + s.q -
+    Vector x_grad = p.Q[i] * sol.states[i] + s.M * sol.controls[i] + p.q[i] -
                     Transpose(s.A) * sol.dynamics_multipliers[i];
     if (i == 0) {
       x_grad = x_grad + sol.initial_multiplier;
@@ -202,8 +202,8 @@ Scalar MaxKktStationarityResidual(const Problem& p, const Solution& sol) {
     Accumulate(s.D, sol.mixed_multipliers[i], &u_grad);
     residual = std::max(residual, MaxAbsVector(u_grad));
   }
-  Vector terminal_grad = p.terminal_Q * sol.states[N] + p.terminal_q +
-                         sol.dynamics_multipliers[N - 1];
+  Vector terminal_grad =
+      p.Q.back() * sol.states[N] + p.q.back() + sol.dynamics_multipliers[N - 1];
   Accumulate(p.terminal_E, sol.terminal_state_multiplier, &terminal_grad);
   residual = std::max(residual, MaxAbsVector(terminal_grad));
   return residual;
@@ -282,7 +282,7 @@ void AddConstraintRow(std::vector<Vector>* rows, std::vector<Scalar>* rhs,
 DenseKktSolution SolveKkt(const Problem& p) {
   const std::size_t N = p.stages.size();
   std::vector<std::size_t> xoff = StateOffsets(p);
-  std::size_t state_vars = xoff[N] + p.terminal_Q.rows();
+  std::size_t state_vars = xoff[N] + p.Q.back().rows();
   std::vector<std::size_t> uoff = ControlOffsets(p, state_vars);
   std::size_t vars = state_vars;
   for (const Stage& s : p.stages) vars += s.B.cols();
@@ -291,10 +291,10 @@ DenseKktSolution SolveKkt(const Problem& p) {
   Vector h(vars);
   for (std::size_t i = 0; i < N; ++i) {
     const Stage& s = p.stages[i];
-    for (std::size_t r = 0; r < s.Q.rows(); ++r) {
-      h[xoff[i] + r] += s.q[r];
-      for (std::size_t c = 0; c < s.Q.cols(); ++c)
-        H(xoff[i] + r, xoff[i] + c) += s.Q(r, c);
+    for (std::size_t r = 0; r < p.Q[i].rows(); ++r) {
+      h[xoff[i] + r] += p.q[i][r];
+      for (std::size_t c = 0; c < p.Q[i].cols(); ++c)
+        H(xoff[i] + r, xoff[i] + c) += p.Q[i](r, c);
     }
     for (std::size_t r = 0; r < s.R.rows(); ++r) {
       h[uoff[i] + r] += s.r[r];
@@ -308,10 +308,10 @@ DenseKktSolution SolveKkt(const Problem& p) {
       }
     }
   }
-  for (std::size_t r = 0; r < p.terminal_Q.rows(); ++r) {
-    h[xoff[N] + r] += p.terminal_q[r];
-    for (std::size_t c = 0; c < p.terminal_Q.cols(); ++c) {
-      H(xoff[N] + r, xoff[N] + c) += p.terminal_Q(r, c);
+  for (std::size_t r = 0; r < p.Q.back().rows(); ++r) {
+    h[xoff[N] + r] += p.q.back()[r];
+    for (std::size_t c = 0; c < p.Q.back().cols(); ++c) {
+      H(xoff[N] + r, xoff[N] + c) += p.Q.back()(r, c);
     }
   }
 
@@ -399,7 +399,7 @@ DenseKktSolution SolveKkt(const Problem& p) {
     for (std::size_t r = 0; r < out.u[i].size(); ++r)
       out.u[i][r] = z[uoff[i] + r];
   }
-  out.x[N] = Vector(p.terminal_Q.rows());
+  out.x[N] = Vector(p.Q.back().rows());
   for (std::size_t r = 0; r < out.x[N].size(); ++r)
     out.x[N][r] = z[xoff[N] + r];
   return out;
@@ -467,16 +467,18 @@ Problem GeneratedFeasibleProblem(int seed, std::size_t N, std::size_t n,
     u[i] = GeneratedVector(m, seed + 200 + static_cast<int>(i), 0.7);
   problem.initial_state = x[0];
   problem.stages.resize(N);
+  problem.Q.resize(N + 1);
+  problem.q.resize(N + 1);
   for (std::size_t i = 0; i < N; ++i) {
     Stage& stage = problem.stages[i];
     stage.A = GeneratedMatrix(n, n, seed + 10 * static_cast<int>(i), 0.2);
     for (std::size_t row = 0; row < n; ++row) stage.A(row, row) += 0.8;
     stage.B = GeneratedMatrix(n, m, seed + 300 + 10 * static_cast<int>(i), 0.3);
     stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
-    stage.Q = PositiveDefinite(n, seed + 400 + static_cast<int>(i), 1.0);
+    problem.Q[i] = PositiveDefinite(n, seed + 400 + static_cast<int>(i), 1.0);
     stage.R = PositiveDefinite(m, seed + 500 + static_cast<int>(i), 1.5);
     stage.M = GeneratedMatrix(n, m, seed + 600 + static_cast<int>(i), 0.05);
-    stage.q = GeneratedVector(n, seed + 700 + static_cast<int>(i), 0.3);
+    problem.q[i] = GeneratedVector(n, seed + 700 + static_cast<int>(i), 0.3);
     stage.r = GeneratedVector(m, seed + 800 + static_cast<int>(i), 0.3);
     stage.C = Matrix(0, n);
     stage.D = Matrix(0, m);
@@ -504,8 +506,8 @@ Problem GeneratedFeasibleProblem(int seed, std::size_t N, std::size_t n,
       SetStateConstraintFromNominal(&stage.E, &stage.e, x[i]);
     }
   }
-  problem.terminal_Q = PositiveDefinite(n, seed + 1200, 1.5);
-  problem.terminal_q = GeneratedVector(n, seed + 1300, 0.3);
+  problem.Q.back() = PositiveDefinite(n, seed + 1200, 1.5);
+  problem.q.back() = GeneratedVector(n, seed + 1300, 0.3);
   problem.terminal_E = Matrix(0, n);
   problem.terminal_e = Vector(0);
   if (p > 0 && mode == ConstraintMode::kTerminalState) {
@@ -520,14 +522,16 @@ Problem BaseProblem() {
   Problem p;
   p.initial_state = Vector{1.0, -0.5};
   p.stages.resize(2);
+  p.Q.resize(3);
+  p.q.resize(3);
 
   p.stages[0].A = Matrix(2, 2, {1.0, 0.2, 0.0, 1.0});
   p.stages[0].B = Matrix(2, 2, {0.0, 0.1, 1.0, 0.2});
   p.stages[0].c = Vector{0.1, -0.2};
-  p.stages[0].Q = Matrix(2, 2, {2.0, 0.1, 0.1, 1.0});
+  p.Q[0] = Matrix(2, 2, {2.0, 0.1, 0.1, 1.0});
   p.stages[0].R = Matrix(2, 2, {3.0, 0.2, 0.2, 2.0});
   p.stages[0].M = Matrix(2, 2, {0.1, -0.2, 0.0, 0.15});
-  p.stages[0].q = Vector{0.2, -0.1};
+  p.q[0] = Vector{0.2, -0.1};
   p.stages[0].r = Vector{0.3, -0.4};
   p.stages[0].C = Matrix(0, 2);
   p.stages[0].D = Matrix(0, 2);
@@ -538,10 +542,10 @@ Problem BaseProblem() {
   p.stages[1].A = Matrix(2, 2, {0.9, -0.1, 0.3, 1.1});
   p.stages[1].B = Matrix(2, 1, {0.2, 0.7});
   p.stages[1].c = Vector{-0.1, 0.05};
-  p.stages[1].Q = Matrix(2, 2, {1.5, 0.0, 0.0, 1.2});
+  p.Q[1] = Matrix(2, 2, {1.5, 0.0, 0.0, 1.2});
   p.stages[1].R = Matrix(1, 1, {2.5});
   p.stages[1].M = Matrix(2, 1, {0.05, -0.1});
-  p.stages[1].q = Vector{-0.3, 0.2};
+  p.q[1] = Vector{-0.3, 0.2};
   p.stages[1].r = Vector{0.25};
   p.stages[1].C = Matrix(0, 2);
   p.stages[1].D = Matrix(0, 1);
@@ -549,8 +553,8 @@ Problem BaseProblem() {
   p.stages[1].E = Matrix(0, 2);
   p.stages[1].e = Vector(0);
 
-  p.terminal_Q = Matrix(2, 2, {4.0, 0.2, 0.2, 3.0});
-  p.terminal_q = Vector{0.1, -0.2};
+  p.Q.back() = Matrix(2, 2, {4.0, 0.2, 0.2, 3.0});
+  p.q.back() = Vector{0.1, -0.2};
   p.terminal_E = Matrix(0, 2);
   p.terminal_e = Vector(0);
   return p;
@@ -650,12 +654,12 @@ void ReusableFactorizationSolvesNewRightHandSides() {
   Problem changed = original;
   changed.initial_state = Vector{-0.75, 0.9};
   changed.stages[0].c = Vector{-0.2, 0.35};
-  changed.stages[0].q = Vector{-0.4, 0.6};
+  changed.q[0] = Vector{-0.4, 0.6};
   changed.stages[0].r = Vector{0.15, -0.25};
   changed.stages[1].c = Vector{0.3, -0.1};
-  changed.stages[1].q = Vector{0.45, -0.55};
+  changed.q[1] = Vector{0.45, -0.55};
   changed.stages[1].r = Vector{-0.35};
-  changed.terminal_q = Vector{0.8, -0.65};
+  changed.q.back() = Vector{0.8, -0.65};
   const Solution changed_factored = CopySolutionView(
       clqr::Solve(factorization, clqr::ExtractRhs(changed), workspace));
   const Solution changed_reference = SolveWithWorkspace(changed);
@@ -709,9 +713,9 @@ void ReusableFactorizationSolvesNewRightHandSides() {
 
   Problem zero_horizon;
   zero_horizon.initial_state = Vector{Scalar{0.4}, Scalar{-0.6}};
-  zero_horizon.terminal_Q =
-      Matrix(2, 2, {Scalar{2}, Scalar{0.1}, Scalar{0.1}, Scalar{3}});
-  zero_horizon.terminal_q = Vector{Scalar{-0.2}, Scalar{0.3}};
+  zero_horizon.Q = {
+      Matrix(2, 2, {Scalar{2}, Scalar{0.1}, Scalar{0.1}, Scalar{3}})};
+  zero_horizon.q = {Vector{Scalar{-0.2}, Scalar{0.3}}};
   zero_horizon.terminal_E = Matrix(0, 2);
   zero_horizon.terminal_e = Vector(0);
   clqr::Factorization zero_factorization = clqr::Factor(zero_horizon);
@@ -735,6 +739,8 @@ void ReusableFactorizationHandlesChangingAndZeroDimensions() {
   Problem problem;
   problem.initial_state = Vector{Scalar{0.2}, Scalar{-0.4}};
   problem.stages.resize(2);
+  problem.Q.resize(3);
+  problem.q.resize(3);
 
   Stage& first = problem.stages[0];
   first.A = Matrix(3, 2,
@@ -742,10 +748,11 @@ void ReusableFactorizationHandlesChangingAndZeroDimensions() {
                     Scalar{-0.2}, Scalar{0.3}});
   first.B = Matrix(3, 0);
   first.c = Vector{Scalar{0.1}, Scalar{-0.2}, Scalar{0.05}};
-  first.Q = Matrix(2, 2, {Scalar{1.5}, Scalar{0.1}, Scalar{0.1}, Scalar{2}});
+  problem.Q[0] =
+      Matrix(2, 2, {Scalar{1.5}, Scalar{0.1}, Scalar{0.1}, Scalar{2}});
   first.R = Matrix(0, 0);
   first.M = Matrix(2, 0);
-  first.q = Vector{Scalar{0.2}, Scalar{-0.3}};
+  problem.q[0] = Vector{Scalar{0.2}, Scalar{-0.3}};
   first.r = Vector(0);
   first.C = Matrix(0, 2);
   first.D = Matrix(0, 0);
@@ -757,14 +764,15 @@ void ReusableFactorizationHandlesChangingAndZeroDimensions() {
   second.A = Matrix(1, 3, {Scalar{0.4}, Scalar{-0.2}, Scalar{0.7}});
   second.B = Matrix(1, 2, {Scalar{0.3}, Scalar{-0.5}});
   second.c = Vector{Scalar{-0.1}};
-  second.Q = Matrix(3, 3,
-                    {Scalar{1}, Scalar{0}, Scalar{0}, Scalar{0}, Scalar{1.2},
-                     Scalar{0.1}, Scalar{0}, Scalar{0.1}, Scalar{1.4}});
+  problem.Q[1] =
+      Matrix(3, 3,
+             {Scalar{1}, Scalar{0}, Scalar{0}, Scalar{0}, Scalar{1.2},
+              Scalar{0.1}, Scalar{0}, Scalar{0.1}, Scalar{1.4}});
   second.R = Matrix(2, 2, {Scalar{2}, Scalar{0.2}, Scalar{0.2}, Scalar{1.5}});
   second.M = Matrix(3, 2,
                     {Scalar{0.1}, Scalar{0}, Scalar{-0.05}, Scalar{0.03},
                      Scalar{0.02}, Scalar{-0.04}});
-  second.q = Vector{Scalar{0.1}, Scalar{-0.2}, Scalar{0.3}};
+  problem.q[1] = Vector{Scalar{0.1}, Scalar{-0.2}, Scalar{0.3}};
   second.r = Vector{Scalar{-0.15}, Scalar{0.25}};
   second.C = Matrix(0, 3);
   second.D = Matrix(0, 2);
@@ -772,8 +780,8 @@ void ReusableFactorizationHandlesChangingAndZeroDimensions() {
   second.E = Matrix(0, 3);
   second.e = Vector(0);
 
-  problem.terminal_Q = Matrix(1, 1, {Scalar{2.5}});
-  problem.terminal_q = Vector{Scalar{-0.35}};
+  problem.Q.back() = Matrix(1, 1, {Scalar{2.5}});
+  problem.q.back() = Vector{Scalar{-0.35}};
   problem.terminal_E = Matrix(0, 1);
   problem.terminal_e = Vector(0);
 
@@ -897,21 +905,23 @@ void WrongInertiaReportedWithCandidate() {
   Problem p;
   p.initial_state = Vector{0.0};
   p.stages.resize(1);
+  p.Q.resize(2);
+  p.q.resize(2);
   p.stages[0].A = Matrix(1, 1, {1.0});
   p.stages[0].B = Matrix(1, 1, {1.0});
   p.stages[0].c = Vector{0.0};
-  p.stages[0].Q = Matrix(1, 1, {0.0});
+  p.Q[0] = Matrix(1, 1, {0.0});
   p.stages[0].R = Matrix(1, 1, {-1.0});
   p.stages[0].M = Matrix(1, 1, {0.0});
-  p.stages[0].q = Vector{0.0};
+  p.q[0] = Vector{0.0};
   p.stages[0].r = Vector{-2.0};
   p.stages[0].C = Matrix(0, 1);
   p.stages[0].D = Matrix(0, 1);
   p.stages[0].d = Vector(0);
   p.stages[0].E = Matrix(0, 1);
   p.stages[0].e = Vector(0);
-  p.terminal_Q = Matrix(1, 1, {0.0});
-  p.terminal_q = Vector{0.0};
+  p.Q.back() = Matrix(1, 1, {0.0});
+  p.q.back() = Vector{0.0};
   p.terminal_E = Matrix(0, 1);
   p.terminal_e = Vector(0);
 
@@ -922,9 +932,9 @@ void WrongInertiaReportedWithCandidate() {
   Problem changed = p;
   changed.initial_state = Vector{Scalar{0.25}};
   changed.stages[0].c = Vector{Scalar{-0.5}};
-  changed.stages[0].q = Vector{Scalar{0.75}};
+  changed.q[0] = Vector{Scalar{0.75}};
   changed.stages[0].r = Vector{Scalar{1.25}};
-  changed.terminal_q = Vector{Scalar{-0.4}};
+  changed.q.back() = Vector{Scalar{-0.4}};
   Workspace workspace;
   workspace.Reserve(factorization);
   const Solution factored = CopySolutionView(
@@ -947,22 +957,24 @@ void ReusablePivotedFactorMatchesOrdinarySolve() {
   Problem problem;
   problem.initial_state = Vector{Scalar{0.4}};
   problem.stages.resize(1);
+  problem.Q.resize(2);
+  problem.q.resize(2);
   Stage& stage = problem.stages[0];
   stage.A = Matrix(1, 1, {Scalar{0.8}});
   stage.B = Matrix(1, 2, {Scalar{0.2}, Scalar{-0.3}});
   stage.c = Vector{Scalar{0.1}};
-  stage.Q = Matrix(1, 1, {Scalar{1.2}});
+  problem.Q[0] = Matrix(1, 1, {Scalar{1.2}});
   stage.R = Matrix(2, 2, {Scalar{0}, Scalar{1}, Scalar{1}, Scalar{0}});
   stage.M = Matrix(1, 2, {Scalar{0.5}, Scalar{-0.25}});
-  stage.q = Vector{Scalar{-0.2}};
+  problem.q[0] = Vector{Scalar{-0.2}};
   stage.r = Vector{Scalar{0.3}, Scalar{-0.6}};
   stage.C = Matrix(0, 1);
   stage.D = Matrix(0, 2);
   stage.d = Vector(0);
   stage.E = Matrix(0, 1);
   stage.e = Vector(0);
-  problem.terminal_Q = Matrix(1, 1, {Scalar{0}});
-  problem.terminal_q = Vector{Scalar{0}};
+  problem.Q.back() = Matrix(1, 1, {Scalar{0}});
+  problem.q.back() = Vector{Scalar{0}};
   problem.terminal_E = Matrix(0, 1);
   problem.terminal_e = Vector(0);
 
@@ -987,7 +999,7 @@ void ReusablePivotedFactorMatchesOrdinarySolve() {
 
 void ReusableFactorizationRejectsNonfiniteInputs() {
   Problem problem = BaseProblem();
-  problem.stages[0].Q(0, 0) = std::numeric_limits<Scalar>::quiet_NaN();
+  problem.Q[0](0, 0) = std::numeric_limits<Scalar>::quiet_NaN();
   clqr::Factorization nonfinite_matrix = clqr::Factor(problem);
   Expect(nonfinite_matrix.status() == SolveStatus::kInvalidInput,
          "nonfinite factor matrix status");
@@ -1014,7 +1026,6 @@ void ReusableFactorizationRejectsNonfiniteInputs() {
          "nonfinite factored RHS status");
   Expect(std::string(nonfinite_rhs.message).find("finite") != std::string::npos,
          "nonfinite factored RHS message");
-
 }
 
 void MovedFromFactorizationIsSafe() {
@@ -1041,21 +1052,23 @@ void SingularReducedHessianReported() {
   Problem p;
   p.initial_state = Vector{0.0};
   p.stages.resize(1);
+  p.Q.resize(2);
+  p.q.resize(2);
   p.stages[0].A = Matrix(1, 1, {1.0});
   p.stages[0].B = Matrix(1, 1, {1.0});
   p.stages[0].c = Vector{0.0};
-  p.stages[0].Q = Matrix(1, 1, {0.0});
+  p.Q[0] = Matrix(1, 1, {0.0});
   p.stages[0].R = Matrix(1, 1, {0.0});
   p.stages[0].M = Matrix(1, 1, {0.0});
-  p.stages[0].q = Vector{0.0};
+  p.q[0] = Vector{0.0};
   p.stages[0].r = Vector{0.0};
   p.stages[0].C = Matrix(0, 1);
   p.stages[0].D = Matrix(0, 1);
   p.stages[0].d = Vector(0);
   p.stages[0].E = Matrix(0, 1);
   p.stages[0].e = Vector(0);
-  p.terminal_Q = Matrix(1, 1, {0.0});
-  p.terminal_q = Vector{0.0};
+  p.Q.back() = Matrix(1, 1, {0.0});
+  p.q.back() = Vector{0.0};
   p.terminal_E = Matrix(0, 1);
   p.terminal_e = Vector(0);
 
@@ -1176,14 +1189,13 @@ void IndependentlyRescaledConstraintsAreInvariant() {
 
 void FullRankRescaledMixedRowsRemainActive() {
   Problem reference_problem =
-      GeneratedFeasibleProblem(1901, 5, 4, 3, 3,
-                               ConstraintMode::kFullMixed);
+      GeneratedFeasibleProblem(1901, 5, 4, 3, 3, ConstraintMode::kFullMixed);
   Problem scaled_problem = reference_problem;
-  for (std::size_t stage_index = 0;
-       stage_index < scaled_problem.stages.size(); ++stage_index) {
+  for (std::size_t stage_index = 0; stage_index < scaled_problem.stages.size();
+       ++stage_index) {
     Stage& stage = scaled_problem.stages[stage_index];
-    const Scalar scales[3] = {
-        kSmallConstraintScale, Scalar{-1}, kLargeConstraintScale};
+    const Scalar scales[3] = {kSmallConstraintScale, Scalar{-1},
+                              kLargeConstraintScale};
     for (std::size_t row = 0; row < stage.C.rows(); ++row) {
       const Scalar scale = scales[(row + stage_index) % 3];
       ScaleConstraintRow(&stage.C, &stage.d, row, scale);
@@ -1201,24 +1213,22 @@ void FullRankRescaledMixedRowsRemainActive() {
   for (std::size_t stage = 0; stage < reference.states.size(); ++stage) {
     ExpectVectorNear(scaled.states[stage], reference.states[stage],
                      kScalingInvariantTolerance,
-                     "full-rank row-scaling state " +
-                         std::to_string(stage));
+                     "full-rank row-scaling state " + std::to_string(stage));
   }
   for (std::size_t stage = 0; stage < reference.controls.size(); ++stage) {
     ExpectVectorNear(scaled.controls[stage], reference.controls[stage],
                      kScalingInvariantTolerance,
-                     "full-rank row-scaling control " +
-                         std::to_string(stage));
-    const Scalar scales[3] = {
-        kSmallConstraintScale, Scalar{-1}, kLargeConstraintScale};
-    for (std::size_t row = 0;
-         row < reference.mixed_multipliers[stage].size(); ++row) {
+                     "full-rank row-scaling control " + std::to_string(stage));
+    const Scalar scales[3] = {kSmallConstraintScale, Scalar{-1},
+                              kLargeConstraintScale};
+    for (std::size_t row = 0; row < reference.mixed_multipliers[stage].size();
+         ++row) {
       const Scalar recovered =
           scales[(row + stage) % 3] * scaled.mixed_multipliers[stage][row];
       ExpectNear(recovered, reference.mixed_multipliers[stage][row],
                  Scalar{32} * kMultiplierScalingInvariantTolerance,
-                 "full-rank row-scaling multiplier " +
-                     std::to_string(stage) + ":" + std::to_string(row));
+                 "full-rank row-scaling multiplier " + std::to_string(stage) +
+                     ":" + std::to_string(row));
     }
   }
   ExpectNear(MaxKktStationarityResidual(scaled_problem, scaled), Scalar{0},
@@ -1230,22 +1240,24 @@ Problem EssentialSingleRowProblem(bool terminal_constraint, Scalar scale) {
   Problem problem;
   problem.initial_state = Vector{Scalar{1}};
   problem.stages.resize(1);
+  problem.Q.resize(2);
+  problem.q.resize(2);
   Stage& stage = problem.stages[0];
   stage.A = Matrix(1, 1, {Scalar{1}});
   stage.B = Matrix(1, 1, {Scalar{1}});
   stage.c = Vector{Scalar{0}};
-  stage.Q = Matrix(1, 1, {Scalar{1}});
+  problem.Q[0] = Matrix(1, 1, {Scalar{1}});
   stage.R = Matrix(1, 1, {Scalar{1}});
   stage.M = Matrix(1, 1, {Scalar{0}});
-  stage.q = Vector{Scalar{0}};
+  problem.q[0] = Vector{Scalar{0}};
   stage.r = Vector{Scalar{0}};
   stage.C = Matrix(0, 1);
   stage.D = Matrix(0, 1);
   stage.d = Vector(0);
   stage.E = Matrix(0, 1);
   stage.e = Vector(0);
-  problem.terminal_Q = Matrix(1, 1, {Scalar{1}});
-  problem.terminal_q = Vector{Scalar{0}};
+  problem.Q.back() = Matrix(1, 1, {Scalar{1}});
+  problem.q.back() = Vector{Scalar{0}};
   problem.terminal_E = Matrix(0, 1);
   problem.terminal_e = Vector(0);
   if (terminal_constraint) {
@@ -1266,22 +1278,24 @@ Problem ExtremeFiniteRowProblem(bool terminal_constraint, Scalar scale,
   Problem problem;
   problem.initial_state = Vector{Scalar{0}};
   problem.stages.resize(1);
+  problem.Q.resize(2);
+  problem.q.resize(2);
   Stage& stage = problem.stages[0];
   stage.A = Matrix(1, 1, {Scalar{1}});
   stage.B = Matrix(1, 1, {Scalar{1}});
   stage.c = Vector{Scalar{0}};
-  stage.Q = Matrix(1, 1, {Scalar{1}});
+  problem.Q[0] = Matrix(1, 1, {Scalar{1}});
   stage.R = Matrix(1, 1, {Scalar{1}});
   stage.M = Matrix(1, 1, {Scalar{0}});
-  stage.q = Vector{Scalar{0}};
+  problem.q[0] = Vector{Scalar{0}};
   stage.r = Vector{nonzero_multiplier ? Scalar{0} : Scalar{-1}};
   stage.C = Matrix(0, 1);
   stage.D = Matrix(0, 1);
   stage.d = Vector(0);
   stage.E = Matrix(0, 1);
   stage.e = Vector(0);
-  problem.terminal_Q = Matrix(1, 1, {Scalar{0}});
-  problem.terminal_q = Vector{Scalar{0}};
+  problem.Q.back() = Matrix(1, 1, {Scalar{0}});
+  problem.q.back() = Vector{Scalar{0}};
   problem.terminal_E = Matrix(0, 1);
   problem.terminal_e = Vector(0);
   if (terminal_constraint) {

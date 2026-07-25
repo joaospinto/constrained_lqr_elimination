@@ -223,8 +223,7 @@ struct ScratchSize {
   }
 };
 
-__host__ __device__ std::size_t
-AffineTermsScratchBytes(std::size_t entries) {
+__host__ __device__ std::size_t AffineTermsScratchBytes(std::size_t entries) {
   ScratchSize scratch_size;
   scratch_size.Add<Scalar>(SharedScalarEntries(entries));
   return scratch_size.bytes;
@@ -239,8 +238,8 @@ DualRelationLeafScratchBytes(std::size_t matrix_entries, std::size_t rows,
   scratch_size.Add<Scalar>(rows);
   scratch_size.Add<Scalar>(state_constraints);
   scratch_size.Add<int>(rows);
-  scratch_size.Add<int>(
-      rows > coefficient_columns ? rows : coefficient_columns);
+  scratch_size.Add<int>(rows > coefficient_columns ? rows
+                                                   : coefficient_columns);
   return scratch_size.bytes;
 }
 
@@ -701,7 +700,7 @@ ScratchRequirements PlanScratch(const Problem &problem) {
         std::max(result.dual_parameter, dual_parameter.bytes);
   }
 
-  const std::size_t terminal_n = problem.terminal_Q.rows();
+  const std::size_t terminal_n = problem.Q.back().rows();
   result.terminal_reduction = StageHessianTransformScratchBytes(
       terminal_n, terminal_n, "terminal Hessian workspace");
   state_bounds.back() = terminal_n;
@@ -872,7 +871,7 @@ std::vector<int> BuildStructureKey(const Problem &problem) {
   std::vector<int> key;
   key.reserve(5 * problem.stages.size() + 3);
   key.push_back(static_cast<int>(problem.initial_state.size()));
-  key.push_back(static_cast<int>(problem.terminal_Q.rows()));
+  key.push_back(static_cast<int>(problem.Q.back().rows()));
   key.push_back(static_cast<int>(problem.terminal_E.rows()));
   for (const Stage &stage : problem.stages) {
     key.push_back(static_cast<int>(stage.A.cols()));
@@ -3261,6 +3260,8 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
           "CUDA tolerance must be finite and positive");
   Require(options.device >= 0, "CUDA device index must be nonnegative");
   const std::size_t count = problem.stages.size();
+  Require(problem.Q.size() == count + 1, "Q must contain N + 1 entries");
+  Require(problem.q.size() == count + 1, "q must contain N + 1 entries");
   bool structure_matches =
       structure_key.size() ==
       ScratchCheckedSum(
@@ -3275,7 +3276,7 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
     ++key_index;
   };
   match_dimension(problem.initial_state.size());
-  match_dimension(problem.terminal_Q.rows());
+  match_dimension(problem.Q.back().rows());
   match_dimension(problem.terminal_E.rows());
   Require(count < static_cast<std::size_t>(std::numeric_limits<int>::max()),
           "too many stages for CUDA indices");
@@ -3285,14 +3286,14 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
               BalancedTreeNodeCount(std::max<std::size_t>(count, 1)) <=
                   kMaxTreeIndex,
           "too many stages for CUDA tree indices");
-  Require(problem.terminal_Q.rows() == problem.terminal_Q.cols(),
-          "terminal_Q must be square");
-  Require(problem.terminal_Q.rows() <=
+  Require(problem.Q.back().rows() == problem.Q.back().cols(),
+          "Q terminal entry must be square");
+  Require(problem.Q.back().rows() <=
               static_cast<std::size_t>(std::numeric_limits<int>::max()),
           "terminal state dimension exceeds CUDA index range");
-  Require(problem.terminal_q.size() == problem.terminal_Q.rows(),
-          "terminal_q shape mismatch");
-  Require(problem.terminal_E.cols() == problem.terminal_Q.rows(),
+  Require(problem.q.back().size() == problem.Q.back().rows(),
+          "q terminal entry shape mismatch");
+  Require(problem.terminal_E.cols() == problem.Q.back().rows(),
           "terminal_E shape mismatch");
   Require(problem.terminal_E.rows() <=
               static_cast<std::size_t>(std::numeric_limits<int>::max()),
@@ -3300,13 +3301,13 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
   Require(problem.terminal_e.size() == problem.terminal_E.rows(),
           "terminal_e shape mismatch");
   if (validate_values) {
-    Require(Finite(problem.terminal_Q) && Finite(problem.terminal_q) &&
+    Require(Finite(problem.Q.back()) && Finite(problem.q.back()) &&
                 Finite(problem.terminal_E) && Finite(problem.terminal_e) &&
                 Finite(problem.initial_state),
             "problem contains a non-finite terminal or initial value");
   }
   if (count == 0) {
-    Require(problem.initial_state.size() == problem.terminal_Q.rows(),
+    Require(problem.initial_state.size() == problem.Q.back().rows(),
             "initial_state and terminal state dimensions differ");
     return structure_matches;
   }
@@ -3358,7 +3359,8 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
     }
     RequireAtStage(s.B.rows() == next && s.c.size() == next,
                    "dynamics shape mismatch", i);
-    RequireAtStage(s.Q.rows() == n && s.Q.cols() == n && s.q.size() == n,
+    RequireAtStage(problem.Q[i].rows() == n && problem.Q[i].cols() == n &&
+                       problem.q[i].size() == n,
                    "state-cost shape mismatch", i);
     RequireAtStage(s.R.rows() == m && s.R.cols() == m && s.r.size() == m,
                    "control-cost shape mismatch", i);
@@ -3370,15 +3372,16 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
     RequireAtStage(s.E.cols() == n && s.e.size() == s.E.rows(),
                    "state-constraint shape mismatch", i);
     const std::size_t expected_next = i + 1 == count
-                                          ? problem.terminal_Q.rows()
+                                          ? problem.Q.back().rows()
                                           : problem.stages[i + 1].A.cols();
     RequireAtStage(next == expected_next, "neighboring state dimensions differ",
                    i);
     if (validate_values) {
-      RequireAtStage(Finite(s.A) && Finite(s.B) && Finite(s.c) && Finite(s.Q) &&
-                         Finite(s.R) && Finite(s.M) && Finite(s.q) &&
-                         Finite(s.r) && Finite(s.C) && Finite(s.D) &&
-                         Finite(s.d) && Finite(s.E) && Finite(s.e),
+      RequireAtStage(Finite(s.A) && Finite(s.B) && Finite(s.c) &&
+                         Finite(problem.Q[i]) && Finite(s.R) && Finite(s.M) &&
+                         Finite(problem.q[i]) && Finite(s.r) && Finite(s.C) &&
+                         Finite(s.D) && Finite(s.d) && Finite(s.E) &&
+                         Finite(s.e),
                      "problem contains a non-finite value", i);
     }
   }
@@ -3428,9 +3431,9 @@ bool PackVector(const Vector &source, Scalar **host_cursor, Scalar *host_end,
                      device_cursor, target, validate_values);
 }
 
-bool PackStage(const Stage &source, Scalar **host_cursor, Scalar *host_end,
-               Scalar **device_cursor, PackedStage *out, bool validate_values,
-               bool bind_metadata) {
+bool PackStage(const Stage &source, const Matrix &Q, const Vector &q,
+               Scalar **host_cursor, Scalar *host_end, Scalar **device_cursor,
+               PackedStage *out, bool validate_values, bool bind_metadata) {
   if (bind_metadata) {
     out->n = static_cast<int>(source.A.cols());
     out->next_n = static_cast<int>(source.A.rows());
@@ -3448,14 +3451,14 @@ bool PackStage(const Stage &source, Scalar **host_cursor, Scalar *host_end,
                        target(&out->B), validate_values);
   finite &= PackVector(source.c, host_cursor, host_end, device_cursor,
                        target(&out->c), validate_values);
-  finite &= PackMatrix(source.Q, host_cursor, host_end, device_cursor,
-                       target(&out->Q), validate_values);
+  finite &= PackMatrix(Q, host_cursor, host_end, device_cursor, target(&out->Q),
+                       validate_values);
   finite &= PackMatrix(source.R, host_cursor, host_end, device_cursor,
                        target(&out->R), validate_values);
   finite &= PackMatrix(source.M, host_cursor, host_end, device_cursor,
                        target(&out->M), validate_values);
-  finite &= PackVector(source.q, host_cursor, host_end, device_cursor,
-                       target(&out->q), validate_values);
+  finite &= PackVector(q, host_cursor, host_end, device_cursor, target(&out->q),
+                       validate_values);
   finite &= PackVector(source.r, host_cursor, host_end, device_cursor,
                        target(&out->r), validate_values);
   finite &= PackMatrix(source.C, host_cursor, host_end, device_cursor,
@@ -3475,16 +3478,16 @@ bool PackTerminal(const Problem &problem, Scalar **host_cursor,
                   Scalar *host_end, Scalar **device_cursor, PackedTerminal *out,
                   bool validate_values, bool bind_metadata) {
   if (bind_metadata) {
-    out->n = static_cast<int>(problem.terminal_Q.rows());
+    out->n = static_cast<int>(problem.Q.back().rows());
     out->state = static_cast<int>(problem.terminal_E.rows());
   }
   auto target = [bind_metadata](const Scalar **field) {
     return bind_metadata ? field : nullptr;
   };
   bool finite = true;
-  finite &= PackMatrix(problem.terminal_Q, host_cursor, host_end, device_cursor,
+  finite &= PackMatrix(problem.Q.back(), host_cursor, host_end, device_cursor,
                        target(&out->Q), validate_values);
-  finite &= PackVector(problem.terminal_q, host_cursor, host_end, device_cursor,
+  finite &= PackVector(problem.q.back(), host_cursor, host_end, device_cursor,
                        target(&out->q), validate_values);
   finite &= PackMatrix(problem.terminal_E, host_cursor, host_end, device_cursor,
                        target(&out->E), validate_values);
@@ -3504,9 +3507,10 @@ bool PackProblemData(const Problem &problem, WorkspaceStorage *workspace,
   Scalar *device_cursor =
       bind_metadata ? workspace->device_problem_data.get() : nullptr;
   for (std::size_t index = 0; index < problem.stages.size(); ++index) {
-    if (!PackStage(problem.stages[index], &host_cursor, host_end,
-                   &device_cursor, &workspace->host_stages[index],
-                   validate_values, bind_metadata)) {
+    if (!PackStage(problem.stages[index], problem.Q[index], problem.q[index],
+                   &host_cursor, host_end, &device_cursor,
+                   &workspace->host_stages[index], validate_values,
+                   bind_metadata)) {
       return false;
     }
   }
@@ -3614,7 +3618,7 @@ CompactEntryCounts CountCompactEntries(const Problem &problem) {
     CheckedAccumulate(stage_problem_data, &counts.problem_data,
                       "packed problem data");
   }
-  const std::size_t terminal_n = problem.terminal_Q.rows();
+  const std::size_t terminal_n = problem.Q.back().rows();
   const std::size_t terminal_constraints = problem.terminal_E.rows();
   CheckedAccumulate(CheckedSum({CheckedProduct(terminal_n, terminal_n,
                                                "packed terminal data"),
@@ -3654,7 +3658,7 @@ void PrepareStageStorage(const Problem &problem, WorkspaceStorage *workspace) {
     layout_key.push_back(static_cast<int>(stage.C.rows()));
     layout_key.push_back(static_cast<int>(stage.E.rows()));
   }
-  layout_key.push_back(static_cast<int>(problem.terminal_Q.rows()));
+  layout_key.push_back(static_cast<int>(problem.Q.back().rows()));
   layout_key.push_back(static_cast<int>(problem.terminal_E.rows()));
   if (layout_key == workspace->stage_layout_key)
     return;
@@ -3674,7 +3678,7 @@ void PrepareStageStorage(const Problem &problem, WorkspaceStorage *workspace) {
   };
 
   for (std::size_t node = 0; node < node_count; ++node) {
-    const std::size_t n = node == stage_count ? problem.terminal_Q.rows()
+    const std::size_t n = node == stage_count ? problem.Q.back().rows()
                                               : problem.stages[node].A.cols();
     indices(n);
     scalars(square(n)); // StateParam T.
@@ -3722,7 +3726,7 @@ void PrepareStageStorage(const Problem &problem, WorkspaceStorage *workspace) {
     scalars(rectangle(constraints, left_dual));
     scalars(rectangle(constraints, right_dual)); // StateDualParam.
   }
-  const std::size_t terminal_n = problem.terminal_Q.rows();
+  const std::size_t terminal_n = problem.Q.back().rows();
   scalars(square(terminal_n));
   scalars(terminal_n);
 
@@ -3739,7 +3743,7 @@ void PrepareStageStorage(const Problem &problem, WorkspaceStorage *workspace) {
   int *index_cursor = workspace->stage_indices.get();
 
   for (std::size_t node = 0; node < node_count; ++node) {
-    const std::size_t n = node == stage_count ? problem.terminal_Q.rows()
+    const std::size_t n = node == stage_count ? problem.Q.back().rows()
                                               : problem.stages[node].A.cols();
     StateParam &out = workspace->host_state_params[node];
     out = {};
@@ -3868,7 +3872,7 @@ void BuildCompactOffsets(const Problem &problem, WorkspaceStorage *workspace) {
         state_constraint[index], stage.E.rows(), "state-constraint");
   }
   state[problem.stages.size() + 1] = append_offset(
-      state[problem.stages.size()], problem.terminal_Q.rows(), "state");
+      state[problem.stages.size()], problem.Q.back().rows(), "state");
 }
 
 void PrepareOutputViews(const Problem &problem, WorkspaceStorage *workspace) {
@@ -3902,7 +3906,7 @@ void PrepareOutputViews(const Problem &problem, WorkspaceStorage *workspace) {
   workspace->state_views[stage_count] = {
       workspace->host_states.data() +
           workspace->host_state_offsets[stage_count],
-      problem.terminal_Q.rows()};
+      problem.Q.back().rows()};
 }
 
 struct ValueCapacity {
@@ -4107,7 +4111,7 @@ bool PrepareRelationStorage(const Problem &problem,
   }
   if (layout_matches) {
     layout_matches &= workspace->relation_layout_key[2 * stage_count] ==
-                          static_cast<int>(problem.terminal_Q.rows()) &&
+                          static_cast<int>(problem.Q.back().rows()) &&
                       workspace->relation_layout_key[2 * stage_count + 1] == 0;
   }
   if (layout_matches)
@@ -4121,7 +4125,7 @@ bool PrepareRelationStorage(const Problem &problem,
     key.push_back(static_cast<int>(leaves[stage].left));
     key.push_back(static_cast<int>(leaves[stage].right));
   }
-  leaves[stage_count] = MakeScanShape(problem.terminal_Q.rows(), 0);
+  leaves[stage_count] = MakeScanShape(problem.Q.back().rows(), 0);
   key.push_back(static_cast<int>(leaves[stage_count].left));
   key.push_back(0);
   std::vector<RelationCapacity> leaf_capacity;
@@ -4828,8 +4832,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         map_b.get(), stage_level_offsets.back() - stage_count);
     for (int level = static_cast<int>(stage_level_counts.size()) - 2;
          level >= 1; --level) {
-      ExpandAffineContextLevelKernel<<<stage_level_counts[level + 1],
-                                       kThreads, 0, stream>>>(
+      ExpandAffineContextLevelKernel<<<stage_level_counts[level + 1], kThreads,
+                                       0, stream>>>(
           map_b.get(), stage_level_offsets[level] - stage_count,
           stage_level_offsets[level + 1] - stage_count,
           stage_level_counts[level], stage_level_counts[level + 1],
@@ -4912,9 +4916,9 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         }
         if (stage_count > 0) {
           MatrixFeedbackKernel<<<stage_count, kThreads, scratch.feedback,
-                                 stream>>>(
-              reduced_stages.get(), value_suffix, stage_count,
-              options.tolerance, feedback.get(), device_status.get());
+                                 stream>>>(reduced_stages.get(), value_suffix,
+                                           stage_count, options.tolerance,
+                                           feedback.get(), device_status.get());
           InitializeCostateMapsKernel<<<stage_count, kThreads,
                                         scratch.affine_terms, stream>>>(
               reduced_stages.get(), value_suffix, feedback.get(), stage_count,
@@ -4925,8 +4929,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               map_a.get(), reduced_terminal.get(), reduced_state_offsets.get(),
               stage_count, workspace.reduced_value_linear.get(),
               device_status.get());
-          FinalizeFeedbackKernel<<<stage_count, kThreads,
-                                   scratch.affine_terms, stream>>>(
+          FinalizeFeedbackKernel<<<stage_count, kThreads, scratch.affine_terms,
+                                   stream>>>(
               reduced_stages.get(), value_suffix,
               workspace.reduced_value_linear.get(), reduced_state_offsets.get(),
               stage_count, feedback.get(), device_status.get());
@@ -4939,8 +4943,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   auto &controls = workspace.controls;
   AffineMap *prefix = map_a.get();
   QueueTimedKernels(
-      workspace, TimingSlot::kReconstruction, stream,
-      [] {},
+      workspace, TimingSlot::kReconstruction, stream, [] {},
       [&] {
         if (stage_count > 0) {
           InitializeAffineMapsKernel<<<stage_count, kThreads, 0, stream>>>(
@@ -5413,7 +5416,7 @@ void ValidatePaddedDeviceIo(const Problem &problem,
           "device diagnostics output must not be null");
   Require(output.objective != nullptr,
           "device objective output must not be null");
-  std::size_t maximum_state = problem.terminal_Q.rows();
+  std::size_t maximum_state = problem.Q.back().rows();
   std::size_t maximum_control = 0;
   std::size_t maximum_mixed = 0;
   std::size_t maximum_state_constraints = 0;
@@ -6138,9 +6141,9 @@ __global__ void BuildDualParameterRelationsKernel(
   const int right_dim = is_terminal ? 0 : right->free_dim;
   const int rows = state_dim;
   const int columns = state_constraints + left.free_dim + right_dim + 1;
-  const std::size_t scratch_bytes = DualRelationLeafScratchBytes(
-      static_cast<std::size_t>(rows) * columns, rows, state_constraints,
-      columns - 1);
+  const std::size_t scratch_bytes =
+      DualRelationLeafScratchBytes(static_cast<std::size_t>(rows) * columns,
+                                   rows, state_constraints, columns - 1);
   CLQR_BLOCK_SCRATCH(scratch, scratch_bytes);
   Scalar *matrix =
       scratch.Take<Scalar>(static_cast<std::size_t>(rows) * columns);
@@ -6275,10 +6278,10 @@ __global__ void BuildDualParameterRelationsKernel(
   // individual entries through RREF.
   Scalar *residual_matrix = matrix + constraint_rank * columns;
   const int residual_rows = rows - constraint_rank;
-  OrthogonalEchelonBlock(
-      residual_matrix, residual_rows, columns, columns - 1, columns - 1,
-      rank_tolerance, pivot_columns, integer_scratch, &rank, &best_row, factors,
-      &matrix_scale, kMinimumDualRelationRowScale);
+  OrthogonalEchelonBlock(residual_matrix, residual_rows, columns, columns - 1,
+                         columns - 1, rank_tolerance, pivot_columns,
+                         integer_scratch, &rank, &best_row, factors,
+                         &matrix_scale, kMinimumDualRelationRowScale);
   if (threadIdx.x == 0) {
     local_ok =
         !InconsistentRref(residual_matrix, residual_rows, columns, columns - 1,

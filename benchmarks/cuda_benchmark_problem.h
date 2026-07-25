@@ -58,31 +58,29 @@ inline Problem StateOnlyProblem(std::size_t horizon, std::size_t n,
     u[i] = GeneratedVector(m, 2000 + static_cast<int>(i), Scalar{0.4});
   problem.initial_state = x[0];
   problem.stages.resize(horizon);
+  problem.Q.resize(horizon + 1);
+  problem.q.resize(horizon + 1);
   for (std::size_t i = 0; i < horizon; ++i) {
     Stage& stage = problem.stages[i];
-    stage.A = GeneratedMatrix(n, n, 3000 + static_cast<int>(i),
-                              Scalar{0.08});
+    stage.A = GeneratedMatrix(n, n, 3000 + static_cast<int>(i), Scalar{0.08});
     for (std::size_t row = 0; row < n; ++row) stage.A(row, row) += 0.9;
-    stage.B = GeneratedMatrix(n, m, 4000 + static_cast<int>(i),
-                              Scalar{0.15});
+    stage.B = GeneratedMatrix(n, m, 4000 + static_cast<int>(i), Scalar{0.15});
     stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
-    stage.Q = PositiveDefinite(n, 5000 + static_cast<int>(i), Scalar{1.0});
+    problem.Q[i] = PositiveDefinite(n, 5000 + static_cast<int>(i), Scalar{1.0});
     stage.R = PositiveDefinite(m, 6000 + static_cast<int>(i), Scalar{1.5});
-    stage.M = GeneratedMatrix(n, m, 7000 + static_cast<int>(i),
-                              Scalar{0.02});
-    stage.q = GeneratedVector(n, 8000 + static_cast<int>(i), Scalar{0.1});
+    stage.M = GeneratedMatrix(n, m, 7000 + static_cast<int>(i), Scalar{0.02});
+    problem.q[i] = GeneratedVector(n, 8000 + static_cast<int>(i), Scalar{0.1});
     stage.r = GeneratedVector(m, 9000 + static_cast<int>(i), Scalar{0.1});
     stage.C = Matrix(0, n);
     stage.D = Matrix(0, m);
     stage.d = Vector(0);
-    stage.E = GeneratedMatrix(p, n, 10000 + static_cast<int>(i),
-                              Scalar{0.3});
+    stage.E = GeneratedMatrix(p, n, 10000 + static_cast<int>(i), Scalar{0.3});
     stage.e = Vector(p);
     for (std::size_t row = 0; row < p; ++row)
       stage.e[row] = -RowDot(stage.E, row, x[i]);
   }
-  problem.terminal_Q = PositiveDefinite(n, 11000, Scalar{1.5});
-  problem.terminal_q = GeneratedVector(n, 12000, Scalar{0.1});
+  problem.Q.back() = PositiveDefinite(n, 11000, Scalar{1.5});
+  problem.q.back() = GeneratedVector(n, 12000, Scalar{0.1});
   problem.terminal_E = Matrix(0, n);
   problem.terminal_e = Vector(0);
   return problem;

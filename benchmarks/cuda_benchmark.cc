@@ -100,8 +100,8 @@ Scalar MaxKktResidual(const Problem &problem,
     residual = std::max(
         residual, MaxScaledStateResidual(stage.E, stage.e, solution.states[i]));
 
-    Vector gx = stage.Q * solution.states[i] + stage.M * solution.controls[i] +
-                stage.q -
+    Vector gx = problem.Q[i] * solution.states[i] +
+                stage.M * solution.controls[i] + problem.q[i] -
                 clqr::Transpose(stage.A) * solution.dynamics_multipliers[i];
     gx = gx + (i == 0 ? solution.initial_multiplier
                       : solution.dynamics_multipliers[i - 1]);
@@ -121,7 +121,7 @@ Scalar MaxKktResidual(const Problem &problem,
                                                        problem.terminal_e,
                                                        solution.states.back()));
   Vector terminal_gradient =
-      problem.terminal_Q * solution.states.back() + problem.terminal_q;
+      problem.Q.back() * solution.states.back() + problem.q.back();
   terminal_gradient =
       terminal_gradient + (horizon == 0 ? solution.initial_multiplier
                                         : solution.dynamics_multipliers.back());
@@ -151,8 +151,8 @@ clqr::cuda::Solution CopyCpuSolution(const clqr::SolutionView &view) {
   copy.states = CopyVectorViews(view.states, view.state_count);
   copy.controls = CopyVectorViews(view.controls, view.control_count);
   copy.initial_multiplier = CopyVectorView(view.initial_multiplier);
-  copy.dynamics_multipliers = CopyVectorViews(
-      view.dynamics_multipliers, view.dynamics_multiplier_count);
+  copy.dynamics_multipliers = CopyVectorViews(view.dynamics_multipliers,
+                                              view.dynamics_multiplier_count);
   copy.mixed_multipliers =
       CopyVectorViews(view.mixed_multipliers, view.mixed_multiplier_count);
   copy.state_multipliers =
@@ -363,9 +363,8 @@ int main(int argc, char **argv) {
               << Median(feasibility) << ',' << Median(reduction) << ','
               << Median(riccati) << ',' << Median(reconstruction) << ','
               << Median(multiplier) << ',' << Median(download) << ','
-              << min_reduced_n << ',' << min_reduced_m << ','
-              << std::scientific << cpu_kkt_residual << ','
-              << cuda_kkt_residual << '\n';
+              << min_reduced_n << ',' << min_reduced_m << ',' << std::scientific
+              << cpu_kkt_residual << ',' << cuda_kkt_residual << '\n';
     ++completed_horizons;
   }
   return completed_horizons == 0 ? 1 : 0;

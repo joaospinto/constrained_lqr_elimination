@@ -65,33 +65,15 @@ FP32 emulation uses the same multiplier-consistency gate and a quantitative
 gates. The deliberately duplicate-row exact-JAX
 fixture remains FP64-only; the shared redundant-row cases cover FP32.
 
-The hard generated inputs are not replaced by friendlier seeds. In particular,
-horizon-17 seed 27 has a full-rank 71-by-88 equality Jacobian and full-rank
-159-by-159 KKT matrix at the FP32 rank threshold, but the CUDA FP32 dual
-recovery rejects it on the reference build rather than returning its roughly
-`4e-1` KKT residual. Such accuracy-limit cases may either produce their
-documented safe rejection or complete and satisfy their quantitative KKT gate.
-The rejecting tree node is intentionally not prescribed: equivalent
-floating-point instruction orderings can detect the same documented
-phase/diagnostic at different nodes.
-
-With pivoted-QR constraint elimination, the same deliberately ill-conditioned
-seed has a largest observed Linux FP32 CPU state-stationarity residual of about
-`4.8e-2`. Only that fixture uses three times the ordinary FP32 KKT tolerance;
-its primal and dense-reference gates are unchanged. The same fixture-specific
-scale is applied by sequential CPU, emulation, and native CUDA. Separately
-named stable fixtures at the same scan boundaries retain the ordinary KKT
-gate except for the 257-stage FP32 emulation fixture, which permits twice the
-ordinary tolerance: direct Cholesky reuse produces a roughly `5.1e-2`
-residual there while avoiding a second factorization of every reduced control
-Hessian. FP64 must solve both sets with the ordinary gate.
-
-The original 1025-stage alternating seed is also a documented FP32
-accuracy-limit fixture. Its conditional-value interface becomes too
-ill-conditioned for a reliable pure-FP32 solve on the reference P100, so
-native CUDA may reject it as a numerical failure. An instruction ordering that
-does complete must still satisfy the ordinary quantitative KKT gate. The FP64
-expectation remains an optimal solve with the ordinary gate.
+Selected ill-conditioned FP32 fixtures may either return their documented
+numerical failure or complete and satisfy their quantitative KKT gate. The
+rejecting tree node is not prescribed because equivalent floating-point
+instruction orderings can detect the same phase and diagnostic at different
+nodes. The horizon-17 accuracy-limit fixture uses three times the ordinary
+FP32 KKT tolerance, and the stable 257-stage emulation fixture uses twice the
+ordinary tolerance. FP64 must solve these fixtures with the ordinary gate.
+The 1025-stage FP32 extended fixture is diagnostic-only; its FP64 counterpart
+must solve optimally with the ordinary gate.
 
 On a CUDA machine, run the extended native target explicitly:
 
@@ -122,8 +104,8 @@ CLQR_RUN_FP32_EXTENDED_STRESS=1 \
 bash scripts/notebook_cuda_stress.sh
 ```
 
-This opt-in contains the documented 1025-stage FP32 numerical-limit fixture.
-It does not change FP64 coverage or the standard and stable FP32 gates.
+This opt-in does not change FP64 coverage or the standard and stable FP32
+gates.
 
 The reproducible machine-report and Compute Sanitizer workflow is
 `notebooks/kaggle_cuda_stress.ipynb`.

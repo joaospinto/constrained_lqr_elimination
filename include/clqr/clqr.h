@@ -17,10 +17,8 @@ struct Stage {
   Matrix B;
   Vector c;
 
-  Matrix Q;
   Matrix R;
   Matrix M;
-  Vector q;
   Vector r;
 
   Matrix C;
@@ -33,8 +31,8 @@ struct Stage {
 
 struct Problem {
   WorkspaceVector<Stage> stages;
-  Matrix terminal_Q;
-  Vector terminal_q;
+  WorkspaceVector<Matrix> Q;
+  WorkspaceVector<Vector> q;
   Matrix terminal_E;
   Vector terminal_e;
   Vector initial_state;
@@ -42,7 +40,6 @@ struct Problem {
 
 struct StageRhs {
   Vector c;
-  Vector q;
   Vector r;
   Vector d;
   Vector e;
@@ -50,7 +47,7 @@ struct StageRhs {
 
 struct SolveRhs {
   WorkspaceVector<StageRhs> stages;
-  Vector terminal_q;
+  WorkspaceVector<Vector> q;
   Vector terminal_e;
   Vector initial_state;
 };
@@ -353,11 +350,10 @@ class Workspace {
       // Match the runtime constrained-workspace bound for the terminal-only
       // recovery path.  With no stage-proportional scratch, its dense affine
       // products and rectangular multiplier QR coexist in the arena.
-      const std::size_t local_dimension =
-          state_dim + terminal_constraints + 1;
-      bytes = AddAligned(
-          bytes, alignof(Scalar),
-          sizeof(Scalar) * 8 * local_dimension * local_dimension);
+      const std::size_t local_dimension = state_dim + terminal_constraints + 1;
+      bytes =
+          AddAligned(bytes, alignof(Scalar),
+                     sizeof(Scalar) * 8 * local_dimension * local_dimension);
     }
     bytes =
         AddAligned(bytes, alignof(Vector), sizeof(Vector) * (5 * stages + 1));

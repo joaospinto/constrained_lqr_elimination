@@ -27,18 +27,22 @@ def test_python_solve():
                 "A": np.array([[1.0]], dtype=np.float64),
                 "B": np.array([[1.0]], dtype=np.float64),
                 "c": np.array([0.0], dtype=np.float64),
-                "Q": np.array([[1.0]], dtype=np.float64),
                 "R": np.array([[2.0]], dtype=np.float64),
                 "M": np.array([[0.0]], dtype=np.float64),
-                "q": np.array([0.0], dtype=np.float64),
                 "r": np.array([0.0], dtype=np.float64),
                 "C": np.array([[1.0]], dtype=np.float64),
                 "D": np.array([[1.0]], dtype=np.float64),
                 "d": np.array([0.0], dtype=np.float64),
             }
         ],
-        "terminal_Q": np.array([[1.0]], dtype=np.float64),
-        "terminal_q": np.array([0.0], dtype=np.float64),
+        "Q": [
+            np.array([[1.0]], dtype=np.float64),
+            np.array([[1.0]], dtype=np.float64),
+        ],
+        "q": [
+            np.array([0.0], dtype=np.float64),
+            np.array([0.0], dtype=np.float64),
+        ],
     }
     result = clqr.solve(problem)
     assert result["status"] == "optimal", result
@@ -69,25 +73,29 @@ def _unconstrained_factor_problem():
                 "A": np.array([[1.0, 0.2], [0.0, 0.9]], dtype=np.float64),
                 "B": np.array([[0.1], [0.7]], dtype=np.float64),
                 "c": np.array([0.05, -0.1], dtype=np.float64),
-                "Q": np.array([[2.0, 0.1], [0.1, 1.5]], dtype=np.float64),
                 "R": np.array([[1.7]], dtype=np.float64),
                 "M": np.array([[0.05], [-0.03]], dtype=np.float64),
-                "q": np.array([0.2, -0.15], dtype=np.float64),
                 "r": np.array([0.12], dtype=np.float64),
             },
             {
                 "A": np.array([[0.95, 0.0], [0.1, 1.05]], dtype=np.float64),
                 "B": np.array([[0.3], [0.4]], dtype=np.float64),
                 "c": np.array([-0.02, 0.08], dtype=np.float64),
-                "Q": np.array([[1.4, 0.0], [0.0, 1.8]], dtype=np.float64),
                 "R": np.array([[2.2]], dtype=np.float64),
                 "M": np.array([[0.02], [0.04]], dtype=np.float64),
-                "q": np.array([-0.1, 0.25], dtype=np.float64),
                 "r": np.array([-0.2], dtype=np.float64),
             },
         ],
-        "terminal_Q": np.array([[2.5, 0.2], [0.2, 3.0]], dtype=np.float64),
-        "terminal_q": np.array([0.3, -0.35], dtype=np.float64),
+        "Q": [
+            np.array([[2.0, 0.1], [0.1, 1.5]], dtype=np.float64),
+            np.array([[1.4, 0.0], [0.0, 1.8]], dtype=np.float64),
+            np.array([[2.5, 0.2], [0.2, 3.0]], dtype=np.float64),
+        ],
+        "q": [
+            np.array([0.2, -0.15], dtype=np.float64),
+            np.array([-0.1, 0.25], dtype=np.float64),
+            np.array([0.3, -0.35], dtype=np.float64),
+        ],
     }
 
 
@@ -129,20 +137,20 @@ def test_python_reusable_factorization():
     changed = _unconstrained_factor_problem()
     changed["initial_state"] = np.array([-0.45, 0.65], dtype=np.float64)
     changed["stages"][0]["c"] = np.array([-0.2, 0.3], dtype=np.float64)
-    changed["stages"][0]["q"] = np.array([-0.4, 0.55], dtype=np.float64)
+    changed["q"][0] = np.array([-0.4, 0.55], dtype=np.float64)
     changed["stages"][0]["r"] = np.array([0.35], dtype=np.float64)
     changed["stages"][1]["c"] = np.array([0.15, -0.25], dtype=np.float64)
-    changed["stages"][1]["q"] = np.array([0.45, -0.5], dtype=np.float64)
+    changed["q"][1] = np.array([0.45, -0.5], dtype=np.float64)
     changed["stages"][1]["r"] = np.array([-0.3], dtype=np.float64)
-    changed["terminal_q"] = np.array([0.7, -0.8], dtype=np.float64)
+    changed["q"][-1] = np.array([0.7, -0.8], dtype=np.float64)
 
     solve_rhs.initial_state = changed["initial_state"]
     for index in range(2):
         stage_rhs = solve_rhs.stage(index)
         stage_rhs.c = changed["stages"][index]["c"]
-        stage_rhs.q = changed["stages"][index]["q"]
         stage_rhs.r = changed["stages"][index]["r"]
-    solve_rhs.terminal_q = changed["terminal_q"]
+        solve_rhs.set_q(index, changed["q"][index])
+    solve_rhs.set_q(2, changed["q"][-1])
     second = factors.solve(solve_rhs)
     _assert_primal_results_close(second, clqr.solve(changed))
 
@@ -152,10 +160,10 @@ def test_python_reusable_factorization():
     repeated = factors.solve(solve_rhs)
     _assert_primal_results_close(repeated, second)
 
-    solve_rhs.stage(0).q = np.zeros(1, dtype=np.float64)
+    solve_rhs.set_q(0, np.zeros(1, dtype=np.float64))
     invalid = factors.solve(solve_rhs)
     assert invalid["status"] == "invalid_input", invalid
-    assert "q shape mismatch" in invalid["message"]
+    assert "q entry shape mismatch" in invalid["message"]
 
 
 def test_python_factorization_rejects_constraints():
@@ -196,15 +204,19 @@ def test_python_factorization_reports_indefinite_factor():
                 "A": np.array([[0.8]], dtype=np.float64),
                 "B": np.array([[0.2, -0.3]], dtype=np.float64),
                 "c": np.array([0.1], dtype=np.float64),
-                "Q": np.array([[1.2]], dtype=np.float64),
                 "R": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64),
                 "M": np.array([[0.5, -0.25]], dtype=np.float64),
-                "q": np.array([-0.2], dtype=np.float64),
                 "r": np.array([0.3, -0.6], dtype=np.float64),
             }
         ],
-        "terminal_Q": np.array([[0.0]], dtype=np.float64),
-        "terminal_q": np.array([0.0], dtype=np.float64),
+        "Q": [
+            np.array([[1.2]], dtype=np.float64),
+            np.array([[0.0]], dtype=np.float64),
+        ],
+        "q": [
+            np.array([-0.2], dtype=np.float64),
+            np.array([0.0], dtype=np.float64),
+        ],
     }
     factors = clqr.factor(problem)
     factored = factors.solve(clqr.rhs(problem))
@@ -218,7 +230,7 @@ def test_python_factorization_reports_indefinite_factor():
 def test_python_factorization_rejects_nonfinite_inputs():
     clqr = _load_extension()
     nonfinite_matrix = _unconstrained_factor_problem()
-    nonfinite_matrix["stages"][0]["Q"][0, 0] = np.nan
+    nonfinite_matrix["Q"][0][0, 0] = np.nan
     try:
         clqr.factor(nonfinite_matrix)
     except ValueError as error:
@@ -269,10 +281,8 @@ def test_python_multiplier_shapes_multistage():
                 "A": A0,
                 "B": B0,
                 "c": c0,
-                "Q": np.eye(2, dtype=np.float64),
                 "R": np.array([[2.0]], dtype=np.float64),
                 "M": np.zeros((2, 1), dtype=np.float64),
-                "q": np.array([0.1, -0.1], dtype=np.float64),
                 "r": np.array([0.2], dtype=np.float64),
                 "C": C0,
                 "D": D0,
@@ -282,17 +292,23 @@ def test_python_multiplier_shapes_multistage():
                 "A": A1,
                 "B": B1,
                 "c": c1,
-                "Q": 1.2 * np.eye(2, dtype=np.float64),
                 "R": np.array([[1.5]], dtype=np.float64),
                 "M": np.zeros((2, 1), dtype=np.float64),
-                "q": np.array([0.0, 0.2], dtype=np.float64),
                 "r": np.array([-0.1], dtype=np.float64),
                 "E": E1,
                 "e": -(E1 @ x1),
             },
         ],
-        "terminal_Q": 2.0 * np.eye(2, dtype=np.float64),
-        "terminal_q": np.array([0.0, 0.0], dtype=np.float64),
+        "Q": [
+            np.eye(2, dtype=np.float64),
+            1.2 * np.eye(2, dtype=np.float64),
+            2.0 * np.eye(2, dtype=np.float64),
+        ],
+        "q": [
+            np.array([0.1, -0.1], dtype=np.float64),
+            np.array([0.0, 0.2], dtype=np.float64),
+            np.array([0.0, 0.0], dtype=np.float64),
+        ],
         "terminal_E": terminal_E,
         "terminal_e": -(terminal_E @ x2),
     }

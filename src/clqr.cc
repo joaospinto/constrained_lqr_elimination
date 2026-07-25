@@ -72,8 +72,8 @@ struct ControlMap {
 
 struct WorkingProblem {
   WorkspaceVector<Stage> stages;
-  Matrix terminal_Q;
-  Vector terminal_q;
+  WorkspaceVector<Matrix> Q;
+  WorkspaceVector<Vector> q;
   Matrix terminal_E;
   Vector terminal_e;
 };
@@ -398,8 +398,7 @@ RectangularSolve SolveMixedMultiplierOrthogonally(
       scale = std::max(scale, std::abs(stage.C(constraint, state)));
     for (std::size_t control = 0; control < stage.D.cols(); ++control)
       scale = std::max(scale, std::abs(stage.D(constraint, control)));
-    constraint_scales[constraint] =
-        scale > Scalar{0} ? scale : Scalar{1};
+    constraint_scales[constraint] = scale > Scalar{0} ? scale : Scalar{1};
   }
 
   Matrix augmented(controls, constraints + 1);
@@ -432,8 +431,7 @@ RectangularSolve SolveMixedMultiplierOrthogonally(
     out.x[constraint] =
         echelon.matrix(i, constraints) / constraint_scales[constraint];
     if (!std::isfinite(out.x[constraint])) {
-      throw NumericalFailureError(
-          "constraint multiplier is not representable");
+      throw NumericalFailureError("constraint multiplier is not representable");
     }
   }
   for (std::size_t row = out.rank; row < echelon.matrix.rows(); ++row) {
@@ -630,17 +628,20 @@ void ValidateProblem(const Problem& problem) {
   const std::size_t N = problem.stages.size();
   Check(problem.initial_state.size() > 0 || N == 0,
         "initial_state must be set");
-  Check(problem.terminal_Q.rows() == problem.terminal_Q.cols(),
-        "terminal_Q must be square");
-  Check(problem.terminal_q.size() == problem.terminal_Q.rows(),
-        "terminal_q shape mismatch");
-  Check(problem.terminal_E.cols() == problem.terminal_Q.rows(),
+  Check(problem.Q.size() == N + 1, "Q must contain N + 1 entries");
+  Check(problem.q.size() == N + 1, "q must contain N + 1 entries");
+  for (std::size_t i = 0; i <= N; ++i) {
+    Check(problem.Q[i].rows() == problem.Q[i].cols(),
+          "Q entries must be square");
+    Check(problem.q[i].size() == problem.Q[i].rows(), "q entry shape mismatch");
+  }
+  Check(problem.terminal_E.cols() == problem.Q.back().rows(),
         "terminal_E shape mismatch");
   Check(problem.terminal_e.size() == problem.terminal_E.rows(),
         "terminal_e shape mismatch");
   if (N == 0) {
-    Check(problem.initial_state.size() == problem.terminal_Q.rows(),
-          "initial_state and terminal_Q shape mismatch");
+    Check(problem.initial_state.size() == problem.Q.front().rows(),
+          "initial_state and Q[0] shape mismatch");
     return;
   }
   Check(problem.stages.front().A.cols() == problem.initial_state.size(),
@@ -652,19 +653,19 @@ void ValidateProblem(const Problem& problem) {
     const std::size_t m = s.B.cols();
     Check(s.B.rows() == next_n, "B row count must match A row count");
     Check(s.c.size() == next_n, "c shape mismatch");
-    Check(s.Q.rows() == n && s.Q.cols() == n, "Q shape mismatch");
+    Check(problem.Q[i].rows() == n && problem.Q[i].cols() == n,
+          "Q entry shape mismatch");
     Check(s.R.rows() == m && s.R.cols() == m, "R shape mismatch");
     Check(s.M.rows() == n && s.M.cols() == m, "M shape mismatch");
-    Check(s.q.size() == n, "q shape mismatch");
+    Check(problem.q[i].size() == n, "q entry shape mismatch");
     Check(s.r.size() == m, "r shape mismatch");
     Check(s.C.cols() == n, "C shape mismatch");
     Check(s.D.rows() == s.C.rows() && s.D.cols() == m, "D shape mismatch");
     Check(s.d.size() == s.C.rows(), "d shape mismatch");
     Check(s.E.cols() == n, "E shape mismatch");
     Check(s.e.size() == s.E.rows(), "e shape mismatch");
-    const std::size_t expected_next = (i + 1 == N)
-                                          ? problem.terminal_Q.rows()
-                                          : problem.stages[i + 1].A.cols();
+    const std::size_t expected_next =
+        (i + 1 == N) ? problem.Q.back().rows() : problem.stages[i + 1].A.cols();
     Check(next_n == expected_next, "neighboring stage dimensions do not match");
   }
 }
@@ -677,10 +678,10 @@ void ValidateTolerance(Scalar tolerance) {
 void ValidateFiniteProblem(const Problem& problem) {
   Check(AllFinite(problem.initial_state),
         "initial_state must contain only finite values");
-  Check(AllFinite(problem.terminal_Q),
-        "terminal_Q must contain only finite values");
-  Check(AllFinite(problem.terminal_q),
-        "terminal_q must contain only finite values");
+  for (const Matrix& Q : problem.Q)
+    Check(AllFinite(Q), "Q must contain only finite values");
+  for (const Vector& q : problem.q)
+    Check(AllFinite(q), "q must contain only finite values");
   Check(AllFinite(problem.terminal_E),
         "terminal_E must contain only finite values");
   Check(AllFinite(problem.terminal_e),
@@ -689,10 +690,8 @@ void ValidateFiniteProblem(const Problem& problem) {
     Check(AllFinite(stage.A), "A must contain only finite values");
     Check(AllFinite(stage.B), "B must contain only finite values");
     Check(AllFinite(stage.c), "c must contain only finite values");
-    Check(AllFinite(stage.Q), "Q must contain only finite values");
     Check(AllFinite(stage.R), "R must contain only finite values");
     Check(AllFinite(stage.M), "M must contain only finite values");
-    Check(AllFinite(stage.q), "q must contain only finite values");
     Check(AllFinite(stage.r), "r must contain only finite values");
     Check(AllFinite(stage.C), "C must contain only finite values");
     Check(AllFinite(stage.D), "D must contain only finite values");
@@ -707,9 +706,10 @@ Scalar Objective(const Problem& original, const WorkspaceVector<Vector>& xs,
   Scalar value = Scalar{0};
   for (std::size_t i = 0; i < original.stages.size(); ++i) {
     const Stage& s = original.stages[i];
-    for (std::size_t row = 0; row < s.Q.rows(); ++row) {
-      for (std::size_t col = 0; col < s.Q.cols(); ++col) {
-        value += Scalar{0.5} * xs[i][row] * s.Q(row, col) * xs[i][col];
+    for (std::size_t row = 0; row < original.Q[i].rows(); ++row) {
+      for (std::size_t col = 0; col < original.Q[i].cols(); ++col) {
+        value +=
+            Scalar{0.5} * xs[i][row] * original.Q[i](row, col) * xs[i][col];
       }
     }
     for (std::size_t row = 0; row < s.R.rows(); ++row) {
@@ -722,24 +722,24 @@ Scalar Objective(const Problem& original, const WorkspaceVector<Vector>& xs,
         value += xs[i][row] * s.M(row, col) * us[i][col];
       }
     }
-    value += Dot(s.q, xs[i]);
+    value += Dot(original.q[i], xs[i]);
     value += Dot(s.r, us[i]);
   }
-  for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
-    for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
-      value += Scalar{0.5} * xs.back()[row] * original.terminal_Q(row, col) *
+  for (std::size_t row = 0; row < original.Q.back().rows(); ++row) {
+    for (std::size_t col = 0; col < original.Q.back().cols(); ++col) {
+      value += Scalar{0.5} * xs.back()[row] * original.Q.back()(row, col) *
                xs.back()[col];
     }
   }
-  value += Dot(original.terminal_q, xs.back());
+  value += Dot(original.q.back(), xs.back());
   return value;
 }
 
 WorkingState Initialize(const Problem& problem) {
   WorkingState state;
   state.problem.stages = problem.stages;
-  state.problem.terminal_Q = problem.terminal_Q;
-  state.problem.terminal_q = problem.terminal_q;
+  state.problem.Q = problem.Q;
+  state.problem.q = problem.q;
   state.problem.terminal_E = problem.terminal_E;
   state.problem.terminal_e = problem.terminal_e;
 
@@ -936,12 +936,14 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
     AddIndexedDiagnostic(diagnostics,
                          "redundant mixed equality constraints at stage ", i);
   }
-  const Matrix& old_Q = s.Q;
+  Matrix& Q = state.problem.Q[i];
+  Vector& q = state.problem.q[i];
+  const Matrix old_Q = Q;
   const Matrix& old_R = s.R;
   const Matrix& old_M = s.M;
   const Matrix& old_A = s.A;
   const Matrix& old_B = s.B;
-  const Vector& old_q = s.q;
+  const Vector old_q = q;
   const Vector& old_r = s.r;
   const Vector& old_c = s.c;
   const std::size_t n = old_Q.rows();
@@ -966,10 +968,10 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
         value += old_M(col, u) * basis.Y(u, row);
         value += basis.Y(u, row) * r_times_y(u, col);
       }
-      s.Q(row, col) = value;
+      Q(row, col) = value;
     }
   }
-  SymmetrizeInPlace(s.Q);
+  SymmetrizeInPlace(Q);
 
   Matrix new_R(reduced_m, reduced_m);
   for (std::size_t row = 0; row < reduced_m; ++row) {
@@ -1001,7 +1003,7 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
       value += basis.Y(u, row) * affine_control_gradient[u];
       value += old_M(row, u) * basis.y[u];
     }
-    s.q[row] = value;
+    q[row] = value;
   }
 
   Vector new_r(reduced_m);
@@ -1113,16 +1115,14 @@ bool StateBasisIsIdentity(const AffineStateBasis& basis, Scalar tolerance) {
 void ApplyTerminalStateBasis(WorkingState& state, const AffineStateBasis& basis,
                              Scalar tolerance) {
   if (StateBasisIsIdentity(basis, tolerance)) {
-    state.problem.terminal_E = Matrix(0, state.problem.terminal_Q.rows());
+    state.problem.terminal_E = Matrix(0, state.problem.Q.back().rows());
     state.problem.terminal_e = Vector(0);
     return;
   }
-  const Matrix old_terminal_Q = state.problem.terminal_Q;
-  const Vector old_terminal_q = state.problem.terminal_q;
-  state.problem.terminal_Q =
-      Symmetrize(Transpose(basis.T) * old_terminal_Q * basis.T);
-  state.problem.terminal_q =
-      Transpose(basis.T) * (old_terminal_q + old_terminal_Q * basis.offset);
+  const Matrix old_Q = state.problem.Q.back();
+  const Vector old_q = state.problem.q.back();
+  state.problem.Q.back() = Symmetrize(Transpose(basis.T) * old_Q * basis.T);
+  state.problem.q.back() = Transpose(basis.T) * (old_q + old_Q * basis.offset);
   state.problem.terminal_E = Matrix(0, basis.T.cols());
   state.problem.terminal_e = Vector(0);
 
@@ -1192,13 +1192,13 @@ void ApplyCurrentStateBasisToStage(WorkingState& state, std::size_t i,
     return;
   }
   const Matrix old_A = s.A;
-  const Matrix old_Q = s.Q;
+  const Matrix old_Q = state.problem.Q[i];
   const Matrix old_M = s.M;
-  const Vector old_q = s.q;
+  const Vector old_q = state.problem.q[i];
 
-  s.Q = Symmetrize(Transpose(cur.T) * old_Q * cur.T);
+  state.problem.Q[i] = Symmetrize(Transpose(cur.T) * old_Q * cur.T);
   s.M = Transpose(cur.T) * old_M;
-  s.q = Transpose(cur.T) * (old_q + old_Q * cur.offset);
+  state.problem.q[i] = Transpose(cur.T) * (old_q + old_Q * cur.offset);
   s.r = s.r + Transpose(old_M) * cur.offset;
   s.A = old_A * cur.T;
   s.c = old_A * cur.offset + s.c;
@@ -1244,7 +1244,7 @@ void EliminateConstraintsRightToLeft(WorkingState& state, Scalar tolerance,
   if (state.problem.terminal_E.rows() > 0) {
     state.state_bases[N] =
         StateBasis(state.problem.terminal_E, state.problem.terminal_e,
-                   state.problem.terminal_Q.rows(), tolerance);
+                   state.problem.Q.back().rows(), tolerance);
     CheckStateBasis(state.state_bases[N], N, error, diagnostics);
     ApplyTerminalStateBasis(state, state.state_bases[N], tolerance);
   }
@@ -1621,8 +1621,8 @@ void SolveMatrixWithPivotedLuRaw(const Scalar* CLQR_RESTRICT factor,
 
 void SolveControlVectorInPlaceRaw(
     const Scalar* CLQR_RESTRICT control_factor,
-    const std::size_t* CLQR_RESTRICT control_pivots,
-    bool factor_is_cholesky, Scalar* CLQR_RESTRICT values, std::size_t m,
+    const std::size_t* CLQR_RESTRICT control_pivots, bool factor_is_cholesky,
+    Scalar* CLQR_RESTRICT values, std::size_t m,
     Scalar* CLQR_RESTRICT scratch) {
   if (!factor_is_cholesky) {
     for (std::size_t row = 0; row < m; ++row) {
@@ -1967,24 +1967,25 @@ void ValidateSolveRhs(const Factorization::Impl& factorization,
                       const SolveRhs& rhs) {
   const std::size_t N = factorization.stages.size();
   Check(rhs.stages.size() == N, "RHS stage count mismatch");
+  Check(rhs.q.size() == N + 1, "q must contain N + 1 entries");
   Check(rhs.initial_state.size() == factorization.initial_state_size,
         "initial_state shape mismatch");
-  Check(rhs.terminal_q.size() == factorization.terminal_Q.rows(),
-        "terminal_q shape mismatch");
+  Check(rhs.q.back().size() == factorization.terminal_Q.rows(),
+        "q terminal entry shape mismatch");
   Check(AllFinite(rhs.initial_state),
         "initial_state must contain only finite values");
-  Check(AllFinite(rhs.terminal_q),
-        "terminal_q must contain only finite values");
+  Check(AllFinite(rhs.q.back()),
+        "q terminal entry must contain only finite values");
   Check(rhs.terminal_e.empty(),
         "terminal_e must be empty for an unconstrained factorization");
   for (std::size_t i = 0; i < N; ++i) {
     const Factorization::Impl::StageData& factor = factorization.stages[i];
     const StageRhs& stage = rhs.stages[i];
     Check(stage.c.size() == factor.A.rows(), "c shape mismatch");
-    Check(stage.q.size() == factor.A.cols(), "q shape mismatch");
+    Check(rhs.q[i].size() == factor.A.cols(), "q entry shape mismatch");
     Check(stage.r.size() == factor.B.cols(), "r shape mismatch");
     Check(AllFinite(stage.c), "c must contain only finite values");
-    Check(AllFinite(stage.q), "q must contain only finite values");
+    Check(AllFinite(rhs.q[i]), "q must contain only finite values");
     Check(AllFinite(stage.r), "r must contain only finite values");
     Check(stage.d.empty(),
           "d must be empty for an unconstrained factorization");
@@ -1999,8 +2000,7 @@ std::size_t MatrixScalars(const Matrix& matrix) {
 
 std::size_t StageStorageScalars(const Stage& stage) {
   return MatrixScalars(stage.A) + MatrixScalars(stage.B) + stage.c.size() +
-         MatrixScalars(stage.Q) + MatrixScalars(stage.R) +
-         MatrixScalars(stage.M) + stage.q.size() + stage.r.size() +
+         MatrixScalars(stage.R) + MatrixScalars(stage.M) + stage.r.size() +
          MatrixScalars(stage.C) + MatrixScalars(stage.D) + stage.d.size() +
          MatrixScalars(stage.E) + stage.e.size();
 }
@@ -2024,11 +2024,11 @@ struct WorkspaceDimensionSummary {
 WorkspaceDimensionSummary SummarizeWorkspaceDimensions(const Problem& problem) {
   WorkspaceDimensionSummary dims;
   dims.stages = problem.stages.size();
-  dims.terminal_state = problem.terminal_Q.rows();
+  dims.terminal_state = problem.Q.back().rows();
   dims.max_terminal_rows = problem.terminal_E.rows();
   dims.max_state =
-      std::max(problem.initial_state.size(), problem.terminal_Q.rows());
-  dims.max_next_state = problem.terminal_Q.rows();
+      std::max(problem.initial_state.size(), problem.Q.back().rows());
+  dims.max_next_state = problem.Q.back().rows();
   dims.total_state = TotalStateScalars(problem);
   dims.total_control = TotalControlScalars(problem);
   dims.total_dynamics = TotalDynamicsMultiplierScalars(problem);
@@ -2075,14 +2075,18 @@ void AddWorkingProblemStorageBound(const Problem& problem,
   AddObjects<Stage>(offset, N);
   for (const Stage& stage : problem.stages)
     AddScalars(offset, StageStorageScalars(stage));
+  AddObjects<Matrix>(offset, N + 1);
+  AddObjects<Vector>(offset, N + 1);
+  for (std::size_t i = 0; i <= N; ++i) {
+    AddScalars(offset, MatrixScalars(problem.Q[i]) + problem.q[i].size());
+  }
   AddScalars(offset,
-             MatrixScalars(problem.terminal_Q) + problem.terminal_q.size() +
-                 MatrixScalars(problem.terminal_E) + problem.terminal_e.size());
+             MatrixScalars(problem.terminal_E) + problem.terminal_e.size());
 
   AddObjects<StateMap>(offset, N + 1);
   for (std::size_t i = 0; i <= N; ++i) {
     const std::size_t n =
-        (i == N) ? problem.terminal_Q.rows() : problem.stages[i].A.cols();
+        (i == N) ? problem.Q.back().rows() : problem.stages[i].A.cols();
     AddScalars(offset, n * n + n);
   }
   AddObjects<ControlMap>(offset, N);
@@ -2305,21 +2309,21 @@ SolutionWorkspaceLayout BindSolutionWorkspace(const Problem& problem,
 }
 
 bool ComputeUnconstrainedRiccatiInto(
-    const WorkspaceVector<Stage>& stages, const Matrix& terminal_Q,
-    const Vector& terminal_q, Scalar tolerance, RiccatiWorkspace* workspace,
-    NewtonKktDiagnostics* diagnostics,
+    const WorkspaceVector<Stage>& stages, const WorkspaceVector<Matrix>& Q,
+    const WorkspaceVector<Vector>& q, Scalar tolerance,
+    RiccatiWorkspace* workspace, NewtonKktDiagnostics* diagnostics,
     Factorization::Impl* factorization = nullptr, bool compute_affine = true) {
   const std::size_t N = stages.size();
   if (N == 0) return true;
   {
     Scalar* terminal_P = workspace->PPtr(N);
-    for (std::size_t i = 0; i < terminal_Q.data().size(); ++i) {
-      terminal_P[i] = terminal_Q.data()[i];
+    for (std::size_t i = 0; i < Q.back().data().size(); ++i) {
+      terminal_P[i] = Q.back().data()[i];
     }
     if (compute_affine) {
       Scalar* terminal_p = workspace->pPtr(N);
-      for (std::size_t i = 0; i < terminal_q.size(); ++i)
-        terminal_p[i] = terminal_q[i];
+      for (std::size_t i = 0; i < q.back().size(); ++i)
+        terminal_p[i] = q.back()[i];
     }
   }
   for (std::size_t rev = 0; rev < N; ++rev) {
@@ -2331,7 +2335,7 @@ bool ComputeUnconstrainedRiccatiInto(
     const Scalar* CLQR_RESTRICT P_next = workspace->PPtr(i + 1);
     const Scalar* CLQR_RESTRICT A_data = s.A.data().data();
     const Scalar* CLQR_RESTRICT B_data = s.B.data().data();
-    const Scalar* CLQR_RESTRICT Q_data = s.Q.data().data();
+    const Scalar* CLQR_RESTRICT Q_data = Q[i].data().data();
     const Scalar* CLQR_RESTRICT R_data = s.R.data().data();
     const Scalar* CLQR_RESTRICT M_data = s.M.data().data();
 
@@ -2450,7 +2454,7 @@ bool ComputeUnconstrainedRiccatiInto(
       Factorization::Impl::StageData& stage = factorization->stages[i];
       stage.A = s.A;
       stage.B = s.B;
-      stage.Q = s.Q;
+      stage.Q = Q[i];
       stage.R = s.R;
       stage.M = s.M;
       CopyRawToMatrix(P, n, n, &stage.P);
@@ -2468,7 +2472,7 @@ bool ComputeUnconstrainedRiccatiInto(
     if (compute_affine) {
       ComputeUnconstrainedAffineStageRaw(
           A_data, B_data, P_next, workspace->pPtr(i + 1), s.c.data().data(),
-          s.q.data().data(), s.r.data().data(), workspace->Hxu, control_factor,
+          q[i].data().data(), s.r.data().data(), workspace->Hxu, control_factor,
           control_pivots, factor_is_cholesky, n, next_n, m, workspace->pPtr(i),
           workspace->kPtr(i), workspace->solve_hu);
     }
@@ -2479,13 +2483,13 @@ bool ComputeUnconstrainedRiccatiInto(
 bool BuildMatrixFactors(const Problem& problem, Scalar tolerance,
                         Factorization::Impl* factorization) {
   factorization->stages.resize(problem.stages.size());
-  factorization->terminal_Q = problem.terminal_Q;
+  factorization->terminal_Q = problem.Q.back();
   RiccatiWorkspace workspace;
   workspace.Reserve(problem.stages);
   NewtonKktDiagnostics diagnostics;
-  if (!ComputeUnconstrainedRiccatiInto(
-          problem.stages, problem.terminal_Q, problem.terminal_q, tolerance,
-          &workspace, &diagnostics, factorization, false)) {
+  if (!ComputeUnconstrainedRiccatiInto(problem.stages, problem.Q, problem.q,
+                                       tolerance, &workspace, &diagnostics,
+                                       factorization, false)) {
     factorization->newton_kkt_singular = diagnostics.singular;
     factorization->newton_kkt_wrong_inertia = diagnostics.wrong_inertia;
     factorization->newton_kkt_diagnostic = JoinMessages(diagnostics.messages);
@@ -2505,8 +2509,8 @@ void RecoverUnconstrainedMultipliersInto(const Problem& original,
   const std::size_t N = original.stages.size();
   if (N == 0) {
     RecoverUnconstrainedNodeMultiplierRaw(
-        original.terminal_Q.data().data(), original.terminal_q.data().data(),
-        original.terminal_Q.rows(), out->states[0], out->initial_multiplier);
+        original.Q.front().data().data(), original.q.front().data().data(),
+        original.Q.front().rows(), out->states[0], out->initial_multiplier);
     return;
   }
   for (std::size_t node = 0; node <= N; ++node) {
@@ -2527,9 +2531,9 @@ bool SolveUnconstrainedIntoView(const Problem& problem, Scalar tolerance,
   for (std::size_t i = 0; i < problem.initial_state.size(); ++i) {
     out->states[0][i] = problem.initial_state[i];
   }
-  if (!ComputeUnconstrainedRiccatiInto(problem.stages, problem.terminal_Q,
-                                       problem.terminal_q, tolerance,
-                                       &layout->riccati, diagnostics)) {
+  if (!ComputeUnconstrainedRiccatiInto(problem.stages, problem.Q, problem.q,
+                                       tolerance, &layout->riccati,
+                                       diagnostics)) {
     out->status = SolveStatus::kNumericalFailure;
     out->message = "reduced control Hessian is not positive definite";
     out->newton_kkt_singular = diagnostics != nullptr && diagnostics->singular;
@@ -2550,15 +2554,15 @@ bool SolveUnconstrainedIntoView(const Problem& problem, Scalar tolerance,
         s.A.data().data(), s.B.data().data(), s.c.data().data(), K, k, n,
         next_n, m, out->states[i], out->controls[i], out->states[i + 1]);
     objective += UnconstrainedStageObjectiveRaw(
-        s.Q.data().data(), s.R.data().data(), s.M.data().data(),
-        s.q.data().data(), s.r.data().data(), n, m, out->states[i],
+        problem.Q[i].data().data(), s.R.data().data(), s.M.data().data(),
+        problem.q[i].data().data(), s.r.data().data(), n, m, out->states[i],
         out->controls[i]);
   }
   RecoverUnconstrainedMultipliersInto(problem, layout->riccati, out);
   const VectorView& terminal = out->states[problem.stages.size()];
-  objective += UnconstrainedTerminalObjectiveRaw(
-      problem.terminal_Q.data().data(), problem.terminal_q.data().data(),
-      terminal.size, terminal);
+  objective += UnconstrainedTerminalObjectiveRaw(problem.Q.back().data().data(),
+                                                 problem.q.back().data().data(),
+                                                 terminal.size, terminal);
   out->objective = objective;
   out->status = SolveStatus::kOptimal;
   out->message = "optimal";
@@ -2619,8 +2623,8 @@ SolutionView MakeSolutionViewFromSolution(Solution* solution,
 }
 
 ReducedSolution SolveUnconstrained(const WorkspaceVector<Stage>& stages,
-                                   const Matrix& terminal_Q,
-                                   const Vector& terminal_q,
+                                   const WorkspaceVector<Matrix>& Q,
+                                   const WorkspaceVector<Vector>& q,
                                    const Vector& initial_state,
                                    Scalar tolerance,
                                    NewtonKktDiagnostics* diagnostics) {
@@ -2639,8 +2643,8 @@ ReducedSolution SolveUnconstrained(const WorkspaceVector<Stage>& stages,
     sol.x.push_back(initial_state);
     return sol;
   }
-  if (!ComputeUnconstrainedRiccatiInto(stages, terminal_Q, terminal_q,
-                                       tolerance, &workspace, diagnostics)) {
+  if (!ComputeUnconstrainedRiccatiInto(stages, Q, q, tolerance, &workspace,
+                                       diagnostics)) {
     throw std::runtime_error(
         "reduced control Hessian is not positive definite");
   }
@@ -2680,7 +2684,7 @@ ReducedSolution SolveUnconstrained(const WorkspaceVector<Stage>& stages,
 
 bool RecoverZeroHorizonMultipliers(const Problem& original, Solution* out,
                                    Scalar tolerance, std::string* error) {
-  const std::size_t n = original.terminal_Q.rows();
+  const std::size_t n = original.Q.front().rows();
   const std::size_t pt = original.terminal_E.rows();
   Matrix system(n, n + pt);
   for (std::size_t row = 0; row < n; ++row) system(row, row) = Scalar{1};
@@ -2689,7 +2693,7 @@ bool RecoverZeroHorizonMultipliers(const Problem& original, Solution* out,
       system(row, n + col) = original.terminal_E(col, row);
     }
   }
-  Vector rhs = Scale(original.terminal_Q * out->states[0] + original.terminal_q,
+  Vector rhs = Scale(original.Q.front() * out->states[0] + original.q.front(),
                      -Scalar{1});
   RectangularSolve solve = SolveRectangularOrthogonally(
       system, rhs, tolerance, MultiplierConsistencyTolerance(tolerance));
@@ -2709,11 +2713,11 @@ void RecoverUnconstrainedMultipliers(const Problem& original, Solution* out) {
   out->terminal_state_multiplier = Vector(0);
   if (N == 0) {
     out->dynamics_multipliers.clear();
-    out->initial_multiplier = Vector(original.terminal_Q.rows());
-    for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
-      Scalar value = original.terminal_q[row];
-      for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
-        value += original.terminal_Q(row, col) * out->states[0][col];
+    out->initial_multiplier = Vector(original.Q.front().rows());
+    for (std::size_t row = 0; row < original.Q.front().rows(); ++row) {
+      Scalar value = original.q.front()[row];
+      for (std::size_t col = 0; col < original.Q.front().cols(); ++col) {
+        value += original.Q.front()(row, col) * out->states[0][col];
       }
       out->initial_multiplier[row] = -value;
     }
@@ -2721,11 +2725,11 @@ void RecoverUnconstrainedMultipliers(const Problem& original, Solution* out) {
   }
 
   out->dynamics_multipliers.assign(N, Vector());
-  out->dynamics_multipliers[N - 1] = Vector(original.terminal_Q.rows());
-  for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
-    Scalar value = original.terminal_q[row];
-    for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
-      value += original.terminal_Q(row, col) * out->states[N][col];
+  out->dynamics_multipliers[N - 1] = Vector(original.Q.back().rows());
+  for (std::size_t row = 0; row < original.Q.back().rows(); ++row) {
+    Scalar value = original.q.back()[row];
+    for (std::size_t col = 0; col < original.Q.back().cols(); ++col) {
+      value += original.Q.back()(row, col) * out->states[N][col];
     }
     out->dynamics_multipliers[N - 1][row] = -value;
   }
@@ -2734,12 +2738,12 @@ void RecoverUnconstrainedMultipliers(const Problem& original, Solution* out) {
     const Stage& s = original.stages[i + 1];
     out->dynamics_multipliers[i] = Vector(s.A.cols());
     for (std::size_t col = 0; col < s.A.cols(); ++col) {
-      Scalar value = -s.q[col];
+      Scalar value = -original.q[i + 1][col];
       for (std::size_t row = 0; row < s.A.rows(); ++row) {
         value += s.A(row, col) * out->dynamics_multipliers[i + 1][row];
       }
-      for (std::size_t q_col = 0; q_col < s.Q.cols(); ++q_col) {
-        value -= s.Q(col, q_col) * out->states[i + 1][q_col];
+      for (std::size_t q_col = 0; q_col < original.Q[i + 1].cols(); ++q_col) {
+        value -= original.Q[i + 1](col, q_col) * out->states[i + 1][q_col];
       }
       for (std::size_t u_col = 0; u_col < s.M.cols(); ++u_col) {
         value -= s.M(col, u_col) * out->controls[i + 1][u_col];
@@ -2750,12 +2754,12 @@ void RecoverUnconstrainedMultipliers(const Problem& original, Solution* out) {
   const Stage& first = original.stages[0];
   out->initial_multiplier = Vector(first.A.cols());
   for (std::size_t col = 0; col < first.A.cols(); ++col) {
-    Scalar value = -first.q[col];
+    Scalar value = -original.q.front()[col];
     for (std::size_t row = 0; row < first.A.rows(); ++row) {
       value += first.A(row, col) * out->dynamics_multipliers[0][row];
     }
-    for (std::size_t q_col = 0; q_col < first.Q.cols(); ++q_col) {
-      value -= first.Q(col, q_col) * out->states[0][q_col];
+    for (std::size_t q_col = 0; q_col < original.Q.front().cols(); ++q_col) {
+      value -= original.Q.front()(col, q_col) * out->states[0][q_col];
     }
     for (std::size_t u_col = 0; u_col < first.M.cols(); ++u_col) {
       value -= first.M(col, u_col) * out->controls[0][u_col];
@@ -2773,22 +2777,22 @@ bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out,
   out->terminal_state_multiplier = Vector(0);
 
   if (N == 0) {
-    out->initial_multiplier = Vector(original.terminal_Q.rows());
-    for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
-      Scalar value = original.terminal_q[row];
-      for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
-        value += original.terminal_Q(row, col) * out->states[0][col];
+    out->initial_multiplier = Vector(original.Q.front().rows());
+    for (std::size_t row = 0; row < original.Q.front().rows(); ++row) {
+      Scalar value = original.q.front()[row];
+      for (std::size_t col = 0; col < original.Q.front().cols(); ++col) {
+        value += original.Q.front()(row, col) * out->states[0][col];
       }
       out->initial_multiplier[row] = -value;
     }
     return true;
   }
 
-  out->dynamics_multipliers[N - 1].resize(original.terminal_Q.rows());
-  for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
-    Scalar value = original.terminal_q[row];
-    for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
-      value += original.terminal_Q(row, col) * out->states[N][col];
+  out->dynamics_multipliers[N - 1].resize(original.Q.back().rows());
+  for (std::size_t row = 0; row < original.Q.back().rows(); ++row) {
+    Scalar value = original.q.back()[row];
+    for (std::size_t col = 0; col < original.Q.back().cols(); ++col) {
+      value += original.Q.back()(row, col) * out->states[N][col];
     }
     out->dynamics_multipliers[N - 1][row] = -value;
   }
@@ -2813,12 +2817,12 @@ bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out,
         i == 0 ? out->initial_multiplier : out->dynamics_multipliers[i - 1];
     previous.resize(stage.A.cols());
     for (std::size_t state = 0; state < stage.A.cols(); ++state) {
-      Scalar value = -stage.q[state];
+      Scalar value = -original.q[i][state];
       for (std::size_t row = 0; row < stage.A.rows(); ++row) {
         value += stage.A(row, state) * y[row];
       }
-      for (std::size_t col = 0; col < stage.Q.cols(); ++col) {
-        value -= stage.Q(state, col) * out->states[i][col];
+      for (std::size_t col = 0; col < original.Q[i].cols(); ++col) {
+        value -= original.Q[i](state, col) * out->states[i][col];
       }
       for (std::size_t control = 0; control < stage.M.cols(); ++control) {
         value -= stage.M(state, control) * out->controls[i][control];
@@ -2915,14 +2919,14 @@ WorkspaceVector<Vector> ReducedDynamicsMultipliers(
   if (N == 0) return dynamics;
 
   dynamics[N - 1] =
-      Scale(problem.terminal_Q * reduced.x[N] + problem.terminal_q, -Scalar{1});
+      Scale(problem.Q.back() * reduced.x[N] + problem.q.back(), -Scalar{1});
   for (std::size_t rev = 1; rev < N; ++rev) {
     const std::size_t i = N - 1 - rev;
     const Stage& stage = problem.stages[i + 1];
-    dynamics[i] =
-        Scale(stage.Q * reduced.x[i + 1] + stage.M * reduced.u[i + 1] + stage.q,
-              -Scalar{1}) +
-        TransposeMultiply(stage.A, dynamics[i + 1]);
+    dynamics[i] = Scale(problem.Q[i + 1] * reduced.x[i + 1] +
+                            stage.M * reduced.u[i + 1] + problem.q[i + 1],
+                        -Scalar{1}) +
+                  TransposeMultiply(stage.A, dynamics[i + 1]);
   }
   return dynamics;
 }
@@ -2940,8 +2944,7 @@ bool RecoverEliminatedMultipliers(const Problem& original,
   out->state_multipliers.assign(N, Vector());
   WorkspaceVector<Vector> offset_cotangent(N + 1);
   for (std::size_t node = 0; node <= N; ++node) {
-    const std::size_t n =
-        node == N ? original.terminal_Q.rows() : original.stages[node].A.cols();
+    const std::size_t n = original.Q[node].rows();
     offset_cotangent[node] = Vector(n);
   }
 
@@ -2969,9 +2972,8 @@ bool RecoverEliminatedMultipliers(const Problem& original,
     }
 
     if (current.active) {
-      Vector bar_offset = original_stage.Q * out->states[i] +
-                          original_stage.M * out->controls[i] +
-                          original_stage.q;
+      Vector bar_offset = original.Q[i] * out->states[i] +
+                          original_stage.M * out->controls[i] + original.q[i];
       AddInPlace(&bar_offset,
                  TransposeSelectedRowsMultiply(original_stage.A, next, bar_c));
       if (trace.mixed.active) {
@@ -3051,8 +3053,7 @@ bool RecoverEliminatedMultipliers(const Problem& original,
 
   const AffineStateBasis& terminal = working.state_bases[N];
   if (terminal.active) {
-    Vector bar_offset =
-        original.terminal_Q * out->states[N] + original.terminal_q;
+    Vector bar_offset = original.Q.back() * out->states[N] + original.q.back();
     AddInPlace(&offset_cotangent[N], bar_offset);
     Vector reduced_rhs_cotangent(terminal.rhs_operations.row_scales.size());
     for (std::size_t pivot = 0; pivot < terminal.pivot_rows.size(); ++pivot) {
@@ -3067,7 +3068,8 @@ bool RecoverEliminatedMultipliers(const Problem& original,
 
   const Stage& first = original.stages.front();
   out->initial_multiplier =
-      Scale(first.Q * out->states[0] + first.M * out->controls[0] + first.q,
+      Scale(original.Q.front() * out->states[0] + first.M * out->controls[0] +
+                original.q.front(),
             -Scalar{1}) +
       TransposeMultiply(first.A, out->dynamics_multipliers[0]);
   if (first.C.rows() > 0) {
@@ -3164,9 +3166,8 @@ Solution SolveMixedOnlyIdentityState(const Problem& original,
   } else {
     workspace.Reserve(stages);
   }
-  if (!ComputeUnconstrainedRiccatiInto(stages, state.problem.terminal_Q,
-                                       state.problem.terminal_q, tolerance,
-                                       &workspace, diagnostics)) {
+  if (!ComputeUnconstrainedRiccatiInto(stages, state.problem.Q, state.problem.q,
+                                       tolerance, &workspace, diagnostics)) {
     throw std::runtime_error(
         "reduced control Hessian is not positive definite");
   }
@@ -3219,11 +3220,11 @@ Solution SolveMixedOnlyIdentityState(const Problem& original,
 
     const Vector& x = out.states[i];
     const Vector& u = out.controls[i];
-    for (std::size_t row = 0; row < original_stage.Q.rows(); ++row) {
+    for (std::size_t row = 0; row < original.Q[i].rows(); ++row) {
       Scalar value = Scalar{0};
       CLQR_UNROLL
-      for (std::size_t col = 0; col < original_stage.Q.cols(); ++col) {
-        value += original_stage.Q(row, col) * x[col];
+      for (std::size_t col = 0; col < original.Q[i].cols(); ++col) {
+        value += original.Q[i](row, col) * x[col];
       }
       objective += Scalar{0.5} * x[row] * value;
     }
@@ -3243,8 +3244,8 @@ Solution SolveMixedOnlyIdentityState(const Problem& original,
       }
       objective += x[row] * value;
     }
-    for (std::size_t row = 0; row < original_stage.q.size(); ++row) {
-      objective += original_stage.q[row] * x[row];
+    for (std::size_t row = 0; row < original.q[i].size(); ++row) {
+      objective += original.q[i][row] * x[row];
     }
     for (std::size_t row = 0; row < original_stage.r.size(); ++row) {
       objective += original_stage.r[row] * u[row];
@@ -3252,16 +3253,16 @@ Solution SolveMixedOnlyIdentityState(const Problem& original,
   }
 
   const Vector& terminal = out.states[N];
-  for (std::size_t row = 0; row < original.terminal_Q.rows(); ++row) {
+  for (std::size_t row = 0; row < original.Q.back().rows(); ++row) {
     Scalar value = Scalar{0};
     CLQR_UNROLL
-    for (std::size_t col = 0; col < original.terminal_Q.cols(); ++col) {
-      value += original.terminal_Q(row, col) * terminal[col];
+    for (std::size_t col = 0; col < original.Q.back().cols(); ++col) {
+      value += original.Q.back()(row, col) * terminal[col];
     }
     objective += Scalar{0.5} * terminal[row] * value;
   }
-  for (std::size_t row = 0; row < original.terminal_q.size(); ++row) {
-    objective += original.terminal_q[row] * terminal[row];
+  for (std::size_t row = 0; row < original.q.back().size(); ++row) {
+    objective += original.q.back()[row] * terminal[row];
   }
   out.objective = objective;
   std::string error;
@@ -3362,14 +3363,13 @@ std::size_t Factorization::RequiredSolveBytes() const {
 SolveRhs ExtractRhs(const Problem& problem) {
   SolveRhs rhs;
   rhs.stages.resize(problem.stages.size());
+  rhs.q = problem.q;
   for (std::size_t i = 0; i < problem.stages.size(); ++i) {
     rhs.stages[i].c = problem.stages[i].c;
-    rhs.stages[i].q = problem.stages[i].q;
     rhs.stages[i].r = problem.stages[i].r;
     rhs.stages[i].d = problem.stages[i].d;
     rhs.stages[i].e = problem.stages[i].e;
   }
-  rhs.terminal_q = problem.terminal_q;
   rhs.terminal_e = problem.terminal_e;
   rhs.initial_state = problem.initial_state;
   return rhs;
@@ -3389,7 +3389,7 @@ Factorization Factor(const Problem& problem, const SolveOptions& options) {
     out.impl_->tolerance = options.tolerance;
     const std::size_t N = problem.stages.size();
     out.impl_->initial_state_size =
-        N == 0 ? problem.terminal_Q.rows() : problem.stages.front().A.cols();
+        N == 0 ? problem.Q.front().rows() : problem.stages.front().A.cols();
     out.impl_->state_offsets.resize(N + 1);
     out.impl_->control_offsets.resize(N);
     out.impl_->total_state = out.impl_->initial_state_size;
@@ -3558,8 +3558,8 @@ SolutionView Solve(const Factorization& factorization, const SolveRhs& rhs,
     const std::size_t N = factors.stages.size();
 
     Scalar* terminal_p = layout.p + factors.state_offsets[N];
-    for (std::size_t row = 0; row < rhs.terminal_q.size(); ++row) {
-      terminal_p[row] = rhs.terminal_q[row];
+    for (std::size_t row = 0; row < rhs.q.back().size(); ++row) {
+      terminal_p[row] = rhs.q.back()[row];
     }
     for (std::size_t rev = 0; rev < N; ++rev) {
       const std::size_t i = N - 1 - rev;
@@ -3575,7 +3575,7 @@ SolutionView Solve(const Factorization& factorization, const SolveRhs& rhs,
       Scalar* k = layout.k + factors.control_offsets[i];
       ComputeUnconstrainedAffineStageRaw(
           stage.A.data().data(), stage.B.data().data(), P_next.data().data(),
-          p_next, stage_rhs.c.data().data(), stage_rhs.q.data().data(),
+          p_next, stage_rhs.c.data().data(), rhs.q[i].data().data(),
           stage_rhs.r.data().data(), stage.Hxu.data().data(),
           stage.control_factor.data().data(),
           stage.control_pivots.empty() ? nullptr : stage.control_pivots.data(),
@@ -3602,11 +3602,11 @@ SolutionView Solve(const Factorization& factorization, const SolveRhs& rhs,
                                    layout.view.states[i + 1]);
       objective += UnconstrainedStageObjectiveRaw(
           stage.Q.data().data(), stage.R.data().data(), stage.M.data().data(),
-          stage_rhs.q.data().data(), stage_rhs.r.data().data(), n, m, x, u);
+          rhs.q[i].data().data(), stage_rhs.r.data().data(), n, m, x, u);
     }
     const VectorView terminal = layout.view.states[N];
     objective += UnconstrainedTerminalObjectiveRaw(
-        factors.terminal_Q.data().data(), rhs.terminal_q.data().data(),
+        factors.terminal_Q.data().data(), rhs.q.back().data().data(),
         terminal.size, terminal);
 
     for (std::size_t node = 0; node <= N; ++node) {
@@ -3648,8 +3648,8 @@ static Solution SolveInternalResult(const Problem& problem,
     if (!AnyOriginalConstraints(problem)) {
       try {
         ReducedSolution reduced = SolveUnconstrained(
-            problem.stages, problem.terminal_Q, problem.terminal_q,
-            problem.initial_state, options.tolerance, &diagnostics);
+            problem.stages, problem.Q, problem.q, problem.initial_state,
+            options.tolerance, &diagnostics);
         return RecoverUnmapped(problem, std::move(reduced), options.tolerance,
                                diagnostics);
       } catch (const std::runtime_error& e) {
@@ -3689,10 +3689,9 @@ static Solution SolveInternalResult(const Problem& problem,
         return SolveMixedOnlyIdentityState(problem, state, initial.offset,
                                            options.tolerance, &diagnostics);
       }
-      ReducedSolution reduced =
-          SolveUnconstrained(state.problem.stages, state.problem.terminal_Q,
-                             state.problem.terminal_q, initial.offset,
-                             options.tolerance, &diagnostics);
+      ReducedSolution reduced = SolveUnconstrained(
+          state.problem.stages, state.problem.Q, state.problem.q,
+          initial.offset, options.tolerance, &diagnostics);
       return Recover(problem, state, std::move(reduced), options.tolerance,
                      diagnostics);
     } catch (const std::runtime_error& e) {

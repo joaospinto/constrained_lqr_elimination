@@ -113,7 +113,7 @@ for precision in "${precisions[@]}"; do
   esac
   precision_suffix="$(printf '%s' "${precision}" | tr '[:upper:]' '[:lower:]')"
   echo "=== ${precision} build and tests ==="
-  echo "The native CUDA suite includes dimensions beyond the former compile-time capacities, zero controls, and a zero horizon."
+  echo "The native CUDA suite covers varied runtime dimensions, zero controls, and a zero horizon."
   bazel_args=(
     "--config=${precision_suffix}"
     --config=cuda

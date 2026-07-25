@@ -47,18 +47,22 @@ def _problem(dtype, initial_state=1.0):
                 "A": np.array([[1.0]], dtype=dtype),
                 "B": np.array([[1.0]], dtype=dtype),
                 "c": np.array([0.0], dtype=dtype),
-                "Q": np.array([[1.0]], dtype=dtype),
                 "R": np.array([[2.0]], dtype=dtype),
                 "M": np.array([[0.0]], dtype=dtype),
-                "q": np.array([0.0], dtype=dtype),
                 "r": np.array([0.0], dtype=dtype),
                 "C": np.array([[1.0]], dtype=dtype),
                 "D": np.array([[1.0]], dtype=dtype),
                 "d": np.array([0.0], dtype=dtype),
             }
         ],
-        "terminal_Q": np.array([[1.0]], dtype=dtype),
-        "terminal_q": np.array([0.0], dtype=dtype),
+        "Q": [
+            np.array([[1.0]], dtype=dtype),
+            np.array([[1.0]], dtype=dtype),
+        ],
+        "q": [
+            np.array([0.0], dtype=dtype),
+            np.array([0.0], dtype=dtype),
+        ],
     }
 
 
@@ -70,25 +74,29 @@ def _heterogeneous_problem(dtype):
                 "A": np.array([[1.0, 0.3]], dtype=dtype),
                 "B": np.array([[0.5]], dtype=dtype),
                 "c": np.array([0.1], dtype=dtype),
-                "Q": np.eye(2, dtype=dtype),
                 "R": np.array([[2.0]], dtype=dtype),
                 "M": np.zeros((2, 1), dtype=dtype),
-                "q": np.array([0.1, -0.1], dtype=dtype),
                 "r": np.array([0.2], dtype=dtype),
             },
             {
                 "A": np.array([[1.0], [-0.5]], dtype=dtype),
                 "B": np.zeros((2, 0), dtype=dtype),
                 "c": np.array([0.0, 0.1], dtype=dtype),
-                "Q": np.array([[1.5]], dtype=dtype),
                 "R": np.zeros((0, 0), dtype=dtype),
                 "M": np.zeros((1, 0), dtype=dtype),
-                "q": np.array([0.3], dtype=dtype),
                 "r": np.zeros((0,), dtype=dtype),
             },
         ],
-        "terminal_Q": 2.0 * np.eye(2, dtype=dtype),
-        "terminal_q": np.array([-0.1, 0.2], dtype=dtype),
+        "Q": [
+            np.eye(2, dtype=dtype),
+            np.array([[1.5]], dtype=dtype),
+            2.0 * np.eye(2, dtype=dtype),
+        ],
+        "q": [
+            np.array([0.1, -0.1], dtype=dtype),
+            np.array([0.3], dtype=dtype),
+            np.array([-0.1, 0.2], dtype=dtype),
+        ],
     }
 
 
@@ -213,7 +221,7 @@ def _max_primal_residual(problem, result):
     terminal_E = np.asarray(
         problem.get(
             "terminal_E",
-            np.zeros((0, np.asarray(problem["terminal_Q"]).shape[0])),
+            np.zeros((0, np.asarray(problem["Q"][-1]).shape[0])),
         )
     )
     terminal_e = np.asarray(problem.get("terminal_e", np.zeros((terminal_E.shape[0],))))
@@ -240,10 +248,10 @@ def _max_kkt_residual(problem, result):
         A = np.asarray(stage["A"])
         B = np.asarray(stage["B"])
         c = np.asarray(stage["c"])
-        Q = np.asarray(stage["Q"])
+        Q = np.asarray(problem["Q"][index])
         R = np.asarray(stage["R"])
         M = np.asarray(stage["M"])
-        q = np.asarray(stage["q"])
+        q = np.asarray(problem["q"][index])
         r = np.asarray(stage["r"])
         n = A.shape[1]
         next_n = A.shape[0]
@@ -277,8 +285,8 @@ def _max_kkt_residual(problem, result):
         control_gradient += D.T @ mixed
         residual = max(residual, _max_abs(control_gradient))
 
-    terminal_Q = np.asarray(problem["terminal_Q"])
-    terminal_q = np.asarray(problem["terminal_q"])
+    terminal_Q = np.asarray(problem["Q"][-1])
+    terminal_q = np.asarray(problem["q"][-1])
     terminal_n = terminal_Q.shape[0]
     terminal_x = states[-1, :terminal_n]
     terminal_E = np.asarray(
@@ -355,6 +363,8 @@ def _random_feasible_problem(seed, horizon):
     states = rng.normal(scale=0.3, size=(horizon + 1, state_dimension))
     controls = rng.normal(scale=0.2, size=(horizon, control_dimension))
     stages = []
+    Q = []
+    q = []
     for index in range(horizon):
         A = 0.45 * np.eye(state_dimension) + rng.normal(
             scale=0.04, size=(state_dimension, state_dimension)
@@ -368,7 +378,6 @@ def _random_feasible_problem(seed, horizon):
             "c": (states[index + 1] - A @ states[index] - B @ controls[index]).astype(
                 dtype
             ),
-            "Q": (q_factor @ q_factor.T + 0.7 * np.eye(state_dimension)).astype(dtype),
             "R": (r_factor @ r_factor.T + 1.0 * np.eye(control_dimension)).astype(
                 dtype
             ),
@@ -376,9 +385,10 @@ def _random_feasible_problem(seed, horizon):
                 scale=0.025,
                 size=(state_dimension, control_dimension),
             ).astype(dtype),
-            "q": rng.normal(scale=0.1, size=state_dimension).astype(dtype),
             "r": rng.normal(scale=0.1, size=control_dimension).astype(dtype),
         }
+        Q.append((q_factor @ q_factor.T + 0.7 * np.eye(state_dimension)).astype(dtype))
+        q.append(rng.normal(scale=0.1, size=state_dimension).astype(dtype))
         if index % 2 == 0:
             C = rng.normal(scale=0.4, size=(1, state_dimension))
             D = rng.normal(scale=0.4, size=(1, control_dimension))
@@ -396,13 +406,17 @@ def _random_feasible_problem(seed, horizon):
         stages.append(stage)
     terminal_factor = rng.normal(scale=0.25, size=(state_dimension, state_dimension))
     terminal_E = rng.normal(scale=0.4, size=(1, state_dimension))
+    Q.append(
+        (terminal_factor @ terminal_factor.T + 0.8 * np.eye(state_dimension)).astype(
+            dtype
+        )
+    )
+    q.append(rng.normal(scale=0.1, size=state_dimension).astype(dtype))
     return {
         "initial_state": states[0].astype(dtype),
         "stages": stages,
-        "terminal_Q": (
-            terminal_factor @ terminal_factor.T + 0.8 * np.eye(state_dimension)
-        ).astype(dtype),
-        "terminal_q": rng.normal(scale=0.1, size=state_dimension).astype(dtype),
+        "Q": Q,
+        "q": q,
         "terminal_E": terminal_E.astype(dtype),
         "terminal_e": (-(terminal_E @ states[-1])).astype(dtype),
     }
@@ -427,10 +441,8 @@ def _wide_constrained_problem():
                 "A": A.copy(),
                 "B": B.copy(),
                 "c": np.zeros(n, dtype=dtype),
-                "Q": np.eye(n, dtype=dtype),
                 "R": 2.0 * np.eye(m, dtype=dtype),
                 "M": np.zeros((n, m), dtype=dtype),
-                "q": np.zeros(n, dtype=dtype),
                 "r": np.zeros(m, dtype=dtype),
                 "C": np.zeros((p, n), dtype=dtype),
                 "D": D.copy(),
@@ -440,8 +452,9 @@ def _wide_constrained_problem():
     return {
         "initial_state": np.linspace(0.1, 0.8, n, dtype=dtype),
         "stages": stages,
-        "terminal_Q": 1.5 * np.eye(n, dtype=dtype),
-        "terminal_q": np.zeros(n, dtype=dtype),
+        "Q": [np.eye(n, dtype=dtype) for _ in range(horizon)]
+        + [1.5 * np.eye(n, dtype=dtype)],
+        "q": [np.zeros(n, dtype=dtype) for _ in range(horizon + 1)],
     }
 
 
@@ -471,10 +484,8 @@ def _sliced_primal_leaf_problem(horizon, constraint_kind):
             "A": A.copy(),
             "B": B.copy(),
             "c": 0.1 * state,
-            "Q": np.eye(n, dtype=dtype),
             "R": 2.0 * np.eye(m, dtype=dtype),
             "M": np.zeros((n, m), dtype=dtype),
-            "q": np.zeros(n, dtype=dtype),
             "r": np.zeros(m, dtype=dtype),
         }
         if constraint_kind == "state-only":
@@ -499,8 +510,9 @@ def _sliced_primal_leaf_problem(horizon, constraint_kind):
     return {
         "initial_state": state,
         "stages": stages,
-        "terminal_Q": 1.5 * np.eye(n, dtype=dtype),
-        "terminal_q": np.zeros(n, dtype=dtype),
+        "Q": [np.eye(n, dtype=dtype) for _ in range(horizon)]
+        + [1.5 * np.eye(n, dtype=dtype)],
+        "q": [np.zeros(n, dtype=dtype) for _ in range(horizon + 1)],
     }
 
 
@@ -514,11 +526,11 @@ def test_metal_eager_jit_and_vmap():
         raise AssertionError("Metal silently cast a float64 mapping")
 
     mixed_dtype = _problem(np.float32)
-    mixed_dtype["stages"][0]["q"] = np.array([0.0], dtype=np.float64)
+    mixed_dtype["q"][0] = np.array([0.0], dtype=np.float64)
     try:
         clqr_jax.solve(mixed_dtype, backend="metal")
     except ValueError as error:
-        assert "problem.stages[0].q uses float64" in str(error)
+        assert "q[0] uses float64" in str(error)
     else:
         raise AssertionError("Metal silently cast a nested float64 leaf")
 
@@ -583,15 +595,19 @@ def test_metal_heterogeneous_zero_control_and_reuse():
                 "A": np.array([[0.9]], dtype=np.float32),
                 "B": np.zeros((1, 0), dtype=np.float32),
                 "c": np.array([0.1], dtype=np.float32),
-                "Q": np.array([[1.0]], dtype=np.float32),
                 "R": np.zeros((0, 0), dtype=np.float32),
                 "M": np.zeros((1, 0), dtype=np.float32),
-                "q": np.array([0.0], dtype=np.float32),
                 "r": np.zeros((0,), dtype=np.float32),
             }
         ],
-        "terminal_Q": np.array([[2.0]], dtype=np.float32),
-        "terminal_q": np.array([0.1], dtype=np.float32),
+        "Q": [
+            np.array([[1.0]], dtype=np.float32),
+            np.array([[2.0]], dtype=np.float32),
+        ],
+        "q": [
+            np.array([0.0], dtype=np.float32),
+            np.array([0.1], dtype=np.float32),
+        ],
     }
     _compare_cpu_and_metal(clqr_jax, zero_control)
     second = jax.jit(lambda value: clqr_jax.solve(value, backend="metal"))(packed)
@@ -604,8 +620,8 @@ def test_metal_zero_horizon_and_all_constraint_families():
     zero_horizon = {
         "initial_state": np.array([0.5, -0.25], dtype=np.float32),
         "stages": [],
-        "terminal_Q": np.eye(2, dtype=np.float32),
-        "terminal_q": np.array([0.1, -0.2], dtype=np.float32),
+        "Q": [np.eye(2, dtype=np.float32)],
+        "q": [np.array([0.1, -0.2], dtype=np.float32)],
     }
     _, result = _compare_cpu_and_metal(clqr_jax, zero_horizon)
     assert result.controls.shape == (0, 0)
@@ -617,10 +633,8 @@ def test_metal_zero_horizon_and_all_constraint_families():
                 "A": np.eye(2, dtype=np.float32),
                 "B": np.eye(2, dtype=np.float32),
                 "c": np.zeros(2, dtype=np.float32),
-                "Q": np.array([[1.2, 0.1], [0.1, 1.5]], dtype=np.float32),
                 "R": np.array([[2.0, 0.2], [0.2, 1.7]], dtype=np.float32),
                 "M": np.array([[0.03, 0.01], [-0.02, 0.04]], dtype=np.float32),
-                "q": np.array([0.1, -0.2], dtype=np.float32),
                 "r": np.array([-0.1, 0.05], dtype=np.float32),
                 "C": np.zeros((1, 2), dtype=np.float32),
                 "D": np.array([[1.0, 0.0]], dtype=np.float32),
@@ -630,17 +644,23 @@ def test_metal_zero_horizon_and_all_constraint_families():
                 "A": np.eye(2, dtype=np.float32),
                 "B": np.eye(2, dtype=np.float32),
                 "c": np.zeros(2, dtype=np.float32),
-                "Q": np.array([[1.4, -0.1], [-0.1, 1.1]], dtype=np.float32),
                 "R": np.array([[1.8, 0.1], [0.1, 2.1]], dtype=np.float32),
                 "M": np.array([[0.02, -0.03], [0.01, 0.02]], dtype=np.float32),
-                "q": np.array([-0.03, 0.08], dtype=np.float32),
                 "r": np.array([0.04, -0.02], dtype=np.float32),
                 "E": np.array([[0.0, 1.0]], dtype=np.float32),
                 "e": np.array([-0.2], dtype=np.float32),
             },
         ],
-        "terminal_Q": np.array([[1.7, 0.05], [0.05, 1.3]], dtype=np.float32),
-        "terminal_q": np.array([0.02, -0.04], dtype=np.float32),
+        "Q": [
+            np.array([[1.2, 0.1], [0.1, 1.5]], dtype=np.float32),
+            np.array([[1.4, -0.1], [-0.1, 1.1]], dtype=np.float32),
+            np.array([[1.7, 0.05], [0.05, 1.3]], dtype=np.float32),
+        ],
+        "q": [
+            np.array([0.1, -0.2], dtype=np.float32),
+            np.array([-0.03, 0.08], dtype=np.float32),
+            np.array([0.02, -0.04], dtype=np.float32),
+        ],
         "terminal_E": np.array([[1.0, 0.0]], dtype=np.float32),
         "terminal_e": np.array([-0.3], dtype=np.float32),
     }
@@ -668,9 +688,7 @@ def test_metal_zero_horizon_and_all_constraint_families():
     )
     if int(metal.status) == clqr_jax.SolveStatus.OPTIMAL:
         np.testing.assert_allclose(metal.states, cpu.states, atol=8e-3, rtol=8e-3)
-        np.testing.assert_allclose(
-            metal.controls, cpu.controls, atol=3e-2, rtol=3e-2
-        )
+        np.testing.assert_allclose(metal.controls, cpu.controls, atol=3e-2, rtol=3e-2)
         assert _max_primal_residual(wide_constrained, metal) <= 2e-6
         assert _max_kkt_residual(wide_constrained, metal) <= 5e-2
     else:
@@ -690,8 +708,8 @@ def test_metal_rank_deficiency_and_failure_statuses():
     infeasible = {
         "initial_state": np.array([1.0], dtype=np.float32),
         "stages": [],
-        "terminal_Q": np.array([[1.0]], dtype=np.float32),
-        "terminal_q": np.array([0.0], dtype=np.float32),
+        "Q": [np.array([[1.0]], dtype=np.float32)],
+        "q": [np.array([0.0], dtype=np.float32)],
         "terminal_E": np.array([[1.0]], dtype=np.float32),
         "terminal_e": np.array([-2.0], dtype=np.float32),
     }
@@ -798,10 +816,8 @@ def test_metal_long_horizon_and_dimension_bounds():
         "A": np.array([[0.98]], dtype=np.float32),
         "B": np.array([[0.2]], dtype=np.float32),
         "c": np.array([0.01], dtype=np.float32),
-        "Q": np.array([[1.0]], dtype=np.float32),
         "R": np.array([[2.0]], dtype=np.float32),
         "M": np.array([[0.01]], dtype=np.float32),
-        "q": np.array([0.02], dtype=np.float32),
         "r": np.array([-0.01], dtype=np.float32),
     }
     for horizon in (127, 257, 1025):
@@ -811,8 +827,10 @@ def test_metal_long_horizon_and_dimension_bounds():
                 {key: value.copy() for key, value in stage.items()}
                 for _ in range(horizon)
             ],
-            "terminal_Q": np.array([[1.5]], dtype=np.float32),
-            "terminal_q": np.array([0.1], dtype=np.float32),
+            "Q": [np.array([[1.0]], dtype=np.float32) for _ in range(horizon)]
+            + [np.array([[1.5]], dtype=np.float32)],
+            "q": [np.array([0.02], dtype=np.float32) for _ in range(horizon)]
+            + [np.array([0.1], dtype=np.float32)],
         }
         _, result = _compare_cpu_and_metal(
             clqr_jax,
@@ -844,15 +862,13 @@ def test_metal_long_horizon_and_dimension_bounds():
                 "A": 0.9 * np.eye(n, dtype=np.float32),
                 "B": np.zeros((n, m), dtype=np.float32),
                 "c": np.zeros(n, dtype=np.float32),
-                "Q": np.eye(n, dtype=np.float32),
                 "R": np.eye(m, dtype=np.float32),
                 "M": np.zeros((n, m), dtype=np.float32),
-                "q": np.zeros(n, dtype=np.float32),
                 "r": np.zeros(m, dtype=np.float32),
             }
         ],
-        "terminal_Q": np.eye(n, dtype=np.float32),
-        "terminal_q": np.zeros(n, dtype=np.float32),
+        "Q": [np.eye(n, dtype=np.float32), np.eye(n, dtype=np.float32)],
+        "q": [np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32)],
     }
     packed = clqr_jax.pack_problem(oversized_scratch, dtype=np.float32)
     try:

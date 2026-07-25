@@ -43,6 +43,12 @@ separate, pure-precision build selected at compile time. Because the scalar
 type is part of the C++ ABI, libraries and clients must use the same precision
 configuration.
 
+All native and Python problem interfaces use one cost schema. For a problem
+with `N` stages, `Q` and `q` each contain `N + 1` entries: indices `0` through
+`N - 1` are the stage state costs and index `N` is the terminal state cost.
+Each `Stage` contains `A`, `B`, `c`, `R`, `M`, `r`, and its optional equality
+constraints.
+
 ## CUDA backend
 
 The CUDA backend implements the parallel form of the same reduction. For a
@@ -148,8 +154,7 @@ the CPU and CUDA implementations in the same precision, runs the CPU,
 kernel-emulation, native-CUDA, and Compute Sanitizer tests, and benchmarks all
 configured horizons. It bootstraps the Bazel version pinned in `.bazelversion`
 when needed. The canonical shell driver is
-[`scripts/notebook_cuda.sh`](scripts/notebook_cuda.sh); the former
-`scripts/colab_t4.sh` name remains as a compatibility wrapper.
+[`scripts/notebook_cuda.sh`](scripts/notebook_cuda.sh).
 
 After validating a candidate, compare it against `main` with alternating
 benchmark order:
@@ -216,11 +221,11 @@ Pass an integer scale factor to increase the per-case iteration counts:
 bazel run -c opt //:clqr_benchmark -- 10
 ```
 
-Sample workspace-API results from `bazel-bin/clqr_benchmark 5` at `9e85b6f`,
-after building `//:clqr_benchmark -c opt` on arm64 macOS with Apple clang
-21.0.0. The benchmark reserves workspace once per problem and times repeated
-solves. It also reports `max_us`; local scheduler spikes can make maxima
-unrepresentative, so median and p90 are usually better summary statistics.
+Sample workspace-API results from `bazel-bin/clqr_benchmark 5`, after building
+`//:clqr_benchmark -c opt` on arm64 macOS with Apple clang 21.0.0. The
+benchmark reserves workspace once per problem and times repeated solves. It
+also reports `max_us`; local scheduler spikes can make maxima unrepresentative,
+so median and p90 are usually better summary statistics.
 
 | Case | Iterations | Mean | Median | P90 | Min | Max |
 |---|---:|---:|---:|---:|---:|---:|
@@ -242,7 +247,7 @@ unrepresentative, so median and p90 are usually better summary statistics.
 
 All sample cases reported `singular_count=0` and `wrong_inertia_count=0`.
 
-For revision-to-revision evidence on the constrained CPU path, including
+For revision-to-revision comparison of the constrained CPU path, including
 adversarial row scaling, redundant rows, primal/KKT residuals, and alternating
 benchmark order, run:
 
@@ -294,16 +299,15 @@ solve_workspace.Reserve(factors);
 
 clqr::SolutionView first = clqr::Solve(factors, rhs, solve_workspace);
 rhs.initial_state = next_initial_state;
-rhs.stages[0].q = next_state_gradient;
+rhs.q[0] = next_state_gradient;
+rhs.q.back() = next_terminal_gradient;
 clqr::SolutionView second = clqr::Solve(factors, rhs, solve_workspace);
 ```
 
-`Factor` owns the fixed `A`, `B`, `Q`, `R`, `M`, and terminal `Q` data.
-Each factored `Solve` accepts new `c`, `q`, `r`, terminal `q`, and initial
-state values with unchanged dimensions, and performs no heap allocation when
-given a reserved workspace. The first API slice deliberately rejects equality
-constraints; reusable CUDA/JAX factorization and constrained factorization
-remain follow-up work.
+`Factor` owns the fixed `A`, `B`, `Q`, `R`, and `M` data. Each factored
+`Solve` accepts new `c`, all `N + 1` entries of `q`, `r`, and the initial state
+with unchanged dimensions, and performs no heap allocation when given a
+reserved workspace. This factorized interface accepts unconstrained problems.
 
 As with the ordinary workspace API, every buffer and string referenced by the
 returned `SolutionView` is workspace-backed and remains valid only until that
@@ -311,10 +315,6 @@ workspace is reused or destroyed. Copy any values that must survive the next
 solve.
 
 ### Native NumPy binding
-
-The native C++ `Problem`, `SolveRhs`, and NumPy dictionary APIs intentionally
-keep `terminal_Q` and `terminal_q` as separate fields. This schema mirrors the
-C++ types and is distinct from the packed JAX API below.
 
 The Python extension is built by the Bazel target `//:_clqr`; the shared-object output is
 addressable as `//:_clqr.so`. It exposes the `_clqr` module directly:
@@ -327,13 +327,13 @@ result = _clqr.solve({
     "stages": [
         {
             "A": ..., "B": ..., "c": ...,
-            "Q": ..., "R": ..., "M": ..., "q": ..., "r": ...,
+            "R": ..., "M": ..., "r": ...,
             "C": ..., "D": ..., "d": ...,  # optional
             "E": ..., "e": ...,            # optional
         },
     ],
-    "terminal_Q": ...,
-    "terminal_q": ...,
+    "Q": [Q_0, ..., Q_N],
+    "q": [q_0, ..., q_N],
     "terminal_E": ...,  # optional
     "terminal_e": ...,  # optional
 })
@@ -349,9 +349,9 @@ solve_rhs = _clqr.rhs(problem)
 first = factors.solve(solve_rhs)
 solve_rhs.initial_state = next_initial_state
 solve_rhs.stage(0).c = next_dynamics_offset
-solve_rhs.stage(0).q = next_state_gradient
 solve_rhs.stage(0).r = next_control_gradient
-solve_rhs.terminal_q = next_terminal_gradient
+solve_rhs.set_q(0, next_state_gradient)
+solve_rhs.set_q(solve_rhs.q_count - 1, next_terminal_gradient)
 second = factors.solve(solve_rhs)
 ```
 
@@ -421,10 +421,10 @@ the `N` control dimensions, the `N` mixed-constraint counts, the `N`
 state-constraint counts, and the terminal-constraint count. `factors.Q` and
 `rhs.q` have `N + 1` entries, with their last entries holding the terminal
 cost; the other stage arrays have `N` entries. The optional `pack_problem`
-adapter converts a native NumPy dictionary with separate terminal fields into
-this representation. The split lets callers replace any RHS vector without
-changing the compiled JAX shape. It is not yet a numerical factor/solve split:
-the current call refactors after either part changes.
+adapter validates and pads the same dictionary schema used by the native
+NumPy binding. The split lets callers replace any RHS vector without changing
+the compiled JAX shape. It is not a numerical factor/solve split: the current
+call refactors after either part changes.
 
 CPU arrays dispatch to the sequential C++ solver. When `//:_clqr_cuda` is
 installed, CUDA arrays dispatch to the CUDA solver on the device selected by

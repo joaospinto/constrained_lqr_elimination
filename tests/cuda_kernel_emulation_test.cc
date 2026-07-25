@@ -115,8 +115,8 @@ bool FinishAllowedDeviceFailure(const DeviceStatus &status,
   if (status.code == kDeviceOk)
     return false;
   Expect(allowed != nullptr,
-         name + " unexpected " + phase + " failure (stage=" +
-             std::to_string(status.stage) +
+         name + " unexpected " + phase +
+             " failure (stage=" + std::to_string(status.stage) +
              ", detail=" + std::to_string(status.detail) + ")");
   Expect(status.code == allowed->code && std::string(phase) == allowed->phase &&
              status.detail == allowed->detail,
@@ -275,14 +275,11 @@ void DualResidualOrthogonalEchelonCase() {
   constexpr int variables = eliminated + left_dim + right_dim;
   constexpr int columns = variables + 1;
   Scalar matrix[rows * columns]{
-      Scalar{0}, Scalar{0}, Scalar{1e6}, Scalar{2e6},  Scalar{0},
-      Scalar{5e6},
-      Scalar{0}, Scalar{0}, Scalar{0},   Scalar{1e-6}, Scalar{1e-6},
-      Scalar{4e-6},
-      Scalar{0}, Scalar{0}, Scalar{3},   Scalar{9},    Scalar{3},
-      Scalar{27},
-      Scalar{0}, Scalar{0}, Scalar{0},   Scalar{0},    Scalar{0},
-      Scalar{0}};
+      Scalar{0},    Scalar{0},    Scalar{1e6}, Scalar{2e6}, Scalar{0},
+      Scalar{5e6},  Scalar{0},    Scalar{0},   Scalar{0},   Scalar{1e-6},
+      Scalar{1e-6}, Scalar{4e-6}, Scalar{0},   Scalar{0},   Scalar{3},
+      Scalar{9},    Scalar{3},    Scalar{27},  Scalar{0},   Scalar{0},
+      Scalar{0},    Scalar{0},    Scalar{0},   Scalar{0}};
   int pivot_columns[rows]{};
   int permutation[variables]{};
   int rank = -1;
@@ -292,10 +289,10 @@ void DualResidualOrthogonalEchelonCase() {
   threadIdx.x = 0;
   blockDim.x = 1;
 
-  OrthogonalEchelonBlock(
-      matrix, rows, columns, variables, variables, kTolerance, pivot_columns,
-      permutation, &rank, &best_column, reflector, &matrix_scale,
-      kMinimumDualRelationRowScale);
+  OrthogonalEchelonBlock(matrix, rows, columns, variables, variables,
+                         kTolerance, pivot_columns, permutation, &rank,
+                         &best_column, reflector, &matrix_scale,
+                         kMinimumDualRelationRowScale);
 
   Expect(rank == 2, "dual residual QR detects the outer relation rank");
   for (int row = 0; row < rank; ++row) {
@@ -303,9 +300,9 @@ void DualResidualOrthogonalEchelonCase() {
            "dual residual QR does not pivot eliminated zero columns");
   }
   constexpr int relation_capacity = left_dim + right_dim;
-  constexpr int relation_entries =
-      relation_capacity * left_dim + relation_capacity * right_dim +
-      relation_capacity;
+  constexpr int relation_entries = relation_capacity * left_dim +
+                                   relation_capacity * right_dim +
+                                   relation_capacity;
   Scalar relation_storage[relation_entries]{};
   DualRelation relation{};
   BindDualRelationScratch(&relation, relation_storage, left_dim, right_dim);
@@ -337,17 +334,16 @@ void DualResidualOrthogonalEchelonCase() {
   int inconsistent_permutation[inconsistent_variables]{};
   int inconsistent_rank = -1;
   Scalar inconsistent_reflector[inconsistent_rows]{};
-  OrthogonalEchelonBlock(
-      inconsistent, inconsistent_rows, inconsistent_columns,
-      inconsistent_variables, inconsistent_variables, kTolerance,
-      inconsistent_pivots, inconsistent_permutation, &inconsistent_rank,
-      &best_column, inconsistent_reflector, &matrix_scale,
-      kMinimumDualRelationRowScale);
+  OrthogonalEchelonBlock(inconsistent, inconsistent_rows, inconsistent_columns,
+                         inconsistent_variables, inconsistent_variables,
+                         kTolerance, inconsistent_pivots,
+                         inconsistent_permutation, &inconsistent_rank,
+                         &best_column, inconsistent_reflector, &matrix_scale,
+                         kMinimumDualRelationRowScale);
   Expect(inconsistent_rank == 1,
          "dual residual QR identifies a repeated coefficient row");
-  Expect(InconsistentRref(inconsistent, inconsistent_rows,
-                          inconsistent_columns, inconsistent_variables,
-                          kTolerance, kTolerance),
+  Expect(InconsistentRref(inconsistent, inconsistent_rows, inconsistent_columns,
+                          inconsistent_variables, kTolerance, kTolerance),
          "dual residual QR retains the orthogonal consistency residual");
 
 #ifdef CLQR_USE_FLOAT
@@ -360,18 +356,18 @@ void DualResidualOrthogonalEchelonCase() {
   int marginal_permutation[1]{};
   int marginal_rank = -1;
   Scalar marginal_reflector[2]{};
-  OrthogonalEchelonBlock(
-      marginal, 2, 2, 1, 1, kMinimumMultiplierRankTolerance,
-      marginal_pivots, marginal_permutation, &marginal_rank, &best_column,
-      marginal_reflector, &matrix_scale, kMinimumDualRelationRowScale);
+  OrthogonalEchelonBlock(marginal, 2, 2, 1, 1, kMinimumMultiplierRankTolerance,
+                         marginal_pivots, marginal_permutation, &marginal_rank,
+                         &best_column, marginal_reflector, &matrix_scale,
+                         kMinimumDualRelationRowScale);
   const Scalar tree_tolerance =
       kMultiplierConsistencyTolerancePerTreeLevel * Scalar{7};
   const Scalar leaf_tolerance = kMultiplierConsistencyTolerancePerTreeLevel;
-  Expect(!InconsistentRref(marginal, 2, 2, 1,
-                           kMinimumMultiplierRankTolerance, tree_tolerance),
+  Expect(!InconsistentRref(marginal, 2, 2, 1, kMinimumMultiplierRankTolerance,
+                           tree_tolerance),
          "tree-accumulated tolerance admits a marginal leaf residual");
-  Expect(InconsistentRref(marginal, 2, 2, 1,
-                          kMinimumMultiplierRankTolerance, leaf_tolerance),
+  Expect(InconsistentRref(marginal, 2, 2, 1, kMinimumMultiplierRankTolerance,
+                          leaf_tolerance),
          "per-leaf tolerance rejects a marginal leaf residual");
 }
 
@@ -756,24 +752,26 @@ Problem PathologicalScratchProblem() {
   Problem problem;
   problem.initial_state = Vector(n);
   problem.stages.resize(1);
+  problem.Q.resize(2);
+  problem.q.resize(2);
   Stage &stage = problem.stages[0];
   stage.A = Matrix(0, n);
   stage.B = Matrix(0, 0);
   stage.c = Vector(0);
-  stage.Q = Matrix(n, n);
+  problem.Q[0] = Matrix(n, n);
   for (std::size_t row = 0; row < n; ++row)
-    stage.Q(row, row) = Scalar{1};
+    problem.Q[0](row, row) = Scalar{1};
   stage.R = Matrix(0, 0);
   stage.M = Matrix(n, 0);
-  stage.q = Vector(n);
+  problem.q[0] = Vector(n);
   stage.r = Vector(0);
   stage.C = Matrix(0, n);
   stage.D = Matrix(0, 0);
   stage.d = Vector(0);
   stage.E = Matrix(0, n);
   stage.e = Vector(0);
-  problem.terminal_Q = Matrix(0, 0);
-  problem.terminal_q = Vector(0);
+  problem.Q.back() = Matrix(0, 0);
+  problem.q.back() = Vector(0);
   problem.terminal_E = Matrix(0, 0);
   problem.terminal_e = Vector(0);
   return problem;
@@ -1006,6 +1004,8 @@ Problem MakeProblem() {
     u[i] = GeneratedVector(m, 200 + static_cast<int>(i), 0.4);
   problem.initial_state = x[0];
   problem.stages.resize(horizon);
+  problem.Q.resize(horizon + 1);
+  problem.q.resize(horizon + 1);
   for (std::size_t i = 0; i < horizon; ++i) {
     Stage &stage = problem.stages[i];
     stage.A = GeneratedMatrix(n, n, 300 + static_cast<int>(i), 0.12);
@@ -1013,10 +1013,10 @@ Problem MakeProblem() {
       stage.A(row, row) += 0.8;
     stage.B = GeneratedMatrix(n, m, 400 + static_cast<int>(i), 0.22);
     stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
-    stage.Q = PositiveDefinite(n, 500 + static_cast<int>(i), 1.0);
+    problem.Q[i] = PositiveDefinite(n, 500 + static_cast<int>(i), 1.0);
     stage.R = PositiveDefinite(m, 600 + static_cast<int>(i), 1.4);
     stage.M = GeneratedMatrix(n, m, 700 + static_cast<int>(i), 0.025);
-    stage.q = GeneratedVector(n, 800 + static_cast<int>(i), 0.15);
+    problem.q[i] = GeneratedVector(n, 800 + static_cast<int>(i), 0.15);
     stage.r = GeneratedVector(m, 900 + static_cast<int>(i), 0.15);
     stage.C = Matrix(0, n);
     stage.D = Matrix(0, m);
@@ -1042,8 +1042,8 @@ Problem MakeProblem() {
       stage.e[1] = -3.0 * stage.e[0];
     }
   }
-  problem.terminal_Q = PositiveDefinite(n, 1300, 1.5);
-  problem.terminal_q = GeneratedVector(n, 1400, 0.15);
+  problem.Q.back() = PositiveDefinite(n, 1300, 1.5);
+  problem.q.back() = GeneratedVector(n, 1400, 0.15);
   problem.terminal_E = GeneratedMatrix(1, n, 1500, 0.3);
   problem.terminal_e = Vector{-RowDot(problem.terminal_E, 0, x.back())};
   return problem;
@@ -1060,6 +1060,8 @@ Problem UniformProblem(int seed, std::size_t horizon, std::size_t n,
     u[i] = GeneratedVector(m, seed + 200 + static_cast<int>(i), 0.4);
   problem.initial_state = x.front();
   problem.stages.resize(horizon);
+  problem.Q.resize(horizon + 1);
+  problem.q.resize(horizon + 1);
   for (std::size_t i = 0; i < horizon; ++i) {
     Stage &stage = problem.stages[i];
     stage.A = GeneratedMatrix(n, n, seed + 300 + static_cast<int>(i), 0.08);
@@ -1067,10 +1069,10 @@ Problem UniformProblem(int seed, std::size_t horizon, std::size_t n,
       stage.A(row, row) += 0.9;
     stage.B = GeneratedMatrix(n, m, seed + 400 + static_cast<int>(i), 0.2);
     stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
-    stage.Q = PositiveDefinite(n, seed + 500 + static_cast<int>(i), 1.0);
+    problem.Q[i] = PositiveDefinite(n, seed + 500 + static_cast<int>(i), 1.0);
     stage.R = PositiveDefinite(m, seed + 600 + static_cast<int>(i), 1.4);
     stage.M = GeneratedMatrix(n, m, seed + 700 + static_cast<int>(i), 0.02);
-    stage.q = GeneratedVector(n, seed + 800 + static_cast<int>(i), 0.15);
+    problem.q[i] = GeneratedVector(n, seed + 800 + static_cast<int>(i), 0.15);
     stage.r = GeneratedVector(m, seed + 900 + static_cast<int>(i), 0.15);
     stage.C = Matrix(0, n);
     stage.D = Matrix(0, m);
@@ -1078,8 +1080,8 @@ Problem UniformProblem(int seed, std::size_t horizon, std::size_t n,
     stage.E = Matrix(0, n);
     stage.e = Vector(0);
   }
-  problem.terminal_Q = PositiveDefinite(n, seed + 1000, 1.5);
-  problem.terminal_q = GeneratedVector(n, seed + 1100, 0.15);
+  problem.Q.back() = PositiveDefinite(n, seed + 1000, 1.5);
+  problem.q.back() = GeneratedVector(n, seed + 1100, 0.15);
   problem.terminal_E = Matrix(0, n);
   problem.terminal_e = Vector(0);
   return problem;
@@ -1089,27 +1091,29 @@ enum class AffineSource { kStateCost, kControlCost, kDynamics };
 
 Problem SingleAffineSourceProblem(AffineSource source) {
   Problem problem = UniformProblem(1550 + static_cast<int>(source), 7, 4, 3);
-  for (Stage &stage : problem.stages) {
+  for (std::size_t i = 0; i < problem.stages.size(); ++i) {
+    Stage &stage = problem.stages[i];
     const Vector dynamics_offset = stage.c;
-    const Vector state_gradient = stage.q;
+    const Vector state_gradient = problem.q[i];
     const Vector control_gradient = stage.r;
     stage.c = source == AffineSource::kDynamics ? dynamics_offset
                                                 : Vector(stage.c.size());
-    stage.q = source == AffineSource::kStateCost ? state_gradient
-                                                 : Vector(stage.q.size());
+    problem.q[i] = source == AffineSource::kStateCost
+                       ? state_gradient
+                       : Vector(problem.q[i].size());
     stage.r = source == AffineSource::kControlCost ? control_gradient
                                                    : Vector(stage.r.size());
   }
   if (source != AffineSource::kStateCost)
-    problem.terminal_q = Vector(problem.terminal_q.size());
+    problem.q.back() = Vector(problem.q.back().size());
   return problem;
 }
 
 Problem ZeroHorizonProblem() {
   Problem problem;
   problem.initial_state = Vector{0.4, -0.2, 0.7};
-  problem.terminal_Q = PositiveDefinite(3, 1600, 1.2);
-  problem.terminal_q = GeneratedVector(3, 1610, 0.2);
+  problem.Q = {PositiveDefinite(3, 1600, 1.2)};
+  problem.q = {GeneratedVector(3, 1610, 0.2)};
   problem.terminal_E = Matrix(0, 3);
   problem.terminal_e = Vector(0);
   return problem;
@@ -1161,6 +1165,8 @@ Problem HeterogeneousDimensionProblem() {
                            Scalar{0.2});
   problem.initial_state = x.front();
   problem.stages.resize(horizon);
+  problem.Q.resize(horizon + 1);
+  problem.q.resize(horizon + 1);
   for (std::size_t i = 0; i < horizon; ++i) {
     Stage &stage = problem.stages[i];
     const std::size_t n = dimensions[i];
@@ -1171,12 +1177,13 @@ Problem HeterogeneousDimensionProblem() {
     stage.B = GeneratedMatrix(next, m, seed + 400 + static_cast<int>(i),
                               Scalar{0.08});
     stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
-    stage.Q = PositiveDefinite(n, seed + 500 + static_cast<int>(i), Scalar{1});
+    problem.Q[i] =
+        PositiveDefinite(n, seed + 500 + static_cast<int>(i), Scalar{1});
     stage.R =
         PositiveDefinite(m, seed + 600 + static_cast<int>(i), Scalar{1.5});
     stage.M =
         GeneratedMatrix(n, m, seed + 700 + static_cast<int>(i), Scalar{0.01});
-    stage.q =
+    problem.q[i] =
         GeneratedVector(n, seed + 800 + static_cast<int>(i), Scalar{0.05});
     stage.r =
         GeneratedVector(m, seed + 900 + static_cast<int>(i), Scalar{0.05});
@@ -1186,9 +1193,9 @@ Problem HeterogeneousDimensionProblem() {
     stage.E = Matrix(0, n);
     stage.e = Vector(0);
   }
-  problem.terminal_Q =
+  problem.Q.back() =
       PositiveDefinite(dimensions.back(), seed + 1000, Scalar{1.5});
-  problem.terminal_q =
+  problem.q.back() =
       GeneratedVector(dimensions.back(), seed + 1100, Scalar{0.05});
   problem.terminal_E = Matrix(0, dimensions.back());
   problem.terminal_e = Vector(0);
@@ -1270,28 +1277,30 @@ void PackVector(const Vector &source, Scalar **cursor, const Scalar **target) {
   *cursor += source.size();
 }
 
-std::size_t PackedEntries(const Stage &source) {
+std::size_t PackedEntries(const Stage &source, const Matrix &Q,
+                          const Vector &q) {
   const auto matrix_entries = [](const Matrix &matrix) {
     return matrix.rows() * matrix.cols();
   };
   return matrix_entries(source.A) + matrix_entries(source.B) + source.c.size() +
-         matrix_entries(source.Q) + matrix_entries(source.R) +
-         matrix_entries(source.M) + source.q.size() + source.r.size() +
+         matrix_entries(Q) + matrix_entries(source.R) +
+         matrix_entries(source.M) + q.size() + source.r.size() +
          matrix_entries(source.C) + matrix_entries(source.D) + source.d.size() +
          matrix_entries(source.E) + source.e.size();
 }
 
 std::size_t PackedEntries(const Problem &problem) {
-  std::size_t entries = problem.terminal_Q.rows() * problem.terminal_Q.cols() +
-                        problem.terminal_q.size() +
+  std::size_t entries = problem.Q.back().rows() * problem.Q.back().cols() +
+                        problem.q.back().size() +
                         problem.terminal_E.rows() * problem.terminal_E.cols() +
                         problem.terminal_e.size();
-  for (const Stage &stage : problem.stages)
-    entries += PackedEntries(stage);
+  for (std::size_t i = 0; i < problem.stages.size(); ++i)
+    entries += PackedEntries(problem.stages[i], problem.Q[i], problem.q[i]);
   return entries;
 }
 
-PackedStage Pack(const Stage &source, Scalar **cursor) {
+PackedStage Pack(const Stage &source, const Matrix &Q, const Vector &q,
+                 Scalar **cursor) {
   PackedStage out{};
   out.n = static_cast<int>(source.A.cols());
   out.next_n = static_cast<int>(source.A.rows());
@@ -1301,10 +1310,10 @@ PackedStage Pack(const Stage &source, Scalar **cursor) {
   PackMatrix(source.A, cursor, &out.A);
   PackMatrix(source.B, cursor, &out.B);
   PackVector(source.c, cursor, &out.c);
-  PackMatrix(source.Q, cursor, &out.Q);
+  PackMatrix(Q, cursor, &out.Q);
   PackMatrix(source.R, cursor, &out.R);
   PackMatrix(source.M, cursor, &out.M);
-  PackVector(source.q, cursor, &out.q);
+  PackVector(q, cursor, &out.q);
   PackVector(source.r, cursor, &out.r);
   PackMatrix(source.C, cursor, &out.C);
   PackMatrix(source.D, cursor, &out.D);
@@ -1316,10 +1325,10 @@ PackedStage Pack(const Stage &source, Scalar **cursor) {
 
 PackedTerminal Pack(const Problem &problem, Scalar **cursor) {
   PackedTerminal out{};
-  out.n = static_cast<int>(problem.terminal_Q.rows());
+  out.n = static_cast<int>(problem.Q.back().rows());
   out.state = static_cast<int>(problem.terminal_E.rows());
-  PackMatrix(problem.terminal_Q, cursor, &out.Q);
-  PackVector(problem.terminal_q, cursor, &out.q);
+  PackMatrix(problem.Q.back(), cursor, &out.Q);
+  PackVector(problem.q.back(), cursor, &out.q);
   PackMatrix(problem.terminal_E, cursor, &out.E);
   PackVector(problem.terminal_e, cursor, &out.e);
   return out;
@@ -1517,9 +1526,9 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
       update(value / scale, "state feasibility at stage " + std::to_string(i));
     }
     for (std::size_t row = 0; row < s.A.cols(); ++row) {
-      Scalar value = s.q[row] + left[row];
-      for (std::size_t col = 0; col < s.Q.cols(); ++col)
-        value += s.Q(row, col) * x[col];
+      Scalar value = problem.q[i][row] + left[row];
+      for (std::size_t col = 0; col < problem.Q[i].cols(); ++col)
+        value += problem.Q[i](row, col) * x[col];
       for (std::size_t col = 0; col < s.M.cols(); ++col)
         value += s.M(row, col) * u[col];
       for (std::size_t next = 0; next < s.A.rows(); ++next)
@@ -1551,10 +1560,10 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
   const Scalar *left =
       horizon == 0 ? initial_multiplier.data()
                    : dynamics.data() + (horizon - 1) * kTestStateCapacity;
-  for (std::size_t row = 0; row < problem.terminal_Q.rows(); ++row) {
-    Scalar value = problem.terminal_q[row] + left[row];
-    for (std::size_t col = 0; col < problem.terminal_Q.cols(); ++col)
-      value += problem.terminal_Q(row, col) * terminal[col];
+  for (std::size_t row = 0; row < problem.Q.back().rows(); ++row) {
+    Scalar value = problem.q.back()[row] + left[row];
+    for (std::size_t col = 0; col < problem.Q.back().cols(); ++col)
+      value += problem.Q.back()(row, col) * terminal[col];
     for (std::size_t constraint = 0; constraint < problem.terminal_E.rows();
          ++constraint)
       value +=
@@ -1574,8 +1583,9 @@ void RunEmulation(const Problem &problem, const std::string &name,
   std::vector<Scalar> packed_data(PackedEntries(problem));
   Scalar *packed_cursor = packed_data.data();
   std::vector<PackedStage> stages;
-  for (const Stage &stage : problem.stages)
-    stages.push_back(Pack(stage, &packed_cursor));
+  for (std::size_t i = 0; i < problem.stages.size(); ++i)
+    stages.push_back(
+        Pack(problem.stages[i], problem.Q[i], problem.q[i], &packed_cursor));
   const PackedTerminal terminal = Pack(problem, &packed_cursor);
   Expect(packed_cursor == packed_data.data() + packed_data.size(),
          "compact problem packing uses the exact allocation");
@@ -2031,9 +2041,8 @@ void RunEmulation(const Problem &problem, const std::string &name,
       std::max(multiplier_rank_tolerance,
                kMultiplierConsistencyTolerancePerTreeLevel *
                    static_cast<Scalar>(stage_level_counts.size()));
-  const Scalar multiplier_leaf_consistency_tolerance =
-      std::max(multiplier_rank_tolerance,
-               kMultiplierConsistencyTolerancePerTreeLevel);
+  const Scalar multiplier_leaf_consistency_tolerance = std::max(
+      multiplier_rank_tolerance, kMultiplierConsistencyTolerancePerTreeLevel);
   std::vector<DualParam> dual_params(horizon);
   std::vector<StateDualParam> state_dual_params(horizon);
   std::vector<int> dual_free_columns(static_cast<std::size_t>(horizon) *
@@ -2169,8 +2178,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
 }
 
 bool FitsAdversarialEmulationStorage(const Problem &problem) {
-  if (problem.terminal_Q.rows() >
-          static_cast<std::size_t>(kTestStateCapacity) ||
+  if (problem.Q.back().rows() > static_cast<std::size_t>(kTestStateCapacity) ||
       problem.terminal_E.rows() >
           static_cast<std::size_t>(kTestStateConstraintCapacity)) {
     return false;

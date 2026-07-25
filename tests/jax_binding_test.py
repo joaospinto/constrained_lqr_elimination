@@ -44,18 +44,22 @@ def _one_stage_problem(dtype):
                 "A": np.array([[1.0]], dtype=dtype),
                 "B": np.array([[1.0]], dtype=dtype),
                 "c": np.array([0.0], dtype=dtype),
-                "Q": np.array([[1.0]], dtype=dtype),
                 "R": np.array([[2.0]], dtype=dtype),
                 "M": np.array([[0.0]], dtype=dtype),
-                "q": np.array([0.0], dtype=dtype),
                 "r": np.array([0.0], dtype=dtype),
                 "C": np.array([[1.0]], dtype=dtype),
                 "D": np.array([[1.0]], dtype=dtype),
                 "d": np.array([0.0], dtype=dtype),
             }
         ],
-        "terminal_Q": np.array([[1.0]], dtype=dtype),
-        "terminal_q": np.array([0.0], dtype=dtype),
+        "Q": [
+            np.array([[1.0]], dtype=dtype),
+            np.array([[1.0]], dtype=dtype),
+        ],
+        "q": [
+            np.array([0.0], dtype=dtype),
+            np.array([0.0], dtype=dtype),
+        ],
     }
 
 
@@ -68,10 +72,10 @@ def test_eager_and_jit():
     packed = clqr_jax.pack_problem(problem, dtype=dtype)
     assert packed.factors.Q.shape == (2, 1, 1)
     assert packed.rhs.q.shape == (2, 1)
-    np.testing.assert_array_equal(packed.factors.Q[-1], problem["terminal_Q"])
-    np.testing.assert_array_equal(packed.rhs.q[-1], problem["terminal_q"])
-    assert "terminal_Q" not in packed.factors._fields
-    assert "terminal_q" not in packed.rhs._fields
+    np.testing.assert_array_equal(packed.factors.Q[0], problem["Q"][0])
+    np.testing.assert_array_equal(packed.rhs.q[0], problem["q"][0])
+    np.testing.assert_array_equal(packed.factors.Q[-1], problem["Q"][-1])
+    np.testing.assert_array_equal(packed.rhs.q[-1], problem["q"][-1])
 
     eager = clqr_jax.solve(packed)
     compiled = jax.jit(clqr_jax.solve)(packed)
@@ -121,9 +125,7 @@ def test_direct_mapping_and_sequential_vmap():
 
     packed = clqr_jax.pack_problem(problem, dtype=dtype)
     second = packed._replace(
-        rhs=packed.rhs._replace(
-            initial_state=2.0 * packed.rhs.initial_state
-        )
+        rhs=packed.rhs._replace(initial_state=2.0 * packed.rhs.initial_state)
     )
     batched = jax.tree.map(lambda *leaves: np.stack(leaves), packed, second)
     result = jax.jit(jax.vmap(clqr_jax.solve))(batched)
@@ -163,25 +165,29 @@ def test_heterogeneous_dimensions_match_python_solver():
                 "A": np.array([[1.0, 0.3]], dtype=dtype),
                 "B": np.array([[0.5]], dtype=dtype),
                 "c": np.array([0.1], dtype=dtype),
-                "Q": np.eye(2, dtype=dtype),
                 "R": np.array([[2.0]], dtype=dtype),
                 "M": np.zeros((2, 1), dtype=dtype),
-                "q": np.array([0.1, -0.1], dtype=dtype),
                 "r": np.array([0.2], dtype=dtype),
             },
             {
                 "A": np.array([[1.0], [-0.5]], dtype=dtype),
                 "B": np.zeros((2, 0), dtype=dtype),
                 "c": np.array([0.0, 0.1], dtype=dtype),
-                "Q": np.array([[1.5]], dtype=dtype),
                 "R": np.zeros((0, 0), dtype=dtype),
                 "M": np.zeros((1, 0), dtype=dtype),
-                "q": np.array([0.3], dtype=dtype),
                 "r": np.zeros((0,), dtype=dtype),
             },
         ],
-        "terminal_Q": 2.0 * np.eye(2, dtype=dtype),
-        "terminal_q": np.array([-0.1, 0.2], dtype=dtype),
+        "Q": [
+            np.eye(2, dtype=dtype),
+            np.array([[1.5]], dtype=dtype),
+            2.0 * np.eye(2, dtype=dtype),
+        ],
+        "q": [
+            np.array([0.1, -0.1], dtype=dtype),
+            np.array([0.3], dtype=dtype),
+            np.array([-0.1, 0.2], dtype=dtype),
+        ],
     }
     packed = clqr_jax.pack_problem(problem, dtype=dtype)
     result = jax.jit(clqr_jax.solve)(packed)
@@ -195,7 +201,11 @@ def test_heterogeneous_dimensions_match_python_solver():
                 for stage in value
             ]
             if key == "stages"
-            else np.asarray(value, dtype=np.float64)
+            else (
+                [np.asarray(item, dtype=np.float64) for item in value]
+                if key in ("Q", "q")
+                else np.asarray(value, dtype=np.float64)
+            )
         )
         for key, value in problem.items()
     }
@@ -205,9 +215,7 @@ def test_heterogeneous_dimensions_match_python_solver():
     assert reference["status"] == "optimal"
     np.testing.assert_allclose(result.objective[0], reference["objective"], atol=atol)
     for node, state in enumerate(reference["states"]):
-        np.testing.assert_allclose(
-            result.states[node, : state.size], state, atol=atol
-        )
+        np.testing.assert_allclose(result.states[node, : state.size], state, atol=atol)
     for stage, control in enumerate(reference["controls"]):
         np.testing.assert_allclose(
             result.controls[stage, : control.size], control, atol=atol
@@ -226,8 +234,8 @@ def test_zero_horizon_and_zero_capacities():
     problem = {
         "initial_state": np.array([0.5, -0.25], dtype=dtype),
         "stages": [],
-        "terminal_Q": np.eye(2, dtype=dtype),
-        "terminal_q": np.array([0.1, -0.2], dtype=dtype),
+        "Q": [np.eye(2, dtype=dtype)],
+        "q": [np.array([0.1, -0.2], dtype=dtype)],
     }
     packed = clqr_jax.pack_problem(problem, dtype=dtype)
     result = jax.jit(clqr_jax.solve)(packed)

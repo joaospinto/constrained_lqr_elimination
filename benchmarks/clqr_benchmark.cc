@@ -72,6 +72,8 @@ clqr::Problem MakeFeasibleMixedProblem(int seed, std::size_t horizon,
 
   problem.initial_state = x[0];
   problem.stages.resize(horizon);
+  problem.Q.resize(horizon + 1);
+  problem.q.resize(horizon + 1);
   for (std::size_t i = 0; i < horizon; ++i) {
     clqr::Stage& stage = problem.stages[i];
     stage.A =
@@ -80,11 +82,13 @@ clqr::Problem MakeFeasibleMixedProblem(int seed, std::size_t horizon,
     stage.B = GeneratedMatrix(states, controls,
                               seed + 300 + 10 * static_cast<int>(i), 0.2);
     stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
-    stage.Q = PositiveDefinite(states, seed + 400 + static_cast<int>(i), 1.0);
+    problem.Q[i] =
+        PositiveDefinite(states, seed + 400 + static_cast<int>(i), 1.0);
     stage.R = PositiveDefinite(controls, seed + 500 + static_cast<int>(i), 1.5);
     stage.M = GeneratedMatrix(states, controls,
                               seed + 600 + static_cast<int>(i), 0.03);
-    stage.q = GeneratedVector(states, seed + 700 + static_cast<int>(i), 0.2);
+    problem.q[i] =
+        GeneratedVector(states, seed + 700 + static_cast<int>(i), 0.2);
     stage.r = GeneratedVector(controls, seed + 800 + static_cast<int>(i), 0.2);
     stage.C = clqr::Matrix(0, states);
     stage.D = clqr::Matrix(0, controls);
@@ -104,8 +108,8 @@ clqr::Problem MakeFeasibleMixedProblem(int seed, std::size_t horizon,
       }
     }
   }
-  problem.terminal_Q = PositiveDefinite(states, seed + 1200, 1.5);
-  problem.terminal_q = GeneratedVector(states, seed + 1300, 0.2);
+  problem.Q.back() = PositiveDefinite(states, seed + 1200, 1.5);
+  problem.q.back() = GeneratedVector(states, seed + 1300, 0.2);
   problem.terminal_E = clqr::Matrix(0, states);
   problem.terminal_e = clqr::Vector(0);
   return problem;

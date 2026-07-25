@@ -58,6 +58,8 @@ Problem MakeProblem(std::size_t stages, std::size_t state_dim,
     problem.initial_state[i] = 0.1 * static_cast<Scalar>(i + 1);
   }
   problem.stages.resize(stages);
+  problem.Q.resize(stages + 1);
+  problem.q.resize(stages + 1);
   for (std::size_t i = 0; i < stages; ++i) {
     Stage& stage = problem.stages[i];
     stage.A = Matrix(state_dim, state_dim);
@@ -74,12 +76,13 @@ Problem MakeProblem(std::size_t stages, std::size_t state_dim,
       }
     }
     stage.c = Vector(state_dim);
-    stage.Q = Matrix(state_dim, state_dim);
-    for (std::size_t row = 0; row < state_dim; ++row) stage.Q(row, row) = 1.0;
+    problem.Q[i] = Matrix(state_dim, state_dim);
+    for (std::size_t row = 0; row < state_dim; ++row)
+      problem.Q[i](row, row) = 1.0;
     stage.R = Matrix(control_dim, control_dim);
     for (std::size_t row = 0; row < control_dim; ++row) stage.R(row, row) = 2.0;
     stage.M = Matrix(state_dim, control_dim);
-    stage.q = Vector(state_dim);
+    problem.q[i] = Vector(state_dim);
     stage.r = Vector(control_dim);
     stage.C = Matrix(0, state_dim);
     stage.D = Matrix(0, control_dim);
@@ -87,10 +90,10 @@ Problem MakeProblem(std::size_t stages, std::size_t state_dim,
     stage.E = Matrix(0, state_dim);
     stage.e = Vector(0);
   }
-  problem.terminal_Q = Matrix(state_dim, state_dim);
+  problem.Q.back() = Matrix(state_dim, state_dim);
   for (std::size_t row = 0; row < state_dim; ++row)
-    problem.terminal_Q(row, row) = 1.5;
-  problem.terminal_q = Vector(state_dim);
+    problem.Q.back()(row, row) = 1.5;
+  problem.q.back() = Vector(state_dim);
   problem.terminal_E = Matrix(0, state_dim);
   problem.terminal_e = Vector(0);
   return problem;
@@ -126,14 +129,13 @@ void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
 void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
 
 int main() {
-  constexpr std::size_t kMaximumSize =
-      std::numeric_limits<std::size_t>::max();
-  static_assert(Workspace::RequiredBytesUniform(0, kMaximumSize, 0) ==
-                    kMaximumSize,
-                "unconstrained workspace overflow must saturate");
-  static_assert(Workspace::RequiredBytesUniform(kMaximumSize, 0, 0) ==
-                    kMaximumSize,
-                "unconstrained horizon overflow must saturate");
+  constexpr std::size_t kMaximumSize = std::numeric_limits<std::size_t>::max();
+  static_assert(
+      Workspace::RequiredBytesUniform(0, kMaximumSize, 0) == kMaximumSize,
+      "unconstrained workspace overflow must saturate");
+  static_assert(
+      Workspace::RequiredBytesUniform(kMaximumSize, 0, 0) == kMaximumSize,
+      "unconstrained horizon overflow must saturate");
   static_assert(Workspace::RequiredBytesUniformConstrained(
                     0, kMaximumSize, 0, 0, 0, 0) == kMaximumSize,
                 "constrained workspace overflow must saturate");
@@ -181,16 +183,15 @@ int main() {
       clqr::Solve(factorization, rhs, factored_workspace);
   rhs.initial_state[0] += Scalar{0.25};
   rhs.stages[0].c[0] -= Scalar{0.1};
-  rhs.stages[0].q[0] += Scalar{0.2};
+  rhs.q[0][0] += Scalar{0.2};
   rhs.stages[0].r[0] -= Scalar{0.15};
-  rhs.terminal_q[0] += Scalar{0.3};
+  rhs.q.back()[0] += Scalar{0.3};
   SolutionView second_factored =
       clqr::Solve(factorization, rhs, factored_workspace);
   StopCounting();
   const std::size_t factored_allocations =
       g_allocations.load(std::memory_order_relaxed);
-  const std::size_t factored_bytes =
-      g_bytes.load(std::memory_order_relaxed);
+  const std::size_t factored_bytes = g_bytes.load(std::memory_order_relaxed);
   Expect(first_factored.status == SolveStatus::kOptimal,
          "first reusable factored solve status");
   Expect(second_factored.status == SolveStatus::kOptimal,
@@ -326,12 +327,11 @@ int main() {
             << terminal_external_allocations
             << " terminal_external_bytes=" << terminal_external_bytes
             << " zero_horizon_required=" << zero_horizon_required
-            << " zero_horizon_constexpr="
-            << kZeroHorizonConstrainedBytes
+            << " zero_horizon_constexpr=" << kZeroHorizonConstrainedBytes
             << " zero_horizon_external_allocations="
             << zero_horizon_external_allocations
-            << " zero_horizon_external_bytes="
-            << zero_horizon_external_bytes << "\n";
+            << " zero_horizon_external_bytes=" << zero_horizon_external_bytes
+            << "\n";
   Expect(constrained_owned_allocations == 1,
          "constrained owned workspace should allocate exactly once");
   Expect(constrained_external_allocations == 0,

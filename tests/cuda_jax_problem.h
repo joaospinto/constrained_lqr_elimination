@@ -64,18 +64,20 @@ inline Problem MakeJaxCrossValidationProblem() {
     u[i] = detail::JaxFixtureVector(m, 201 + static_cast<int>(i), 0.4);
   problem.initial_state = x.front();
   problem.stages.resize(horizon);
+  problem.Q.resize(horizon + 1);
+  problem.q.resize(horizon + 1);
   for (std::size_t i = 0; i < horizon; ++i) {
     Stage& stage = problem.stages[i];
     stage.A = detail::JaxFixtureMatrix(n, n, 301 + static_cast<int>(i), 0.1);
     for (std::size_t row = 0; row < n; ++row) stage.A(row, row) += 0.85;
     stage.B = detail::JaxFixtureMatrix(n, m, 401 + static_cast<int>(i), 0.2);
     stage.c = x[i + 1] - stage.A * x[i] - stage.B * u[i];
-    stage.Q =
+    problem.Q[i] =
         detail::JaxFixturePositiveDefinite(n, 501 + static_cast<int>(i), 1.0);
     stage.R =
         detail::JaxFixturePositiveDefinite(m, 601 + static_cast<int>(i), 1.3);
     stage.M = detail::JaxFixtureMatrix(n, m, 701 + static_cast<int>(i), 0.025);
-    stage.q = detail::JaxFixtureVector(n, 801 + static_cast<int>(i), 0.15);
+    problem.q[i] = detail::JaxFixtureVector(n, 801 + static_cast<int>(i), 0.15);
     stage.r = detail::JaxFixtureVector(m, 901 + static_cast<int>(i), 0.15);
     stage.C = Matrix(0, n);
     stage.D = Matrix(0, m);
@@ -87,8 +89,8 @@ inline Problem MakeJaxCrossValidationProblem() {
     stage.e[0] = -detail::RowDot(stage.E, 0, x[i]);
     stage.e[1] = 2.0 * stage.e[0];
   }
-  problem.terminal_Q = detail::JaxFixturePositiveDefinite(n, 1101, 1.4);
-  problem.terminal_q = detail::JaxFixtureVector(n, 1201, 0.15);
+  problem.Q.back() = detail::JaxFixturePositiveDefinite(n, 1101, 1.4);
+  problem.q.back() = detail::JaxFixtureVector(n, 1201, 0.15);
   problem.terminal_E = Matrix(0, n);
   problem.terminal_e = Vector(0);
   return problem;

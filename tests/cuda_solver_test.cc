@@ -93,6 +93,8 @@ Problem GeneratedProblem(int seed, std::size_t horizon, std::size_t n,
     nominal_u[i] = GeneratedVector(m, seed + 200 + static_cast<int>(i), 0.5);
   problem.initial_state = nominal_x[0];
   problem.stages.resize(horizon);
+  problem.Q.resize(horizon + 1);
+  problem.q.resize(horizon + 1);
   for (std::size_t i = 0; i < horizon; ++i) {
     Stage &stage = problem.stages[i];
     stage.A = GeneratedMatrix(n, n, seed + 10 * static_cast<int>(i), 0.15);
@@ -101,10 +103,10 @@ Problem GeneratedProblem(int seed, std::size_t horizon, std::size_t n,
     stage.B = GeneratedMatrix(n, m, seed + 300 + static_cast<int>(i), 0.25);
     stage.c =
         nominal_x[i + 1] - stage.A * nominal_x[i] - stage.B * nominal_u[i];
-    stage.Q = PositiveDefinite(n, seed + 400 + static_cast<int>(i), 1.0);
+    problem.Q[i] = PositiveDefinite(n, seed + 400 + static_cast<int>(i), 1.0);
     stage.R = PositiveDefinite(m, seed + 500 + static_cast<int>(i), 1.4);
     stage.M = GeneratedMatrix(n, m, seed + 600 + static_cast<int>(i), 0.04);
-    stage.q = GeneratedVector(n, seed + 700 + static_cast<int>(i), 0.2);
+    problem.q[i] = GeneratedVector(n, seed + 700 + static_cast<int>(i), 0.2);
     stage.r = GeneratedVector(m, seed + 800 + static_cast<int>(i), 0.2);
     stage.C = Matrix(0, n);
     stage.D = Matrix(0, m);
@@ -138,8 +140,8 @@ Problem GeneratedProblem(int seed, std::size_t horizon, std::size_t n,
         stage.e[row] = -RowDot(stage.E, row, nominal_x[i]);
     }
   }
-  problem.terminal_Q = PositiveDefinite(n, seed + 1200, 1.5);
-  problem.terminal_q = GeneratedVector(n, seed + 1300, 0.2);
+  problem.Q.back() = PositiveDefinite(n, seed + 1200, 1.5);
+  problem.q.back() = GeneratedVector(n, seed + 1300, 0.2);
   problem.terminal_E = Matrix(0, n);
   problem.terminal_e = Vector(0);
   if (mode == ConstraintMode::kTerminal && p > 0) {
@@ -166,6 +168,8 @@ Problem NonuniformProblem() {
         GeneratedVector(controls[i], 2200 + static_cast<int>(i), 0.4));
   problem.initial_state = nominal_x.front();
   problem.stages.resize(controls.size());
+  problem.Q.resize(controls.size() + 1);
+  problem.q.resize(controls.size() + 1);
   for (std::size_t i = 0; i < controls.size(); ++i) {
     Stage &stage = problem.stages[i];
     const std::size_t n = dimensions[i];
@@ -175,10 +179,10 @@ Problem NonuniformProblem() {
     stage.B = GeneratedMatrix(next, m, 2400 + static_cast<int>(i), 0.25);
     stage.c =
         nominal_x[i + 1] - stage.A * nominal_x[i] - stage.B * nominal_u[i];
-    stage.Q = PositiveDefinite(n, 2500 + static_cast<int>(i), 1.0);
+    problem.Q[i] = PositiveDefinite(n, 2500 + static_cast<int>(i), 1.0);
     stage.R = PositiveDefinite(m, 2600 + static_cast<int>(i), 1.2);
     stage.M = GeneratedMatrix(n, m, 2700 + static_cast<int>(i), 0.03);
-    stage.q = GeneratedVector(n, 2800 + static_cast<int>(i), 0.2);
+    problem.q[i] = GeneratedVector(n, 2800 + static_cast<int>(i), 0.2);
     stage.r = GeneratedVector(m, 2900 + static_cast<int>(i), 0.2);
     stage.C = Matrix(0, n);
     stage.D = Matrix(0, m);
@@ -195,8 +199,8 @@ Problem NonuniformProblem() {
       stage.e = Vector{-RowDot(stage.E, 0, nominal_x[i])};
     }
   }
-  problem.terminal_Q = PositiveDefinite(dimensions.back(), 3100, 1.4);
-  problem.terminal_q = GeneratedVector(dimensions.back(), 3110, 0.2);
+  problem.Q.back() = PositiveDefinite(dimensions.back(), 3100, 1.4);
+  problem.q.back() = GeneratedVector(dimensions.back(), 3110, 0.2);
   problem.terminal_E = GeneratedMatrix(1, dimensions.back(), 3120, 0.4);
   problem.terminal_e = Vector{-RowDot(problem.terminal_E, 0, nominal_x.back())};
   return problem;
@@ -223,24 +227,26 @@ Problem PathologicalScratchProblem() {
   Problem problem;
   problem.initial_state = Vector(n);
   problem.stages.resize(1);
+  problem.Q.resize(2);
+  problem.q.resize(2);
   Stage &stage = problem.stages[0];
   stage.A = Matrix(0, n);
   stage.B = Matrix(0, 0);
   stage.c = Vector(0);
-  stage.Q = Matrix(n, n);
+  problem.Q[0] = Matrix(n, n);
   for (std::size_t row = 0; row < n; ++row)
-    stage.Q(row, row) = Scalar{1};
+    problem.Q[0](row, row) = Scalar{1};
   stage.R = Matrix(0, 0);
   stage.M = Matrix(n, 0);
-  stage.q = Vector(n);
+  problem.q[0] = Vector(n);
   stage.r = Vector(0);
   stage.C = Matrix(0, n);
   stage.D = Matrix(0, 0);
   stage.d = Vector(0);
   stage.E = Matrix(0, n);
   stage.e = Vector(0);
-  problem.terminal_Q = Matrix(0, 0);
-  problem.terminal_q = Vector(0);
+  problem.Q.back() = Matrix(0, 0);
+  problem.q.back() = Vector(0);
   problem.terminal_E = Matrix(0, 0);
   problem.terminal_e = Vector(0);
   return problem;
@@ -320,8 +326,8 @@ Scalar MaxKktResidual(const Problem &problem,
       update(MaxScaledStateResidual(stage.E, stage.e, solution.states[i]),
              "state feasibility at stage " + std::to_string(i));
 
-    Vector gx = stage.Q * solution.states[i] + stage.M * solution.controls[i] +
-                stage.q -
+    Vector gx = problem.Q[i] * solution.states[i] +
+                stage.M * solution.controls[i] + problem.q[i] -
                 clqr::Transpose(stage.A) * solution.dynamics_multipliers[i];
     gx = gx + (i == 0 ? solution.initial_multiplier
                       : solution.dynamics_multipliers[i - 1]);
@@ -343,7 +349,7 @@ Scalar MaxKktResidual(const Problem &problem,
                                   solution.states.back()),
            "terminal-state feasibility");
   Vector terminal_gradient =
-      problem.terminal_Q * solution.states.back() + problem.terminal_q;
+      problem.Q.back() * solution.states.back() + problem.q.back();
   terminal_gradient =
       terminal_gradient + (horizon == 0 ? solution.initial_multiplier
                                         : solution.dynamics_multipliers.back());
@@ -420,22 +426,24 @@ void NonPositiveDefiniteReducedControlCostCase() {
   Problem problem;
   problem.initial_state = Vector{0.4};
   problem.stages.resize(1);
+  problem.Q.resize(2);
+  problem.q.resize(2);
   Stage &stage = problem.stages[0];
   stage.A = Matrix(1, 1, {1.0});
   stage.B = Matrix(1, 1, {1.0});
   stage.c = Vector{0.0};
-  stage.Q = Matrix(1, 1, {0.0});
+  problem.Q[0] = Matrix(1, 1, {0.0});
   stage.R = Matrix(1, 1, {0.0});
   stage.M = Matrix(1, 1, {0.0});
-  stage.q = Vector{0.0};
+  problem.q[0] = Vector{0.0};
   stage.r = Vector{-0.3};
   stage.C = Matrix(0, 1);
   stage.D = Matrix(0, 1);
   stage.d = Vector(0);
   stage.E = Matrix(0, 1);
   stage.e = Vector(0);
-  problem.terminal_Q = Matrix(1, 1, {2.0});
-  problem.terminal_q = Vector{-0.2};
+  problem.Q.back() = Matrix(1, 1, {2.0});
+  problem.q.back() = Vector{-0.2};
   problem.terminal_E = Matrix(0, 1);
   problem.terminal_e = Vector(0);
 
@@ -450,8 +458,8 @@ void NonPositiveDefiniteReducedControlCostCase() {
 Problem ZeroHorizonProblem() {
   Problem problem;
   problem.initial_state = Vector{0.4, -0.2, 0.7};
-  problem.terminal_Q = PositiveDefinite(3, 3200, 1.2);
-  problem.terminal_q = GeneratedVector(3, 3210, 0.2);
+  problem.Q = {PositiveDefinite(3, 3200, 1.2)};
+  problem.q = {GeneratedVector(3, 3210, 0.2)};
   problem.terminal_E = Matrix(0, 3);
   problem.terminal_e = Vector(0);
   return problem;
@@ -544,8 +552,8 @@ void WorkspaceBackedViewCase() {
          name + " materialized full primal-dual KKT residual");
 
   Problem oversized = problem;
-  const std::size_t terminal_n = oversized.terminal_Q.rows();
-  oversized.terminal_Q = Matrix(terminal_n + 1, terminal_n + 1);
+  const std::size_t terminal_n = oversized.Q.back().rows();
+  oversized.Q.back() = Matrix(terminal_n + 1, terminal_n + 1);
   const clqr::cuda::SolutionView oversized_view =
       clqr::cuda::SolvePreparedView(oversized, workspace);
   Expect(oversized_view.status == SolveStatus::kInvalidInput,
@@ -565,8 +573,7 @@ void WorkspaceBackedViewCase() {
          name + " clears metadata after prepared-option validation");
 
   Problem invalid = problem;
-  invalid.stages[0].A(0, 0) =
-      std::numeric_limits<Scalar>::quiet_NaN();
+  invalid.stages[0].A(0, 0) = std::numeric_limits<Scalar>::quiet_NaN();
   const clqr::cuda::SolutionView invalid_view =
       clqr::cuda::SolvePreparedView(invalid, workspace);
   Expect(invalid_view.status == SolveStatus::kInvalidInput,

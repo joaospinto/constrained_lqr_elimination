@@ -89,9 +89,7 @@ int main(int argc, char** argv) {
   PrintSequence(horizon,
                 [&](std::size_t i) { PrintMatrix(problem.stages[i].B); });
   std::cout << ",\"Q\":";
-  PrintSequence(horizon + 1, [&](std::size_t i) {
-    PrintMatrix(i == horizon ? problem.terminal_Q : problem.stages[i].Q);
-  });
+  PrintSequence(horizon + 1, [&](std::size_t i) { PrintMatrix(problem.Q[i]); });
   std::cout << ",\"M\":";
   PrintSequence(horizon,
                 [&](std::size_t i) { PrintMatrix(problem.stages[i].M); });
@@ -111,9 +109,7 @@ int main(int argc, char** argv) {
     PrintMatrix(Matrix(p, problem.stages[i].B.cols()));
   });
   std::cout << ",\"q\":";
-  PrintSequence(horizon + 1, [&](std::size_t i) {
-    PrintVector(i == horizon ? problem.terminal_q : problem.stages[i].q);
-  });
+  PrintSequence(horizon + 1, [&](std::size_t i) { PrintVector(problem.q[i]); });
   std::cout << ",\"r\":";
   PrintSequence(horizon,
                 [&](std::size_t i) { PrintVector(problem.stages[i].r); });

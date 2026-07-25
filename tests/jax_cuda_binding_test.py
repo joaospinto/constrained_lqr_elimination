@@ -46,18 +46,22 @@ def _problem(dtype, initial_state=1.0):
                 "A": np.array([[1.0]], dtype=dtype),
                 "B": np.array([[1.0]], dtype=dtype),
                 "c": np.array([0.0], dtype=dtype),
-                "Q": np.array([[1.0]], dtype=dtype),
                 "R": np.array([[2.0]], dtype=dtype),
                 "M": np.array([[0.0]], dtype=dtype),
-                "q": np.array([0.0], dtype=dtype),
                 "r": np.array([0.0], dtype=dtype),
                 "C": np.array([[1.0]], dtype=dtype),
                 "D": np.array([[1.0]], dtype=dtype),
                 "d": np.array([0.0], dtype=dtype),
             }
         ],
-        "terminal_Q": np.array([[1.0]], dtype=dtype),
-        "terminal_q": np.array([0.0], dtype=dtype),
+        "Q": [
+            np.array([[1.0]], dtype=dtype),
+            np.array([[1.0]], dtype=dtype),
+        ],
+        "q": [
+            np.array([0.0], dtype=dtype),
+            np.array([0.0], dtype=dtype),
+        ],
     }
 
 
@@ -69,32 +73,34 @@ def _heterogeneous_problem(dtype):
                 "A": np.array([[1.0, 0.3]], dtype=dtype),
                 "B": np.array([[0.5]], dtype=dtype),
                 "c": np.array([0.1], dtype=dtype),
-                "Q": np.eye(2, dtype=dtype),
                 "R": np.array([[2.0]], dtype=dtype),
                 "M": np.zeros((2, 1), dtype=dtype),
-                "q": np.array([0.1, -0.1], dtype=dtype),
                 "r": np.array([0.2], dtype=dtype),
             },
             {
                 "A": np.array([[1.0], [-0.5]], dtype=dtype),
                 "B": np.zeros((2, 0), dtype=dtype),
                 "c": np.array([0.0, 0.1], dtype=dtype),
-                "Q": np.array([[1.5]], dtype=dtype),
                 "R": np.zeros((0, 0), dtype=dtype),
                 "M": np.zeros((1, 0), dtype=dtype),
-                "q": np.array([0.3], dtype=dtype),
                 "r": np.zeros((0,), dtype=dtype),
             },
         ],
-        "terminal_Q": 2.0 * np.eye(2, dtype=dtype),
-        "terminal_q": np.array([-0.1, 0.2], dtype=dtype),
+        "Q": [
+            np.eye(2, dtype=dtype),
+            np.array([[1.5]], dtype=dtype),
+            2.0 * np.eye(2, dtype=dtype),
+        ],
+        "q": [
+            np.array([0.1, -0.1], dtype=dtype),
+            np.array([0.3], dtype=dtype),
+            np.array([-0.1, 0.2], dtype=dtype),
+        ],
     }
 
 
 def _cuda_device():
-    devices = [
-        device for device in jax.devices() if device.platform in ("gpu", "cuda")
-    ]
+    devices = [device for device in jax.devices() if device.platform in ("gpu", "cuda")]
     if not devices:
         raise RuntimeError("jax_cuda_binding_test requires a CUDA device")
     return devices[0]
@@ -125,9 +131,7 @@ def test_cuda_eager_jit_and_new_rhs():
     changed = packed._replace(
         rhs=packed.rhs._replace(
             c=packed.rhs.c.at[0, 0].set(0.25),
-            q=packed.rhs.q.at[:, 0].set(
-                np.array([0.1, 0.2], dtype=dtype)
-            ),
+            q=packed.rhs.q.at[:, 0].set(np.array([0.1, 0.2], dtype=dtype)),
             r=packed.rhs.r.at[0, 0].set(0.3),
             d=packed.rhs.d.at[0, 0].set(0.5),
             e=packed.rhs.e,
@@ -185,12 +189,10 @@ def test_cuda_zero_horizon():
     problem = {
         "initial_state": np.array([0.5, -0.25], dtype=dtype),
         "stages": [],
-        "terminal_Q": np.eye(2, dtype=dtype),
-        "terminal_q": np.array([0.1, -0.2], dtype=dtype),
+        "Q": [np.eye(2, dtype=dtype)],
+        "q": [np.array([0.1, -0.2], dtype=dtype)],
     }
-    packed = jax.device_put(
-        clqr_jax.pack_problem(problem, dtype=dtype), device
-    )
+    packed = jax.device_put(clqr_jax.pack_problem(problem, dtype=dtype), device)
     result = jax.jit(clqr_jax.solve)(packed)
     assert int(result.status) == clqr_jax.SolveStatus.OPTIMAL
     assert result.controls.shape == (0, 0)
