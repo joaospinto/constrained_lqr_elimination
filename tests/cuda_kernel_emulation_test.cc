@@ -85,6 +85,8 @@ const AllowedDeviceFailure *AllowedFailureForCase(const std::string &name) {
        {kDeviceNumericalFailure, "value scan", 20}},
       {"shared-extended-horizon-257",
        {kDeviceNumericalFailure, "multiplier recovery", 17}},
+      {"shared-stable-extended-horizon-257",
+       {kDeviceNumericalFailure, "multiplier recovery", 17}},
       {"shared-property-seed-1",
        {kDeviceNumericalFailure, "independent reduction", 7}},
       {"shared-property-seed-5",
@@ -482,12 +484,13 @@ void FreeFixedFreeValueCompositionCase() {
   DeviceStatus status{kDeviceOk, -1, 0};
   Scalar augmented[1]{};
   Scalar factors[1]{};
+  Scalar product[1]{};
   int best_row = -1;
   threadIdx.x = 0;
   blockDim.x = 1;
 
   ComposeValueElementsBlock(first, second, kTolerance, &output, &status, 0,
-                            augmented, factors, &best_row);
+                            augmented, factors, product, &best_row);
 
   Expect(status.code == kDeviceOk, "free-fixed-free value composition status");
   Expect(output.left_dim == 2 && output.right_dim == 3,
@@ -501,6 +504,230 @@ void FreeFixedFreeValueCompositionCase() {
   for (std::size_t i = 0; i < std::size(second_c); ++i)
     Expect(output_c[i] == second_c[i],
            "free-fixed-free value composition preserves the right curvature");
+}
+
+void NonuniformValueCompositionCase() {
+  constexpr int left = 2;
+  constexpr int shared = 3;
+  constexpr int right = 4;
+  constexpr int columns = 2 * shared + left;
+  Scalar first_a[]{Scalar{1.0}, Scalar{0.2}, Scalar{-0.3},
+                   Scalar{0.8}, Scalar{0.4}, Scalar{-0.5}};
+  Scalar first_c[]{Scalar{0.2},   Scalar{0.02}, Scalar{-0.01},
+                   Scalar{0.02},  Scalar{0.3},  Scalar{0.04},
+                   Scalar{-0.01}, Scalar{0.04}, Scalar{0.25}};
+  Scalar first_j[]{Scalar{1.4}, Scalar{0.1}, Scalar{0.1}, Scalar{1.1}};
+  Scalar second_a[]{Scalar{0.6}, Scalar{-0.2}, Scalar{0.1},  Scalar{0.3},
+                    Scalar{0.7}, Scalar{-0.4}, Scalar{-0.5}, Scalar{0.2},
+                    Scalar{0.8}, Scalar{0.9},  Scalar{0.1},  Scalar{-0.3}};
+  Scalar second_c[]{Scalar{0.4},   Scalar{0.03},  Scalar{-0.02}, Scalar{0.01},
+                    Scalar{0.03},  Scalar{0.5},   Scalar{0.04},  Scalar{-0.01},
+                    Scalar{-0.02}, Scalar{0.04},  Scalar{0.6},   Scalar{0.02},
+                    Scalar{0.01},  Scalar{-0.01}, Scalar{0.02},  Scalar{0.45}};
+  Scalar second_j[]{Scalar{0.7},   Scalar{0.05}, Scalar{-0.02},
+                    Scalar{0.05},  Scalar{0.9},  Scalar{0.03},
+                    Scalar{-0.02}, Scalar{0.03}, Scalar{0.8}};
+  ValueElement first{left, shared, first_a, first_c, first_j};
+  ValueElement second{shared, right, second_a, second_c, second_j};
+
+  Scalar output_a[right * left]{};
+  Scalar output_c[right * right]{};
+  Scalar output_j[left * left]{};
+  ValueElement output{0, 0, output_a, output_c, output_j};
+  Scalar augmented[shared * columns]{};
+  Scalar factors[shared]{};
+  Scalar product[shared * right]{};
+  DeviceStatus status{kDeviceOk, -1, 0};
+  int best_row = -1;
+  threadIdx.x = 0;
+  blockDim.x = 1;
+  ComposeValueElementsBlock(first, second, kTolerance, &output, &status, 0,
+                            augmented, factors, product, &best_row);
+  Expect(status.code == kDeviceOk,
+         "nonuniform staged value composition status");
+
+  Scalar reference_augmented[shared * columns]{};
+  for (int row = 0; row < shared; ++row) {
+    for (int col = 0; col < shared; ++col) {
+      Scalar value = row == col ? Scalar{1} : Scalar{0};
+      for (int k = 0; k < shared; ++k)
+        value += first_c[row * shared + k] * second_j[k * shared + col];
+      reference_augmented[row * columns + col] = value;
+    }
+    for (int col = 0; col < left; ++col)
+      reference_augmented[row * columns + shared + col] =
+          first_a[row * left + col];
+    for (int col = 0; col < shared; ++col)
+      reference_augmented[row * columns + shared + left + col] =
+          first_c[row * shared + col];
+  }
+  Scalar reference_factors[shared]{};
+  int reference_best_row = -1;
+  Expect(SolveGeneralMultipleRhsBlock(reference_augmented, shared, columns,
+                                      kTolerance, reference_factors,
+                                      &reference_best_row),
+         "nonuniform reference value solve");
+
+  Scalar reference_a[right * left]{};
+  Scalar reference_c[right * right]{};
+  Scalar reference_j[left * left]{};
+  for (int row = 0; row < right; ++row) {
+    for (int col = 0; col < left; ++col) {
+      for (int k = 0; k < shared; ++k) {
+        reference_a[row * left + col] +=
+            second_a[row * shared + k] *
+            reference_augmented[k * columns + shared + col];
+      }
+    }
+  }
+  for (int row = 0; row < right; ++row) {
+    for (int col = 0; col < right; ++col) {
+      Scalar value = second_c[row * right + col];
+      for (int p = 0; p < shared; ++p) {
+        for (int q = 0; q < shared; ++q) {
+          value += second_a[row * shared + p] *
+                   reference_augmented[p * columns + shared + left + q] *
+                   second_a[col * shared + q];
+        }
+      }
+      reference_c[row * right + col] = value;
+    }
+  }
+  for (int row = 0; row < left; ++row) {
+    for (int col = 0; col < left; ++col) {
+      Scalar value = first_j[row * left + col];
+      for (int p = 0; p < shared; ++p) {
+        for (int q = 0; q < shared; ++q) {
+          value += first_a[p * left + row] * second_j[p * shared + q] *
+                   reference_augmented[q * columns + shared + col];
+        }
+      }
+      reference_j[row * left + col] = value;
+    }
+  }
+  for (int row = 0; row < right; ++row) {
+    for (int col = row + 1; col < right; ++col) {
+      const Scalar value = Scalar{0.5} * (reference_c[row * right + col] +
+                                          reference_c[col * right + row]);
+      reference_c[row * right + col] = value;
+      reference_c[col * right + row] = value;
+    }
+  }
+  for (int row = 0; row < left; ++row) {
+    for (int col = row + 1; col < left; ++col) {
+      const Scalar value = Scalar{0.5} * (reference_j[row * left + col] +
+                                          reference_j[col * left + row]);
+      reference_j[row * left + col] = value;
+      reference_j[col * left + row] = value;
+    }
+  }
+#ifdef CLQR_USE_FLOAT
+  constexpr Scalar comparison_tolerance = Scalar{2e-6};
+#else
+  constexpr Scalar comparison_tolerance = Scalar{2e-14};
+#endif
+  for (int entry = 0; entry < right * left; ++entry)
+    Expect(std::abs(output_a[entry] - reference_a[entry]) <
+               comparison_tolerance,
+           "nonuniform staged value A entry " + std::to_string(entry));
+  for (int entry = 0; entry < right * right; ++entry)
+    Expect(std::abs(output_c[entry] - reference_c[entry]) <
+               comparison_tolerance,
+           "nonuniform staged value C entry " + std::to_string(entry));
+  for (int entry = 0; entry < left * left; ++entry)
+    Expect(std::abs(output_j[entry] - reference_j[entry]) <
+               comparison_tolerance,
+           "nonuniform staged value J entry " + std::to_string(entry));
+}
+
+void StagedFeedbackSystemCase() {
+  constexpr int n = 3;
+  constexpr int next_n = 4;
+  constexpr int m = 2;
+  constexpr int columns = m + n;
+  Scalar A[]{Scalar{0.8}, Scalar{-0.2}, Scalar{0.1},  Scalar{0.3},
+             Scalar{0.7}, Scalar{-0.1}, Scalar{-0.4}, Scalar{0.2},
+             Scalar{0.9}, Scalar{0.5},  Scalar{0.1},  Scalar{-0.3}};
+  Scalar B[]{Scalar{0.6},  Scalar{-0.2}, Scalar{0.1}, Scalar{0.7},
+             Scalar{-0.5}, Scalar{0.4},  Scalar{0.8}, Scalar{0.3}};
+  Scalar R[]{Scalar{1.4}, Scalar{0.1}, Scalar{0.1}, Scalar{1.2}};
+  Scalar M[]{Scalar{0.02}, Scalar{-0.03}, Scalar{0.04},
+             Scalar{0.01}, Scalar{-0.02}, Scalar{0.05}};
+  Scalar J[]{Scalar{0.9},   Scalar{0.03},  Scalar{-0.02}, Scalar{0.01},
+             Scalar{0.03},  Scalar{0.8},   Scalar{0.04},  Scalar{-0.01},
+             Scalar{-0.02}, Scalar{0.04},  Scalar{0.7},   Scalar{0.02},
+             Scalar{0.01},  Scalar{-0.01}, Scalar{0.02},  Scalar{0.6}};
+  ReducedStage stage{};
+  stage.n = n;
+  stage.next_n = next_n;
+  stage.m = m;
+  stage.A = A;
+  stage.B = B;
+  stage.R = R;
+  stage.M = M;
+  ValueElement next{};
+  next.left_dim = next_n;
+  next.J = J;
+  Scalar augmented[m * columns]{};
+  Scalar product[next_n * columns]{};
+  threadIdx.x = 0;
+  blockDim.x = 1;
+  BuildMatrixFeedbackSystem(stage, next, augmented, product, columns);
+
+#ifdef CLQR_USE_FLOAT
+  constexpr Scalar comparison_tolerance = Scalar{2e-6};
+#else
+  constexpr Scalar comparison_tolerance = Scalar{2e-14};
+#endif
+  for (int row = 0; row < m; ++row) {
+    for (int col = 0; col < columns; ++col) {
+      Scalar expected = col < m ? R[row * m + col] : -M[(col - m) * m + row];
+      for (int a = 0; a < next_n; ++a) {
+        for (int b = 0; b < next_n; ++b) {
+          const Scalar operand = col < m ? B[b * m + col] : A[b * n + col - m];
+          const Scalar term = B[a * m + row] * J[a * next_n + b] * operand;
+          expected += col < m ? term : -term;
+        }
+      }
+      Expect(std::abs(augmented[row * columns + col] - expected) <
+                 comparison_tolerance,
+             "staged feedback system entry " +
+                 std::to_string(row * columns + col));
+    }
+  }
+}
+
+void TerminalReductionScratchPaddingCase() {
+  Scalar terminal_Q[]{Scalar{2}};
+  Scalar terminal_q[]{Scalar{-0.2}};
+  PackedTerminal terminal{};
+  terminal.n = 1;
+  terminal.Q = terminal_Q;
+  terminal.q = terminal_q;
+  Scalar transform[]{Scalar{1}};
+  Scalar offset[]{Scalar{0.4}};
+  StateParam param{};
+  param.physical_dim = 1;
+  param.reduced_dim = 1;
+  param.T = transform;
+  param.t = offset;
+  Scalar reduced_Q[1]{};
+  Scalar reduced_q[1]{};
+  ReducedTerminal reduced{};
+  reduced.Q = reduced_Q;
+  reduced.q = reduced_q;
+  threadIdx.x = 0;
+  blockDim.x = 1;
+
+  ReduceTerminalKernel(&terminal, &param, 0, &reduced);
+
+  Expect(g_emulated_block_scratch_bytes == kSharedVectorAccessBytes,
+         "scalar terminal reduction requests one complete shared-memory "
+         "transaction");
+  Expect(std::abs(reduced_Q[0] - Scalar{2}) < kTolerance &&
+             std::abs(reduced_q[0] - Scalar{0.6}) < kTolerance,
+         "scalar terminal reduction preserves the staged Hessian and "
+         "gradient");
 }
 
 void DualRelationLeafScratchSizeCase() {
@@ -564,6 +791,77 @@ void ScratchPlannerTopologyCase() {
          "the former synthetic cross-maximum would reject the 45-to-0 case");
 
   constexpr std::size_t n = 8;
+  const ScanShape nonuniform_first = MakeScanShape(2, 3);
+  const ScanShape nonuniform_second = MakeScanShape(3, 4);
+  ScratchSize nonuniform_value_compose;
+  nonuniform_value_compose.Add<Scalar>(3 * (2 * 3 + 2));
+  nonuniform_value_compose.Add<Scalar>(3);
+  nonuniform_value_compose.Add<Scalar>(3 * 4);
+  Expect(ValueComposeScratchBytes(nonuniform_first, nonuniform_second,
+                                  "nonuniform value workspace") ==
+             nonuniform_value_compose.bytes,
+         "nonuniform value-composition scratch uses the exact largest staged "
+         "product");
+  bool staged_overflow_rejected = false;
+  try {
+    const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+    const ScanShape large_first{maximum / 4, 2, 0, true};
+    const ScanShape large_second{2, maximum / 2 + 1, 0, true};
+    (void)ValueComposeScratchBytes(large_first, large_second,
+                                   "overflowing staged value workspace");
+  } catch (const std::invalid_argument &) {
+    staged_overflow_rejected = true;
+  }
+  Expect(staged_overflow_rejected,
+         "value-composition planner rejects staged-product size overflow");
+
+  Expect(StageHessianTransformScratchBytes(
+             1, 1, "scalar terminal Hessian workspace") ==
+             kSharedVectorAccessBytes,
+         "scalar Hessian transform planner covers one complete shared-memory "
+         "transaction");
+  ScratchSize relation_matrix;
+  relation_matrix.Add<Scalar>(7 * 11);
+  ScratchSize elimination_tail;
+  elimination_tail.Add<Scalar>(7);
+  elimination_tail.Add<int>(7);
+  elimination_tail.Add<int>(7);
+  ScratchSize dynamics_tail;
+  dynamics_tail.Add<Scalar>(5 * 3);
+  dynamics_tail.Add<Scalar>(5);
+  Expect(StageRelationReductionScratchBytes(
+             7, 11, 5, 3, "nonuniform stage-reduction workspace") ==
+             relation_matrix.bytes +
+                 std::max(elimination_tail.bytes, dynamics_tail.bytes),
+         "stage-reduction scratch exactly aliases nonoverlapping relation and "
+         "elimination lifetimes");
+  bool transform_overflow_rejected = false;
+  try {
+    (void)StageHessianTransformScratchBytes(
+        std::numeric_limits<std::size_t>::max() / 2 + 1, 2,
+        "overflowing Hessian workspace");
+  } catch (const std::invalid_argument &) {
+    transform_overflow_rejected = true;
+  }
+  Expect(transform_overflow_rejected,
+         "Hessian-transform planner rejects staged-product size overflow");
+  bool transform_padding_overflow_rejected = false;
+  try {
+    (void)StageHessianTransformScratchBytes(
+        std::numeric_limits<std::size_t>::max(), 1,
+        "overflowing padded Hessian workspace");
+  } catch (const std::invalid_argument &) {
+    transform_padding_overflow_rejected = true;
+  }
+  Expect(transform_padding_overflow_rejected,
+         "Hessian-transform planner rejects transaction-padding overflow");
+
+  const ScratchRequirements scalar =
+      PlanScratch(clqr::benchmark::StateOnlyProblem(1, 1, 1, 0));
+  Expect(scalar.terminal_reduction == kSharedVectorAccessBytes,
+         "scalar terminal launch allocates one complete shared-memory "
+         "transaction");
+
   const Problem uniform_problem = clqr::benchmark::StateOnlyProblem(8, n, 4, 2);
   const ScratchRequirements uniform = PlanScratch(uniform_problem);
   const ScanShape uniform_relation = MakeScanShape(n, n);
@@ -571,8 +869,13 @@ void ScratchPlannerTopologyCase() {
   ScratchSize value_leaf;
   value_leaf.Add<Scalar>(4 * 4);
   value_leaf.Add<Scalar>(4 * (2 * n));
+  ScratchSize value_compose;
+  value_compose.Add<Scalar>(n * (3 * n));
+  value_compose.Add<Scalar>(n);
+  value_compose.Add<Scalar>(n * n);
   ScratchSize feedback;
   feedback.Add<Scalar>(4 * (4 + n));
+  feedback.Add<Scalar>(n * (4 + n));
   ScratchSize dual_parameter;
   dual_parameter.Add<Scalar>(12 * 9);
   dual_parameter.Add<Scalar>(0);
@@ -585,19 +888,26 @@ void ScratchPlannerTopologyCase() {
              DenseEliminationScratchBytes(4 * n, 3 * n + 1,
                                           "uniform primal workspace"),
          "uniform n=8 primal-relation launch scratch is unchanged");
-  Expect(uniform.primal_leaf == DenseEliminationScratchBytes(
-                                    10, 21, "uniform primal-leaf workspace") &&
-             uniform.primal_relation_final ==
-                 RelationFinalizeScratchBytes(
-                     uniform_relation, &uniform_relation, terminal_relation) &&
-             uniform.state_parameter == n * sizeof(int) &&
-             uniform.stage_reduction ==
-                 DenseEliminationScratchBytes(
-                     8, 13, "uniform stage-reduction workspace"),
-         "uniform n=8 feasibility launch scratch is unchanged");
-  Expect(uniform.value_compose ==
-             GeneralSolveScratchBytes(n, 3 * n, "uniform value workspace"),
-         "uniform n=8 value-composition launch scratch uses LU workspace");
+  Expect(
+      uniform.primal_leaf == DenseEliminationScratchBytes(
+                                 10, 21, "uniform primal-leaf workspace") &&
+          uniform.primal_relation_final ==
+              RelationFinalizeScratchBytes(uniform_relation, &uniform_relation,
+                                           terminal_relation) &&
+          uniform.state_parameter == n * sizeof(int) &&
+          uniform.stage_reduction ==
+              std::max(StageRelationReductionScratchBytes(
+                           8, 13, n, n, "uniform stage-reduction workspace"),
+                       StageHessianTransformScratchBytes(
+                           n + 4, n + 4, "uniform stage Hessian workspace")) &&
+          uniform.terminal_reduction ==
+              StageHessianTransformScratchBytes(
+                  n, n, "uniform terminal Hessian workspace"),
+      "uniform n=8 reduction scratch exactly covers staged dynamics and "
+      "Hessian products");
+  Expect(uniform.value_compose == value_compose.bytes,
+         "uniform n=8 value-composition scratch includes the exact staged "
+         "matrix product");
   Expect(uniform.value_leaf == value_leaf.bytes &&
              uniform.value_finalize ==
                  ValueFinalizeScratchBytes(uniform_relation, &uniform_relation,
@@ -1899,6 +2209,9 @@ int main(int argc, char **argv) {
   IllConditionedPositiveDefiniteMultiRhsCase();
   InvalidValueElementCopyCase();
   FreeFixedFreeValueCompositionCase();
+  NonuniformValueCompositionCase();
+  StagedFeedbackSystemCase();
+  TerminalReductionScratchPaddingCase();
   DualRelationLeafScratchSizeCase();
   ScratchPlannerTopologyCase();
   NonPositiveDefiniteReducedControlCostCase();
