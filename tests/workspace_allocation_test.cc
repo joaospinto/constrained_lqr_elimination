@@ -236,6 +236,39 @@ int main() {
   Expect(constrained_external_solution.status == SolveStatus::kOptimal,
          "constrained external workspace solve status");
 
+  clqr::Factorization constrained_factorization = clqr::Factor(constrained);
+  Expect(constrained_factorization.status() == SolveStatus::kOptimal,
+         "constrained reusable factorization status");
+  clqr::SolveRhs constrained_rhs = clqr::ExtractRhs(constrained);
+  std::vector<unsigned char> constrained_factored_memory(
+      Workspace::RequiredBytes(constrained_factorization));
+  Workspace constrained_factored_workspace(
+      constrained_factored_memory.data(), constrained_factored_memory.size());
+  StartCounting();
+  SolutionView first_constrained_factored = clqr::Solve(
+      constrained_factorization, constrained_rhs,
+      constrained_factored_workspace);
+  constrained_rhs.initial_state[0] += Scalar{0.25};
+  constrained_rhs.stages[0].c[0] -= Scalar{0.1};
+  constrained_rhs.q[0][0] += Scalar{0.2};
+  constrained_rhs.stages[0].r[0] -= Scalar{0.15};
+  constrained_rhs.stages[0].d[0] += Scalar{0.3};
+  constrained_rhs.q.back()[0] += Scalar{0.3};
+  SolutionView second_constrained_factored = clqr::Solve(
+      constrained_factorization, constrained_rhs,
+      constrained_factored_workspace);
+  StopCounting();
+  const std::size_t constrained_factored_allocations =
+      g_allocations.load(std::memory_order_relaxed);
+  const std::size_t constrained_factored_bytes =
+      g_bytes.load(std::memory_order_relaxed);
+  Expect(first_constrained_factored.status == SolveStatus::kOptimal,
+         "first constrained reusable factored solve status");
+  Expect(second_constrained_factored.status == SolveStatus::kOptimal,
+         "second constrained reusable factored solve status");
+  Expect(constrained_factored_allocations == 0,
+         "constrained reusable factored solves should not allocate");
+
   const std::size_t constrained_32 =
       Workspace::RequiredBytes(MakeConstrainedProblem(32, 4, 2));
   const std::size_t constrained_64 =
@@ -322,6 +355,10 @@ int main() {
             << " constrained_external_allocations="
             << constrained_external_allocations
             << " constrained_external_bytes=" << constrained_external_bytes
+            << " constrained_factored_allocations="
+            << constrained_factored_allocations
+            << " constrained_factored_bytes="
+            << constrained_factored_bytes
             << " terminal_required=" << terminal_required
             << " terminal_external_allocations="
             << terminal_external_allocations

@@ -288,8 +288,8 @@ The workspace API covers constrained and unconstrained problems. Unconstrained p
 the raw Riccati path directly. Constrained problems activate the workspace arena and run the
 constraint-elimination algorithm, including the reduced Riccati solve and multiplier recovery.
 
-For repeated unconstrained solves with fixed matrices and new right-hand
-sides, factor the matrix-dependent Riccati recursion once:
+For repeated solves with fixed matrices and new right-hand sides, cache the
+constraint elimination and reduced Riccati factorization once:
 
 ```cpp
 clqr::Factorization factors = clqr::Factor(problem);
@@ -301,13 +301,16 @@ clqr::SolutionView first = clqr::Solve(factors, rhs, solve_workspace);
 rhs.initial_state = next_initial_state;
 rhs.q[0] = next_state_gradient;
 rhs.q.back() = next_terminal_gradient;
+rhs.stages[0].d = next_mixed_constraint_offset;
+rhs.stages[0].e = next_state_constraint_offset;
+rhs.terminal_e = next_terminal_constraint_offset;
 clqr::SolutionView second = clqr::Solve(factors, rhs, solve_workspace);
 ```
 
-`Factor` owns the fixed `A`, `B`, `Q`, `R`, and `M` data. Each factored
-`Solve` accepts new `c`, all `N + 1` entries of `q`, `r`, and the initial state
-with unchanged dimensions, and performs no heap allocation when given a
-reserved workspace. This factorized interface accepts unconstrained problems.
+`Factor` owns the fixed `A`, `B`, `Q`, `R`, `M`, `C`, `D`, `E`, and
+`terminal_E` data. Each factored `Solve` accepts new `c`, all `N + 1` entries
+of `q`, `r`, `d`, `e`, `terminal_e`, and the initial state with unchanged
+dimensions. It performs no heap allocation when given a reserved workspace.
 
 As with the ordinary workspace API, every buffer and string referenced by the
 returned `SolutionView` is workspace-backed and remains valid only until that
@@ -339,8 +342,8 @@ result = _clqr.solve({
 })
 ```
 
-For repeated unconstrained solves, the Python extension exposes the same
-matrix/RHS split as C++:
+For repeated solves, the Python extension exposes the same matrix/RHS split as
+C++:
 
 ```python
 factors = _clqr.factor(problem)
@@ -350,6 +353,9 @@ first = factors.solve(solve_rhs)
 solve_rhs.initial_state = next_initial_state
 solve_rhs.stage(0).c = next_dynamics_offset
 solve_rhs.stage(0).r = next_control_gradient
+solve_rhs.stage(0).d = next_mixed_constraint_offset
+solve_rhs.stage(0).e = next_state_constraint_offset
+solve_rhs.terminal_e = next_terminal_constraint_offset
 solve_rhs.set_q(0, next_state_gradient)
 solve_rhs.set_q(solve_rhs.q_count - 1, next_terminal_gradient)
 second = factors.solve(solve_rhs)
@@ -357,8 +363,7 @@ second = factors.solve(solve_rhs)
 
 `Factorization` owns the matrices and internally reuses its native solve
 workspace. Assigning an RHS property copies that array into owned native
-storage; result arrays are newly owned NumPy arrays. This factorized Python
-path currently rejects equality-constrained problems.
+storage; result arrays are newly owned NumPy arrays.
 
 The lightweight package wrapper in `python/clqr/__init__.py` re-exports the same `solve`
 function, as well as `factor` and `rhs`, once `_clqr` is on `PYTHONPATH`.

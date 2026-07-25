@@ -55,6 +55,22 @@ void RunCase(const TestCase &test_case, Workspace *reusable_workspace) {
   const SolutionView solution = clqr::Solve(problem, *reusable_workspace);
   Expect(solution.status == test_case.cpu_status,
          test_case.name + " status: " + solution.message);
+
+  clqr::Factorization factorization = clqr::Factor(problem);
+  SolutionView factored_solution;
+  Workspace factored_workspace;
+  if (factorization.status() == SolveStatus::kOptimal) {
+    factored_workspace.Reserve(factorization);
+    factored_solution = clqr::Solve(
+        factorization, clqr::ExtractRhs(problem), factored_workspace);
+    Expect(factored_solution.status == test_case.cpu_status,
+           test_case.name + " factored status: " + factored_solution.message);
+  } else {
+    Expect(factorization.status() == test_case.cpu_status,
+           test_case.name +
+               " matrix factorization status: " + factorization.message());
+  }
+
   if (solution.status != SolveStatus::kOptimal) {
     Expect(std::string(solution.message) != clqr::StatusName(solution.status),
            test_case.name + " preserves its detailed diagnostic");
@@ -64,12 +80,21 @@ void RunCase(const TestCase &test_case, Workspace *reusable_workspace) {
   }
 
   const KktPoint point = clqr::test::adversarial::CopyCpuSolution(solution);
+  const KktPoint factored_point =
+      clqr::test::adversarial::CopyCpuSolution(factored_solution);
   const Scalar primal_residual =
       clqr::test::adversarial::MaxPrimalResidual(problem, point);
   Expect(primal_residual <= clqr::test::adversarial::kPrimalTolerance *
                                 test_case.tolerance_scale,
          test_case.name +
              " primal residual=" + std::to_string(primal_residual));
+  const Scalar factored_primal_residual =
+      clqr::test::adversarial::MaxPrimalResidual(problem, factored_point);
+  Expect(factored_primal_residual <=
+             clqr::test::adversarial::kPrimalTolerance *
+                 test_case.tolerance_scale,
+         test_case.name + " factored primal residual=" +
+             std::to_string(factored_primal_residual));
   if (test_case.check_full_kkt) {
     std::string worst;
     const Scalar residual =
@@ -79,6 +104,17 @@ void RunCase(const TestCase &test_case, Workspace *reusable_workspace) {
                            test_case.kkt_tolerance_scale,
            test_case.name + " KKT residual=" + std::to_string(residual) +
                " in " + worst);
+    std::string factored_worst;
+    const Scalar factored_residual =
+        clqr::test::adversarial::MaxKktResidual(
+            problem, factored_point, &factored_worst);
+    Expect(factored_residual <=
+               clqr::test::adversarial::kKktTolerance *
+                   test_case.tolerance_scale *
+                   test_case.kkt_tolerance_scale,
+           test_case.name + " factored KKT residual=" +
+               std::to_string(factored_residual) + " in " +
+               factored_worst);
   }
   if (test_case.dense_reference) {
     const DensePrimal dense = clqr::test::adversarial::SolveDenseKkt(problem);

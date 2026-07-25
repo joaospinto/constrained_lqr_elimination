@@ -693,31 +693,117 @@ void ReusableFactorizationSolvesNewRightHandSides() {
   Expect(small.status == SolveStatus::kInvalidInput,
          "factored undersized workspace status");
 
-  Problem constrained = original;
-  constrained.stages[0].C = Matrix(1, 2, {Scalar{1}, Scalar{0}});
-  constrained.stages[0].D = Matrix(1, 2, {Scalar{0}, Scalar{1}});
-  constrained.stages[0].d = Vector{Scalar{0}};
-  const clqr::Factorization unsupported = clqr::Factor(constrained);
-  Expect(unsupported.status() == SolveStatus::kInvalidInput,
-         "constrained factorization is explicitly rejected");
-  constrained = original;
-  constrained.stages[1].E = Matrix(1, 2, {Scalar{1}, Scalar{-1}});
-  constrained.stages[1].e = Vector{Scalar{0}};
-  Expect(clqr::Factor(constrained).status() == SolveStatus::kInvalidInput,
-         "state-constrained factorization is explicitly rejected");
-  constrained = original;
-  constrained.terminal_E = Matrix(1, 2, {Scalar{0}, Scalar{1}});
-  constrained.terminal_e = Vector{Scalar{0}};
-  Expect(clqr::Factor(constrained).status() == SolveStatus::kInvalidInput,
-         "terminal-constrained factorization is explicitly rejected");
+  const auto scale_rhs = [](Problem* problem, Scalar scale) {
+    for (Scalar& value : problem->initial_state.data()) value *= scale;
+    for (Vector& q : problem->q) {
+      for (Scalar& value : q.data()) value *= scale;
+    }
+    for (Stage& stage : problem->stages) {
+      for (Scalar& value : stage.c.data()) value *= scale;
+      for (Scalar& value : stage.r.data()) value *= scale;
+      for (Scalar& value : stage.d.data()) value *= scale;
+      for (Scalar& value : stage.e.data()) value *= scale;
+    }
+    for (Scalar& value : problem->terminal_e.data()) value *= scale;
+  };
+  std::vector<Problem> constrained_cases = {
+      GeneratedFeasibleProblem(700, 5, 3, 2, 1,
+                               ConstraintMode::kStateOnly),
+      GeneratedFeasibleProblem(701, 5, 3, 2, 2, ConstraintMode::kMixed),
+      GeneratedFeasibleProblem(702, 4, 3, 2, 1,
+                               ConstraintMode::kTerminalState),
+      GeneratedFeasibleProblem(703, 4, 3, 2, 2,
+                               ConstraintMode::kRankDeficientMixed),
+  };
+#ifndef CLQR_USE_FLOAT
+  constrained_cases.push_back(GeneratedFeasibleProblem(
+      704, 4, 3, 2, 3, ConstraintMode::kFullMixed));
+#endif
+  for (std::size_t case_index = 0; case_index < constrained_cases.size();
+       ++case_index) {
+    Problem& constrained = constrained_cases[case_index];
+    clqr::Factorization constrained_factor = clqr::Factor(constrained);
+    Expect(constrained_factor.status() == SolveStatus::kOptimal,
+           "constrained factorization status " +
+               std::to_string(case_index));
+    if (case_index == 0) {
+      std::vector<unsigned char> constrained_too_small(
+          constrained_factor.RequiredSolveBytes() - 1);
+      Workspace constrained_small_workspace(constrained_too_small.data(),
+                                            constrained_too_small.size());
+      const SolutionView small = clqr::Solve(
+          constrained_factor, clqr::ExtractRhs(constrained),
+          constrained_small_workspace);
+      Expect(small.status == SolveStatus::kInvalidInput,
+             "constrained factored undersized workspace status");
+    }
+    Workspace constrained_workspace;
+    constrained_workspace.Reserve(constrained_factor);
+    Solution constrained_factored = CopySolutionView(clqr::Solve(
+        constrained_factor, clqr::ExtractRhs(constrained),
+        constrained_workspace));
+    Solution constrained_reference = SolveWithWorkspace(constrained);
+    Expect(constrained_factored.status == SolveStatus::kOptimal,
+           "constrained factored solve status " +
+               std::to_string(case_index) + ": " +
+               constrained_factored.message);
+    ExpectNear(MaxKktResidual(constrained, constrained_factored), Scalar{0},
+               kKktTol, "constrained factored KKT residual " +
+                            std::to_string(case_index));
+    for (std::size_t node = 0; node < constrained_factored.states.size();
+         ++node) {
+      ExpectVectorNear(constrained_factored.states[node],
+                       constrained_reference.states[node], kTol,
+                       "constrained factored state");
+    }
+    for (std::size_t stage = 0; stage < constrained_factored.controls.size();
+         ++stage) {
+      ExpectVectorNear(constrained_factored.controls[stage],
+                       constrained_reference.controls[stage], kTol,
+                       "constrained factored control");
+    }
+
+    scale_rhs(&constrained, Scalar{-0.7});
+    Solution changed_constrained = CopySolutionView(clqr::Solve(
+        constrained_factor, clqr::ExtractRhs(constrained),
+        constrained_workspace));
+    Solution changed_reference = SolveWithWorkspace(constrained);
+    Expect(changed_constrained.status == SolveStatus::kOptimal,
+           "changed constrained factored solve status: " +
+               changed_constrained.message);
+    ExpectNear(MaxKktResidual(constrained, changed_constrained), Scalar{0},
+               kKktTol, "changed constrained factored KKT residual");
+    for (std::size_t node = 0; node < changed_constrained.states.size();
+         ++node) {
+      ExpectVectorNear(changed_constrained.states[node],
+                       changed_reference.states[node], kTol,
+                       "changed constrained factored state");
+    }
+    for (std::size_t stage = 0; stage < changed_constrained.controls.size();
+         ++stage) {
+      ExpectVectorNear(changed_constrained.controls[stage],
+                       changed_reference.controls[stage], kTol,
+                       "changed constrained factored control");
+    }
+
+    if (case_index == 0) {
+      constrained.stages.front().e[0] += Scalar{1};
+      const Solution infeasible = CopySolutionView(clqr::Solve(
+          constrained_factor, clqr::ExtractRhs(constrained),
+          constrained_workspace));
+      Expect(infeasible.status == SolveStatus::kInfeasible,
+             "cached factorization reports an inconsistent RHS");
+    }
+  }
 
   Problem zero_horizon;
   zero_horizon.initial_state = Vector{Scalar{0.4}, Scalar{-0.6}};
   zero_horizon.Q = {
       Matrix(2, 2, {Scalar{2}, Scalar{0.1}, Scalar{0.1}, Scalar{3}})};
   zero_horizon.q = {Vector{Scalar{-0.2}, Scalar{0.3}}};
-  zero_horizon.terminal_E = Matrix(0, 2);
-  zero_horizon.terminal_e = Vector(0);
+  zero_horizon.terminal_E =
+      Matrix(1, 2, {Scalar{1}, Scalar{2}});
+  zero_horizon.terminal_e = Vector{Scalar{0.8}};
   clqr::Factorization zero_factorization = clqr::Factor(zero_horizon);
   Workspace zero_workspace;
   zero_workspace.Reserve(zero_factorization);
@@ -733,6 +819,9 @@ void ReusableFactorizationSolvesNewRightHandSides() {
                    "zero-horizon factored initial multiplier");
   ExpectNear(zero_factored.objective, zero_reference.objective, kTol,
              "zero-horizon factored objective");
+  ExpectVectorNear(zero_factored.terminal_state_multiplier,
+                   zero_reference.terminal_state_multiplier, kTol,
+                   "zero-horizon factored terminal multiplier");
 }
 
 void ReusableFactorizationHandlesChangingAndZeroDimensions() {

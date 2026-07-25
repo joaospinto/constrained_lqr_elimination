@@ -6,7 +6,7 @@ independent dense-KKT primal oracle used by the adversarial suites. The dense
 oracle assembles a monolithic KKT system independently from either solver but
 shares the library's low-level RREF and linear-system primitives.
 
-| Property | Sequential C++ | Kernel emulation | Native CUDA |
+| Property | Sequential C++ (ordinary and cached) | Kernel emulation | Native CUDA |
 |---|---:|---:|---:|
 | Empty and zero-horizon problems | yes | yes | yes |
 | Feasible zero-horizon terminal equalities | yes | yes | yes |

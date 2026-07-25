@@ -117,6 +117,15 @@ def _assert_primal_results_close(actual, expected):
         actual["dynamics_multipliers"], expected["dynamics_multipliers"]
     ):
         np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
+    for key in ("mixed_multipliers", "state_multipliers"):
+        for got, want in zip(actual[key], expected[key]):
+            np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(
+        actual["terminal_state_multiplier"],
+        expected["terminal_state_multiplier"],
+        rtol=2e-5,
+        atol=2e-6,
+    )
     np.testing.assert_allclose(
         actual["objective"], expected["objective"], rtol=2e-5, atol=2e-6
     )
@@ -166,33 +175,73 @@ def test_python_reusable_factorization():
     assert "q entry shape mismatch" in invalid["message"]
 
 
-def test_python_factorization_rejects_constraints():
+def test_python_constrained_factorization():
     clqr = _load_extension()
-    problems = []
+    problem = {
+        "initial_state": np.array([1.0], dtype=np.float64),
+        "stages": [
+            {
+                "A": np.array([[1.0]], dtype=np.float64),
+                "B": np.array([[1.0]], dtype=np.float64),
+                "c": np.array([0.0], dtype=np.float64),
+                "R": np.array([[2.0]], dtype=np.float64),
+                "M": np.array([[0.0]], dtype=np.float64),
+                "r": np.array([0.0], dtype=np.float64),
+                "C": np.array([[1.0]], dtype=np.float64),
+                "D": np.array([[1.0]], dtype=np.float64),
+                "d": np.array([0.0], dtype=np.float64),
+                "E": np.array([[1.0]], dtype=np.float64),
+                "e": np.array([-1.0], dtype=np.float64),
+            }
+        ],
+        "Q": [
+            np.array([[1.0]], dtype=np.float64),
+            np.array([[1.0]], dtype=np.float64),
+        ],
+        "q": [
+            np.array([0.0], dtype=np.float64),
+            np.array([0.0], dtype=np.float64),
+        ],
+        "terminal_E": np.array([[1.0]], dtype=np.float64),
+        "terminal_e": np.array([0.0], dtype=np.float64),
+    }
+    factors = clqr.factor(problem)
+    rhs = clqr.rhs(problem)
+    _assert_primal_results_close(factors.solve(rhs), clqr.solve(problem))
 
-    mixed = _unconstrained_factor_problem()
-    mixed["stages"][0]["C"] = np.array([[1.0, 0.0]], dtype=np.float64)
-    mixed["stages"][0]["D"] = np.array([[0.0]], dtype=np.float64)
-    mixed["stages"][0]["d"] = np.array([0.0], dtype=np.float64)
-    problems.append(mixed)
+    changed = {
+        **problem,
+        "initial_state": np.array([0.4], dtype=np.float64),
+        "stages": [{**problem["stages"][0]}],
+        "q": [
+            np.array([0.2], dtype=np.float64),
+            np.array([-0.3], dtype=np.float64),
+        ],
+        "terminal_e": np.array([0.1], dtype=np.float64),
+    }
+    changed["stages"][0]["c"] = np.array([0.2], dtype=np.float64)
+    changed["stages"][0]["r"] = np.array([-0.1], dtype=np.float64)
+    changed["stages"][0]["d"] = np.array([0.3], dtype=np.float64)
+    changed["stages"][0]["e"] = np.array([-0.4], dtype=np.float64)
+    rhs.initial_state = changed["initial_state"]
+    rhs.set_q(0, changed["q"][0])
+    rhs.set_q(1, changed["q"][1])
+    rhs.terminal_e = changed["terminal_e"]
+    stage_rhs = rhs.stage(0)
+    stage_rhs.c = changed["stages"][0]["c"]
+    stage_rhs.r = changed["stages"][0]["r"]
+    stage_rhs.d = changed["stages"][0]["d"]
+    stage_rhs.e = changed["stages"][0]["e"]
+    _assert_primal_results_close(factors.solve(rhs), clqr.solve(changed))
 
-    state = _unconstrained_factor_problem()
-    state["stages"][1]["E"] = np.array([[0.0, 1.0]], dtype=np.float64)
-    state["stages"][1]["e"] = np.array([0.0], dtype=np.float64)
-    problems.append(state)
-
-    terminal = _unconstrained_factor_problem()
-    terminal["terminal_E"] = np.array([[1.0, 0.0]], dtype=np.float64)
-    terminal["terminal_e"] = np.array([0.0], dtype=np.float64)
-    problems.append(terminal)
-
-    for problem in problems:
-        try:
-            clqr.factor(problem)
-        except (ValueError, RuntimeError) as error:
-            assert "unconstrained problems only" in str(error)
-        else:
-            raise AssertionError("constrained factorization unexpectedly succeeded")
+    stage_rhs.e = np.array([-0.5], dtype=np.float64)
+    infeasible = factors.solve(rhs)
+    assert infeasible["status"] == "infeasible", infeasible
+    stage_rhs.e = changed["stages"][0]["e"]
+    stage_rhs.d = np.zeros(0, dtype=np.float64)
+    invalid = factors.solve(rhs)
+    assert invalid["status"] == "invalid_input", invalid
+    assert "d shape mismatch" in invalid["message"]
 
 
 def test_python_factorization_reports_indefinite_factor():
@@ -328,7 +377,7 @@ def test_python_multiplier_shapes_multistage():
 if __name__ == "__main__":
     test_python_solve()
     test_python_reusable_factorization()
-    test_python_factorization_rejects_constraints()
+    test_python_constrained_factorization()
     test_python_factorization_reports_indefinite_factor()
     test_python_factorization_rejects_nonfinite_inputs()
     test_python_multiplier_shapes_multistage()
