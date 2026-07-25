@@ -2,7 +2,8 @@
 
 CPU and CUDA implementations of equality-constrained finite-horizon
 LQR via affine constraint elimination, followed by an unconstrained LQR solve
-in reduced coordinates.
+in reduced coordinates, plus a native Metal implementation exposed through
+the JAX binding.
 
 The implemented problem form is:
 
@@ -413,8 +414,35 @@ stages the padded FFI inputs through host memory because the public CUDA solver
 accepts a host `Problem`; a future device-packed entry point can remove that
 round trip.
 
-The typed FFI lives in optional `_clqr_jax_cpu` and `_clqr_cuda` extensions;
-the existing `_clqr` Python binding remains independent of JAX.
+On Apple silicon, the optional `_clqr_metal` extension provides the same
+elimination/scan numerical design as CUDA in a native FP32 Metal
+implementation. Select it explicitly because JAX exposes Apple Metal hosts
+through its CPU platform:
+
+```python
+metal_solve = jax.jit(lambda value: solve(value, backend="metal"))
+result = metal_solve(packed)
+```
+
+Metal uses one command buffer and one compute encoder per solve, with reusable
+shared buffers on unified memory. It is FP32-only: an FP64 build reports the
+unsupported precision before dispatch, and `backend="metal"` never silently
+falls back to CPU. Mapping inputs with an explicit non-FP32 dtype are rejected
+rather than silently cast.
+
+Build and test it on macOS with:
+
+```bash
+bazel test //:jax_metal_binding_test \
+  //:jax_metal_source_audit_test \
+  --config=fp32 \
+  --test_output=errors
+bazel test //:jax_metal_fp64_test --config=fp64 --test_output=errors
+```
+
+The typed FFI lives in optional `_clqr_jax_cpu`, `_clqr_cuda`, and
+`_clqr_metal` extensions; the existing `_clqr` Python binding remains
+independent of JAX.
 
 The raw FFI call supports eager execution, `jax.jit`, and sequential `jax.vmap`.
 Automatic differentiation and sharded-problem rules are not implemented.
