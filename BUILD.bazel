@@ -76,6 +76,12 @@ cc_test(
     deps = [":clqr"],
 )
 
+py_test(
+    name = "cpu_mixed_cubic_source_audit_test",
+    srcs = ["tests/cpu_mixed_cubic_source_audit_test.py"],
+    data = ["src/clqr.cc"],
+)
+
 cc_library(
     name = "adversarial_test_support",
     hdrs = ["tests/adversarial_test_support.h"],

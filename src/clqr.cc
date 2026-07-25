@@ -948,6 +948,8 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
   const std::size_t m = old_R.rows();
   const std::size_t next_n = old_B.rows();
   const std::size_t reduced_m = basis.Z.cols();
+  const Matrix r_times_y = old_R * basis.Y;
+  const Matrix r_times_z = old_R * basis.Z;
   Vector affine_control_gradient(m);
   for (std::size_t row = 0; row < m; ++row) {
     Scalar value = Scalar{0};
@@ -962,9 +964,7 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
       for (std::size_t u = 0; u < m; ++u) {
         value += old_M(row, u) * basis.Y(u, col);
         value += old_M(col, u) * basis.Y(u, row);
-        for (std::size_t v = 0; v < m; ++v) {
-          value += basis.Y(u, row) * old_R(u, v) * basis.Y(v, col);
-        }
+        value += basis.Y(u, row) * r_times_y(u, col);
       }
       s.Q(row, col) = value;
     }
@@ -976,9 +976,7 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
     for (std::size_t col = 0; col < reduced_m; ++col) {
       Scalar value = Scalar{0};
       for (std::size_t u = 0; u < m; ++u) {
-        for (std::size_t v = 0; v < m; ++v) {
-          value += basis.Z(u, row) * old_R(u, v) * basis.Z(v, col);
-        }
+        value += basis.Z(u, row) * r_times_z(u, col);
       }
       new_R(row, col) = value;
     }
@@ -991,9 +989,7 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
       Scalar value = Scalar{0};
       for (std::size_t u = 0; u < m; ++u) {
         value += old_M(row, u) * basis.Z(u, col);
-        for (std::size_t v = 0; v < m; ++v) {
-          value += basis.Y(u, row) * old_R(u, v) * basis.Z(v, col);
-        }
+        value += basis.Y(u, row) * r_times_z(u, col);
       }
       new_M(row, col) = value;
     }
