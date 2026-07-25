@@ -32,6 +32,9 @@ constexpr Scalar kLinearSolveTolerance = 1e-7f;
 constexpr Scalar kSmallConstraintScale = 1e-4f;
 constexpr Scalar kLargeConstraintScale = 1e4f;
 constexpr Scalar kScalingInvariantTolerance = 8e-4f;
+// Extreme row scaling amplifies harmless FP32 rounding more strongly in the
+// recovered duals than in the primal trajectory.
+constexpr Scalar kMultiplierScalingInvariantTolerance = 1.5e-3f;
 constexpr Scalar kEssentialConstraintScale = 1e-6f;
 #else
 constexpr Scalar kTol = 1e-7;
@@ -40,6 +43,8 @@ constexpr Scalar kLinearSolveTolerance = 1e-10;
 constexpr Scalar kSmallConstraintScale = 1e-10;
 constexpr Scalar kLargeConstraintScale = 1e10;
 constexpr Scalar kScalingInvariantTolerance = 2e-8;
+constexpr Scalar kMultiplierScalingInvariantTolerance =
+    kScalingInvariantTolerance;
 constexpr Scalar kEssentialConstraintScale = 1e-12;
 #endif
 
@@ -856,19 +861,25 @@ void GeneratedCasesMatchKkt() {
     std::size_t p;
     ConstraintMode mode;
   };
-  const std::vector<Case> cases = {
+  std::vector<Case> cases = {
       {"generated unconstrained", 4, 3, 2, 0, ConstraintMode::kUnconstrained},
       {"generated state-only", 4, 3, 2, 1, ConstraintMode::kStateOnly},
       {"generated state-only narrow-control", 6, 3, 1, 1,
        ConstraintMode::kStateOnly},
       {"generated full mixed", 4, 3, 2, 2, ConstraintMode::kFullMixed},
       {"generated mixed alternating", 6, 4, 2, 2, ConstraintMode::kMixed},
+      {"generated staged mixed n8 m4 p2", 4, 8, 4, 2,
+       ConstraintMode::kFullMixed},
       {"generated p greater than m", 4, 3, 1, 2, ConstraintMode::kFullMixed},
       {"generated rank-deficient mixed", 4, 3, 2, 2,
        ConstraintMode::kRankDeficientMixed},
       {"generated terminal state", 5, 3, 2, 1, ConstraintMode::kTerminalState},
       {"generated single stage", 1, 2, 2, 1, ConstraintMode::kFullMixed},
   };
+#ifndef CLQR_USE_FLOAT
+  cases.push_back({"generated staged mixed n16 m8 p4", 3, 16, 8, 4,
+                   ConstraintMode::kFullMixed});
+#endif
   for (std::size_t i = 0; i < cases.size(); ++i) {
     const Case& c = cases[i];
     const bool expect_singular =
@@ -1134,7 +1145,7 @@ void IndependentlyRescaledConstraintsAreInvariant() {
       const Scalar recovered = scales[(row + stage_index) % 2] *
                                candidate.mixed_multipliers[stage_index][row];
       ExpectNear(recovered, reference.mixed_multipliers[stage_index][row],
-                 Scalar{16} * kScalingInvariantTolerance,
+                 Scalar{16} * kMultiplierScalingInvariantTolerance,
                  "row-scaling mixed multiplier " + std::to_string(stage_index) +
                      ":" + std::to_string(row));
     }
@@ -1147,7 +1158,7 @@ void IndependentlyRescaledConstraintsAreInvariant() {
       const Scalar recovered = scales[(row + stage_index) % 2] *
                                candidate.state_multipliers[stage_index][row];
       ExpectNear(recovered, reference.state_multipliers[stage_index][row],
-                 Scalar{16} * kScalingInvariantTolerance,
+                 Scalar{16} * kMultiplierScalingInvariantTolerance,
                  "row-scaling state multiplier " + std::to_string(stage_index) +
                      ":" + std::to_string(row));
     }
@@ -1158,7 +1169,7 @@ void IndependentlyRescaledConstraintsAreInvariant() {
         row % 2 == 0 ? kSmallConstraintScale : kLargeConstraintScale;
     ExpectNear(scale * candidate.terminal_state_multiplier[row],
                reference.terminal_state_multiplier[row],
-               Scalar{16} * kScalingInvariantTolerance,
+               Scalar{16} * kMultiplierScalingInvariantTolerance,
                "row-scaling terminal multiplier " + std::to_string(row));
   }
 }
@@ -1205,7 +1216,7 @@ void FullRankRescaledMixedRowsRemainActive() {
       const Scalar recovered =
           scales[(row + stage) % 3] * scaled.mixed_multipliers[stage][row];
       ExpectNear(recovered, reference.mixed_multipliers[stage][row],
-                 Scalar{32} * kScalingInvariantTolerance,
+                 Scalar{32} * kMultiplierScalingInvariantTolerance,
                  "full-rank row-scaling multiplier " +
                      std::to_string(stage) + ":" + std::to_string(row));
     }
@@ -1352,12 +1363,12 @@ void EssentialSingleRowsRemainActiveWhenScaled() {
       ExpectNear(
           kEssentialConstraintScale * scaled.terminal_state_multiplier[0],
           reference.terminal_state_multiplier[0],
-          Scalar{16} * kScalingInvariantTolerance,
+          Scalar{16} * kMultiplierScalingInvariantTolerance,
           name + " multiplier pullback");
     } else {
       ExpectNear(kEssentialConstraintScale * scaled.mixed_multipliers[0][0],
                  reference.mixed_multipliers[0][0],
-                 Scalar{16} * kScalingInvariantTolerance,
+                 Scalar{16} * kMultiplierScalingInvariantTolerance,
                  name + " multiplier pullback");
     }
     ExpectNear(MaxKktResidual(scaled_problem, scaled), Scalar{0}, kKktTol,

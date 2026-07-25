@@ -50,6 +50,12 @@ std::vector<BenchmarkCase> Cases() {
   std::vector<BenchmarkCase> cases;
   cases.push_back({"mixed-N32-n6-m3-p2",
                    UniformProblem(5001, 32, 6, 3, 2, Pattern::kMixed)});
+  cases.push_back({"mixed-N32-n8-m4-p2",
+                   UniformProblem(5011, 32, 8, 4, 2, Pattern::kMixed)});
+  cases.push_back({"mixed-N16-n16-m8-p4",
+                   UniformProblem(5012, 16, 16, 8, 4, Pattern::kMixed)});
+  cases.push_back({"mixed-N8-n32-m16-p8",
+                   UniformProblem(5013, 8, 32, 16, 8, Pattern::kMixed)});
   cases.push_back({"alternating-N64-n6-m3-p2",
                    UniformProblem(5002, 64, 6, 3, 2, Pattern::kAlternating)});
   // Reuse the adversarial suite's fixed seed for the p > m case so both
