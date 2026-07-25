@@ -440,6 +440,10 @@ bazel test //:jax_metal_binding_test \
 bazel test //:jax_metal_fp64_test --config=fp64 --test_output=errors
 ```
 
+Hosted macOS CI builds the native target and source-audits its GPU path because
+hosted runners do not guarantee a usable Apple-family Metal device. The full
+binding test above runs natively on supported Apple silicon.
+
 The typed FFI lives in optional `_clqr_jax_cpu`, `_clqr_cuda`, and
 `_clqr_metal` extensions; the existing `_clqr` Python binding remains
 independent of JAX.

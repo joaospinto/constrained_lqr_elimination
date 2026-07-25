@@ -143,6 +143,43 @@ def test_metal_ffi_uses_one_precise_native_gpu_submission():
         "product({sizeof(float), value_composition_scratch})" in planner
     )
 
+    # Device validation follows active dimensions rather than scanning padded
+    # storage, and the existing final dispatch clears every public output on
+    # any non-optimal status.
+    finite_scan = primal.split(
+        "kernel void clqr_check_finite_inputs", 1
+    )[1].split("kernel void clqr_build_primal_leaves", 1)[0]
+    assert "gid > p.stage_count" in finite_scan
+    assert "const uint input_entries" not in finite_scan
+    for active_input in (
+        "p.input_A",
+        "p.input_B",
+        "p.input_c",
+        "p.input_Q",
+        "p.input_R",
+        "p.input_M",
+        "p.input_q",
+        "p.input_r",
+        "p.input_C",
+        "p.input_D",
+        "p.input_d",
+        "p.input_E",
+        "p.input_e",
+        "p.input_terminal_E",
+        "p.input_terminal_e",
+        "p.input_initial_state",
+    ):
+        assert active_input in finite_scan
+    assert (
+        "runtime.check_finite_inputs(), workspace, base,\n"
+        "                 N + 1"
+    ) in source
+    finalize = dual.split("kernel void clqr_finalize_objective", 1)[1]
+    assert "if (enabled(metadata, p))" in finalize
+    assert "p.output_terminal_state_multiplier" in finalize
+    assert "p.terminal_constraint_capacity" in finalize
+    assert "output[index] = 0.0f;" in finalize
+
 
 def test_metal_dense_products_remain_staged_and_cubic():
     value = _source("metal_value_affine_source.h")

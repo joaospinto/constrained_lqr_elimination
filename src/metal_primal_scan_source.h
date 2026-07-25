@@ -728,12 +728,94 @@ kernel void clqr_check_finite_inputs(
     device int *metadata [[buffer(4)]],
     constant KernelParams &p [[buffer(5)]],
     uint gid [[thread_position_in_grid]]) {
-  (void)dimensions;
   (void)output;
   (void)workspace;
-  const uint input_entries = p.input_initial_state + p.state_capacity;
-  if (gid < input_entries && !isfinite(input[gid]))
-    set_failure(metadata, p, kDeviceInvalidInput, -1, 21);
+  if (gid > p.stage_count || !status_ok(metadata, p))
+    return;
+
+  const uint nx = p.state_capacity;
+  const uint nu = p.control_capacity;
+  const uint nc = p.mixed_capacity;
+  const uint ne = p.state_constraint_capacity;
+  const int n = dimensions[gid];
+  bool finite = true;
+
+  // Every node owns its state cost.  Traverse only the active leading block;
+  // padded storage is deliberately outside the mathematical problem.
+  device const float *Q = input + p.input_Q + gid * nx * nx;
+  device const float *q = input + p.input_q + gid * nx;
+  for (int row = 0; row < n && finite; ++row) {
+    for (int col = 0; col < n; ++col)
+      finite = finite && isfinite(Q[uint(row) * nx + uint(col)]);
+    finite = finite && isfinite(q[row]);
+  }
+
+  if (gid < p.stage_count) {
+    const int next_n = dimensions[gid + 1u];
+    const int m = dimensions[control_dimension_offset(p) + gid];
+    const int mixed = dimensions[mixed_dimension_offset(p) + gid];
+    const int state_constraints =
+        dimensions[state_constraint_dimension_offset(p) + gid];
+    device const float *A = input + p.input_A + gid * nx * nx;
+    device const float *B = input + p.input_B + gid * nx * nu;
+    device const float *c = input + p.input_c + gid * nx;
+    device const float *R = input + p.input_R + gid * nu * nu;
+    device const float *M = input + p.input_M + gid * nx * nu;
+    device const float *r = input + p.input_r + gid * nu;
+    device const float *C = input + p.input_C + gid * nc * nx;
+    device const float *D = input + p.input_D + gid * nc * nu;
+    device const float *d = input + p.input_d + gid * nc;
+    device const float *E = input + p.input_E + gid * ne * nx;
+    device const float *e = input + p.input_e + gid * ne;
+
+    for (int row = 0; row < next_n && finite; ++row) {
+      for (int col = 0; col < n; ++col)
+        finite = finite && isfinite(A[uint(row) * nx + uint(col)]);
+      for (int col = 0; col < m; ++col)
+        finite = finite && isfinite(B[uint(row) * nu + uint(col)]);
+      finite = finite && isfinite(c[row]);
+    }
+    for (int row = 0; row < m && finite; ++row) {
+      for (int col = 0; col < m; ++col)
+        finite = finite && isfinite(R[uint(row) * nu + uint(col)]);
+      finite = finite && isfinite(r[row]);
+    }
+    for (int row = 0; row < n && finite; ++row) {
+      for (int col = 0; col < m; ++col)
+        finite = finite && isfinite(M[uint(row) * nu + uint(col)]);
+    }
+    for (int row = 0; row < mixed && finite; ++row) {
+      for (int col = 0; col < n; ++col)
+        finite = finite && isfinite(C[uint(row) * nx + uint(col)]);
+      for (int col = 0; col < m; ++col)
+        finite = finite && isfinite(D[uint(row) * nu + uint(col)]);
+      finite = finite && isfinite(d[row]);
+    }
+    for (int row = 0; row < state_constraints && finite; ++row) {
+      for (int col = 0; col < n; ++col)
+        finite = finite && isfinite(E[uint(row) * nx + uint(col)]);
+      finite = finite && isfinite(e[row]);
+    }
+  } else {
+    const int terminal_constraints =
+        dimensions[terminal_constraint_dimension_offset(p)];
+    const int initial_n = dimensions[0];
+    device const float *terminal_E = input + p.input_terminal_E;
+    device const float *terminal_e = input + p.input_terminal_e;
+    device const float *initial_state = input + p.input_initial_state;
+    for (int row = 0; row < terminal_constraints && finite; ++row) {
+      for (int col = 0; col < n; ++col) {
+        finite =
+            finite && isfinite(terminal_E[uint(row) * nx + uint(col)]);
+      }
+      finite = finite && isfinite(terminal_e[row]);
+    }
+    for (int col = 0; col < initial_n; ++col)
+      finite = finite && isfinite(initial_state[col]);
+  }
+
+  if (!finite)
+    set_failure(metadata, p, kDeviceInvalidInput, int(gid), 21);
 }
 
 kernel void clqr_build_primal_leaves(

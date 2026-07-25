@@ -2320,9 +2320,21 @@ kernel void clqr_finalize_objective(
     uint gid [[thread_position_in_grid]]) {
   (void)dimensions;
   (void)input;
-  if (gid == 0u && enabled(metadata, p))
+  if (gid != 0u)
+    return;
+  if (enabled(metadata, p)) {
     output[p.output_objective] =
         workspace[p.objective_tree + p.child_offset];
+    return;
+  }
+
+  // A late numerical or consistency failure can follow kernels that already
+  // wrote a partial solution.  Clear the complete public arena on-device
+  // before the shared buffer becomes visible to the caller.
+  const uint output_entries =
+      p.output_terminal_state_multiplier + p.terminal_constraint_capacity;
+  for (uint index = 0; index < output_entries; ++index)
+    output[index] = 0.0f;
 }
 )CLQR_METAL";
 

@@ -92,6 +92,70 @@ def _heterogeneous_problem(dtype):
     }
 
 
+def _expanded_problem_with_padding(clqr_jax, padding):
+    """Expand every packed field while preserving one active scalar per family."""
+    packed = clqr_jax.pack_problem(_problem(np.float32), dtype=np.float32)
+
+    def padded(shape):
+        return np.full(shape, padding, dtype=np.float32)
+
+    A = padded((1, 2, 2))
+    B = padded((1, 2, 2))
+    Q = padded((2, 2, 2))
+    R = padded((1, 2, 2))
+    M = padded((1, 2, 2))
+    C = padded((1, 2, 2))
+    D = padded((1, 2, 2))
+    E = padded((1, 2, 2))
+    terminal_E = padded((2, 2))
+    c = padded((1, 2))
+    q = padded((2, 2))
+    r = padded((1, 2))
+    d = padded((1, 2))
+    e = padded((1, 2))
+    terminal_e = padded((2,))
+    initial_state = padded((2,))
+
+    A[0, 0, 0] = packed.factors.A[0, 0, 0]
+    B[0, 0, 0] = packed.factors.B[0, 0, 0]
+    Q[:, 0, 0] = packed.factors.Q[:, 0, 0]
+    R[0, 0, 0] = packed.factors.R[0, 0, 0]
+    M[0, 0, 0] = packed.factors.M[0, 0, 0]
+    C[0, 0, 0] = packed.factors.C[0, 0, 0]
+    D[0, 0, 0] = packed.factors.D[0, 0, 0]
+    c[0, 0] = packed.rhs.c[0, 0]
+    q[:, 0] = packed.rhs.q[:, 0]
+    r[0, 0] = packed.rhs.r[0, 0]
+    d[0, 0] = packed.rhs.d[0, 0]
+    initial_state[0] = packed.rhs.initial_state[0]
+
+    # E/e and terminal_E/terminal_e have padded capacity two but active
+    # dimension zero, so every one of their entries intentionally remains
+    # padding.
+    return packed._replace(
+        factors=packed.factors._replace(
+            A=A,
+            B=B,
+            Q=Q,
+            R=R,
+            M=M,
+            C=C,
+            D=D,
+            E=E,
+            terminal_E=terminal_E,
+        ),
+        rhs=packed.rhs._replace(
+            c=c,
+            q=q,
+            r=r,
+            d=d,
+            e=e,
+            terminal_e=terminal_e,
+            initial_state=initial_state,
+        ),
+    )
+
+
 _NUMERICAL_FIELDS = (
     "objective",
     "states",
@@ -102,6 +166,12 @@ _NUMERICAL_FIELDS = (
     "state_multipliers",
     "terminal_state_multiplier",
 )
+
+
+def _assert_zero_numerical_outputs(result):
+    for field in _NUMERICAL_FIELDS:
+        value = np.asarray(getattr(result, field))
+        np.testing.assert_array_equal(value, np.zeros_like(value))
 
 
 def _max_abs(value):
@@ -479,14 +549,32 @@ def test_metal_heterogeneous_zero_control_and_reuse():
     clqr_jax = _load_modules()
     packed, first = _compare_cpu_and_metal(clqr_jax, _heterogeneous_problem(np.float32))
     assert int(first.status) == clqr_jax.SolveStatus.OPTIMAL
-    # Put a NaN in an entry that occupies an alignment gap in the smaller
-    # layout below. Reusing the larger thread-local arena must not leak that
-    # stale value into the smaller solve's finite-input scan.
-    invalid_A = np.asarray(packed.factors.A).copy()
-    invalid_A[0, 0, 1] = np.nan
-    invalid = packed._replace(factors=packed.factors._replace(A=invalid_A))
+
+    # Every packed field has inactive capacity here. NaNs in those padded
+    # cells are not mathematical inputs and must not poison the solve.
+    clean_padding = _expanded_problem_with_padding(clqr_jax, 0.0)
+    clean_result = clqr_jax.solve(clean_padding, backend="metal")
+    assert int(clean_result.status) == clqr_jax.SolveStatus.OPTIMAL
+    nan_padding = _expanded_problem_with_padding(clqr_jax, np.nan)
+    nan_result = clqr_jax.solve(nan_padding, backend="metal")
+    assert int(nan_result.status) == clqr_jax.SolveStatus.OPTIMAL
+    for field in _NUMERICAL_FIELDS:
+        np.testing.assert_allclose(
+            getattr(nan_result, field),
+            getattr(clean_result, field),
+            atol=2e-4,
+            rtol=2e-4,
+        )
+
+    # The immediately following failure reuses a workspace containing a
+    # successful solution. An active NaN is invalid and no stale value may be
+    # returned from any numeric result.
+    active_q = np.asarray(nan_padding.rhs.q).copy()
+    active_q[0, 0] = np.nan
+    invalid = nan_padding._replace(rhs=nan_padding.rhs._replace(q=active_q))
     invalid_result = clqr_jax.solve(invalid, backend="metal")
     assert int(invalid_result.status) == clqr_jax.SolveStatus.INVALID_INPUT
+    _assert_zero_numerical_outputs(invalid_result)
 
     zero_control = {
         "initial_state": np.array([0.25], dtype=np.float32),
@@ -578,11 +666,15 @@ def test_metal_zero_horizon_and_all_constraint_families():
         clqr_jax.SolveStatus.OPTIMAL,
         clqr_jax.SolveStatus.NUMERICAL_FAILURE,
     )
-    np.testing.assert_allclose(metal.states, cpu.states, atol=8e-3, rtol=8e-3)
-    np.testing.assert_allclose(metal.controls, cpu.controls, atol=3e-2, rtol=3e-2)
-    assert _max_primal_residual(wide_constrained, metal) <= 2e-6
     if int(metal.status) == clqr_jax.SolveStatus.OPTIMAL:
+        np.testing.assert_allclose(metal.states, cpu.states, atol=8e-3, rtol=8e-3)
+        np.testing.assert_allclose(
+            metal.controls, cpu.controls, atol=3e-2, rtol=3e-2
+        )
+        assert _max_primal_residual(wide_constrained, metal) <= 2e-6
         assert _max_kkt_residual(wide_constrained, metal) <= 5e-2
+    else:
+        _assert_zero_numerical_outputs(metal)
 
 
 def test_metal_rank_deficiency_and_failure_statuses():
@@ -607,6 +699,7 @@ def test_metal_rank_deficiency_and_failure_statuses():
     result = clqr_jax.solve(packed, backend="metal")
     assert int(result.status) == clqr_jax.SolveStatus.INFEASIBLE
     np.testing.assert_array_equal(result.diagnostics[1:], [0, 0])
+    _assert_zero_numerical_outputs(result)
 
     nonfinite = clqr_jax.pack_problem(_problem(np.float32), dtype=np.float32)
     nonfinite_q = np.asarray(nonfinite.rhs.q).copy()
@@ -614,7 +707,13 @@ def test_metal_rank_deficiency_and_failure_statuses():
     nonfinite = nonfinite._replace(rhs=nonfinite.rhs._replace(q=nonfinite_q))
     result = clqr_jax.solve(nonfinite, backend="metal")
     assert int(result.status) == clqr_jax.SolveStatus.INVALID_INPUT
+    _assert_zero_numerical_outputs(result)
 
+    warm = clqr_jax.solve(
+        clqr_jax.pack_problem(_problem(np.float32), dtype=np.float32),
+        backend="metal",
+    )
+    assert int(warm.status) == clqr_jax.SolveStatus.OPTIMAL
     singular = _problem(np.float32)
     singular["stages"][0]["R"] = np.array([[0.0]], dtype=np.float32)
     singular["stages"][0]["C"] = np.zeros((0, 1), dtype=np.float32)
@@ -623,6 +722,7 @@ def test_metal_rank_deficiency_and_failure_statuses():
     packed = clqr_jax.pack_problem(singular, dtype=np.float32)
     result = clqr_jax.solve(packed, backend="metal")
     assert int(result.status) == clqr_jax.SolveStatus.NUMERICAL_FAILURE
+    _assert_zero_numerical_outputs(result)
 
 
 def test_metal_deterministic_random_properties():
@@ -657,21 +757,23 @@ def test_metal_deterministic_random_properties():
             state_tolerance, control_tolerance, kkt_tolerance = (
                 accuracy_limit_tolerances[seed]
             )
-            np.testing.assert_allclose(
-                metal.states,
-                cpu.states,
-                atol=state_tolerance,
-                rtol=state_tolerance,
-            )
-            np.testing.assert_allclose(
-                metal.controls,
-                cpu.controls,
-                atol=control_tolerance,
-                rtol=control_tolerance,
-            )
-            assert _max_primal_residual(problem, metal) < 2e-6
             if int(metal.status) == clqr_jax.SolveStatus.OPTIMAL:
+                np.testing.assert_allclose(
+                    metal.states,
+                    cpu.states,
+                    atol=state_tolerance,
+                    rtol=state_tolerance,
+                )
+                np.testing.assert_allclose(
+                    metal.controls,
+                    cpu.controls,
+                    atol=control_tolerance,
+                    rtol=control_tolerance,
+                )
+                assert _max_primal_residual(problem, metal) < 2e-6
                 assert _max_kkt_residual(problem, metal) < kkt_tolerance
+            else:
+                _assert_zero_numerical_outputs(metal)
             # These FP32 accuracy-limit cases may either return an honest
             # numerical failure or an accurate KKT point. Their dense KKT
             # condition numbers are approximately 7.88e2, 3.56e3, and 4.37e5.

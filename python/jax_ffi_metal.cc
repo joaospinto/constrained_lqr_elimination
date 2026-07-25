@@ -920,7 +920,7 @@ ffi::Error SolveMetalImpl(
       throw std::runtime_error("failed to create CLQR Metal command encoder");
     BindWorkspace(command_buffer, workspace);
     EncodeKernel(command_buffer, runtime.check_finite_inputs(), workspace, base,
-                 static_cast<std::uint32_t>(layout.input_floats));
+                 N + 1);
     if (N < 64u ||
         !EncodeLaneSlicedKernelWithThreadgroupMemory(
             command_buffer, runtime.build_primal_leaves_threadgroup_sliced(),

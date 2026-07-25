@@ -35,6 +35,9 @@ jobs:
           --test_output=errors
       - name: Build FP32 Metal JAX backend and run its source audit
         if: runner.os == 'macOS' && matrix.precision == 'fp32'
+        # Hosted macOS runners do not guarantee an Apple-family GPU that can
+        # execute Metal compute. Native validation therefore remains an
+        # explicit local test; CI still builds it and audits its GPU path.
         run: |
           bazel build \
             //:_clqr_metal \
