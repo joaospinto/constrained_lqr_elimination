@@ -165,20 +165,10 @@ comparisons. The default CSV includes absolute candidate packing/transfer time
 and its share of the wall--kernel gap. Temporary build trees are removed
 automatically; set `CLQR_KEEP_COMPARE_OUTPUT=1` to retain them.
 
-Revision-specific build flags can be supplied without shell evaluation. To
-isolate the transition from tuned compile-time capacities to runtime-sized
-CUDA dimensions, use the direct parent and candidate revisions:
-
-```sh
-CLQR_BASE_REVISION=3d225eae7e8f7c24c42ddd1cfbf921ef4d540764 \
-CLQR_BASE_EXTRA_BAZEL_ARGS="--cuda_max_state_dimension=8 --cuda_max_control_dimension=4 --cuda_max_mixed_constraints=2 --cuda_max_state_constraints=2" \
-CLQR_CANDIDATE_REVISION=511cd314445a421c35dcb77cd6154a70e99267e2 \
-CLQR_CUDA_ARCH=60 bash scripts/compare_cuda_revisions.sh
-```
-
-The emitted report records both revisions and both revision-specific build
-argument strings. Fields unavailable from a historical benchmark schema are
-reported as `nan`.
+Revision-specific build flags can be supplied through
+`CLQR_BASE_EXTRA_BAZEL_ARGS` and `CLQR_CANDIDATE_EXTRA_BAZEL_ARGS`, without
+shell evaluation. The emitted report records both revisions and both
+revision-specific build argument strings.
 
 The benchmark does not install or time the JAX implementation. To run the
 additional solution-level JAX cross-validation diagnostic, set
@@ -205,6 +195,8 @@ bazel test //:adversarial_cpu_extended_test \
   --test_output=errors
 ```
 
+## CPU backend and native APIs
+
 Build and test either precision:
 
 ```sh
@@ -224,7 +216,7 @@ Pass an integer scale factor to increase the per-case iteration counts:
 bazel run -c opt //:clqr_benchmark -- 10
 ```
 
-Sample workspace-API results from `bazel-bin/clqr_benchmark 5` at `6dc4b2d`,
+Sample workspace-API results from `bazel-bin/clqr_benchmark 5` at `9e85b6f`,
 after building `//:clqr_benchmark -c opt` on arm64 macOS with Apple clang
 21.0.0. The benchmark reserves workspace once per problem and times repeated
 solves. It also reports `max_us`; local scheduler spikes can make maxima
@@ -232,21 +224,21 @@ unrepresentative, so median and p90 are usually better summary statistics.
 
 | Case | Iterations | Mean | Median | P90 | Min | Max |
 |---|---:|---:|---:|---:|---:|---:|
-| `N=16 n=4 m=2 p=0` | 1000 | `3.573 us` | `3.459 us` | `3.875 us` | `3.208 us` | `4.750 us` |
-| `N=16 n=4 m=2 p=1` | 1000 | `9.746 us` | `9.750 us` | `10.083 us` | `9.042 us` | `24.208 us` |
-| `N=16 n=4 m=2 p=2` | 1000 | `9.797 us` | `9.500 us` | `10.541 us` | `9.084 us` | `54.500 us` |
-| `N=16 n=6 m=3 p=0` | 500 | `7.758 us` | `7.500 us` | `8.334 us` | `7.292 us` | `14.250 us` |
-| `N=16 n=6 m=3 p=1` | 500 | `16.260 us` | `16.083 us` | `17.375 us` | `15.416 us` | `21.042 us` |
-| `N=16 n=6 m=3 p=2` | 500 | `16.057 us` | `15.875 us` | `16.958 us` | `15.250 us` | `22.291 us` |
-| `N=32 n=6 m=3 p=0` | 250 | `15.514 us` | `15.375 us` | `15.833 us` | `14.583 us` | `27.583 us` |
-| `N=32 n=6 m=3 p=1` | 250 | `33.641 us` | `32.750 us` | `35.958 us` | `31.708 us` | `53.500 us` |
-| `N=32 n=6 m=3 p=2` | 250 | `33.187 us` | `32.417 us` | `35.500 us` | `31.542 us` | `40.916 us` |
-| `N=64 n=6 m=3 p=0` | 100 | `30.585 us` | `30.084 us` | `32.625 us` | `29.250 us` | `33.250 us` |
-| `N=64 n=6 m=3 p=1` | 100 | `66.710 us` | `65.667 us` | `68.667 us` | `63.125 us` | `115.125 us` |
-| `N=64 n=6 m=3 p=2` | 100 | `65.599 us` | `65.417 us` | `66.333 us` | `63.500 us` | `76.000 us` |
-| `N=128 n=8 m=4 p=0` | 50 | `111.271 us` | `110.708 us` | `113.125 us` | `108.334 us` | `122.166 us` |
-| `N=128 n=8 m=4 p=1` | 50 | `209.742 us` | `209.417 us` | `213.625 us` | `207.125 us` | `217.583 us` |
-| `N=128 n=8 m=4 p=2` | 50 | `204.350 us` | `203.708 us` | `205.208 us` | `201.458 us` | `223.750 us` |
+| `N=16 n=4 m=2 p=0` | 1000 | `3.551 us` | `3.542 us` | `3.583 us` | `3.416 us` | `5.917 us` |
+| `N=16 n=4 m=2 p=1` | 1000 | `9.768 us` | `9.750 us` | `9.833 us` | `9.625 us` | `12.334 us` |
+| `N=16 n=4 m=2 p=2` | 1000 | `9.980 us` | `9.750 us` | `10.625 us` | `9.167 us` | `34.625 us` |
+| `N=16 n=6 m=3 p=0` | 500 | `7.714 us` | `7.542 us` | `8.042 us` | `7.292 us` | `30.292 us` |
+| `N=16 n=6 m=3 p=1` | 500 | `16.033 us` | `15.542 us` | `17.000 us` | `15.000 us` | `37.875 us` |
+| `N=16 n=6 m=3 p=2` | 500 | `16.004 us` | `15.708 us` | `16.583 us` | `15.083 us` | `37.875 us` |
+| `N=32 n=6 m=3 p=0` | 250 | `15.429 us` | `15.083 us` | `16.000 us` | `14.542 us` | `37.084 us` |
+| `N=32 n=6 m=3 p=1` | 250 | `33.072 us` | `32.416 us` | `35.125 us` | `30.875 us` | `53.167 us` |
+| `N=32 n=6 m=3 p=2` | 250 | `32.632 us` | `31.958 us` | `33.833 us` | `31.041 us` | `55.917 us` |
+| `N=64 n=6 m=3 p=0` | 100 | `30.888 us` | `30.000 us` | `32.959 us` | `29.334 us` | `46.625 us` |
+| `N=64 n=6 m=3 p=1` | 100 | `64.560 us` | `64.000 us` | `66.042 us` | `61.958 us` | `92.333 us` |
+| `N=64 n=6 m=3 p=2` | 100 | `65.601 us` | `65.083 us` | `67.333 us` | `62.458 us` | `88.250 us` |
+| `N=128 n=8 m=4 p=0` | 50 | `112.403 us` | `111.000 us` | `113.042 us` | `109.250 us` | `133.416 us` |
+| `N=128 n=8 m=4 p=1` | 50 | `202.968 us` | `199.125 us` | `219.167 us` | `196.667 us` | `222.125 us` |
+| `N=128 n=8 m=4 p=2` | 50 | `195.794 us` | `192.958 us` | `212.541 us` | `190.250 us` | `219.500 us` |
 
 All sample cases reported `singular_count=0` and `wrong_inertia_count=0`.
 
@@ -310,16 +302,19 @@ clqr::SolutionView second = clqr::Solve(factors, rhs, solve_workspace);
 Each factored `Solve` accepts new `c`, `q`, `r`, terminal `q`, and initial
 state values with unchanged dimensions, and performs no heap allocation when
 given a reserved workspace. The first API slice deliberately rejects equality
-constraints; CUDA, JAX, and constrained factorization remain follow-up work.
+constraints; reusable CUDA/JAX factorization and constrained factorization
+remain follow-up work.
+
 As with the ordinary workspace API, every buffer and string referenced by the
 returned `SolutionView` is workspace-backed and remains valid only until that
 workspace is reused or destroyed. Copy any values that must survive the next
 solve.
 
-The native C++ `Problem`, `SolveRhs`, and NumPy dictionary APIs keep
-`terminal_Q` and `terminal_q` as separate fields. The padded JAX representation
-alone folds them into `factors.Q[-1]` and `rhs.q[-1]`; `pack_problem` performs
-that conversion from the native dictionary schema.
+### Native NumPy binding
+
+The native C++ `Problem`, `SolveRhs`, and NumPy dictionary APIs intentionally
+keep `terminal_Q` and `terminal_q` as separate fields. This schema mirrors the
+C++ types and is distinct from the packed JAX API below.
 
 The Python extension is built by the Bazel target `//:_clqr`; the shared-object output is
 addressable as `//:_clqr.so`. It exposes the `_clqr` module directly:
@@ -377,7 +372,7 @@ dict contains `status`, `message`,
 constraints exactly as written above. The Newton-KKT diagnostic fields are reported separately
 from `status`; when the reduced solve can proceed, a candidate solution is still returned.
 
-### JAX
+## JAX bindings
 
 `python/clqr/jax.py` exposes the solver through JAX's typed FFI:
 
@@ -389,30 +384,54 @@ PYTHONPATH="$PWD/python:$PWD/bazel-bin" python your_program.py
 ```python
 import jax
 
-from clqr.jax import pack_problem, solve
+from clqr.jax import FactorizationInputs, PackedProblem, SolveInputs, solve
 
-packed = pack_problem(problem)
+# Canonical JAX storage: Q and q include the terminal entry at index N.
+packed = PackedProblem(
+    factors=FactorizationInputs(
+        dimensions=dimensions,
+        A=A,
+        B=B,
+        Q=Q,  # shape (N + 1, nx, nx)
+        R=R,
+        M=M,
+        C=C,
+        D=D,
+        E=E,
+        terminal_E=terminal_E,
+    ),
+    rhs=SolveInputs(
+        c=c,
+        q=q,  # shape (N + 1, nx)
+        r=r,
+        d=d,
+        e=e,
+        terminal_e=terminal_e,
+        initial_state=initial_state,
+    ),
+)
 result = jax.jit(solve)(jax.device_put(packed, jax.devices()[0]))
 ```
 
 `PackedProblem.factors` contains the matrices and active dimensions;
 `PackedProblem.rhs` contains the vectors and initial state. Arrays are padded
-only at the interface, while each C++/CUDA stage still operates on its active
-runtime dimensions. `factors.Q` and `rhs.q` have `N + 1` entries, with their
-last entries holding the terminal cost; the other stage arrays have `N`
-entries. `pack_problem` still accepts `terminal_Q` and `terminal_q` as separate
-input-dictionary fields and folds them into those last entries. The split lets
-callers replace any RHS vector without changing the compiled JAX shape. It is
-not yet a numerical factor/solve split: the current call refactors after either
-part changes.
+only at the interface, while each backend stage still operates on its active
+runtime dimensions. `dimensions` concatenates the `N + 1` state dimensions,
+the `N` control dimensions, the `N` mixed-constraint counts, the `N`
+state-constraint counts, and the terminal-constraint count. `factors.Q` and
+`rhs.q` have `N + 1` entries, with their last entries holding the terminal
+cost; the other stage arrays have `N` entries. The optional `pack_problem`
+adapter converts a native NumPy dictionary with separate terminal fields into
+this representation. The split lets callers replace any RHS vector without
+changing the compiled JAX shape. It is not yet a numerical factor/solve split:
+the current call refactors after either part changes.
 
 CPU arrays dispatch to the sequential C++ solver. When `//:_clqr_cuda` is
 installed, CUDA arrays dispatch to the CUDA solver on the device selected by
-JAX. The CUDA bridge preserves JAX stream ordering and reuses pinned staging
-buffers and the native CUDA workspace for unchanged dimensions. It currently
-stages the padded FFI inputs through host memory because the public CUDA solver
-accepts a host `Problem`; a future device-packed entry point can remove that
-round trip.
+JAX. Scalar inputs and outputs remain device-resident, the bridge preserves
+JAX stream ordering, and the native CUDA workspace is reused for unchanged
+dimensions. Only the compact active-dimension vector is copied to the host for
+workspace planning; there is no bulk scalar round trip through host memory.
 
 On Apple silicon, the optional `_clqr_metal` extension provides the same
 elimination/scan numerical design as CUDA in a native FP32 Metal

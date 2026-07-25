@@ -30,6 +30,13 @@ shares the library's low-level RREF and linear-system primitives.
 | ASan/UBSan | yes | yes | no |
 | memcheck/initcheck/racecheck/synccheck | n/a | n/a | stress notebook |
 
+JAX binding validation is separate from the native table. The CPU and CUDA
+binding suites cover eager execution, `jax.jit`, sequential `jax.vmap`, changed
+right-hand sides, heterogeneous dimensions, zero controls, and zero horizons.
+The native Metal binding suite additionally covers all constraint families,
+rank deficiency and failure statuses, deterministic property cases, workspace
+reuse, and horizons through 1025 under its FP32-only precision contract.
+
 The normal CI-sized suite is:
 
 ```sh

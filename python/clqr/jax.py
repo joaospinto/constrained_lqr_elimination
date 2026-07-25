@@ -176,9 +176,11 @@ def _expect_shape(array: np.ndarray, shape: tuple[int, ...], name: str) -> None:
 def pack_problem(
     problem: Mapping[str, Any], *, dtype: Any | None = None
 ) -> PackedProblem:
-    """Validate and pad a dict problem for ``solve`` and ``jax.jit``.
+    """Convert the native dictionary schema to a padded ``PackedProblem``.
 
-    The accepted dictionary schema is the same as :func:`clqr.solve`.
+    The input schema is the same as :func:`clqr.solve`, with separate
+    ``terminal_Q`` and ``terminal_q`` fields. The returned JAX representation
+    folds them into ``factors.Q[-1]`` and ``rhs.q[-1]``.
     """
 
     if not isinstance(problem, Mapping):
