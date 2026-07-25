@@ -30,9 +30,10 @@ struct Factorization::Impl {
   };
 
   SolveStatus status = SolveStatus::kInvalidInput;
-  std::string message = "factorization has not been initialized";
+  std::string message = "uninitialized";
   Scalar tolerance = SolveOptions{}.tolerance;
-  std::unique_ptr<ConstrainedFactorData> constrained;
+  ConstrainedFactorData* constrained = nullptr;
+  bool constrained_owns_memory = false;
   WorkspaceVector<StageData> stages;
   Matrix terminal_Q;
   WorkspaceVector<std::size_t> state_offsets;
@@ -2704,6 +2705,120 @@ std::size_t WorkspaceRequiredBytesInternal(
   return offset;
 }
 
+void AddMatrixOnlyProblemStorageBound(const Problem& problem,
+                                      std::size_t* offset) {
+  const std::size_t N = problem.stages.size();
+  AddObjects<Stage>(offset, N);
+  for (const Stage& stage : problem.stages) {
+    AddScalars(offset, StageStorageScalars(stage));
+    AddScalars(offset, stage.c.size() + stage.r.size() + stage.d.size() +
+                           stage.e.size());
+  }
+  AddObjects<Matrix>(offset, N + 1);
+  AddObjects<Vector>(offset, N + 1);
+  for (std::size_t node = 0; node <= N; ++node) {
+    AddScalars(offset,
+               MatrixScalars(problem.Q[node]) + 2 * problem.q[node].size());
+  }
+  AddScalars(offset, MatrixScalars(problem.terminal_E) +
+                         2 * problem.terminal_e.size() +
+                         2 * problem.initial_state.size());
+}
+
+void AddFactorCacheStorageBound(const Problem& problem,
+                                const WorkspaceDimensionSummary& dims,
+                                std::size_t* offset) {
+  const std::size_t N = problem.stages.size();
+  AddObjects<Factorization::Impl::StageData>(offset, N);
+  for (std::size_t i = 0; i < N; ++i) {
+    const Stage& stage = problem.stages[i];
+    const std::size_t n = stage.A.cols();
+    const std::size_t next_n = stage.A.rows();
+    const std::size_t m = stage.B.cols();
+    const std::size_t scalars =
+        next_n * (n + m) + 2 * n * n + 3 * n * m + 2 * m * m;
+    AddScalars(offset, scalars);
+    AddIndices(offset, m);
+  }
+  AddScalars(offset, dims.terminal_state * dims.terminal_state);
+  AddIndices(offset, 2 * N + 1);
+  AddWorkspaceBytes(offset, alignof(std::size_t),
+                    RiccatiWorkspace::RequiredBytes(problem.stages));
+}
+
+void AddTerminalEliminationStorageBound(
+    const WorkspaceDimensionSummary& dims, std::size_t* offset) {
+  const std::size_t n = dims.terminal_state;
+  const std::size_t rows = dims.max_terminal_rows;
+  if (rows == 0) return;
+  const std::size_t rank = std::min(n, rows);
+  // StateBasis: augmented and restored echelon matrices, reflectors, QR
+  // vectors, the state basis, and its offset. AddEliminationStorageBound
+  // already includes this storage, but counting it again makes this phase
+  // independently conservative and covers all monotonic-arena temporaries.
+  AddScalars(offset, 2 * rows * (n + 1) + rank * rows + 2 * rank + rows +
+                         n * n + n);
+  AddIndices(offset, 2 * n + 2 * rank);
+  // ApplyTerminalStateBasis: copies plus every matrix/vector temporary in the
+  // quadratic, affine, and state-map pullbacks. This uses the full-state
+  // dimension as the worst-case number of free coordinates.
+  AddScalars(offset, 7 * n * n + 5 * n);
+}
+
+void AddConstrainedReplayStorageBound(const Problem& problem,
+                                      const WorkspaceDimensionSummary& dims,
+                                      std::size_t* offset) {
+  const std::size_t N = problem.stages.size();
+  AddObjects<ConstrainedReplayStage>(offset, N);
+  for (const Stage& stage : problem.stages) {
+    const std::size_t n = stage.A.cols();
+    const std::size_t next_n = stage.A.rows();
+    const std::size_t m = stage.B.cols();
+    // BuildConstrainedReplayCache retains four matrices and forms its
+    // products through the allocation-backed linalg operators. Count every
+    // possible output and temporary, including the Rows copies used by a
+    // non-identity next-state basis.
+    const std::size_t replay_scalars =
+        4 * next_n * n + 2 * next_n * m + 7 * n * n + 6 * n * m + m * m;
+    AddScalars(offset, replay_scalars);
+  }
+  if (N == 0) {
+    const std::size_t n = dims.terminal_state;
+    const std::size_t t = dims.max_terminal_rows;
+    // Dense system, augmented QR input, restored echelon matrix, reflector
+    // matrix, and three rank-sized vectors.
+    AddScalars(offset, n * (n + t) + 2 * n * (n + t + 1) + n * n + 3 * n);
+    AddIndices(offset, t + 2 * n);
+  }
+}
+
+std::size_t FactorizationWorkspaceRequiredBytesInternal(
+    const Problem& problem, const SolveOptions& options) {
+  static_assert(sizeof(Factorization::Impl::StageData) +
+                        sizeof(ConstrainedReplayStage) + sizeof(Stage) +
+                        sizeof(Matrix) + sizeof(Vector) <=
+                    1536,
+                "constexpr factorization metadata allowance is too small");
+  static_assert(
+      sizeof(Factorization::Impl) + sizeof(ConstrainedFactorData) +
+              sizeof(Matrix) + sizeof(Vector) <=
+          1536,
+      "constexpr fixed factorization metadata allowance is too small");
+  const WorkspaceDimensionSummary dims = SummarizeWorkspaceDimensions(problem);
+  std::size_t offset = 0;
+  AddObjects<Factorization::Impl>(&offset, 1);
+  if (AnyOriginalConstraints(problem)) {
+    AddObjects<ConstrainedFactorData>(&offset, 1);
+    AddMatrixOnlyProblemStorageBound(problem, &offset);
+    AddWorkingProblemStorageBound(problem, &offset);
+    AddEliminationStorageBound(problem, options, dims, &offset);
+    AddTerminalEliminationStorageBound(dims, &offset);
+    AddConstrainedReplayStorageBound(problem, dims, &offset);
+  }
+  AddFactorCacheStorageBound(problem, dims, &offset);
+  return offset;
+}
+
 SolutionWorkspaceLayout BindSolutionWorkspace(const Problem& problem,
                                               Workspace& workspace) {
   const std::size_t required = WorkspaceRequiredBytesInternal(problem);
@@ -4035,9 +4150,27 @@ Solution RecoverUnmapped(const Problem& original, ReducedSolution&& reduced,
 
 }  // namespace
 
-Factorization::Impl::~Impl() = default;
+Factorization::Impl::~Impl() {
+  if (constrained == nullptr) return;
+  if (constrained_owns_memory) {
+    delete constrained;
+  } else {
+    constrained->~ConstrainedFactorData();
+  }
+}
 
-Factorization::Factorization() : impl_(std::make_unique<Impl>()) {}
+void Factorization::ImplDeleter::operator()(Impl* impl) const noexcept {
+  if (impl == nullptr) return;
+  if (owns_memory) {
+    delete impl;
+  } else {
+    impl->~Impl();
+  }
+}
+
+Factorization::Factorization() : impl_(new Impl(), ImplDeleter{true}) {}
+Factorization::Factorization(Impl* impl, bool owns_memory)
+    : impl_(impl, ImplDeleter{owns_memory}) {}
 Factorization::~Factorization() = default;
 Factorization::Factorization(Factorization&&) noexcept = default;
 Factorization& Factorization::operator=(Factorization&&) noexcept = default;
@@ -4071,92 +4204,164 @@ SolveRhs ExtractRhs(const Problem& problem) {
   return rhs;
 }
 
-Factorization Factor(const Problem& problem, const SolveOptions& options) {
-  Factorization out;
+namespace {
+
+ConstrainedFactorData* AllocateConstrainedFactorData(bool* owns_memory) {
+  WorkspaceArena* arena = ActiveWorkspaceArena();
+  if (arena == nullptr) {
+    *owns_memory = true;
+    return new ConstrainedFactorData();
+  }
+  *owns_memory = false;
+  void* memory = arena->Allocate(sizeof(ConstrainedFactorData),
+                                 alignof(ConstrainedFactorData));
+  return new (memory) ConstrainedFactorData();
+}
+
+void PopulateFactorization(const Problem& problem, const SolveOptions& options,
+                           Factorization::Impl* impl) {
   try {
     ValidateTolerance(options.tolerance);
     ValidateProblem(problem);
     ValidateFiniteProblem(problem);
-    out.impl_->tolerance = options.tolerance;
+    impl->tolerance = options.tolerance;
 
     if (AnyOriginalConstraints(problem)) {
-      auto constrained = std::make_unique<ConstrainedFactorData>();
+      bool constrained_owns_memory = false;
+      ConstrainedFactorData* constrained =
+          AllocateConstrainedFactorData(&constrained_owns_memory);
+      impl->constrained = constrained;
+      impl->constrained_owns_memory = constrained_owns_memory;
       constrained->original = MatrixOnlyProblem(problem);
       constrained->reduced = Initialize(constrained->original);
       NewtonKktDiagnostics elimination_diagnostics;
       std::string error;
-      EliminateConstraintsRightToLeft(
-          constrained->reduced, options.tolerance, &error,
-          &elimination_diagnostics);
+      EliminateConstraintsRightToLeft(constrained->reduced, options.tolerance,
+                                      &error, &elimination_diagnostics);
       if (!error.empty()) {
         throw std::runtime_error(error);
       }
-      BuildConstrainedReplayCache(constrained.get(), options.tolerance);
+      BuildConstrainedReplayCache(constrained, options.tolerance);
 
       const bool elimination_singular = elimination_diagnostics.singular;
       const bool elimination_wrong_inertia =
           elimination_diagnostics.wrong_inertia;
       const std::string elimination_message =
-          JoinMessages(elimination_diagnostics.messages);
+          elimination_diagnostics.messages.empty()
+              ? std::string{}
+              : JoinMessages(elimination_diagnostics.messages);
       const bool matrix_factorization_succeeded = BuildMatrixFactors(
-          constrained->reduced.problem.stages,
-          constrained->reduced.problem.Q,
-          constrained->reduced.problem.q, options.tolerance,
-          out.impl_.get());
-      out.impl_->newton_kkt_singular =
-          out.impl_->newton_kkt_singular || elimination_singular;
-      out.impl_->newton_kkt_wrong_inertia =
-          out.impl_->newton_kkt_wrong_inertia || elimination_wrong_inertia;
+          constrained->reduced.problem.stages, constrained->reduced.problem.Q,
+          constrained->reduced.problem.q, options.tolerance, impl);
+      impl->newton_kkt_singular =
+          impl->newton_kkt_singular || elimination_singular;
+      impl->newton_kkt_wrong_inertia =
+          impl->newton_kkt_wrong_inertia || elimination_wrong_inertia;
       if (!elimination_message.empty()) {
-        if (!out.impl_->newton_kkt_diagnostic.empty()) {
-          out.impl_->newton_kkt_diagnostic += "; ";
+        if (!impl->newton_kkt_diagnostic.empty()) {
+          impl->newton_kkt_diagnostic += "; ";
         }
-        out.impl_->newton_kkt_diagnostic += elimination_message;
+        impl->newton_kkt_diagnostic += elimination_message;
       }
-      if (!matrix_factorization_succeeded) return out;
+      if (!matrix_factorization_succeeded) return;
       constrained->reduced.problem = WorkingProblem{};
-      out.impl_->constrained = std::move(constrained);
-    } else if (!BuildMatrixFactors(problem, options.tolerance,
-                                   out.impl_.get())) {
-      return out;
+    } else if (!BuildMatrixFactors(problem, options.tolerance, impl)) {
+      return;
     }
 
-    const std::size_t N = out.impl_->stages.size();
-    out.impl_->initial_state_size =
-        N == 0 ? out.impl_->terminal_Q.rows()
-               : out.impl_->stages.front().A.cols();
-    out.impl_->state_offsets.resize(N + 1);
-    out.impl_->control_offsets.resize(N);
-    out.impl_->total_state = out.impl_->initial_state_size;
-    out.impl_->state_offsets[0] = 0;
-    out.impl_->total_control = 0;
-    out.impl_->total_dynamics = 0;
-    out.impl_->max_control = 0;
+    const std::size_t N = impl->stages.size();
+    impl->initial_state_size =
+        N == 0 ? impl->terminal_Q.rows() : impl->stages.front().A.cols();
+    impl->state_offsets.resize(N + 1);
+    impl->control_offsets.resize(N);
+    impl->total_state = impl->initial_state_size;
+    impl->state_offsets[0] = 0;
+    impl->total_control = 0;
+    impl->total_dynamics = 0;
+    impl->max_control = 0;
     for (std::size_t i = 0; i < N; ++i) {
-      out.impl_->control_offsets[i] = out.impl_->total_control;
-      out.impl_->total_control += out.impl_->stages[i].B.cols();
-      out.impl_->max_control =
-          std::max(out.impl_->max_control, out.impl_->stages[i].B.cols());
-      out.impl_->total_dynamics += out.impl_->stages[i].A.rows();
-      out.impl_->state_offsets[i + 1] = out.impl_->total_state;
-      out.impl_->total_state += out.impl_->stages[i].A.rows();
+      impl->control_offsets[i] = impl->total_control;
+      impl->total_control += impl->stages[i].B.cols();
+      impl->max_control = std::max(impl->max_control, impl->stages[i].B.cols());
+      impl->total_dynamics += impl->stages[i].A.rows();
+      impl->state_offsets[i + 1] = impl->total_state;
+      impl->total_state += impl->stages[i].A.rows();
     }
-    if (out.impl_->constrained != nullptr) {
-      out.impl_->required_solve_bytes =
-          WorkspaceRequiredBytesInternal(
-              out.impl_->constrained->original, options);
+    if (impl->constrained != nullptr) {
+      impl->required_solve_bytes =
+          WorkspaceRequiredBytesInternal(impl->constrained->original, options);
     } else {
-      out.impl_->required_solve_bytes = FactoredSolveRequiredBytes(*out.impl_);
+      impl->required_solve_bytes = FactoredSolveRequiredBytes(*impl);
     }
-    out.impl_->status = SolveStatus::kOptimal;
-    out.impl_->message = "factorized";
+    impl->status = SolveStatus::kOptimal;
+    impl->message = "factorized";
   } catch (const std::invalid_argument& e) {
-    out.impl_->status = SolveStatus::kInvalidInput;
-    out.impl_->message = e.what();
+    impl->status = SolveStatus::kInvalidInput;
+    impl->message = e.what();
   } catch (const std::exception& e) {
-    out.impl_->status = SolveStatus::kNumericalFailure;
-    out.impl_->message = e.what();
+    impl->status = SolveStatus::kNumericalFailure;
+    impl->message = e.what();
   }
+}
+
+}  // namespace
+
+Factorization Factor(const Problem& problem, const SolveOptions& options) {
+  Factorization out;
+  PopulateFactorization(problem, options, out.impl_.get());
+  return out;
+}
+
+std::size_t FactorizationWorkspace::num_bytes(const Problem& problem,
+                                              const SolveOptions& options) {
+  ValidateTolerance(options.tolerance);
+  ValidateProblem(problem);
+  return FactorizationWorkspaceRequiredBytesInternal(problem, options);
+}
+
+void FactorizationWorkspace::ResetArena() { arena_.Reset(data_, size_); }
+
+void FactorizationWorkspace::reserve(const Problem& problem,
+                                     const SolveOptions& options) {
+  const std::size_t required = num_bytes(problem, options);
+  owned_.assign(required, 0);
+  external_ = nullptr;
+  data_ = owned_.data();
+  size_ = owned_.size();
+  ResetArena();
+}
+
+std::size_t FactorizationWorkspace::mem_assign(const Problem& problem,
+                                               unsigned char* memory,
+                                               const SolveOptions& options) {
+  const std::size_t required = num_bytes(problem, options);
+  mem_assign(memory, required);
+  return required;
+}
+
+std::size_t FactorizationWorkspace::mem_assign(void* memory,
+                                               std::size_t bytes) {
+  external_ = reinterpret_cast<unsigned char*>(memory);
+  data_ = external_;
+  size_ = bytes;
+  owned_.clear();
+  ResetArena();
+  return bytes;
+}
+
+Factorization Factor(const Problem& problem, FactorizationWorkspace& workspace,
+                     const SolveOptions& options) {
+  const std::size_t required =
+      FactorizationWorkspace::num_bytes(problem, options);
+  if (workspace.size_ < required) {
+    throw std::invalid_argument("factorization workspace is too small");
+  }
+  workspace.ResetArena();
+  ScopedWorkspaceArena scoped(&workspace.arena_);
+  void* memory = workspace.arena_.Allocate(sizeof(Factorization::Impl),
+                                           alignof(Factorization::Impl));
+  Factorization out(new (memory) Factorization::Impl(), false);
+  PopulateFactorization(problem, options, out.impl_.get());
   return out;
 }
 

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -56,7 +57,37 @@ void RunCase(const TestCase &test_case, Workspace *reusable_workspace) {
   Expect(solution.status == test_case.cpu_status,
          test_case.name + " status: " + solution.message);
 
-  clqr::Factorization factorization = clqr::Factor(problem);
+  clqr::FactorizationWorkspace factorization_workspace;
+  std::vector<unsigned char> factorization_memory;
+  clqr::Factorization factorization;
+  if (test_case.cpu_status == SolveStatus::kInvalidInput) {
+    factorization = clqr::Factor(problem);
+  } else {
+    const std::size_t factorization_bytes =
+        clqr::FactorizationWorkspace::num_bytes(problem);
+    std::size_t max_state = problem.Q.back().rows();
+    std::size_t max_control = 0;
+    std::size_t max_mixed = 0;
+    std::size_t max_state_constraints = 0;
+    for (const clqr::Stage& stage : problem.stages) {
+      max_state =
+          std::max(max_state, std::max(stage.A.cols(), stage.A.rows()));
+      max_control = std::max(max_control, stage.B.cols());
+      max_mixed = std::max(max_mixed, stage.C.rows());
+      max_state_constraints =
+          std::max(max_state_constraints, stage.E.rows());
+    }
+    const std::size_t uniform_factorization_bytes =
+        clqr::FactorizationWorkspace::num_bytes(
+            problem.stages.size(), max_state, max_control, max_mixed,
+            max_state_constraints, problem.terminal_E.rows());
+    Expect(factorization_bytes <= uniform_factorization_bytes,
+           test_case.name + " constexpr factorization workspace bound");
+    factorization_memory.resize(factorization_bytes);
+    factorization_workspace.mem_assign(factorization_memory.data(),
+                                       factorization_memory.size());
+    factorization = clqr::Factor(problem, factorization_workspace);
+  }
   SolutionView factored_solution;
   Workspace factored_workspace;
   if (factorization.status() == SolveStatus::kOptimal) {

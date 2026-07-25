@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -620,6 +621,20 @@ void WorkspaceUnconstrainedMatchesKkt() {
 
 void ReusableFactorizationSolvesNewRightHandSides() {
   Problem original = BaseProblem();
+  const std::size_t factor_bytes =
+      clqr::FactorizationWorkspace::num_bytes(original);
+  std::vector<unsigned char> undersized_factor_memory(factor_bytes - 1);
+  clqr::FactorizationWorkspace undersized_factor_workspace(
+      undersized_factor_memory.data(), undersized_factor_memory.size());
+  bool rejected_undersized_factor_workspace = false;
+  try {
+    (void)clqr::Factor(original, undersized_factor_workspace);
+  } catch (const std::invalid_argument&) {
+    rejected_undersized_factor_workspace = true;
+  }
+  Expect(rejected_undersized_factor_workspace,
+         "undersized factorization workspace is rejected");
+
   clqr::Factorization factorization = clqr::Factor(original);
   Expect(factorization.status() == SolveStatus::kOptimal,
          std::string("factorization status: ") + factorization.message());

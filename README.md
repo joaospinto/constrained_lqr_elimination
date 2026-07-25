@@ -260,20 +260,22 @@ scripts/compare_cpu_constraint_revisions.sh
 The focused comparison defaults to FP64 and FP32, 101 timed solves per process,
 and seven alternating-order rounds.
 
-C++ users include `clqr/clqr.h` and call `clqr::Solve` with a workspace:
+C++ users include `clqr/clqr.h` and call `clqr::Solve` with a solve
+workspace:
 
 ```cpp
-clqr::Workspace workspace;
-workspace.Reserve(problem);  // one allocation owned by workspace
+clqr::SolveWorkspace workspace;
+workspace.reserve(problem);  // one allocation owned by workspace
 clqr::SolutionView result = clqr::Solve(problem, workspace);
 ```
 
 For fixed-size uniform unconstrained problems, the required byte count is `constexpr`:
 
 ```cpp
-constexpr std::size_t kBytes = clqr::Workspace::RequiredBytesUniform(64, 6, 3);
+constexpr std::size_t kBytes = clqr::SolveWorkspace::num_bytes(64, 6, 3);
 alignas(std::max_align_t) std::array<unsigned char, kBytes> memory{};
-clqr::Workspace workspace(memory.data(), memory.size());
+clqr::SolveWorkspace workspace;
+workspace.mem_assign(problem, memory.data());
 clqr::SolutionView result = clqr::Solve(problem, workspace);  // zero heap allocations
 ```
 
@@ -281,7 +283,7 @@ There is also a constexpr size helper for uniform constrained workspace solves:
 
 ```cpp
 constexpr std::size_t kBytes =
-    clqr::Workspace::RequiredBytesUniformConstrained(16, 4, 2, 1);
+    clqr::SolveWorkspace::num_bytes(16, 4, 2, 1);
 ```
 
 The workspace API covers constrained and unconstrained problems. Unconstrained problems use
@@ -294,8 +296,8 @@ constraint elimination and reduced Riccati factorization once:
 ```cpp
 clqr::Factorization factors = clqr::Factor(problem);
 clqr::SolveRhs rhs = clqr::ExtractRhs(problem);
-clqr::Workspace solve_workspace;
-solve_workspace.Reserve(factors);
+clqr::SolveWorkspace solve_workspace;
+solve_workspace.reserve(factors);
 
 clqr::SolutionView first = clqr::Solve(factors, rhs, solve_workspace);
 rhs.initial_state = next_initial_state;
@@ -311,6 +313,44 @@ clqr::SolutionView second = clqr::Solve(factors, rhs, solve_workspace);
 `terminal_E` data. Each factored `Solve` accepts new `c`, all `N + 1` entries
 of `q`, `r`, `d`, `e`, `terminal_e`, and the initial state with unchanged
 dimensions. It performs no heap allocation when given a reserved workspace.
+
+The convenience `Factor(problem)` call owns and dynamically allocates its
+persistent cache. For a completely caller-allocated factor/solve path, use
+the `num_bytes` / `mem_assign` pattern:
+
+```cpp
+constexpr std::size_t kFactorBytes =
+    clqr::FactorizationWorkspace::num_bytes(16, 4, 2, 1);
+constexpr std::size_t kSolveBytes =
+    clqr::SolveWorkspace::num_bytes(16, 4, 2, 1);
+
+alignas(std::max_align_t)
+    std::array<unsigned char, kFactorBytes> factor_memory{};
+alignas(std::max_align_t)
+    std::array<unsigned char, kSolveBytes> solve_memory{};
+
+clqr::FactorizationWorkspace factor_workspace;
+factor_workspace.mem_assign(problem, factor_memory.data());
+clqr::Factorization factors =
+    clqr::Factor(problem, factor_workspace);  // zero heap allocations
+
+clqr::SolveWorkspace solve_workspace;
+solve_workspace.mem_assign(factors, solve_memory.data());
+clqr::SolveRhs rhs = clqr::ExtractRhs(problem);
+clqr::SolutionView result =
+    clqr::Solve(factors, rhs, solve_workspace);  // zero heap allocations
+```
+
+The constexpr overloads take capacity bounds for a uniform problem: horizon,
+state dimension, control dimension, mixed rows per stage, state-only rows per
+stage, and terminal rows. Runtime `num_bytes(problem)` supports heterogeneous
+dimensions and returns a tighter bound. `FactorizationWorkspace::reserve`
+provides the corresponding one-allocation owning path.
+
+An externally backed `FactorizationWorkspace` must outlive its
+`Factorization`. Destroy the factorization before reassigning, reserving, or
+reusing that workspace. The factorization remains immutable and may be shared
+by concurrent solves, provided each solve has its own `SolveWorkspace`.
 
 As with the ordinary workspace API, every buffer and string referenced by the
 returned `SolutionView` is workspace-backed and remains valid only until that

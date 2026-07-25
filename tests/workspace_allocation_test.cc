@@ -1,3 +1,4 @@
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
@@ -40,6 +41,7 @@ void StopCounting() {
   g_count_allocations.store(false, std::memory_order_relaxed);
 }
 
+using clqr::FactorizationWorkspace;
 using clqr::Matrix;
 using clqr::Problem;
 using clqr::Scalar;
@@ -142,9 +144,106 @@ int main() {
   static_assert(Workspace::RequiredBytesUniformConstrained(
                     kMaximumSize, 0, 0, 0, 0, 0) == kMaximumSize,
                 "constrained horizon overflow must saturate");
+  static_assert(
+      FactorizationWorkspace::num_bytes(kMaximumSize, 1, 1) == kMaximumSize,
+      "factorization horizon overflow must saturate");
+  static_assert(
+      FactorizationWorkspace::num_bytes(1, kMaximumSize, 1) == kMaximumSize,
+      "factorization dimension overflow must saturate");
   static_assert(Workspace::RequiredBytesUniform(1000000, 1, 1) != kMaximumSize,
                 "large safe horizons must retain a finite workspace bound");
   Problem problem = MakeProblem(64, 6, 3);
+
+  constexpr std::size_t kStackFactorBytes =
+      FactorizationWorkspace::num_bytes(2, 2, 1);
+  static_assert(kStackFactorBytes > 0,
+                "stack factorization workspace size must be positive");
+  {
+    Problem stack_problem = MakeProblem(2, 2, 1);
+    Expect(
+        FactorizationWorkspace::num_bytes(stack_problem) <= kStackFactorBytes,
+        "constexpr factorization workspace bound");
+    alignas(std::max_align_t) std::array<unsigned char, kStackFactorBytes>
+        factor_memory{};
+    FactorizationWorkspace factor_workspace;
+    factor_workspace.mem_assign(stack_problem, factor_memory.data());
+    StartCounting();
+    clqr::Factorization stack_factor =
+        clqr::Factor(stack_problem, factor_workspace);
+    StopCounting();
+    Expect(stack_factor.status() == SolveStatus::kOptimal,
+           "stack-backed factorization status");
+    if (g_allocations.load(std::memory_order_relaxed) != 0) {
+      std::cerr << "stack factor allocations="
+                << g_allocations.load(std::memory_order_relaxed)
+                << " bytes=" << g_bytes.load(std::memory_order_relaxed) << "\n";
+    }
+    Expect(g_allocations.load(std::memory_order_relaxed) == 0,
+           "stack-backed factorization should not allocate");
+
+    constexpr std::size_t kStackSolveBytes =
+        Workspace::RequiredBytesUniform(2, 2, 1);
+    alignas(std::max_align_t) std::array<unsigned char, kStackSolveBytes>
+        solve_memory{};
+    clqr::SolveWorkspace solve_workspace;
+    solve_workspace.mem_assign(stack_factor, solve_memory.data());
+    const clqr::SolveRhs stack_rhs = clqr::ExtractRhs(stack_problem);
+    StartCounting();
+    const SolutionView stack_solution =
+        Solve(stack_factor, stack_rhs, solve_workspace);
+    StopCounting();
+    Expect(stack_solution.status == SolveStatus::kOptimal,
+           "stack-backed factored solve status");
+    Expect(g_allocations.load(std::memory_order_relaxed) == 0,
+           "stack-backed factored solve should not allocate");
+  }
+  {
+    FactorizationWorkspace owned_factor_workspace;
+    StartCounting();
+    owned_factor_workspace.reserve(problem);
+    clqr::Factorization owned_factors =
+        clqr::Factor(problem, owned_factor_workspace);
+    StopCounting();
+    Expect(owned_factors.status() == SolveStatus::kOptimal,
+           "owned factorization workspace status");
+    Expect(g_allocations.load(std::memory_order_relaxed) == 1,
+           "owned factorization workspace should allocate exactly once");
+  }
+  constexpr std::size_t kConstrainedStackFactorBytes =
+      FactorizationWorkspace::num_bytes(2, 2, 1, 1);
+  constexpr std::size_t kConstrainedStackSolveBytes =
+      clqr::SolveWorkspace::num_bytes(2, 2, 1, 1, 0, 0);
+  {
+    Problem stack_problem = MakeConstrainedProblem(2, 2, 1);
+    Expect(FactorizationWorkspace::num_bytes(stack_problem) <=
+               kConstrainedStackFactorBytes,
+           "constrained constexpr factorization workspace bound");
+    alignas(std::max_align_t)
+        std::array<unsigned char, kConstrainedStackFactorBytes>
+            factor_memory{};
+    alignas(std::max_align_t)
+        std::array<unsigned char, kConstrainedStackSolveBytes>
+            solve_memory{};
+    FactorizationWorkspace factor_workspace;
+    factor_workspace.mem_assign(stack_problem, factor_memory.data());
+    StartCounting();
+    clqr::Factorization factors = clqr::Factor(stack_problem, factor_workspace);
+    StopCounting();
+    Expect(factors.status() == SolveStatus::kOptimal,
+           "constrained stack-backed factorization status");
+    Expect(g_allocations.load(std::memory_order_relaxed) == 0,
+           "constrained stack-backed factorization should not allocate");
+    clqr::SolveWorkspace solve_workspace;
+    solve_workspace.mem_assign(factors, solve_memory.data());
+    const clqr::SolveRhs rhs = clqr::ExtractRhs(stack_problem);
+    StartCounting();
+    const SolutionView solution = Solve(factors, rhs, solve_workspace);
+    StopCounting();
+    Expect(solution.status == SolveStatus::kOptimal,
+           "constrained stack-backed factored solve status");
+    Expect(g_allocations.load(std::memory_order_relaxed) == 0,
+           "constrained stack-backed factored solve should not allocate");
+  }
 
   Workspace owned;
   StartCounting();
@@ -200,6 +299,35 @@ int main() {
          "reusable factored solves should not allocate");
 
   Problem constrained = MakeConstrainedProblem(16, 4, 2);
+  const std::size_t constrained_factor_required =
+      FactorizationWorkspace::num_bytes(constrained);
+  constexpr std::size_t kConstrainedFactorBytes =
+      FactorizationWorkspace::num_bytes(16, 4, 2, 1);
+  static_assert(kConstrainedFactorBytes > 0,
+                "constrained factorization bound must be positive");
+  Expect(constrained_factor_required <= kConstrainedFactorBytes,
+         "constrained constexpr factorization workspace bound");
+  std::vector<unsigned char> constrained_factor_memory(
+      constrained_factor_required);
+  FactorizationWorkspace constrained_factor_workspace;
+  constrained_factor_workspace.mem_assign(constrained_factor_memory.data(),
+                                          constrained_factor_memory.size());
+  StartCounting();
+  clqr::Factorization external_constrained_factorization =
+      clqr::Factor(constrained, constrained_factor_workspace);
+  StopCounting();
+  const std::size_t constrained_factor_allocations =
+      g_allocations.load(std::memory_order_relaxed);
+  const std::size_t constrained_factor_bytes =
+      g_bytes.load(std::memory_order_relaxed);
+  const std::size_t constrained_factor_used =
+      constrained_factor_workspace.used();
+  Expect(external_constrained_factorization.status() == SolveStatus::kOptimal,
+         "external constrained factorization status");
+  Expect(constrained_factor_allocations == 0,
+         "external constrained factorization should not allocate");
+  Expect(constrained_factor_used <= constrained_factor_required,
+         "constrained factorization stays within its runtime bound");
   constexpr std::size_t kConstrainedBytes =
       Workspace::RequiredBytesUniformConstrained(16, 4, 2, 1);
   static_assert(kConstrainedBytes > 0,
@@ -347,6 +475,13 @@ int main() {
             << " external_bytes=" << external_bytes
             << " factored_allocations=" << factored_allocations
             << " factored_bytes=" << factored_bytes
+            << " constrained_factor_required="
+            << constrained_factor_required
+            << " constrained_factor_constexpr=" << kConstrainedFactorBytes
+            << " constrained_factor_allocations="
+            << constrained_factor_allocations
+            << " constrained_factor_bytes=" << constrained_factor_bytes
+            << " constrained_factor_used=" << constrained_factor_used
             << " constrained_required=" << constrained_required
             << " constrained_constexpr=" << kConstrainedBytes
             << " constrained_owned_allocations="

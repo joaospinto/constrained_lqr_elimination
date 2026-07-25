@@ -99,10 +99,15 @@ struct SolutionView {
 };
 
 class Workspace;
+class FactorizationWorkspace;
 
 class Factorization {
  public:
   struct Impl;
+  struct ImplDeleter {
+    bool owns_memory = true;
+    void operator()(Impl* impl) const noexcept;
+  };
 
   Factorization();
   ~Factorization();
@@ -117,13 +122,64 @@ class Factorization {
   std::size_t RequiredSolveBytes() const;
 
  private:
-  std::unique_ptr<Impl> impl_;
+  explicit Factorization(Impl* impl, bool owns_memory);
+
+  std::unique_ptr<Impl, ImplDeleter> impl_;
 
   friend Factorization Factor(const Problem&, const SolveOptions&);
+  friend Factorization Factor(const Problem&, FactorizationWorkspace&,
+                              const SolveOptions&);
   friend SolutionView Solve(const Factorization&, const SolveRhs&, Workspace&);
 };
 
 Factorization Factor(const Problem& problem,
+                     const SolveOptions& options = SolveOptions{});
+
+class FactorizationWorkspace {
+ public:
+  FactorizationWorkspace() = default;
+  FactorizationWorkspace(void* memory, std::size_t bytes) {
+    mem_assign(memory, bytes);
+  }
+  FactorizationWorkspace(const FactorizationWorkspace&) = delete;
+  FactorizationWorkspace& operator=(const FactorizationWorkspace&) = delete;
+  FactorizationWorkspace(FactorizationWorkspace&&) = delete;
+  FactorizationWorkspace& operator=(FactorizationWorkspace&&) = delete;
+
+  static std::size_t num_bytes(const Problem& problem,
+                               const SolveOptions& options = SolveOptions{});
+  static constexpr std::size_t num_bytes(
+      std::size_t stages, std::size_t state_dim, std::size_t control_dim,
+      std::size_t mixed_constraints_per_stage = 0,
+      std::size_t state_constraints_per_stage = 0,
+      std::size_t terminal_constraints = 0);
+
+  void reserve(const Problem& problem,
+               const SolveOptions& options = SolveOptions{});
+  std::size_t mem_assign(const Problem& problem, unsigned char* memory,
+                         const SolveOptions& options = SolveOptions{});
+  std::size_t mem_assign(void* memory, std::size_t bytes);
+
+  unsigned char* data() { return data_; }
+  const unsigned char* data() const { return data_; }
+  std::size_t size() const { return size_; }
+  std::size_t used() const { return arena_.used(); }
+  bool owns_memory() const { return external_ == nullptr; }
+
+ private:
+  void ResetArena();
+
+  std::vector<unsigned char> owned_;
+  unsigned char* external_ = nullptr;
+  unsigned char* data_ = nullptr;
+  std::size_t size_ = 0;
+  WorkspaceArena arena_;
+
+  friend Factorization Factor(const Problem&, FactorizationWorkspace&,
+                              const SolveOptions&);
+};
+
+Factorization Factor(const Problem& problem, FactorizationWorkspace& workspace,
                      const SolveOptions& options = SolveOptions{});
 
 class Workspace {
@@ -137,6 +193,30 @@ class Workspace {
   static std::size_t RequiredBytes(const Problem& problem,
                                    const SolveOptions& options);
   static std::size_t RequiredBytes(const Factorization& factorization);
+  static std::size_t num_bytes(const Problem& problem) {
+    return RequiredBytes(problem);
+  }
+  static std::size_t num_bytes(const Problem& problem,
+                               const SolveOptions& options) {
+    return RequiredBytes(problem, options);
+  }
+  static std::size_t num_bytes(const Factorization& factorization) {
+    return RequiredBytes(factorization);
+  }
+  static constexpr std::size_t num_bytes(std::size_t stages,
+                                         std::size_t state_dim,
+                                         std::size_t control_dim) {
+    return RequiredBytesUniform(stages, state_dim, control_dim);
+  }
+  static constexpr std::size_t num_bytes(
+      std::size_t stages, std::size_t state_dim, std::size_t control_dim,
+      std::size_t mixed_constraints_per_stage,
+      std::size_t state_constraints_per_stage = 0,
+      std::size_t terminal_constraints = 0) {
+    return RequiredBytesUniformConstrained(
+        stages, state_dim, control_dim, mixed_constraints_per_stage,
+        state_constraints_per_stage, terminal_constraints);
+  }
   static constexpr std::size_t RequiredBytesUniform(std::size_t stages,
                                                     std::size_t state_dim,
                                                     std::size_t control_dim) {
@@ -369,6 +449,32 @@ class Workspace {
   void Reserve(const Problem& problem);
   void Reserve(const Problem& problem, const SolveOptions& options);
   void Reserve(const Factorization& factorization);
+  void reserve(const Problem& problem) { Reserve(problem); }
+  void reserve(const Problem& problem, const SolveOptions& options) {
+    Reserve(problem, options);
+  }
+  void reserve(const Factorization& factorization) { Reserve(factorization); }
+  std::size_t mem_assign(const Problem& problem, unsigned char* memory) {
+    const std::size_t bytes = RequiredBytes(problem);
+    UseExternalMemory(memory, bytes);
+    return bytes;
+  }
+  std::size_t mem_assign(const Problem& problem, const SolveOptions& options,
+                         unsigned char* memory) {
+    const std::size_t bytes = RequiredBytes(problem, options);
+    UseExternalMemory(memory, bytes);
+    return bytes;
+  }
+  std::size_t mem_assign(const Factorization& factorization,
+                         unsigned char* memory) {
+    const std::size_t bytes = RequiredBytes(factorization);
+    UseExternalMemory(memory, bytes);
+    return bytes;
+  }
+  std::size_t mem_assign(void* memory, std::size_t bytes) {
+    UseExternalMemory(memory, bytes);
+    return bytes;
+  }
   void UseExternalMemory(void* memory, std::size_t bytes);
   unsigned char* data() { return data_; }
   const unsigned char* data() const { return data_; }
@@ -427,6 +533,91 @@ class Workspace {
   friend SolutionView Solve(const Problem&, Workspace&, const SolveOptions&);
   friend SolutionView Solve(const Factorization&, const SolveRhs&, Workspace&);
 };
+
+constexpr std::size_t FactorizationWorkspace::num_bytes(
+    std::size_t stages, std::size_t state_dim, std::size_t control_dim,
+    std::size_t mixed_constraints_per_stage,
+    std::size_t state_constraints_per_stage, std::size_t terminal_constraints) {
+  const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+  const std::size_t largest_dimension =
+      state_dim > control_dim ? state_dim : control_dim;
+  const std::size_t largest_constraint =
+      mixed_constraints_per_stage > state_constraints_per_stage
+          ? (mixed_constraints_per_stage > terminal_constraints
+                 ? mixed_constraints_per_stage
+                 : terminal_constraints)
+          : (state_constraints_per_stage > terminal_constraints
+                 ? state_constraints_per_stage
+                 : terminal_constraints);
+  const std::size_t largest = largest_dimension > largest_constraint
+                                  ? largest_dimension
+                                  : largest_constraint;
+  if (stages == maximum || largest == maximum) return maximum;
+  const std::size_t stage_count = stages + 1;
+  const std::size_t dimension = largest + 1;
+  if (dimension > maximum / dimension) return maximum;
+  const std::size_t dimension_square = dimension * dimension;
+  if (stage_count > maximum / dimension_square) return maximum;
+  const std::size_t scale = stage_count * dimension_square;
+  const bool constrained = mixed_constraints_per_stage != 0 ||
+                           state_constraints_per_stage != 0 ||
+                           terminal_constraints != 0;
+  const std::size_t base =
+      constrained
+          ? Workspace::RequiredBytesUniformConstrained(
+                stages, state_dim, control_dim, mixed_constraints_per_stage,
+                state_constraints_per_stage, terminal_constraints)
+          : Workspace::RequiredBytesUniform(stages, state_dim, control_dim);
+  if (base == maximum) return maximum;
+  // All explicit storage terms below have a coefficient below 256 relative
+  // to stage_count * (largest_dimension + 1)^2.
+  if (scale > maximum / 256 / sizeof(Scalar)) return maximum;
+
+  const std::size_t n = state_dim;
+  const std::size_t m = control_dim;
+  const std::size_t p = mixed_constraints_per_stage;
+  const std::size_t e = state_constraints_per_stage;
+  const std::size_t t = terminal_constraints;
+  const std::size_t cache_stage_scalars = 3 * n * n + 4 * n * m + 2 * m * m;
+  std::size_t extra_scalars = stages * cache_stage_scalars + n * n;
+  std::size_t extra_indices = stages * m + 2 * stages + 1;
+  if (constrained) {
+    const std::size_t matrix_only_stage_scalars =
+        n * n + 2 * n * m + m * m + p * (n + m) + e * n + 2 * (n + m + p + e);
+    const std::size_t matrix_only_node_scalars = n * n + 2 * n;
+    const std::size_t replay_stage_scalars =
+        11 * n * n + 8 * n * m + m * m;
+    extra_scalars +=
+        stages * (matrix_only_stage_scalars + replay_stage_scalars) +
+        stage_count * matrix_only_node_scalars + t * n + 2 * t + 2 * n;
+    if (t != 0) {
+      const std::size_t rank = n < t ? n : t;
+      extra_scalars += 8 * n * n + 6 * n + 2 * t * (n + 1) +
+                       rank * t + 2 * rank + t;
+      extra_indices += 2 * n + 2 * rank;
+    }
+    if (stages == 0) {
+      extra_scalars +=
+          n * (n + t) + 2 * n * (n + t + 1) + n * n + 3 * n;
+      extra_indices += t + 2 * n;
+    }
+  }
+  if (extra_scalars > maximum / sizeof(Scalar)) return maximum;
+  const std::size_t scalar_bytes = extra_scalars * sizeof(Scalar);
+  if (extra_indices > maximum / sizeof(std::size_t)) return maximum;
+  const std::size_t index_bytes = extra_indices * sizeof(std::size_t);
+  constexpr std::size_t kMetadataBytesPerStage = 1536;
+  if (stage_count > maximum / kMetadataBytesPerStage) return maximum;
+  const std::size_t metadata_bytes = stage_count * kMetadataBytesPerStage;
+  if (scalar_bytes > maximum - index_bytes) return maximum;
+  const std::size_t data_bytes = scalar_bytes + index_bytes;
+  if (data_bytes > maximum - metadata_bytes) return maximum;
+  const std::size_t extra = data_bytes + metadata_bytes;
+  if (base > maximum - extra) return maximum;
+  return base + extra;
+}
+
+using SolveWorkspace = Workspace;
 
 SolutionView Solve(const Problem& problem, Workspace& workspace,
                    const SolveOptions& options = SolveOptions{});
