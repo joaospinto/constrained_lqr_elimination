@@ -7494,7 +7494,7 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
       static_cast<std::size_t>(s.n + s.m) * (s.n + s.m);
   transform_scratch_size.Add<Scalar>(
       SharedScalarEntries(transform_capacity_entries));
-  ScratchSize scratch_size;
+  [[maybe_unused]] ScratchSize scratch_size;
   scratch_size.bytes =
       relation_scratch_size.bytes > transform_scratch_size.bytes
           ? relation_scratch_size.bytes
