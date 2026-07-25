@@ -697,6 +697,39 @@ void StagedFeedbackSystemCase() {
   }
 }
 
+void TerminalReductionScratchPaddingCase() {
+  Scalar terminal_Q[]{Scalar{2}};
+  Scalar terminal_q[]{Scalar{-0.2}};
+  PackedTerminal terminal{};
+  terminal.n = 1;
+  terminal.Q = terminal_Q;
+  terminal.q = terminal_q;
+  Scalar transform[]{Scalar{1}};
+  Scalar offset[]{Scalar{0.4}};
+  StateParam param{};
+  param.physical_dim = 1;
+  param.reduced_dim = 1;
+  param.T = transform;
+  param.t = offset;
+  Scalar reduced_Q[1]{};
+  Scalar reduced_q[1]{};
+  ReducedTerminal reduced{};
+  reduced.Q = reduced_Q;
+  reduced.q = reduced_q;
+  threadIdx.x = 0;
+  blockDim.x = 1;
+
+  ReduceTerminalKernel(&terminal, &param, 0, &reduced);
+
+  Expect(g_emulated_block_scratch_bytes == kSharedVectorAccessBytes,
+         "scalar terminal reduction requests one complete shared-memory "
+         "transaction");
+  Expect(std::abs(reduced_Q[0] - Scalar{2}) < kTolerance &&
+             std::abs(reduced_q[0] - Scalar{0.6}) < kTolerance,
+         "scalar terminal reduction preserves the staged Hessian and "
+         "gradient");
+}
+
 void DualRelationLeafScratchSizeCase() {
   ScratchSize without_constraint_scales;
   without_constraint_scales.Add<Scalar>(2);
@@ -782,6 +815,11 @@ void ScratchPlannerTopologyCase() {
   Expect(staged_overflow_rejected,
          "value-composition planner rejects staged-product size overflow");
 
+  Expect(StageHessianTransformScratchBytes(
+             1, 1, "scalar terminal Hessian workspace") ==
+             kSharedVectorAccessBytes,
+         "scalar Hessian transform planner covers one complete shared-memory "
+         "transaction");
   ScratchSize relation_matrix;
   relation_matrix.Add<Scalar>(7 * 11);
   ScratchSize elimination_tail;
@@ -807,6 +845,22 @@ void ScratchPlannerTopologyCase() {
   }
   Expect(transform_overflow_rejected,
          "Hessian-transform planner rejects staged-product size overflow");
+  bool transform_padding_overflow_rejected = false;
+  try {
+    (void)StageHessianTransformScratchBytes(
+        std::numeric_limits<std::size_t>::max(), 1,
+        "overflowing padded Hessian workspace");
+  } catch (const std::invalid_argument &) {
+    transform_padding_overflow_rejected = true;
+  }
+  Expect(transform_padding_overflow_rejected,
+         "Hessian-transform planner rejects transaction-padding overflow");
+
+  const ScratchRequirements scalar =
+      PlanScratch(clqr::benchmark::StateOnlyProblem(1, 1, 1, 0));
+  Expect(scalar.terminal_reduction == kSharedVectorAccessBytes,
+         "scalar terminal launch allocates one complete shared-memory "
+         "transaction");
 
   const Problem uniform_problem = clqr::benchmark::StateOnlyProblem(8, n, 4, 2);
   const ScratchRequirements uniform = PlanScratch(uniform_problem);
@@ -2157,6 +2211,7 @@ int main(int argc, char **argv) {
   FreeFixedFreeValueCompositionCase();
   NonuniformValueCompositionCase();
   StagedFeedbackSystemCase();
+  TerminalReductionScratchPaddingCase();
   DualRelationLeafScratchSizeCase();
   ScratchPlannerTopologyCase();
   NonPositiveDefiniteReducedControlCostCase();

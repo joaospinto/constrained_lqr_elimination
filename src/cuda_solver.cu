@@ -264,6 +264,17 @@ std::size_t ScratchCheckedSum(std::initializer_list<std::size_t> terms,
   return result;
 }
 
+std::size_t ScratchCheckedSharedScalarEntries(std::size_t entries,
+                                              const char *description) {
+  constexpr std::size_t transaction_entries =
+      kSharedVectorAccessBytes / sizeof(Scalar);
+  if (entries >
+      std::numeric_limits<std::size_t>::max() - (transaction_entries - 1)) {
+    throw std::invalid_argument(std::string(description) + " size overflows");
+  }
+  return SharedScalarEntries(entries);
+}
+
 std::size_t DenseEliminationScratchBytes(std::size_t rows, std::size_t columns,
                                          const char *description) {
   ScratchSize size;
@@ -298,8 +309,9 @@ std::size_t StageHessianTransformScratchBytes(std::size_t physical_variables,
                                               std::size_t reduced_variables,
                                               const char *description) {
   ScratchSize size;
-  size.Add<Scalar>(ScratchCheckedProduct(physical_variables, reduced_variables,
-                                         description));
+  const std::size_t entries =
+      ScratchCheckedProduct(physical_variables, reduced_variables, description);
+  size.Add<Scalar>(ScratchCheckedSharedScalarEntries(entries, description));
   return size.bytes;
 }
 
@@ -895,10 +907,13 @@ struct ScratchArena {
 };
 
 #ifdef CLQR_CUDA_EMULATION
+std::size_t g_emulated_block_scratch_bytes = 0;
+
 unsigned char *EmulatedBlockScratch(std::size_t bytes) {
   // vector<unsigned char> does not promise the alignment required by Scalar
   // and the small scan records placed in this arena.  max_align_t does, while
   // retaining the same reusable, exactly runtime-sized emulation buffer.
+  g_emulated_block_scratch_bytes = bytes;
   static thread_local std::vector<std::max_align_t> storage;
   const std::size_t words =
       bytes / sizeof(std::max_align_t) +
@@ -7475,8 +7490,10 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
            ? elimination_tail_size.bytes
            : dynamics_tail_size.bytes);
   ScratchSize transform_scratch_size;
-  transform_scratch_size.Add<Scalar>(static_cast<std::size_t>(s.n + s.m) *
-                                     (s.n + s.m));
+  const std::size_t transform_capacity_entries =
+      static_cast<std::size_t>(s.n + s.m) * (s.n + s.m);
+  transform_scratch_size.Add<Scalar>(
+      SharedScalarEntries(transform_capacity_entries));
   ScratchSize scratch_size;
   scratch_size.bytes =
       relation_scratch_size.bytes > transform_scratch_size.bytes
@@ -7755,17 +7772,22 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
   const int reduced_variables = rs.n + rs.m;
   if (reduced_variables > 0) {
     ScratchArena transform_scratch{scratch.data};
-    Scalar *hessian_times_map = transform_scratch.Take<Scalar>(
-        static_cast<std::size_t>(physical_variables) * reduced_variables);
-    for (int linear = threadIdx.x;
-         linear < physical_variables * reduced_variables;
+    const std::size_t transform_entries =
+        static_cast<std::size_t>(physical_variables) * reduced_variables;
+    const std::size_t shared_transform_entries =
+        SharedScalarEntries(transform_entries);
+    Scalar *hessian_times_map =
+        transform_scratch.Take<Scalar>(shared_transform_entries);
+    for (std::size_t linear = threadIdx.x; linear < shared_transform_entries;
          linear += blockDim.x) {
-      const int row = linear / reduced_variables;
-      const int col = linear % reduced_variables;
       Scalar value = Scalar{0};
-      for (int inner = 0; inner < physical_variables; ++inner) {
-        value += StageHessianEntry(s, row, inner) *
-                 StageReductionMapEntry(s, current, cp, inner, col);
+      if (linear < transform_entries) {
+        const int row = static_cast<int>(linear) / reduced_variables;
+        const int col = static_cast<int>(linear) % reduced_variables;
+        for (int inner = 0; inner < physical_variables; ++inner) {
+          value += StageHessianEntry(s, row, inner) *
+                   StageReductionMapEntry(s, current, cp, inner, col);
+        }
       }
       hessian_times_map[linear] = value;
     }
@@ -7841,22 +7863,26 @@ __global__ void ReduceTerminalKernel(const PackedTerminal *terminal_ptr,
   const StateParam &param = state_params[terminal_index];
   if (threadIdx.x == 0)
     reduced->n = param.reduced_dim;
+  const std::size_t transform_entries =
+      static_cast<std::size_t>(terminal.n) * param.reduced_dim;
+  const std::size_t shared_transform_entries =
+      SharedScalarEntries(transform_entries);
   ScratchSize scratch_size;
-  scratch_size.Add<Scalar>(static_cast<std::size_t>(terminal.n) *
-                           param.reduced_dim);
+  scratch_size.Add<Scalar>(shared_transform_entries);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
-  Scalar *hessian_times_map = scratch.Take<Scalar>(
-      static_cast<std::size_t>(terminal.n) * param.reduced_dim);
+  Scalar *hessian_times_map = scratch.Take<Scalar>(shared_transform_entries);
   if (param.reduced_dim == 0)
     return;
-  for (int linear = threadIdx.x; linear < terminal.n * param.reduced_dim;
+  for (std::size_t linear = threadIdx.x; linear < shared_transform_entries;
        linear += blockDim.x) {
-    const int row = linear / param.reduced_dim;
-    const int col = linear % param.reduced_dim;
     Scalar value = Scalar{0};
-    for (int inner = 0; inner < terminal.n; ++inner) {
-      value += terminal.Q[row * terminal.n + inner] *
-               param.T[inner * param.reduced_dim + col];
+    if (linear < transform_entries) {
+      const int row = static_cast<int>(linear) / param.reduced_dim;
+      const int col = static_cast<int>(linear) % param.reduced_dim;
+      for (int inner = 0; inner < terminal.n; ++inner) {
+        value += terminal.Q[row * terminal.n + inner] *
+                 param.T[inner * param.reduced_dim + col];
+      }
     }
     hessian_times_map[linear] = value;
   }

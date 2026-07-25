@@ -69,6 +69,9 @@ def test_stage_reduction_products_are_staged_cubic():
         assert old_direct_product not in body
     assert "StageRelationReductionScratchBytes" in source
     assert "StageHessianTransformScratchBytes" in source
+    assert "SharedScalarEntries(transform_capacity_entries)" in body
+    assert "SharedScalarEntries(transform_entries)" in body
+    assert "Take<Scalar>(shared_transform_entries)" in body
 
 
 def test_terminal_reduction_product_is_staged_cubic():
@@ -83,6 +86,21 @@ def test_terminal_reduction_product_is_staged_cubic():
         "                 terminal.Q[x * terminal.n + y]"
     ) not in body
     assert "scratch.terminal_reduction" in source
+    assert "SharedScalarEntries(transform_entries)" in body
+    assert "scratch_size.Add<Scalar>(shared_transform_entries)" in body
+    assert "scratch.Take<Scalar>(shared_transform_entries)" in body
+    assert "linear < shared_transform_entries" in body
+
+
+def test_hessian_transform_planner_pads_shared_access_footprint():
+    source = _cuda_source()
+    body = _between(
+        source,
+        "StageHessianTransformScratchBytes(",
+        "struct ScanShape",
+    )
+    assert "ScratchCheckedProduct(physical_variables, reduced_variables" in body
+    assert "ScratchCheckedSharedScalarEntries(entries, description)" in body
 
 
 if __name__ == "__main__":
@@ -90,3 +108,4 @@ if __name__ == "__main__":
     test_feedback_hessian_products_are_staged_cubic()
     test_stage_reduction_products_are_staged_cubic()
     test_terminal_reduction_product_is_staged_cubic()
+    test_hessian_transform_planner_pads_shared_access_footprint()
