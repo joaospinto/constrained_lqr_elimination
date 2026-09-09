@@ -27,24 +27,6 @@ void Expect(bool condition, const std::string &message) {
   }
 }
 
-void CheckKkt(const TestCase &test_case, Scalar residual,
-              const std::string &equation, bool factored) {
-  const std::string label = test_case.name + (factored ? " factored" : "") +
-                            " KKT residual=" + std::to_string(residual) +
-                            " in " + equation;
-  Expect(std::isfinite(residual), label);
-#ifdef CLQR_USE_FLOAT
-  if (test_case.cpu_fp32_kkt_diagnostic_only) {
-    std::cout << "FP32 accuracy-limit diagnostic: " << label << '\n';
-    return;
-  }
-#endif
-  Expect(residual <= clqr::test::adversarial::kKktTolerance *
-                         test_case.tolerance_scale *
-                         test_case.kkt_tolerance_scale,
-         label);
-}
-
 void NonfiniteOracleCase() {
   const Scalar nan = std::numeric_limits<Scalar>::quiet_NaN();
   const Vector nonfinite{nan};
@@ -145,15 +127,27 @@ void RunCase(const TestCase &test_case, Workspace *reusable_workspace) {
          test_case.name + " factored primal residual=" +
              std::to_string(factored_primal_residual));
   if (test_case.check_full_kkt) {
+    Scalar kkt_tolerance = clqr::test::adversarial::kKktTolerance *
+                           test_case.tolerance_scale *
+                           test_case.kkt_tolerance_scale;
+#ifdef CLQR_USE_FLOAT
+    if (test_case.cpu_fp32_kkt_tolerance > Scalar{0})
+      kkt_tolerance = test_case.cpu_fp32_kkt_tolerance;
+#endif
     std::string worst;
     const Scalar residual =
         clqr::test::adversarial::MaxKktResidual(problem, point, &worst);
-    CheckKkt(test_case, residual, worst, false);
+    Expect(residual <= kkt_tolerance,
+           test_case.name + " KKT residual=" + std::to_string(residual) +
+               " in " + worst);
     std::string factored_worst;
     const Scalar factored_residual =
         clqr::test::adversarial::MaxKktResidual(
             problem, factored_point, &factored_worst);
-    CheckKkt(test_case, factored_residual, factored_worst, true);
+    Expect(factored_residual <= kkt_tolerance,
+           test_case.name + " factored KKT residual=" +
+               std::to_string(factored_residual) + " in " +
+               factored_worst);
   }
   if (test_case.dense_reference) {
     const DensePrimal dense = clqr::test::adversarial::SolveDenseKkt(problem);
