@@ -1737,6 +1737,7 @@ bool StateMapsAreIdentity(const WorkingState& state, Scalar tolerance) {
 struct ReducedSolution {
   WorkspaceVector<Vector> x;
   WorkspaceVector<Vector> u;
+  WorkspaceVector<Vector> dynamics_multipliers;
 };
 
 struct RiccatiWorkspace {
@@ -3100,6 +3101,44 @@ bool BuildMatrixFactors(const Problem& problem, Scalar tolerance,
                             factorization);
 }
 
+// Differentiate the reduced cost along the computed feedback u = K*x + k.
+// Exact control stationarity makes the K^T term zero, so this gives the same
+// costate as the open-loop adjoint. In floating point it propagates errors
+// through (A+B*K)^T instead of a potentially unstable A^T. It also avoids the
+// cancellation in P*x+p when constraints leave very little control freedom.
+// Reuse K; no additional factorization, refinement, or matrix product is needed.
+template <typename StageType>
+void RecoverFeedbackMultiplier(const Matrix& Q, const Vector& q,
+                               const StageType& stage, const Vector& r,
+                               const Scalar* K, const Vector& x,
+                               const Vector& u, const Vector& next_multiplier,
+                               Vector* multiplier) {
+  const std::size_t n = x.size();
+  const std::size_t m = u.size();
+  const std::size_t next_n = next_multiplier.size();
+  multiplier->resize(n);
+  for (std::size_t row = 0; row < n; ++row) {
+    Scalar value = -q[row];
+    for (std::size_t col = 0; col < n; ++col) value -= Q(row, col) * x[col];
+    for (std::size_t col = 0; col < m; ++col)
+      value -= stage.M(row, col) * u[col];
+    for (std::size_t col = 0; col < next_n; ++col)
+      value += stage.A(col, row) * next_multiplier[col];
+    (*multiplier)[row] = value;
+  }
+  for (std::size_t control = 0; control < m; ++control) {
+    Scalar gradient = r[control];
+    for (std::size_t col = 0; col < n; ++col)
+      gradient += stage.M(col, control) * x[col];
+    for (std::size_t col = 0; col < m; ++col)
+      gradient += stage.R(control, col) * u[col];
+    for (std::size_t col = 0; col < next_n; ++col)
+      gradient -= stage.B(col, control) * next_multiplier[col];
+    for (std::size_t col = 0; col < n; ++col)
+      (*multiplier)[col] -= K[control * n + col] * gradient;
+  }
+}
+
 ReducedSolution SolveCachedReduced(
     const Factorization::Impl& factorization,
     const ConstrainedAffineData& affine,
@@ -3150,6 +3189,22 @@ ReducedSolution SolveCachedReduced(
         {reduced.x[i].data().data(), reduced.x[i].size()},
         {reduced.u[i].data().data(), reduced.u[i].size()},
         {reduced.x[i + 1].data().data(), reduced.x[i + 1].size()});
+  }
+  reduced.dynamics_multipliers.resize(N);
+  if (N > 0) {
+    Vector& terminal = reduced.dynamics_multipliers[N - 1];
+    terminal.resize(reduced.x[N].size());
+    RecoverUnconstrainedNodeMultiplierRaw(
+        factorization.terminal_Q.data().data(), affine.q[N].data().data(),
+        terminal.size(), {reduced.x[N].data().data(), terminal.size()},
+        {terminal.data().data(), terminal.size()});
+    for (std::size_t i = N - 1; i > 0; --i) {
+      const auto& stage = factorization.stages[i];
+      RecoverFeedbackMultiplier(
+          stage.Q, affine.q[i], stage, affine.r[i], stage.K.data().data(),
+          reduced.x[i], reduced.u[i], reduced.dynamics_multipliers[i],
+          &reduced.dynamics_multipliers[i - 1]);
+    }
   }
   return reduced;
 }
@@ -3278,7 +3333,8 @@ ReducedSolution SolveUnconstrained(const WorkspaceVector<Stage>& stages,
                                    const WorkspaceVector<Vector>& q,
                                    const Vector& initial_state,
                                    Scalar tolerance,
-                                   NewtonKktDiagnostics* diagnostics) {
+                                   NewtonKktDiagnostics* diagnostics,
+                                   bool recover_dynamics = false) {
   const std::size_t N = stages.size();
   RiccatiWorkspace workspace;
   if (WorkspaceArena* arena = ActiveWorkspaceArena(); arena != nullptr) {
@@ -3328,6 +3384,21 @@ ReducedSolution SolveUnconstrained(const WorkspaceVector<Stage>& stages,
         value += s.B(row, col) * sol.u[i][col];
       }
       sol.x[i + 1][row] = value;
+    }
+  }
+  if (recover_dynamics) {
+    sol.dynamics_multipliers.resize(N);
+    Vector& terminal = sol.dynamics_multipliers[N - 1];
+    terminal.resize(sol.x[N].size());
+    RecoverUnconstrainedNodeMultiplierRaw(
+        Q[N].data().data(), q[N].data().data(), terminal.size(),
+        {sol.x[N].data().data(), terminal.size()},
+        {terminal.data().data(), terminal.size()});
+    for (std::size_t i = N - 1; i > 0; --i) {
+      RecoverFeedbackMultiplier(
+          Q[i], q[i], stages[i], stages[i].r, workspace.KPtr(i), sol.x[i],
+          sol.u[i], sol.dynamics_multipliers[i],
+          &sol.dynamics_multipliers[i - 1]);
     }
   }
   return sol;
@@ -3564,76 +3635,11 @@ Vector ApplyOrthogonalTranspose(const OrthogonalOperations& operations,
   return cotangent;
 }
 
-WorkspaceVector<Vector> ReducedDynamicsMultipliers(
-    const WorkingProblem& problem, const ReducedSolution& reduced,
-    const WorkspaceVector<Vector>* affine_q = nullptr) {
-  const std::size_t N = problem.stages.size();
-  WorkspaceVector<Vector> dynamics(N);
-  if (N == 0) return dynamics;
-
-  const WorkspaceVector<Vector>& q =
-      affine_q == nullptr ? problem.q : *affine_q;
-  dynamics[N - 1] =
-      Scale(problem.Q.back() * reduced.x[N] + q.back(), -Scalar{1});
-  for (std::size_t rev = 1; rev < N; ++rev) {
-    const std::size_t i = N - 1 - rev;
-    const Stage& stage = problem.stages[i + 1];
-    dynamics[i] = Scale(problem.Q[i + 1] * reduced.x[i + 1] +
-                            stage.M * reduced.u[i + 1] + q[i + 1],
-                        -Scalar{1}) +
-                  TransposeMultiply(stage.A, dynamics[i + 1]);
-  }
-  return dynamics;
-}
-
-WorkspaceVector<Vector> ReducedDynamicsMultipliers(
-    const Factorization::Impl& factorization,
-    const WorkspaceVector<Vector>& affine_q,
-    const ReducedSolution& reduced) {
-  const std::size_t N = factorization.stages.size();
-  WorkspaceVector<Vector> dynamics(N);
-  if (N == 0) return dynamics;
-
-  dynamics[N - 1].resize(factorization.terminal_Q.rows());
-  for (std::size_t row = 0; row < dynamics[N - 1].size(); ++row) {
-    Scalar value = affine_q[N][row];
-    for (std::size_t col = 0; col < reduced.x[N].size(); ++col) {
-      value += factorization.terminal_Q(row, col) * reduced.x[N][col];
-    }
-    dynamics[N - 1][row] = -value;
-  }
-  for (std::size_t reverse = 1; reverse < N; ++reverse) {
-    const std::size_t i = N - 1 - reverse;
-    const Factorization::Impl::StageData& stage =
-        factorization.stages[i + 1];
-    dynamics[i].resize(stage.A.cols());
-    for (std::size_t state = 0; state < dynamics[i].size(); ++state) {
-      Scalar value = -affine_q[i + 1][state];
-      for (std::size_t col = 0; col < reduced.x[i + 1].size(); ++col) {
-        value -= stage.Q(state, col) * reduced.x[i + 1][col];
-      }
-      for (std::size_t control = 0; control < reduced.u[i + 1].size();
-           ++control) {
-        value -= stage.M(state, control) * reduced.u[i + 1][control];
-      }
-      for (std::size_t row = 0; row < dynamics[i + 1].size(); ++row) {
-        value += stage.A(row, state) * dynamics[i + 1][row];
-      }
-      dynamics[i][state] = value;
-    }
-  }
-  return dynamics;
-}
-
 bool RecoverEliminatedMultipliers(const Problem& original,
                                   const WorkingState& working,
                                   const ReducedSolution& reduced, Solution* out,
                                   Scalar tolerance, std::string* error,
-                                  const SolveRhs* factored_rhs = nullptr,
-                                  const WorkspaceVector<Vector>* reduced_q =
-                                      nullptr,
-                                  const Factorization::Impl* reduced_factors =
-                                      nullptr) {
+                                  const SolveRhs* factored_rhs = nullptr) {
   const std::size_t N = original.stages.size();
   if (N == 0)
     return RecoverZeroHorizonMultipliers(original, out, tolerance, error);
@@ -3647,10 +3653,11 @@ bool RecoverEliminatedMultipliers(const Problem& original,
     offset_cotangent[node] = Vector(n);
   }
 
-  const WorkspaceVector<Vector> reduced_dynamics =
-      reduced_factors == nullptr
-          ? ReducedDynamicsMultipliers(working.problem, reduced, reduced_q)
-          : ReducedDynamicsMultipliers(*reduced_factors, *reduced_q, reduced);
+  // Reuse costates recovered along the reduced Riccati feedback.
+  // Reconstructing these costates by an open-loop A^T recurrence can amplify
+  // rounding errors exponentially even when the optimal trajectory is stable.
+  const auto& reduced_dynamics = reduced.dynamics_multipliers;
+  Check(reduced_dynamics.size() == N, "missing reduced dynamics multipliers");
 
   // Constraint elimination runs right to left.  Its transpose therefore runs
   // left to right, carrying the cotangent of each suffix-state offset to the
@@ -3921,7 +3928,7 @@ Solution RecoverCachedConstrained(
   } else {
     recovered = RecoverEliminatedMultipliers(
         data.original, data.reduced, reduced, &out, factorization.tolerance,
-        &error, &rhs, &affine.q, &factorization);
+        &error, &rhs);
   }
   if (!recovered) {
     out.status = SolveStatus::kNumericalFailure;
@@ -4667,7 +4674,7 @@ static Solution SolveInternalResult(const Problem& problem,
       }
       ReducedSolution reduced = SolveUnconstrained(
           state.problem.stages, state.problem.Q, state.problem.q,
-          initial.offset, options.tolerance, &diagnostics);
+          initial.offset, options.tolerance, &diagnostics, true);
       return Recover(problem, state, std::move(reduced), options.tolerance,
                      diagnostics);
     } catch (const std::runtime_error& e) {

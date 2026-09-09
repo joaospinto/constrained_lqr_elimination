@@ -76,6 +76,22 @@ cc_test(
     deps = [":clqr"],
 )
 
+cc_test(
+    name = "scaling_problem_test",
+    srcs = [
+        "benchmarks/scaling_problem.h",
+        "tests/scaling_problem_test.cc",
+    ],
+    deps = [":clqr", ":adversarial_test_support"],
+    # Validates the dense FP64 paper fixtures, including fully constrained
+    # instances with ill-conditioned coordinate eliminations. FP32 correctness
+    # remains covered by the core and adversarial suites with their own policy.
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)
+
 py_test(
     name = "cpu_mixed_cubic_source_audit_test",
     srcs = ["tests/cpu_mixed_cubic_source_audit_test.py"],
