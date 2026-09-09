@@ -13,18 +13,22 @@ def main():
     parser.add_argument("build", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--repeats", type=int, default=21)
+    parser.add_argument("--independent", action="store_true",
+                        help="use the opt-in reimplementation's independent fixtures")
     args = parser.parse_args()
     native = args.build.resolve() / "clqr_adversarial_benchmark"
     if not native.is_file():
         parser.error("build clqr_adversarial_benchmark first")
     if args.repeats < 1:
         parser.error("repeats must be positive")
-    cases = subprocess.check_output([native, "--list"], text=True).splitlines()
+    extra = ["--independent"] if args.independent else []
+    cases = subprocess.check_output([native, "--list", *extra], text=True).splitlines()
     variants = [(native, "clqr_cpu", "clqr_cpu"),
                 (native, "gen_riccati", "gen_riccati")]
     for target, backends in (
         ("clqr_adversarial_factor_graph_benchmark", ("factor_graph",)),
         ("clqr_adversarial_laine_benchmark", ("laine_author",)),
+        ("clqr_adversarial_laine_reimplementation_benchmark", ("laine_reimplementation",)),
     ):
         executable = args.build.resolve() / target
         if executable.is_file():
@@ -36,7 +40,7 @@ def main():
         for case in cases:
             for executable, backend, label in ordered:
                 command = [executable, "--case", case, "--backend", backend,
-                           "--repeats", str(args.repeats)]
+                           "--repeats", str(args.repeats), *extra]
                 try:
                     result = subprocess.run(command, capture_output=True,
                                             text=True, timeout=30)

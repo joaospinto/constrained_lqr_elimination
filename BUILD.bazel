@@ -133,6 +133,19 @@ cc_binary(
 )
 
 cc_binary(
+    name = "clqr_laine_reimplementation_benchmark",
+    testonly = True,
+    srcs = ["benchmarks/paper_benchmark.cc", "benchmarks/paper_cases.h", "benchmarks/scaling_problem.h"],
+    defines = ["CLQR_BENCHMARK_LAINE_REIMPLEMENTATION"],
+    tags = ["manual"],
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [":clqr", "//external_algorithms/laine_tomlin:comparison_support"],
+)
+
+cc_binary(
     name = "clqr_adversarial_cpu_benchmark",
     testonly = True,
     srcs = ["benchmarks/paper_benchmark.cc", "benchmarks/paper_cases.h", "benchmarks/scaling_problem.h"],
@@ -201,6 +214,7 @@ py_test(
 
 cc_library(
     name = "adversarial_test_support",
+    visibility = ["//external_algorithms/laine_tomlin:__pkg__"],
     hdrs = ["tests/adversarial_test_support.h"],
     includes = ["tests"],
     testonly = True,

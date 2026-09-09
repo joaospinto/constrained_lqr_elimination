@@ -28,8 +28,16 @@
 #ifdef CLQR_BENCHMARK_LAINE
 #include "benchmarks/reference/laine_author_adapter.h"
 #endif
+#ifdef CLQR_BENCHMARK_LAINE_REIMPLEMENTATION
+#include "external_algorithms/laine_tomlin/problem_conversion.h"
+#endif
+#ifdef CLQR_BENCHMARK_INDEPENDENT_FIXTURES
+#include "external_algorithms/laine_tomlin/test_problem.h"
+#include "external_algorithms/laine_tomlin/problem_conversion.h"
+#endif
 #if defined(CLQR_BENCHMARK_ADVERSARIAL) && \
-    (defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_GTSAM))
+    (defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_GTSAM) || \
+     defined(CLQR_BENCHMARK_LAINE_REIMPLEMENTATION))
 #include "benchmarks/reference/stationarity_audit.h"
 #endif
 
@@ -412,9 +420,9 @@ private:
 };
 #endif
 
-#ifdef CLQR_BENCHMARK_LAINE
-Trajectory EigenTrajectory(const std::vector<clqr::benchmark::reference::Vector> &x,
-                           const std::vector<clqr::benchmark::reference::Vector> &u) {
+#if defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_LAINE_REIMPLEMENTATION)
+Trajectory EigenTrajectory(const std::vector<Eigen::VectorXd> &x,
+                           const std::vector<Eigen::VectorXd> &u) {
   Trajectory out;
   auto copy = [](const auto &source, auto &target) {
     for (const auto &v : source) {
@@ -428,7 +436,9 @@ Trajectory EigenTrajectory(const std::vector<clqr::benchmark::reference::Vector>
   copy(u, out.second);
   return out;
 }
+#endif
 
+#ifdef CLQR_BENCHMARK_LAINE
 class LaineAuthorSolver {
 public:
   explicit LaineAuthorSolver(const Problem &p)
@@ -447,8 +457,25 @@ private:
   clqr::benchmark::reference::Problem problem_;
   std::unique_ptr<trajectory::Trajectory> trajectory_;
 };
+#endif
 
-
+#ifdef CLQR_BENCHMARK_LAINE_REIMPLEMENTATION
+class LaineReferenceSolver {
+public:
+  explicit LaineReferenceSolver(const Problem &p)
+      : problem_(laine_tomlin::conversion::Convert(p)) {}
+  void Solve() {
+    result_ = laine_tomlin::Solve(problem_);
+    if (result_.status != laine_tomlin::Status::kOptimal)
+      throw std::runtime_error(result_.message);
+  }
+  Trajectory Result() const {
+    return EigenTrajectory(result_.states, result_.controls);
+  }
+private:
+  laine_tomlin::Problem problem_;
+  laine_tomlin::Result result_;
+};
 #endif
 
 template <class Solver>
@@ -602,7 +629,7 @@ void RunAdversarial(const TestCase &c, const char *backend, int repeats) {
       point.terminal_state_multiplier = dual->terminal;
       unit_kkt = clqr::test::adversarial::MaxKktResidual(p, point, &worst);
     }
-#if defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_GTSAM)
+#if defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_GTSAM) || defined(CLQR_BENCHMARK_LAINE_REIMPLEMENTATION)
     else {
       clqr::benchmark::reference::Trajectory audited;
       for (const auto &x : trajectory.first)
@@ -650,8 +677,17 @@ int AdversarialMain(int argc, char **argv) {
   std::string name, backend;
   int repeats = 21;
   bool list = false;
+#ifdef CLQR_BENCHMARK_INDEPENDENT_FIXTURES
+  bool independent = false;
+#endif
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
+#ifdef CLQR_BENCHMARK_INDEPENDENT_FIXTURES
+    if (arg == "--independent") {
+      independent = true;
+      continue;
+    }
+#endif
     if (arg == "--list") {
       list = true;
       continue;
@@ -679,6 +715,9 @@ int AdversarialMain(int argc, char **argv) {
 #ifdef CLQR_BENCHMARK_LAINE
   backends.push_back("laine_author");
 #endif
+#ifdef CLQR_BENCHMARK_LAINE_REIMPLEMENTATION
+  backends.push_back("laine_reimplementation");
+#endif
   if (!backend.empty() &&
       std::find(backends.begin(), backends.end(), backend) == backends.end())
     throw std::invalid_argument("unknown backend: " + backend);
@@ -689,6 +728,17 @@ int AdversarialMain(int argc, char **argv) {
   auto cases = clqr::test::adversarial::StandardCases();
   const auto extended = clqr::test::adversarial::ExtendedCases();
   cases.insert(cases.end(), extended.begin(), extended.end());
+#ifdef CLQR_BENCHMARK_INDEPENDENT_FIXTURES
+  if (independent) {
+    cases.clear();
+    for (bool uniform : {false, true})
+      for (unsigned seed = 0; seed < 128; ++seed)
+        cases.push_back({std::string(uniform ? "uniform-" : "varying-") +
+                             std::to_string(seed),
+                         laine_tomlin::conversion::ToClqr(
+                             laine_tomlin::test::RandomProblem(seed, uniform))});
+  }
+#endif
   if (!list)
     std::cout << "backend,case,N,n,m,expected,status,repeats,batch,median_ms,"
                  "p10_ms,p90_ms,feasibility_inf,stationarity_inf,kkt_inf,"
@@ -718,6 +768,10 @@ int AdversarialMain(int argc, char **argv) {
 #ifdef CLQR_BENCHMARK_LAINE
     if (backend.empty() || backend == "laine_author")
       RunAdversarial<LaineAuthorSolver>(c, "laine_author", repeats);
+#endif
+#ifdef CLQR_BENCHMARK_LAINE_REIMPLEMENTATION
+    if (backend.empty() || backend == "laine_reimplementation")
+      RunAdversarial<LaineReferenceSolver>(c, "laine_reimplementation", repeats);
 #endif
   }
   if (!found)
@@ -788,6 +842,9 @@ int main(int argc, char **argv) {
 #endif
 #ifdef CLQR_BENCHMARK_LAINE
     Run<LaineAuthorSolver>(c, data, "laine_author", repeats, seed);
+#endif
+#ifdef CLQR_BENCHMARK_LAINE_REIMPLEMENTATION
+    Run<LaineReferenceSolver>(c, data, "laine_reimplementation", repeats, seed);
 #endif
   }
   // Keep all numerical outcomes in the CSV, without turning them into test
