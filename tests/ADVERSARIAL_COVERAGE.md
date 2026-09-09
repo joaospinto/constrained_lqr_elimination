@@ -69,9 +69,12 @@ Selected ill-conditioned FP32 fixtures may either return their documented
 numerical failure or complete and satisfy their quantitative KKT gate. The
 rejecting tree node is not prescribed because equivalent floating-point
 instruction orderings can detect the same phase and diagnostic at different
-nodes. The horizon-17 accuracy-limit fixture uses three times the ordinary
-FP32 KKT tolerance, and the stable 257-stage emulation fixture uses twice the
-ordinary tolerance. FP64 must solve these fixtures with the ordinary gate.
+nodes. For the horizon-17 accuracy-limit fixture, CPU FP32 reports the KKT
+residual as a diagnostic while still requiring finite residuals, primal
+feasibility, and successful fresh and cached solves. CUDA retains three times
+the ordinary FP32 KKT tolerance for this fixture, and the stable 257-stage
+emulation fixture uses twice the ordinary tolerance. FP64 must solve these
+fixtures with the ordinary gate; ordinary FP32 fixtures retain their KKT gates.
 The 1025-stage FP32 extended fixture is diagnostic-only; its FP64 counterpart
 must solve optimally with the ordinary gate.
 
