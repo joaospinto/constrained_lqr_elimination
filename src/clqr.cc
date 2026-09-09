@@ -4026,8 +4026,11 @@ Solution Recover(const Problem& original, const WorkingState& state,
   }
   out.objective = Objective(original, out.states, out.controls);
   std::string error;
+  // Mixed rows can imply state constraints even when every original E is
+  // empty. If elimination changed a state map, replay its transpose to recover
+  // the multipliers of those propagated constraints as well.
   const bool recovered =
-      has_original_state_constraints
+      !identity_state_maps
           ? RecoverEliminatedMultipliers(original, state, reduced, &out,
                                          tolerance, &error)
           : RecoverMixedOnlyMultipliers(original, &out, tolerance, &error);

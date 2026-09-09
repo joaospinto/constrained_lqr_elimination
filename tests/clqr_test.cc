@@ -1192,6 +1192,53 @@ void InfeasibleConstraintDetected() {
   Expect(sol.status == SolveStatus::kInfeasible, "infeasible status");
 }
 
+void MixedRowsThatImplyStateConstraintsRecoverMultipliers() {
+  // x1+u1=0 and x1-u1=0 fix x1=u1=0, hence u0=-1. Although
+  // E is empty, eliminating D creates a state constraint whose multiplier
+  // must propagate back to the preceding stage.
+  Problem p;
+  p.initial_state = Vector{1};
+  p.Q.assign(3, Matrix(1, 1, {1}));
+  p.q.assign(3, Vector{0});
+  p.terminal_E = Matrix(0, 1);
+  p.stages.resize(2);
+  for (Stage& s : p.stages) {
+    s.A = Matrix(1, 1, {1});
+    s.B = Matrix(1, 1, {1});
+    s.c = Vector{0};
+    s.R = Matrix(1, 1, {1});
+    s.M = Matrix(1, 1, {0});
+    s.r = Vector{0};
+    s.C = Matrix(0, 1);
+    s.D = Matrix(0, 1);
+    s.E = Matrix(0, 1);
+  }
+  for (bool state_only_row : {false, true}) {
+    Stage& last = p.stages.back();
+    last.C = Matrix(2, 1, {1, 1});
+    last.D = Matrix(2, 1, {1, state_only_row ? Scalar{0} : Scalar{-1}});
+    last.d = Vector{0, 0};
+    const Solution ordinary = SolveWithWorkspace(p);
+    Expect(ordinary.status == SolveStatus::kOptimal,
+           "implied state constraint status: " + ordinary.message);
+    ExpectVectorNear(ordinary.controls[0], Vector{-1}, kTol,
+                     "implied state constraint control");
+    ExpectNear(MaxKktResidual(p, ordinary), Scalar{0}, kKktTol,
+               "implied state constraint KKT");
+    const clqr::Factorization factors = clqr::Factor(p);
+    Expect(factors.status() == SolveStatus::kOptimal,
+           "implied state constraint factor status");
+    Workspace workspace;
+    workspace.Reserve(factors);
+    const Solution cached = CopySolutionView(
+        Solve(factors, clqr::ExtractRhs(p), workspace));
+    Expect(cached.status == SolveStatus::kOptimal,
+           "implied state constraint cached status");
+    ExpectNear(MaxKktResidual(p, cached), Scalar{0}, kKktTol,
+               "implied state constraint cached KKT");
+  }
+}
+
 void ScaleConstraintRow(Matrix* matrix, Vector* vector, std::size_t row,
                         Scalar scale) {
   for (std::size_t col = 0; col < matrix->cols(); ++col)
@@ -1513,6 +1560,7 @@ int main() {
   SingularReducedHessianReported();
   InfeasibleConstraintDetected();
   IndependentlyRescaledConstraintsAreInvariant();
+  MixedRowsThatImplyStateConstraintsRecoverMultipliers();
   FullRankRescaledMixedRowsRemainActive();
   EssentialSingleRowsRemainActiveWhenScaled();
   ExtremeFiniteConstraintRowsAreSafe();
