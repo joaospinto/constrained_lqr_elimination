@@ -34,6 +34,8 @@ py_test(
     main = "tests/notebook_paper_test.py",
     data = [
         "notebooks/kaggle_paper_comparison.ipynb",
+        "scripts/benchmark_options.sh",
+        "scripts/notebook_bazel.sh",
         "scripts/paper_benchmarks.sh",
     ],
 )
@@ -154,6 +156,17 @@ cc_binary(
         ":fp32": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
+)
+
+cc_binary(
+    name = "clqr_paper_cpu_benchmark",
+    srcs = ["benchmarks/paper_benchmark.cc", "benchmarks/paper_cases.h", "benchmarks/scaling_problem.h"],
+    tags = ["manual"],
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [":clqr"],
 )
 
 cc_binary(

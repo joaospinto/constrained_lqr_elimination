@@ -219,6 +219,35 @@ Sanitizer tools on the standard CUDA suite and dense smoke fixtures before
 collecting GPU timings.
 Requires CMake, a C++ compiler, Git, and at least 3 GiB free disk
 space; `CLQR_JOBS` defaults to 4. Set `CLQR_PAPER_SUITE=smoke` for a short run.
+
+Downloads, builds, and measurements can be selected independently with these
+environment variables (only `0` and `1` are accepted):
+
+| Variable | Default | Controls |
+| --- | --- | --- |
+| `CLQR_RUN_EXTERNAL` | `1` | Default for the four external-method switches below |
+| `CLQR_RUN_VANROYE` | inherits `CLQR_RUN_EXTERNAL` | Vanroye and its BLASFEO dependency |
+| `CLQR_RUN_YANG` | inherits `CLQR_RUN_EXTERNAL` | Yang and its GTSAM dependency |
+| `CLQR_RUN_LAINE` | inherits `CLQR_RUN_EXTERNAL` | Author-written Laine–Tomlin |
+| `CLQR_RUN_CORRECTED_LAINE` | inherits `CLQR_RUN_EXTERNAL` | Corrected Laine–Tomlin |
+| `CLQR_RUN_JAX` | `1` | JAX builds, tests, and timings |
+| `CLQR_RUN_TESTS` | `1` | Regression tests |
+| `CLQR_RUN_SANITIZERS` | `1` | CUDA Compute Sanitizer runs |
+| `CLQR_RUN_ORIGINAL_TABLE` | `1` | Additional original-table timing sweep |
+
+For a native CPU/CUDA-only measurement, preserving correctness checks:
+
+```sh
+CLQR_RUN_EXTERNAL=0 CLQR_RUN_JAX=0 CLQR_RUN_ORIGINAL_TABLE=0 \
+  bash scripts/paper_benchmarks.sh /path/to/new-results --cuda
+```
+
+Individual overrides win: `CLQR_RUN_EXTERNAL=0 CLQR_RUN_VANROYE=1`
+includes only Vanroye among the external methods. Laine comparisons without
+Yang fetch Eigen headers directly, not GTSAM. Selected settings are saved in
+`benchmark_options.txt`; disabled backends are not required by the summary.
+The notebook and desktop runner inherit the same environment variables.
+
 The [paper comparison notebook](notebooks/kaggle_paper_comparison.ipynb)
 runs this workflow from a fresh Kaggle GPU session using an uploaded
 `clqr-source.bundle` snapshot or, by default, current `origin/main`,

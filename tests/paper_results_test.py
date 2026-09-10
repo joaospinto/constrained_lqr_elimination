@@ -20,6 +20,27 @@ def row(backend="clqr_cpu"):
 
 
 class ResultsTest(unittest.TestCase):
+    def test_explicit_cpu_only_selection_needs_no_external_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            value = row()
+            with (work / "cpu_round1.csv").open("w") as output:
+                writer = csv.DictWriter(output, fieldnames=value.keys())
+                writer.writeheader()
+                writer.writerow(value)
+            (work / "cases.json").write_text(json.dumps([
+                {field: value[field] for field in results.KEY_FIELDS[:-1]}]))
+            # Even stale optional results must not enter an explicitly selected run.
+            (work / "laine_round1.csv").write_text("not a valid CSV")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = results.main([str(work), "--suite", "smoke",
+                                     "--backends", "clqr_cpu"])
+            self.assertEqual(code, 0)
+            self.assertEqual(set(json.loads((work / "summary.json").read_text())), {"clqr_cpu"})
+            with self.assertRaises(FileNotFoundError):
+                results.main([str(work), "--suite", "smoke", "--backends",
+                              "clqr_cpu", "gen_riccati"])
+
     def test_duplicate_rejected(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             results.indexed([row(), row()], "clqr_cpu")
