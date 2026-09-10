@@ -222,6 +222,21 @@ memory, driver, clocks, and CUDA/compiler versions in `platform.txt` and
 `gpu.csv`. CUDA architecture is detected rather than fixed to P100; set
 `CLQR_CUDA_ARCH` explicitly when choosing among heterogeneous GPUs.
 
+To create a source bundle, run these commands from a full-history clone with
+local `main` at the revision you want to test, choosing an output path outside
+the repository:
+
+```sh
+git bundle create /path/to/clqr-source.bundle main
+git bundle verify /path/to/clqr-source.bundle
+```
+
+Upload `clqr-source.bundle` as a Kaggle dataset and attach it to the notebook.
+The bundle contains the committed history of `main`, not uncommitted edits,
+build outputs, or external dependencies, and is not checked into the repository.
+Internet is still required for pinned dependencies. Without an attached bundle,
+the notebook fetches current `origin/main` instead.
+
 The paper sweeps vary the horizon (128, 512, 2048, 8192, 32768 at $n=8$)
 and state dimension (8, 16, 32, 64 at $N=128$), always with
 $m=n/2$, $p_s=n/4$, and $p_m=n/8$. State-only rows at the fixed initial
