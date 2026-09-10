@@ -27,4 +27,4 @@ jobs:
           bazel_cmd="$(clqr_notebook_bazel "$PWD" "$RUNNER_TEMP")"
           "$bazel_cmd" build //:cuda_solver_test //:adversarial_cuda_extended_test \
             //:clqr_paper_cuda_benchmark \
-            --config=fp64 --config=cuda --cuda_archs=sm_60,sm_120 --jobs=4
+            --config=fp64 --config=cuda '--cuda_archs=sm_60;sm_120' --jobs=4

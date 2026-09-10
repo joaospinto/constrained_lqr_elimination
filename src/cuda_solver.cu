@@ -3994,10 +3994,10 @@ std::size_t ConfigureScratchMemory(const ScratchRequirements &scratch,
   const std::size_t node_parents = (node_count + 1) / 2;
   const std::size_t stage_parents = (stage_count + 1) / 2;
   std::size_t global_bytes = 0;
-#define CLQR_CONFIGURE_SCRATCH(kernel, member, blocks)                        \\
-  plans->kernel = PlanKernelScratch(                                         \\
-      kernel<false>, kernel<true>, #kernel, scratch.member, capacity,         \\
-      kDefaultGlobalScratch);                                               \\
+#define CLQR_CONFIGURE_SCRATCH(kernel, member, blocks)                        \
+  plans->kernel = PlanKernelScratch(                                         \
+      kernel<false>, kernel<true>, #kernel, scratch.member, capacity,         \
+      kDefaultGlobalScratch);                                               \
   global_bytes = std::max(global_bytes, plans->kernel.GlobalBytes(blocks));
   CLQR_SCRATCH_KERNELS(CLQR_CONFIGURE_SCRATCH)
 #undef CLQR_CONFIGURE_SCRATCH
