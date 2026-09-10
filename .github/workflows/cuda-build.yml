@@ -1,0 +1,31 @@
+name: CUDA compile
+
+on:
+  push:
+    paths:
+      - 'src/cuda*'
+      - 'tests/cuda*'
+      - 'BUILD.bazel'
+      - '.github/workflows/cuda-build.yml'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    steps:
+      - name: Install host build tools
+        run: apt-get update -qq && apt-get install -y --no-install-recommends build-essential git curl unzip zip python3
+      - uses: actions/checkout@v5
+      - uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+      - name: Compile P100 and desktop Blackwell specializations
+        run: >-
+          bazel build //:cuda_solver_test //:adversarial_cuda_extended_test
+          //:clqr_paper_cuda_benchmark
+          --config=fp64 --config=cuda --cuda_archs=sm_60,sm_120 --jobs=4

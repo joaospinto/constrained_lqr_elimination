@@ -32,6 +32,11 @@ namespace {
 // four-warp synchronization and occupancy cost of the former 128-thread
 // blocks; lanes stride over every runtime-sized dense workspace.
 constexpr int kThreads = 32;
+#ifdef CLQR_CUDA_FORCE_GLOBAL_SCRATCH
+constexpr bool kDefaultGlobalScratch = true;
+#else
+constexpr bool kDefaultGlobalScratch = false;
+#endif
 #ifdef CLQR_USE_FLOAT
 constexpr Scalar kMinimumFeasibilityConsistencyTolerance = 1e-4f;
 constexpr Scalar kMinimumMultiplierRankTolerance = 1e-4f;
@@ -922,6 +927,16 @@ struct ScratchArena {
   }
 };
 
+template <bool GlobalScratch>
+__device__ unsigned char *BlockScratchData(unsigned char *shared_data,
+                                           unsigned char *global_data,
+                                           std::size_t global_stride) {
+  if constexpr (GlobalScratch)
+    return global_data + static_cast<std::size_t>(blockIdx.x) * global_stride;
+  else
+    return shared_data;
+}
+
 #ifdef CLQR_CUDA_EMULATION
 std::size_t g_emulated_block_scratch_bytes = 0;
 
@@ -937,13 +952,31 @@ unsigned char *EmulatedBlockScratch(std::size_t bytes) {
   storage.resize(std::max<std::size_t>(words, 1));
   return reinterpret_cast<unsigned char *>(storage.data());
 }
-#define CLQR_BLOCK_SCRATCH(name, required_bytes)                               \
-  ScratchArena name { EmulatedBlockScratch(required_bytes) }
+#define CLQR_SCRATCH_PARAMS                                                  \
+  , unsigned char *global_scratch = nullptr, std::size_t global_stride = 0
+#define CLQR_BLOCK_SCRATCH(name, required_bytes)                              \
+  const std::size_t clqr_scratch_bytes = (required_bytes);                    \
+  unsigned char *clqr_shared_data = nullptr;                                 \
+  if constexpr (GlobalScratch) {                                            \
+    if (global_scratch == nullptr) {                                        \
+      global_stride = AlignUp(clqr_scratch_bytes, 16);                        \
+      global_scratch = EmulatedBlockScratch(                                \
+          (static_cast<std::size_t>(blockIdx.x) + 1) * global_stride);         \
+    }                                                                      \
+  } else {                                                                 \
+    clqr_shared_data = EmulatedBlockScratch(clqr_scratch_bytes);              \
+  }                                                                        \
+  g_emulated_block_scratch_bytes = clqr_scratch_bytes;                         \
+  ScratchArena name { BlockScratchData<GlobalScratch>(                       \
+      clqr_shared_data, global_scratch, global_stride) }
 #else
+#define CLQR_SCRATCH_PARAMS                                                  \
+  , unsigned char *global_scratch, std::size_t global_stride
 #define CLQR_BLOCK_SCRATCH(name, required_bytes)                               \
   extern __shared__ __align__(16) unsigned char clqr_shared_memory[];          \
   (void)(required_bytes);                                                      \
-  ScratchArena name { clqr_shared_memory }
+  ScratchArena name { BlockScratchData<GlobalScratch>(                         \
+      clqr_shared_memory, global_scratch, global_stride) }
 #endif
 
 __device__ inline Scalar DeviceAbs(Scalar x) { return x < Scalar{0} ? -x : x; }
@@ -1951,11 +1984,12 @@ __device__ void SolveSystemOrthogonally(Scalar *matrix, int rows, int columns,
   WarpSynchronize();
 }
 
-__global__ void
-BuildPrimalLeavesKernel(const PackedStage *stages, int stage_count,
+template <bool GlobalScratch = kDefaultGlobalScratch>
+__global__ void BuildPrimalLeavesKernel(const PackedStage *stages, int stage_count,
                         const PackedTerminal *terminal_ptr,
                         Scalar rank_tolerance, Scalar consistency_tolerance,
-                        Relation *leaves, DeviceStatus *status) {
+                        Relation *leaves, DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index > stage_count)
     return;
@@ -2201,10 +2235,11 @@ ComposeScanRelationBlock(const Relation &first, const Relation &second,
                         pivot_rows, rank, best_row, local_ok);
 }
 
-__global__ void
-ReduceRelationLeavesKernel(const Relation *leaves, int count, int parent_count,
+template <bool GlobalScratch = kDefaultGlobalScratch>
+__global__ void ReduceRelationLeavesKernel(const Relation *leaves, int count, int parent_count,
                            Scalar rank_tolerance, Scalar consistency_tolerance,
-                           Relation *parents, DeviceStatus *status) {
+                           Relation *parents, DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
@@ -2239,12 +2274,14 @@ ReduceRelationLeavesKernel(const Relation *leaves, int count, int parent_count,
                         &best_row, &local_ok);
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void ReduceRelationTreeLevelKernel(Relation *tree, int child_offset,
                                               int parent_offset,
                                               int child_count, int parent_count,
                                               Scalar rank_tolerance,
                                               Scalar consistency_tolerance,
-                                              DeviceStatus *status) {
+                                              DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
@@ -2286,10 +2323,12 @@ __global__ void InitializeRelationContextRootKernel(Relation *tree,
     SetInvalidScanRelation(&tree[root_offset]);
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void ExpandRelationContextLevelKernel(
     Relation *tree, int child_offset, int parent_offset, int child_count,
     int parent_count, Scalar rank_tolerance, Scalar consistency_tolerance,
-    DeviceStatus *status) {
+    DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
@@ -2328,10 +2367,12 @@ __global__ void ExpandRelationContextLevelKernel(
   CopyRelationBlock(parent_context, &tree[right]);
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void FinalizeRelationSuffixFromParentsKernel(
     Relation *leaves, int count, const Relation *parent_contexts,
     int parent_count, Scalar rank_tolerance, Scalar consistency_tolerance,
-    DeviceStatus *status) {
+    DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
@@ -2417,9 +2458,11 @@ __global__ void FinalizeRelationSuffixFromParentsKernel(
   CopyRelationBlock(composed, &leaves[left]);
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void StateParamKernel(const Relation *suffix, int count,
                                  StateParam *params, int *state_dimensions,
-                                 DeviceStatus *status, Scalar tolerance) {
+                                 DeviceStatus *status, Scalar tolerance
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= count || !BlockEnabled(status))
     return;
@@ -2540,40 +2583,50 @@ namespace cuda {
 namespace detail {
 namespace {
 
+template <bool GlobalScratch>
 __global__ void ReduceStagesKernel(const PackedStage *, const Relation *,
                                    const StateParam *, int, Scalar, Scalar,
                                    ControlParam *, ReducedStage *, int *,
-                                   DeviceStatus *);
+                                   DeviceStatus *, unsigned char *, std::size_t);
+template <bool GlobalScratch>
 __global__ void ReduceTerminalKernel(const PackedTerminal *, const StateParam *,
-                                     int, ReducedTerminal *);
+                                     int, ReducedTerminal *, unsigned char *, std::size_t);
 __global__ void InitialReducedStateKernel(const StateParam *, const Scalar *,
                                           Scalar *, Scalar, DeviceStatus *);
+template <bool GlobalScratch>
 __global__ void BuildValueElementsKernel(const ReducedStage *,
                                          const ReducedTerminal *, int, Scalar,
-                                         ValueElement *, DeviceStatus *);
+                                         ValueElement *, DeviceStatus *, unsigned char *, std::size_t);
+template <bool GlobalScratch>
 __global__ void ReduceValueLeavesKernel(const ValueElement *, int, int, Scalar,
-                                        DeviceStatus *, ValueElement *);
+                                        DeviceStatus *, ValueElement *, unsigned char *, std::size_t);
+template <bool GlobalScratch>
 __global__ void ReduceValueTreeLevelKernel(ValueElement *, int, int, int, int,
-                                           Scalar, DeviceStatus *);
+                                           Scalar, DeviceStatus *, unsigned char *, std::size_t);
 __global__ void InitializeValueContextRootKernel(ValueElement *, int);
+template <bool GlobalScratch>
 __global__ void ExpandValueContextLevelKernel(ValueElement *, int, int, int,
-                                              int, Scalar, DeviceStatus *);
+                                              int, Scalar, DeviceStatus *, unsigned char *, std::size_t);
+template <bool GlobalScratch>
 __global__ void FinalizeValueSuffixFromParentsKernel(ValueElement *, int,
                                                      const ValueElement *, int,
-                                                     Scalar, DeviceStatus *);
+                                                     Scalar, DeviceStatus *, unsigned char *, std::size_t);
+template <bool GlobalScratch>
 __global__ void MatrixFeedbackKernel(const ReducedStage *, const ValueElement *,
-                                     int, Scalar, Feedback *, DeviceStatus *);
+                                     int, Scalar, Feedback *, DeviceStatus *, unsigned char *, std::size_t);
+template <bool GlobalScratch>
 __global__ void InitializeCostateMapsKernel(const ReducedStage *,
                                             const ValueElement *,
                                             const Feedback *, int, AffineMap *,
-                                            DeviceStatus *);
+                                            DeviceStatus *, unsigned char *, std::size_t);
 __global__ void RecoverCostatesKernel(const AffineMap *,
                                       const ReducedTerminal *, const int *, int,
                                       Scalar *, DeviceStatus *);
+template <bool GlobalScratch>
 __global__ void FinalizeFeedbackKernel(const ReducedStage *,
                                        const ValueElement *, const Scalar *,
                                        const int *, int, Feedback *,
-                                       DeviceStatus *);
+                                       DeviceStatus *, unsigned char *, std::size_t);
 __global__ void InitializeAffineMapsKernel(const Feedback *, int, AffineMap *,
                                            DeviceStatus *);
 __global__ void ReduceAffineLeavesKernel(const AffineMap *, int, int,
@@ -2583,25 +2636,27 @@ __global__ void ReduceAffineTreeLevelKernel(AffineMap *, int, int, int, int,
 __global__ void InitializeAffineContextRootKernel(AffineMap *, int);
 __global__ void ExpandAffineContextLevelKernel(AffineMap *, int, int, int, int,
                                                DeviceStatus *);
+template <bool GlobalScratch>
 __global__ void FinalizeAffinePrefixFromParentsKernel(AffineMap *, int,
                                                       const AffineMap *, int,
-                                                      DeviceStatus *);
+                                                      DeviceStatus *, unsigned char *, std::size_t);
 __global__ void ReconstructPrimalKernel(const AffineMap *, const StateParam *,
                                         const ControlParam *, const Feedback *,
                                         const Scalar *, const int *,
                                         const int *, const int *, int, Scalar *,
                                         Scalar *, Scalar *, Scalar *,
                                         DeviceStatus *);
-__global__ void
-BuildDualParametersKernel(const PackedStage *, const StateParam *,
+template <bool GlobalScratch>
+__global__ void BuildDualParametersKernel(const PackedStage *, const StateParam *,
                           const ValueElement *, const Scalar *, const Scalar *,
                           const Scalar *, const Scalar *, const int *,
                           const int *, const int *, int, Scalar, Scalar,
-                          DualParam *, int *, int *, DeviceStatus *);
+                          DualParam *, int *, int *, DeviceStatus *, unsigned char *, std::size_t);
+template <bool GlobalScratch>
 __global__ void BuildDualParameterRelationsKernel(
     const PackedStage *, const PackedTerminal *, const DualParam *, int,
     const Scalar *, const Scalar *, const int *, const int *, Scalar, Scalar,
-    DualRelation *, const int *, StateDualParam *, DeviceStatus *);
+    DualRelation *, const int *, StateDualParam *, DeviceStatus *, unsigned char *, std::size_t);
 __global__ void RecoverParameterizedMultipliersKernel(
     const DualParam *, const StateDualParam *, const DualNodeValue *,
     const int *, const int *, const int *, int, Scalar *, Scalar *, Scalar *,
@@ -2612,16 +2667,19 @@ RecoverInitialMultiplierKernel(const PackedStage *, const PackedTerminal *, int,
                                const Scalar *, const int *, const int *,
                                const int *, const int *, const int *, Scalar *,
                                Scalar *, Scalar *, DeviceStatus *);
+template <bool GlobalScratch>
 __global__ void ReduceDualTreeLevelKernel(const DualRelation *, int, int, int,
                                           int, Scalar, Scalar, DualRelation *,
-                                          const int *, DeviceStatus *);
+                                          const int *, DeviceStatus *, unsigned char *, std::size_t);
+template <bool GlobalScratch>
 __global__ void SolveDualRootKernel(const DualRelation *, DualNodeValue *,
-                                    const int *, DeviceStatus *, Scalar);
+                                    const int *, DeviceStatus *, Scalar, unsigned char *, std::size_t);
+template <bool GlobalScratch>
 __global__ void ExpandDualTreeLevelKernel(const DualRelation *, int, int, int,
                                           int, Scalar, Scalar,
                                           const DualNodeValue *,
                                           DualNodeValue *, const int *,
-                                          DeviceStatus *);
+                                          DeviceStatus *, unsigned char *, std::size_t);
 __global__ void BuildObjectiveTermsKernel(const PackedStage *, int,
                                           const PackedTerminal *,
                                           const Scalar *, const Scalar *,
@@ -2852,6 +2910,36 @@ constexpr std::size_t TimingSlotCount() {
   return static_cast<std::size_t>(TimingSlot::kCount);
 }
 
+#define CLQR_SCRATCH_KERNELS(X) \
+  X(BuildPrimalLeavesKernel, primal_leaf, node_count) \
+  X(ReduceRelationLeavesKernel, primal_relation, node_parents) \
+  X(ReduceRelationTreeLevelKernel, primal_relation, node_parents) \
+  X(ExpandRelationContextLevelKernel, primal_relation, node_parents) \
+  X(FinalizeRelationSuffixFromParentsKernel, primal_relation_final, node_parents) \
+  X(StateParamKernel, state_parameter, node_count) \
+  X(ReduceStagesKernel, stage_reduction, stage_count) \
+  X(ReduceTerminalKernel, terminal_reduction, 1) \
+  X(BuildValueElementsKernel, value_leaf, node_count) \
+  X(ReduceValueLeavesKernel, value_compose, node_parents) \
+  X(ReduceValueTreeLevelKernel, value_compose, node_parents) \
+  X(ExpandValueContextLevelKernel, value_compose, node_parents) \
+  X(FinalizeValueSuffixFromParentsKernel, value_finalize, node_parents) \
+  X(MatrixFeedbackKernel, feedback, stage_count) \
+  X(InitializeCostateMapsKernel, affine_terms, stage_count) \
+  X(FinalizeFeedbackKernel, affine_terms, stage_count) \
+  X(FinalizeAffinePrefixFromParentsKernel, affine_finalize, stage_parents) \
+  X(BuildDualParametersKernel, dual_parameter, stage_count) \
+  X(BuildDualParameterRelationsKernel, dual_relation_leaf, stage_count) \
+  X(ReduceDualTreeLevelKernel, dual_relation, stage_parents) \
+  X(SolveDualRootKernel, dual_root, 1) \
+  X(ExpandDualTreeLevelKernel, dual_expand, stage_parents)
+
+struct KernelScratchPlans {
+#define CLQR_DECLARE_SCRATCH(kernel, member, blocks) KernelScratchLaunch kernel;
+  CLQR_SCRATCH_KERNELS(CLQR_DECLARE_SCRATCH)
+#undef CLQR_DECLARE_SCRATCH
+};
+
 struct WorkspaceStorage {
   int device = -1;
   std::array<cudaEvent_t, TimingSlotCount()> event_start{};
@@ -2968,6 +3056,8 @@ struct WorkspaceStorage {
   std::vector<int> dual_layout_key;
   std::vector<int> structure_key;
   ScratchRequirements scratch;
+  KernelScratchPlans scratch_launches;
+  DeviceBuffer<unsigned char> global_scratch;
   bool structure_ready = false;
   bool relation_layout_uploaded = false;
 
@@ -3896,36 +3986,22 @@ void PrepareStageStorage(const Problem &problem, WorkspaceStorage *workspace) {
   workspace->stage_layout_uploaded = false;
 }
 
-void ConfigureScratchMemory(const ScratchRequirements &scratch, int device) {
+std::size_t ConfigureScratchMemory(const ScratchRequirements &scratch,
+                                   int device, std::size_t stage_count,
+                                   KernelScratchPlans *plans) {
   const int capacity = DeviceSharedMemoryCapacity(device);
-  // Match every dynamic-scratch launch below. Configuration runs only when
-  // preparing a new workspace structure, not in the repeated-solve path.
-#define CLQR_CONFIGURE_SCRATCH(kernel, member)                                 \
-  ConfigureKernelSharedMemory(kernel, #kernel, scratch.member, capacity)
-  CLQR_CONFIGURE_SCRATCH(BuildPrimalLeavesKernel, primal_leaf);
-  CLQR_CONFIGURE_SCRATCH(ReduceRelationLeavesKernel, primal_relation);
-  CLQR_CONFIGURE_SCRATCH(ReduceRelationTreeLevelKernel, primal_relation);
-  CLQR_CONFIGURE_SCRATCH(ExpandRelationContextLevelKernel, primal_relation);
-  CLQR_CONFIGURE_SCRATCH(FinalizeRelationSuffixFromParentsKernel,
-                         primal_relation_final);
-  CLQR_CONFIGURE_SCRATCH(StateParamKernel, state_parameter);
-  CLQR_CONFIGURE_SCRATCH(ReduceStagesKernel, stage_reduction);
-  CLQR_CONFIGURE_SCRATCH(ReduceTerminalKernel, terminal_reduction);
-  CLQR_CONFIGURE_SCRATCH(BuildValueElementsKernel, value_leaf);
-  CLQR_CONFIGURE_SCRATCH(ReduceValueLeavesKernel, value_compose);
-  CLQR_CONFIGURE_SCRATCH(ReduceValueTreeLevelKernel, value_compose);
-  CLQR_CONFIGURE_SCRATCH(ExpandValueContextLevelKernel, value_compose);
-  CLQR_CONFIGURE_SCRATCH(FinalizeValueSuffixFromParentsKernel, value_finalize);
-  CLQR_CONFIGURE_SCRATCH(MatrixFeedbackKernel, feedback);
-  CLQR_CONFIGURE_SCRATCH(InitializeCostateMapsKernel, affine_terms);
-  CLQR_CONFIGURE_SCRATCH(FinalizeFeedbackKernel, affine_terms);
-  CLQR_CONFIGURE_SCRATCH(FinalizeAffinePrefixFromParentsKernel, affine_finalize);
-  CLQR_CONFIGURE_SCRATCH(BuildDualParametersKernel, dual_parameter);
-  CLQR_CONFIGURE_SCRATCH(BuildDualParameterRelationsKernel, dual_relation_leaf);
-  CLQR_CONFIGURE_SCRATCH(ReduceDualTreeLevelKernel, dual_relation);
-  CLQR_CONFIGURE_SCRATCH(SolveDualRootKernel, dual_root);
-  CLQR_CONFIGURE_SCRATCH(ExpandDualTreeLevelKernel, dual_expand);
+  const std::size_t node_count = stage_count + 1;
+  const std::size_t node_parents = (node_count + 1) / 2;
+  const std::size_t stage_parents = (stage_count + 1) / 2;
+  std::size_t global_bytes = 0;
+#define CLQR_CONFIGURE_SCRATCH(kernel, member, blocks)                        \\
+  plans->kernel = PlanKernelScratch(                                         \\
+      kernel<false>, kernel<true>, #kernel, scratch.member, capacity,         \\
+      kDefaultGlobalScratch);                                               \\
+  global_bytes = std::max(global_bytes, plans->kernel.GlobalBytes(blocks));
+  CLQR_SCRATCH_KERNELS(CLQR_CONFIGURE_SCRATCH)
 #undef CLQR_CONFIGURE_SCRATCH
+  return global_bytes;
 }
 
 void BuildCompactOffsets(const Problem &problem, WorkspaceStorage *workspace) {
@@ -4474,7 +4550,9 @@ void PrepareProblemStructure(const Problem &problem, int device,
                              WorkspaceStorage *workspace) {
   workspace->structure_ready = false;
   RefreshScratchPlan(problem, &workspace->structure_key, &workspace->scratch);
-  ConfigureScratchMemory(workspace->scratch, device);
+  const std::size_t global_scratch_bytes = ConfigureScratchMemory(
+      workspace->scratch, device, problem.stages.size(),
+      &workspace->scratch_launches);
   const int stage_count = static_cast<int>(problem.stages.size());
   const int node_count = stage_count + 1;
   const CompactEntryCounts entries = CountCompactEntries(problem);
@@ -4483,6 +4561,8 @@ void PrepareProblemStructure(const Problem &problem, int device,
                      entries.problem_data,
                      static_cast<int>(problem.initial_state.size()),
                      static_cast<int>(problem.terminal_E.rows()));
+  if (global_scratch_bytes > 0)
+    workspace->global_scratch.Reserve(global_scratch_bytes);
   // Arena slices may move whenever the structure changes. Rebuild every
   // pointer-bearing compact layout before any slice is uploaded or launched.
   workspace->relation_layout_key.clear();
@@ -4505,6 +4585,19 @@ void PrepareProblemStructure(const Problem &problem, int device,
           "internal CUDA problem binding failed");
   workspace->structure_ready = true;
 }
+
+#define CLQR_LAUNCH_SCRATCH(kernel, blocks, ...)                             \
+  do {                                                                     \
+    const auto &clqr_launch = workspace.scratch_launches.kernel;              \
+    if (clqr_launch.global_stride != 0) {                                   \
+      kernel<true><<<blocks, kThreads, 0, stream>>>(                         \
+          __VA_ARGS__, workspace.global_scratch.get(),                      \
+          clqr_launch.global_stride);                                      \
+    } else {                                                               \
+      kernel<false><<<blocks, kThreads, clqr_launch.shared_bytes, stream>>>(  \
+          __VA_ARGS__, nullptr, 0);                                         \
+    }                                                                      \
+  } while (false)
 
 SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                          SolveMetadata &result, const Options &options,
@@ -4536,7 +4629,6 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   CudaCheck(cudaSetDevice(options.device), "cudaSetDevice");
   if (!prepared && (!workspace.structure_ready || !structure_matches))
     PrepareProblemStructure(problem, options.device, &workspace);
-  const ScratchRequirements &scratch = workspace.scratch;
   const auto total_start = std::chrono::steady_clock::now();
   result.status = SolveStatus::kInvalidInput;
   result.message.clear();
@@ -4729,22 +4821,19 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               workspace.host_problem_data.size(), device_initial.get(),
               host_initial.size(), device_status.get());
         }
-        BuildPrimalLeavesKernel<<<node_count, kThreads, scratch.primal_leaf,
-                                  stream>>>(
+        CLQR_LAUNCH_SCRATCH(BuildPrimalLeavesKernel, node_count,
             device_stages.get(), stage_count, device_terminal.get(),
             options.tolerance, feasibility_consistency_tolerance,
             relation_a.get(), device_status.get());
         if (node_count > 1) {
           const int first_parent_count = level_counts[1];
-          ReduceRelationLeavesKernel<<<first_parent_count, kThreads,
-                                       scratch.primal_relation, stream>>>(
+          CLQR_LAUNCH_SCRATCH(ReduceRelationLeavesKernel, first_parent_count,
               relation_a.get(), node_count, first_parent_count,
               options.tolerance, feasibility_consistency_tolerance,
               relation_b.get(), device_status.get());
           for (std::size_t level = 1; level + 1 < level_counts.size();
                ++level) {
-            ReduceRelationTreeLevelKernel<<<level_counts[level + 1], kThreads,
-                                            scratch.primal_relation, stream>>>(
+            CLQR_LAUNCH_SCRATCH(ReduceRelationTreeLevelKernel, level_counts[level + 1],
                 relation_b.get(), level_offsets[level] - node_count,
                 level_offsets[level + 1] - node_count, level_counts[level],
                 level_counts[level + 1], options.tolerance,
@@ -4754,22 +4843,17 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               relation_b.get(), level_offsets.back() - node_count);
           for (int level = static_cast<int>(level_counts.size()) - 2;
                level >= 1; --level) {
-            ExpandRelationContextLevelKernel<<<
-                level_counts[level + 1], kThreads, scratch.primal_relation,
-                stream>>>(relation_b.get(), level_offsets[level] - node_count,
+            CLQR_LAUNCH_SCRATCH(ExpandRelationContextLevelKernel, level_counts[level + 1],relation_b.get(), level_offsets[level] - node_count,
                           level_offsets[level + 1] - node_count,
                           level_counts[level], level_counts[level + 1],
                           options.tolerance, feasibility_consistency_tolerance,
                           device_status.get());
           }
-          FinalizeRelationSuffixFromParentsKernel<<<
-              first_parent_count, kThreads, scratch.primal_relation_final,
-              stream>>>(relation_a.get(), node_count, relation_b.get(),
+          CLQR_LAUNCH_SCRATCH(FinalizeRelationSuffixFromParentsKernel, first_parent_count,relation_a.get(), node_count, relation_b.get(),
                         first_parent_count, options.tolerance,
                         feasibility_consistency_tolerance, device_status.get());
         }
-        StateParamKernel<<<node_count, kThreads, scratch.state_parameter,
-                           stream>>>(relation_a.get(), node_count,
+        CLQR_LAUNCH_SCRATCH(StateParamKernel, node_count,relation_a.get(), node_count,
                                      state_params.get(), state_dimensions.get(),
                                      device_status.get(), options.tolerance);
       },
@@ -4847,15 +4931,13 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       },
       [&] {
         if (stage_count > 0) {
-          ReduceStagesKernel<<<stage_count, kThreads, scratch.stage_reduction,
-                               stream>>>(
+          CLQR_LAUNCH_SCRATCH(ReduceStagesKernel, stage_count,
               device_stages.get(), suffix, state_params.get(), stage_count,
               options.tolerance, feasibility_consistency_tolerance,
               control_params.get(), reduced_stages.get(),
               control_dimensions.get(), device_status.get());
         }
-        ReduceTerminalKernel<<<1, kThreads, scratch.terminal_reduction,
-                               stream>>>(device_terminal.get(),
+        CLQR_LAUNCH_SCRATCH(ReduceTerminalKernel, 1,device_terminal.get(),
                                          state_params.get(), stage_count,
                                          reduced_terminal.get());
         InitialReducedStateKernel<<<1, kThreads, 0, stream>>>(
@@ -4928,8 +5010,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
           stage_level_counts[level], stage_level_counts[level + 1],
           device_status.get());
     }
-    FinalizeAffinePrefixFromParentsKernel<<<first_parent_count, kThreads,
-                                            scratch.affine_finalize, stream>>>(
+    CLQR_LAUNCH_SCRATCH(FinalizeAffinePrefixFromParentsKernel, first_parent_count,
         map_a.get(), stage_count, map_b.get(), first_parent_count,
         device_status.get());
   };
@@ -4968,20 +5049,17 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         }
       },
       [&] {
-        BuildValueElementsKernel<<<node_count, kThreads, scratch.value_leaf,
-                                   stream>>>(
+        CLQR_LAUNCH_SCRATCH(BuildValueElementsKernel, node_count,
             reduced_stages.get(), reduced_terminal.get(), stage_count,
             options.tolerance, value_a.get(), device_status.get());
         if (node_count > 1) {
           const int first_parent_count = level_counts[1];
-          ReduceValueLeavesKernel<<<first_parent_count, kThreads,
-                                    scratch.value_compose, stream>>>(
+          CLQR_LAUNCH_SCRATCH(ReduceValueLeavesKernel, first_parent_count,
               value_a.get(), node_count, first_parent_count, options.tolerance,
               device_status.get(), value_b.get());
           for (std::size_t level = 1; level + 1 < level_counts.size();
                ++level) {
-            ReduceValueTreeLevelKernel<<<level_counts[level + 1], kThreads,
-                                         scratch.value_compose, stream>>>(
+            CLQR_LAUNCH_SCRATCH(ReduceValueTreeLevelKernel, level_counts[level + 1],
                 value_b.get(), level_offsets[level] - node_count,
                 level_offsets[level + 1] - node_count, level_counts[level],
                 level_counts[level + 1], options.tolerance,
@@ -4991,25 +5069,21 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               value_b.get(), level_offsets.back() - node_count);
           for (int level = static_cast<int>(level_counts.size()) - 2;
                level >= 1; --level) {
-            ExpandValueContextLevelKernel<<<level_counts[level + 1], kThreads,
-                                            scratch.value_compose, stream>>>(
+            CLQR_LAUNCH_SCRATCH(ExpandValueContextLevelKernel, level_counts[level + 1],
                 value_b.get(), level_offsets[level] - node_count,
                 level_offsets[level + 1] - node_count, level_counts[level],
                 level_counts[level + 1], options.tolerance,
                 device_status.get());
           }
-          FinalizeValueSuffixFromParentsKernel<<<
-              first_parent_count, kThreads, scratch.value_finalize, stream>>>(
+          CLQR_LAUNCH_SCRATCH(FinalizeValueSuffixFromParentsKernel, first_parent_count,
               value_a.get(), node_count, value_b.get(), first_parent_count,
               options.tolerance, device_status.get());
         }
         if (stage_count > 0) {
-          MatrixFeedbackKernel<<<stage_count, kThreads, scratch.feedback,
-                                 stream>>>(reduced_stages.get(), value_suffix,
+          CLQR_LAUNCH_SCRATCH(MatrixFeedbackKernel, stage_count,reduced_stages.get(), value_suffix,
                                            stage_count, options.tolerance,
                                            feedback.get(), device_status.get());
-          InitializeCostateMapsKernel<<<stage_count, kThreads,
-                                        scratch.affine_terms, stream>>>(
+          CLQR_LAUNCH_SCRATCH(InitializeCostateMapsKernel, stage_count,
               reduced_stages.get(), value_suffix, feedback.get(), stage_count,
               map_a.get(), device_status.get());
           queue_affine_prefix_scan();
@@ -5018,8 +5092,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               map_a.get(), reduced_terminal.get(), reduced_state_offsets.get(),
               stage_count, workspace.reduced_value_linear.get(),
               device_status.get());
-          FinalizeFeedbackKernel<<<stage_count, kThreads, scratch.affine_terms,
-                                   stream>>>(
+          CLQR_LAUNCH_SCRATCH(FinalizeFeedbackKernel, stage_count,
               reduced_stages.get(), value_suffix,
               workspace.reduced_value_linear.get(), reduced_state_offsets.get(),
               stage_count, feedback.get(), device_status.get());
@@ -5111,8 +5184,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                     "initialize dual dimensions");
         },
         [&] {
-          BuildDualParametersKernel<<<stage_count, kThreads,
-                                      scratch.dual_parameter, stream>>>(
+          CLQR_LAUNCH_SCRATCH(BuildDualParametersKernel, stage_count,
               device_stages.get(), state_params.get(), value_suffix,
               workspace.reduced_value_linear.get(), reduced_states.get(),
               states.get(), controls.get(), reduced_state_offsets.get(),
@@ -5184,8 +5256,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
           }
         },
         [&] {
-          BuildDualParameterRelationsKernel<<<
-              stage_count, kThreads, scratch.dual_relation_leaf, stream>>>(
+          CLQR_LAUNCH_SCRATCH(BuildDualParameterRelationsKernel, stage_count,
               device_stages.get(), device_terminal.get(), dual_params.get(),
               stage_count, states.get(), controls.get(), state_offsets.get(),
               control_offsets.get(), multiplier_rank_tolerance,
@@ -5195,9 +5266,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
           if (host_dual_scan_needed != 0) {
             for (std::size_t level = 0; level + 1 < stage_level_counts.size();
                  ++level) {
-              ReduceDualTreeLevelKernel<<<stage_level_counts[level + 1],
-                                          kThreads, scratch.dual_relation,
-                                          stream>>>(
+              CLQR_LAUNCH_SCRATCH(ReduceDualTreeLevelKernel, stage_level_counts[level + 1],
                   dual_tree.get(), stage_level_offsets[level],
                   stage_level_offsets[level + 1], stage_level_counts[level],
                   stage_level_counts[level + 1], multiplier_rank_tolerance,
@@ -5205,15 +5274,13 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                   dual_scan_needed.get(), device_status.get());
             }
             const int root_offset = stage_level_offsets.back();
-            SolveDualRootKernel<<<1, kThreads, scratch.dual_root, stream>>>(
+            CLQR_LAUNCH_SCRATCH(SolveDualRootKernel, 1,
                 dual_tree.get() + root_offset, dual_values.get() + root_offset,
                 dual_scan_needed.get(), device_status.get(),
                 multiplier_rank_tolerance);
             for (int level = static_cast<int>(stage_level_counts.size()) - 2;
                  level >= 0; --level) {
-              ExpandDualTreeLevelKernel<<<stage_level_counts[level + 1],
-                                          kThreads, scratch.dual_expand,
-                                          stream>>>(
+              CLQR_LAUNCH_SCRATCH(ExpandDualTreeLevelKernel, stage_level_counts[level + 1],
                   dual_tree.get(), stage_level_offsets[level],
                   stage_level_offsets[level + 1], stage_level_counts[level],
                   stage_level_counts[level + 1], multiplier_rank_tolerance,
@@ -5777,6 +5844,8 @@ Solution Solve(const Problem &problem, const Options &options) {
 
 } // namespace cuda
 } // namespace clqr
+#undef CLQR_LAUNCH_SCRATCH
+#undef CLQR_SCRATCH_KERNELS
 #endif // CLQR_CUDA_EMULATION
 
 namespace clqr {
@@ -5943,10 +6012,11 @@ ExpandAffineContextLevelKernel(AffineMap *tree, int child_offset,
   CopyAffineMapBlock(parent_context, &tree[left]);
 }
 
-__global__ void
-FinalizeAffinePrefixFromParentsKernel(AffineMap *leaves, int count,
+template <bool GlobalScratch = kDefaultGlobalScratch>
+__global__ void FinalizeAffinePrefixFromParentsKernel(AffineMap *leaves, int count,
                                       const AffineMap *parent_contexts,
-                                      int parent_count, DeviceStatus *status) {
+                                      int parent_count, DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
@@ -6052,6 +6122,7 @@ __global__ void ReconstructPrimalKernel(
   }
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void BuildDualParametersKernel(
     const PackedStage *stages, const StateParam *state_params,
     const ValueElement *value_suffix, const Scalar *reduced_value_linear,
@@ -6059,7 +6130,8 @@ __global__ void BuildDualParametersKernel(
     const int *reduced_state_offsets, const int *state_offsets,
     const int *control_offsets, int stage_count, Scalar rank_tolerance,
     Scalar consistency_tolerance, DualParam *params, int *scan_needed,
-    int *dual_dimensions, DeviceStatus *status) {
+    int *dual_dimensions, DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
@@ -6206,6 +6278,7 @@ __global__ void BuildDualParametersKernel(
   WarpSynchronize();
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void BuildDualParameterRelationsKernel(
     const PackedStage *stages, const PackedTerminal *terminal_ptr,
     const DualParam *params, int stage_count, const Scalar *states,
@@ -6213,7 +6286,8 @@ __global__ void BuildDualParameterRelationsKernel(
     const int *control_offsets, Scalar rank_tolerance,
     Scalar consistency_tolerance, DualRelation *relations,
     const int *scan_needed, StateDualParam *state_params,
-    DeviceStatus *status) {
+    DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int relation_index = blockIdx.x;
   if (relation_index >= stage_count)
     return;
@@ -6483,12 +6557,13 @@ __global__ void RecoverInitialMultiplierKernel(
   }
 }
 
-__global__ void
-ReduceDualTreeLevelKernel(const DualRelation *tree, int child_offset,
+template <bool GlobalScratch = kDefaultGlobalScratch>
+__global__ void ReduceDualTreeLevelKernel(const DualRelation *tree, int child_offset,
                           int parent_offset, int child_count, int parent_count,
                           Scalar rank_tolerance, Scalar consistency_tolerance,
                           DualRelation *mutable_tree, const int *scan_needed,
-                          DeviceStatus *status) {
+                          DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count || *scan_needed == 0)
     return;
@@ -6524,10 +6599,12 @@ ReduceDualTreeLevelKernel(const DualRelation *tree, int child_offset,
                         true);
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void SolveDualRootKernel(const DualRelation *relation,
                                     DualNodeValue *value,
                                     const int *scan_needed,
-                                    DeviceStatus *status, Scalar tolerance) {
+                                    DeviceStatus *status, Scalar tolerance
+    CLQR_SCRATCH_PARAMS) {
   if (blockIdx.x != 0 || *scan_needed == 0)
     return;
   if (!BlockEnabled(status))
@@ -6589,11 +6666,13 @@ __global__ void SolveDualRootKernel(const DualRelation *relation,
     value->left[col] = solution[col];
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void ExpandDualTreeLevelKernel(
     const DualRelation *tree, int child_offset, int parent_offset,
     int child_count, int parent_count, Scalar rank_tolerance,
     Scalar consistency_tolerance, const DualNodeValue *parent_values,
-    DualNodeValue *values, const int *scan_needed, DeviceStatus *status) {
+    DualNodeValue *values, const int *scan_needed, DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count || *scan_needed == 0)
     return;
@@ -6716,11 +6795,13 @@ namespace cuda {
 namespace detail {
 namespace {
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void BuildValueElementsKernel(const ReducedStage *stages,
                                          const ReducedTerminal *terminal_ptr,
                                          int stage_count, Scalar tolerance,
                                          ValueElement *elements,
-                                         DeviceStatus *status) {
+                                         DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index > stage_count)
     return;
@@ -7050,10 +7131,12 @@ __device__ void ComposeScanValueBlock(const ValueElement &first,
                             augmented, factors, product, best_row);
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
                                         int parent_count, Scalar tolerance,
                                         DeviceStatus *status,
-                                        ValueElement *parents) {
+                                        ValueElement *parents
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
@@ -7085,10 +7168,12 @@ __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
                             index, augmented, factors, product, &best_row);
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
                                            int parent_offset, int child_count,
                                            int parent_count, Scalar tolerance,
-                                           DeviceStatus *status) {
+                                           DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
@@ -7128,9 +7213,11 @@ __global__ void InitializeValueContextRootKernel(ValueElement *tree,
     SetInvalidScanValueElement(&tree[root_offset]);
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void ExpandValueContextLevelKernel(
     ValueElement *tree, int child_offset, int parent_offset, int child_count,
-    int parent_count, Scalar tolerance, DeviceStatus *status) {
+    int parent_count, Scalar tolerance, DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
@@ -7167,9 +7254,11 @@ __global__ void ExpandValueContextLevelKernel(
   CopyValueElementBlock(parent_context, &tree[right]);
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void FinalizeValueSuffixFromParentsKernel(
     ValueElement *leaves, int count, const ValueElement *parent_contexts,
-    int parent_count, Scalar tolerance, DeviceStatus *status) {
+    int parent_count, Scalar tolerance, DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= parent_count)
     return;
@@ -7360,10 +7449,12 @@ __device__ bool SolveMatrixFeedbackBlock(const ReducedStage &stage,
   return true;
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void MatrixFeedbackKernel(const ReducedStage *stages,
                                      const ValueElement *suffix,
                                      int stage_count, Scalar tolerance,
-                                     Feedback *feedback, DeviceStatus *status) {
+                                     Feedback *feedback, DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
@@ -7392,11 +7483,13 @@ __global__ void MatrixFeedbackKernel(const ReducedStage *stages,
 //       + (A_i+B_i K_i)^T (p_{i+1}+P_{i+1}c_i).
 // Store f_i:p_{i+1}->p_i in reverse stage order so the same affine-prefix
 // kernels used for state reconstruction compute every costate suffix.
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void InitializeCostateMapsKernel(const ReducedStage *stages,
                                             const ValueElement *suffix,
                                             const Feedback *feedback,
                                             int stage_count, AffineMap *maps,
-                                            DeviceStatus *status) {
+                                            DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
@@ -7464,12 +7557,14 @@ __global__ void RecoverCostatesKernel(const AffineMap *prefix_maps,
   }
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void FinalizeFeedbackKernel(const ReducedStage *stages,
                                        const ValueElement *suffix,
                                        const Scalar *costates,
                                        const int *reduced_state_offsets,
                                        int stage_count, Feedback *feedback,
-                                       DeviceStatus *status) {
+                                       DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
@@ -7548,12 +7643,13 @@ __device__ inline Scalar StageReductionMapEntry(const PackedStage &stage,
                          state.reduced_dim];
 }
 
-__global__ void
-ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
+template <bool GlobalScratch = kDefaultGlobalScratch>
+__global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
                    const StateParam *state_params, int stage_count,
                    Scalar rank_tolerance, Scalar consistency_tolerance,
                    ControlParam *control_params, ReducedStage *reduced,
-                   int *control_dimensions, DeviceStatus *status) {
+                   int *control_dimensions, DeviceStatus *status
+    CLQR_SCRATCH_PARAMS) {
   const int index = blockIdx.x;
   if (index >= stage_count)
     return;
@@ -7947,10 +8043,12 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
   }
 }
 
+template <bool GlobalScratch = kDefaultGlobalScratch>
 __global__ void ReduceTerminalKernel(const PackedTerminal *terminal_ptr,
                                      const StateParam *state_params,
                                      int terminal_index,
-                                     ReducedTerminal *reduced) {
+                                     ReducedTerminal *reduced
+    CLQR_SCRATCH_PARAMS) {
   const PackedTerminal &terminal = *terminal_ptr;
   const StateParam &param = state_params[terminal_index];
   if (threadIdx.x == 0)

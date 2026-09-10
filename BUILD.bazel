@@ -16,6 +16,12 @@ config_setting(
     define_values = {"clqr_precision": "fp32"},
 )
 
+# Diagnostic mode for comparing shared and global scratch on identical cases.
+config_setting(
+    name = "cuda_force_global_scratch",
+    define_values = {"clqr_cuda_scratch": "global"},
+)
+
 py_test(
     name = "paper_results_test",
     srcs = ["tests/paper_results_test.py", "scripts/paper_results.py"],
@@ -302,6 +308,10 @@ cuda_library(
         "src/cuda_shared_memory.h",
     ],
     alwayslink = True,
+    defines = select({
+        ":cuda_force_global_scratch": ["CLQR_CUDA_FORCE_GLOBAL_SCRATCH"],
+        "//conditions:default": [],
+    }),
     copts = [
         "--expt-relaxed-constexpr",
         "-lineinfo",
@@ -402,6 +412,10 @@ cc_binary(
 
 cc_library(
     name = "cuda_kernel_emulation_sources",
+    defines = select({
+        ":cuda_force_global_scratch": ["CLQR_CUDA_FORCE_GLOBAL_SCRATCH"],
+        "//conditions:default": [],
+    }),
     hdrs = [
         "benchmarks/paper_cases.h",
         "benchmarks/scaling_problem.h",

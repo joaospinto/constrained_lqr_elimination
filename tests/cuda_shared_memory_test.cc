@@ -83,6 +83,7 @@ cudaError_t cudaFuncSetAttribute(mock::Kernel kernel,
 namespace {
 using clqr::cuda::detail::ConfigureKernelSharedMemory;
 using clqr::cuda::detail::DeviceSharedMemoryCapacity;
+using clqr::cuda::detail::PlanKernelScratch;
 
 void Expect(bool condition, const char *message) {
   if (!condition) {
@@ -201,6 +202,45 @@ void ApiErrorCase() {
   Configure(60 * 1024);
   Expect(mock::set_calls == 2, "retry a failed configuration");
 }
+
+void GlobalFallbackCase() {
+  mock::Reset();
+  auto plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
+                               1024, mock::ordinary, false);
+  Expect(plan.shared_bytes == 1024 && plan.global_stride == 0 &&
+             plan.GlobalBytes(100) == 0,
+         "fitting kernels do not allocate global scratch");
+  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
+                           76001, mock::ordinary, false);
+  Expect(plan.shared_bytes == 0 && plan.global_stride == 76016 &&
+             plan.GlobalBytes(65) == 76016 * 65 && mock::set_calls == 0,
+         "oversized kernels use aligned per-block global slices");
+  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
+                           76001, mock::optin, false);
+  Expect(plan.shared_bytes == 76001 && plan.global_stride == 0 &&
+             mock::set_calls == 1,
+         "opt-in shared memory is preferred when it fits");
+  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test", 1024,
+                           mock::optin, true);
+  Expect(plan.shared_bytes == 0 && plan.global_stride == 1024,
+         "forced-global mode isolates the memory-placement comparison");
+  bool overflow = false;
+  try {
+    (void)plan.GlobalBytes(std::numeric_limits<std::size_t>::max());
+  } catch (const std::invalid_argument &) {
+    overflow = true;
+  }
+  Expect(overflow, "global allocation multiplication is checked");
+  overflow = false;
+  try {
+    (void)PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
+                           std::numeric_limits<std::size_t>::max(),
+                           mock::ordinary, false);
+  } catch (const std::invalid_argument &) {
+    overflow = true;
+  }
+  Expect(overflow, "global alignment addition is checked");
+}
 } // namespace
 
 int main() {
@@ -209,5 +249,6 @@ int main() {
   BenchmarkDimensionsCase();
   KernelAndDeviceIsolationCase();
   ApiErrorCase();
+  GlobalFallbackCase();
   std::cout << "CUDA shared-memory configuration tests passed\n";
 }

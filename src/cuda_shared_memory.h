@@ -5,10 +5,23 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace clqr::cuda::detail {
+
+struct KernelScratchLaunch {
+  std::size_t shared_bytes = 0;
+  std::size_t global_stride = 0;
+
+  std::size_t GlobalBytes(std::size_t blocks) const {
+    if (blocks && global_stride >
+                      std::numeric_limits<std::size_t>::max() / blocks)
+      throw std::invalid_argument("CUDA global scratch allocation overflows");
+    return global_stride * blocks;
+  }
+};
 
 inline void CheckSharedMemoryApi(cudaError_t error, const char *operation) {
   if (error != cudaSuccess)
@@ -64,6 +77,29 @@ void ConfigureKernelSharedMemory(Kernel kernel, const char *name,
                              dynamic_capacity),
         "enable CUDA kernel opt-in shared memory");
   }
+}
+
+template <typename Kernel>
+KernelScratchLaunch PlanKernelScratch(Kernel shared_kernel, Kernel global_kernel,
+                                     const char *name, std::size_t bytes,
+                                     int device_capacity, bool force_global) {
+  cudaFuncAttributes attributes{};
+  CheckSharedMemoryApi(cudaFuncGetAttributes(&attributes, shared_kernel),
+                       "query CUDA shared-scratch kernel attributes");
+  const auto capacity = static_cast<std::size_t>(std::max(device_capacity, 0));
+  if ((!force_global || bytes == 0) &&
+      attributes.sharedSizeBytes <= capacity &&
+      bytes <= capacity - attributes.sharedSizeBytes) {
+    ConfigureKernelSharedMemory(shared_kernel, name, bytes, device_capacity);
+    return {bytes, 0};
+  }
+  // The fallback retains small static shared scalars, but its dense scratch
+  // lives in separately owned global memory. No dynamic shared allocation.
+  ConfigureKernelSharedMemory(global_kernel, name, 0, device_capacity);
+  constexpr std::size_t alignment = 16;
+  if (bytes > std::numeric_limits<std::size_t>::max() - (alignment - 1))
+    throw std::invalid_argument("CUDA global scratch alignment overflows");
+  return {0, std::max(alignment, (bytes + alignment - 1) / alignment * alignment)};
 }
 
 } // namespace clqr::cuda::detail

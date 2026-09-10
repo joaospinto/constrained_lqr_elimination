@@ -32,10 +32,12 @@ shares the library's low-level RREF and linear-system primitives.
 
 CUDA shared-memory configuration tests check exact static-plus-dynamic capacity,
 opt-in and legacy-device limits, and independent kernel/device configuration.
-A source audit matches every dynamic-scratch launch to its configuration. The
-native suite solves an n=24 fixture on GPUs with sufficient per-block capacity
-(including workspace shrink/grow reuse), or checks its resource diagnostic on
-smaller GPUs; the same fixture is covered by CPU kernel emulation.
+A source audit matches every scratch launch to its configuration and both
+kernel specializations. The native suite solves n=24,32,64 fixtures, using
+global scratch on GPUs with insufficient shared memory and checking workspace
+shrink/grow reuse. Forced-global kernel emulation covers the same numerical
+corpus as the shared path. Allocation checks cover per-block alignment and
+size overflow; native sanitizer runs check device memory and synchronization.
 
 JAX binding validation is separate from the native table. The CPU and CUDA
 binding suites cover eager execution, `jax.jit`, sequential `jax.vmap`, changed

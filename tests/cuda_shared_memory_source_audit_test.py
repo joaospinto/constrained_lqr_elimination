@@ -11,22 +11,21 @@ class SharedMemoryLaunchAudit(unittest.TestCase):
             / os.environ["TEST_WORKSPACE"]
             / "src/cuda_solver.cu"
         ).read_text()
-        configurations = re.findall(
-            r"CLQR_CONFIGURE_SCRATCH\((\w+),\s*(\w+)\);", source
-        )
+        configurations = re.findall(r"X\((\w+),\s*(\w+),\s*\w+\)", source)
         self.assertEqual(len(configurations), len(set(configurations)))
-        launches = set()
-        for kernel, arguments in re.findall(r"(\w+)\s*<<<(.*?)>>>", source, re.S):
-            dynamic_bytes = arguments.split(",")[2].strip()
-            if dynamic_bytes == "0":
-                continue
-            self.assertRegex(dynamic_bytes, r"^scratch\.\w+$")
-            launches.add((kernel, dynamic_bytes.removeprefix("scratch.")))
+        launches = set(re.findall(r"CLQR_LAUNCH_SCRATCH\((\w+),", source))
+        launches.discard("kernel")
         self.assertTrue(launches)
-        self.assertEqual(set(configurations), launches)
-        self.assertEqual(
-            source.count("ConfigureScratchMemory(workspace->scratch, device);"), 1
+        self.assertEqual({kernel for kernel, _ in configurations}, launches)
+        definitions = re.findall(
+            r"template <bool GlobalScratch = kDefaultGlobalScratch>\s*"
+            r"__global__ void (\w+)\([^{};]*CLQR_SCRATCH_PARAMS\)\s*{", source
         )
+        self.assertEqual(set(definitions), launches)
+        self.assertNotRegex(source, r"<<<[^>]*scratch\.\w+")
+        self.assertIn("kernel<true><<<blocks, kThreads, 0, stream>>>", source)
+        self.assertIn("workspace.global_scratch.get()", source)
+        self.assertIn("plans->kernel.GlobalBytes(blocks)", source)
         self.assertNotIn("kStaticSharedMemoryAllowance", source)
 
 

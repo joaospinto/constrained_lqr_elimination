@@ -131,10 +131,16 @@ bazel test //:cuda_solver_test \
 FP32. Local dense workspaces are sized at runtime. Workspace preparation queries
 the selected GPU's shared-memory capacity and each kernel's static usage, and
 opts into larger dynamic shared-memory allocations when needed and supported.
-Each launch still requests only its planned scratch size. If a factorization
-exceeds the device's per-block limit, `Solve` returns a deterministic diagnostic
-describing the required resource; there is no capacity flag to rebuild.
-Scratch storage does not currently fall back to global device memory.
+Each launch still requests only its planned scratch size. Kernels whose dense
+scratch exceeds the per-block limit use separate per-block slices of reusable
+global device workspace instead. Small static shared scalars remain shared.
+The fallback preserves the algorithm and numerical choices, but its memory
+traffic can cost performance. There is no capacity flag to rebuild; total
+device-memory availability still limits the problem size.
+
+For a controlled memory-placement comparison,
+`--define=clqr_cuda_scratch=global` forces dense scratch into global memory.
+The default automatically selects shared memory whenever it fits.
 
 The CUDA benchmark uses `SolvePreparedView`, reuses reserved storage, and
 reports both end-to-end wall time and pure kernel time. Wall time includes host
