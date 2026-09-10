@@ -27,18 +27,19 @@ int main() {
                 "Paper fixtures require FP64");
   constexpr double tolerance = 2e-8;
   const auto cases = clqr::benchmark::PaperCases("all");
-  if (cases.size() != 15)
+  if (cases.size() != 22)
     throw std::runtime_error("paper sweep case count");
   const auto horizons = clqr::benchmark::PaperCases("horizon");
-  if (horizons.size() != 11)
+  if (horizons.size() != 22)
     throw std::runtime_error("paper horizon count");
   for (std::size_t i = 0; i < horizons.size(); ++i)
-    if (horizons[i].horizon != (std::size_t{32} << i))
+    if (horizons[i].horizon != (std::size_t{32} << (i % 11)) ||
+        horizons[i].n != (i < 11 ? 8 : 16))
       throw std::runtime_error("paper horizon sweep skips a power of two");
   for (const auto &c : cases)
     if (c.n % 8 || c.m != c.n / 2 || c.mixed != c.n / 8 ||
         c.state != c.n / 4 ||
-        (c.family != "horizon" && c.family != "dimension"))
+        c.family != "horizon")
       throw std::runtime_error("paper dimension ratios");
   const auto reference = clqr::benchmark::MakeScalingProblem(2, 8, 4, 1, 2);
   auto changed_dual = reference.dual;

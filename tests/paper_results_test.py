@@ -206,13 +206,52 @@ class ResultsTest(unittest.TestCase):
         self.assertIn(r"6.000 \\", text)
 
     def test_fixed_ratio_table_selection(self):
-        identities = [("horizon", N, 8, 4, 1, 2, 7)
-                      for N in (2**exponent for exponent in range(5, 16))]
-        identities += [("dimension", 128, n, n // 2, n // 8, n // 4, 7)
-                       for n in (8, 16, 32, 64)]
-        self.assertEqual(sum(map(results.selected, identities)), 14)
+        identities = [("horizon", 2**exponent, n, n // 2, n // 8, n // 4, 7)
+                      for n in (8, 16) for exponent in range(5, 16)]
+        self.assertEqual(sum(map(results.selected, identities)), 22)
         self.assertFalse(results.selected(("horizon", 16385, 8, 4, 1, 2, 7)))
+        self.assertFalse(results.selected(("dimension", 128, 16, 8, 2, 4, 7)))
         self.assertFalse(results.selected(("dimension", 128, 32, 16, 4, 4, 7)))
+
+    def test_complete_two_dimension_horizon_run(self):
+        # Exercise the actual all-suite summary, not only the table selector:
+        # an obsolete fixed row-count guard must not reject a complete run.
+        manifest = [dict(family="horizon", N=str(2**exponent), n=str(n),
+                         m=str(n // 2), mixed_rows=str(n // 8), state_rows=str(n // 4))
+                    for n in (8, 16) for exponent in range(5, 16)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            files = {}
+            for backend, name in (results.SOURCES | results.OPTIONAL_SOURCES).items():
+                for case in manifest:
+                    value = dict(row(backend), **case)
+                    if backend in results.PRIMAL_ONLY:
+                        value.update(kkt_inf="nan", dual_error_inf="nan")
+                    files.setdefault(name, []).append(value)
+            original = dict(n="8", m="4", p="2", cpp_cpu_ms="3",
+                            cpp_kkt_residual="2e-14", cuda_kernel_ms="1",
+                            cuda_wall_ms="2", cuda_kkt_residual="3e-13",
+                            input_pack_ms="0.4", upload_ms="0.1", download_ms="0.1")
+            files["original_table.csv"] = [dict(original, N=str(2**exponent))
+                                            for exponent in range(5, 15)]
+            for name, values in files.items():
+                with (path / name).open("w") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=values[0])
+                    writer.writeheader()
+                    writer.writerows(values)
+            (path / "cases.json").write_text(json.dumps(manifest))
+            (path / "platform.txt").write_text("test platform\n")
+            (path / "gpu.csv").write_text("index,name,compute_cap\n0,test GPU,12.0\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(results.main([str(path), "--suite", "all",
+                                               "--cuda", "--require-laine"]), 0)
+            table = (path / "comparison_table.tex").read_text()
+            for case in manifest:
+                self.assertIn(f"{case['N']} & {case['n']} &", table)
+            measured = results.read_csv(path / "measurements.csv")
+            corrected = [r for r in measured if r["backend"] == "laine_corrected"]
+            self.assertEqual(len(corrected), 22)
+            self.assertNotIn("corrected", table)
 
     def test_dual_coordinate_errors_are_data(self):
         value = row()

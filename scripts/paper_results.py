@@ -112,14 +112,13 @@ def time_cell(row, field="median_ms"):
 
 def selected(identity):
     family, horizon, n, m, mixed, state, _ = identity
-    return (n % 8 == 0 and (m, mixed, state) == (n // 2, n // 8, n // 4) and
-            ((family == "horizon" and n == 8 and 32 <= horizon <= 32768 and
-              horizon & (horizon - 1) == 0) or
-             (family == "dimension" and horizon == 128 and n in (16, 32, 64))))
+    return (family == "horizon" and n in (8, 16) and
+            (m, mixed, state) == (n // 2, n // 8, n // 4) and
+            32 <= horizon <= 32768 and horizon & (horizon - 1) == 0)
 
 
 def comparison_table(data):
-    """All fixed-ratio horizons plus distinct dimension cases; CSVs retain every backend."""
+    """Complete horizon sweeps at n=8,16; CSVs retain every backend."""
     output = io.StringIO()
     print(r"\begin{table*}[!t]", file=output)
     print(r"\centering\footnotesize\setlength{\tabcolsep}{3pt}", file=output)
@@ -141,7 +140,7 @@ def comparison_table(data):
         if not selected(identity):
             continue
         family, horizon, n, _, mixed, state, _ = identity
-        group = family
+        group = n
         if previous and previous != group:
             print(r"\hline", file=output)
         previous = group
@@ -246,7 +245,11 @@ def main(argv=None):
         report["platform"] = (args.results / "platform.txt").read_text()
         report["gpus"] = read_csv(args.results / "gpu.csv")
         if args.suite == "all":
-            if sum(selected(identity) for identity in identities) != 8:
+            expected_cases = {
+                ("horizon", 2**exponent, n, n // 2, n // 8, n // 4)
+                for n in (8, 16) for exponent in range(5, 16)
+            }
+            if {identity[:-1] for identity in identities} != expected_cases:
                 raise ValueError("paper table requires the complete all-suite run")
             (args.results / "comparison_table.tex").write_text(comparison_table(data))
         original = read_csv(args.results / "original_table.csv")

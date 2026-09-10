@@ -253,11 +253,12 @@ build outputs, or external dependencies, and is not checked into the repository.
 Internet is still required for pinned dependencies. Without an attached bundle,
 the notebook fetches current `origin/main` instead.
 
-The paper sweeps vary the horizon (every power of two from 32 through 32768 at $n=8$)
-and state dimension (8, 16, 32, 64 at $N=128$), always with
+The paper sweeps vary the horizon (every power of two from 32 through 32768
+at both $n=8$ and $n=16$), always with
 $m=n/2$, $p_s=n/4$, and $p_m=n/8$. State-only rows at the fixed initial
 state are omitted to avoid introducing artificial redundancy. A separate
-`CLQR_PAPER_SUITE=constraints` diagnostic varies constraint counts.
+`CLQR_PAPER_SUITE=constraints` diagnostic varies constraint counts;
+`CLQR_PAPER_SUITE=dimension` measures $n=8,16,32,64$ at $N=128$.
 The corrected Laine–Tomlin implementation is included separately from the
 author's original, using the optimized native dense kernels.
 Each solve refactors; setup and setup-plus-solve
