@@ -1,10 +1,10 @@
-#ifndef EXTERNAL_ALGORITHMS_LAINE_TOMLIN_DENSE_H_
-#define EXTERNAL_ALGORITHMS_LAINE_TOMLIN_DENSE_H_
+#ifndef EXTERNAL_ALGORITHMS_CORRECTED_LAINE_TOMLIN_DENSE_H_
+#define EXTERNAL_ALGORITHMS_CORRECTED_LAINE_TOMLIN_DENSE_H_
 
 #include <Eigen/Core>
 #include "src/cpu_dense.h"
 
-namespace laine_tomlin::dense {
+namespace corrected_laine_tomlin::dense {
 
 // Eigen owns the reference solver's storage; CLQR supplies only its allocation-
 // free arithmetic kernels. A column-major output is computed as C'=B'*A',
@@ -66,5 +66,5 @@ void AddProduct(Eigen::MatrixBase<Out>& out, const Eigen::MatrixBase<Left>& a,
   Multiply(out, a, b, alpha, 1);
 }
 
-} // namespace laine_tomlin::dense
+} // namespace corrected_laine_tomlin::dense
 #endif

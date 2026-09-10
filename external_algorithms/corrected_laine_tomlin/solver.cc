@@ -8,7 +8,7 @@
 #include <cmath>
 #include <utility>
 
-namespace laine_tomlin {
+namespace corrected_laine_tomlin {
 namespace {
 using Eigen::Index;
 using dense::AddProduct;
@@ -278,4 +278,4 @@ Result Solve(const Problem &p, const Options &o) {
   result.message = "optimal";
   return result;
 }
-} // namespace laine_tomlin
+} // namespace corrected_laine_tomlin

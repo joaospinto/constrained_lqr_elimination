@@ -118,11 +118,11 @@ are represented with zero rows in `D`. State and control dimensions may vary;
 zero controls and zero horizon are supported.
 
 ```cpp
-#include "external_algorithms/laine_tomlin/solver.h"
+#include "external_algorithms/corrected_laine_tomlin/solver.h"
 
-laine_tomlin::Problem problem; // populate dynamics, costs, and constraints
-auto solution = laine_tomlin::Solve(problem);
-if (solution.status == laine_tomlin::Status::kOptimal) {
+corrected_laine_tomlin::Problem problem; // populate dynamics, costs, and constraints
+auto solution = corrected_laine_tomlin::Solve(problem);
+if (solution.status == corrected_laine_tomlin::Status::kOptimal) {
   // solution.states, solution.controls
   // feedback: u[t] = solution.K[t] * x[t] + solution.k[t]
 }
@@ -152,8 +152,8 @@ including column-major storage, without packing the matrices.
 From the repository root:
 
 ```sh
-bazel test --config=fp64 //external_algorithms/laine_tomlin:all
-bazel run --config=fp64 //external_algorithms/laine_tomlin:compare -- --benchmark
+bazel test --config=fp64 //external_algorithms/corrected_laine_tomlin:all
+bazel run --config=fp64 //external_algorithms/corrected_laine_tomlin:compare -- --benchmark
 ```
 
 `dense_test` checks native-kernel routing for both storage orders, transposes,
@@ -183,12 +183,12 @@ No author source is vendored; the checkout must remain unchanged. Build-only
 compatibility supplies `<functional>` and the old `eigen3/Eigen` include path.
 
 ```sh
-cmake -S external_algorithms/laine_tomlin/author_audit -B "$audit_build" \
+cmake -S external_algorithms/corrected_laine_tomlin/author_audit -B "$audit_build" \
   -DCMAKE_BUILD_TYPE=Release \
   -DLAINE_SOURCE_DIR="$author_checkout" -DEIGEN_SOURCE_DIR="$eigen_headers"
 cmake --build "$audit_build" -j2
 ctest --test-dir "$audit_build" --output-on-failure
-python3 external_algorithms/laine_tomlin/author_audit/run.py \
+python3 external_algorithms/corrected_laine_tomlin/author_audit/run.py \
   "$audit_build/author_audit" "$results/author.json"
 ```
 

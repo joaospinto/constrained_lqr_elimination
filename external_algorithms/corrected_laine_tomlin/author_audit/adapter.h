@@ -1,11 +1,11 @@
-#ifndef LAINE_TOMLIN_AUTHOR_ADAPTER_H_
-#define LAINE_TOMLIN_AUTHOR_ADAPTER_H_
+#ifndef CORRECTED_LAINE_TOMLIN_AUTHOR_ADAPTER_H_
+#define CORRECTED_LAINE_TOMLIN_AUTHOR_ADAPTER_H_
 #include "../solver.h"
 #include "trajectory.h"
 #include <functional>
 #include <memory>
 #include <stdexcept>
-namespace laine_tomlin::author {
+namespace corrected_laine_tomlin::author {
 inline std::unique_ptr<trajectory::Trajectory> MakeTrajectory(const Problem &p,
                                                               bool implicit) {
   const int n = p.initial_state.size();
@@ -92,5 +92,5 @@ inline void Solve(trajectory::Trajectory &t) {
   t.compute_state_control_dependencies();
   t.set_open_loop_traj();
 }
-} // namespace laine_tomlin::author
+} // namespace corrected_laine_tomlin::author
 #endif

@@ -17,9 +17,9 @@ template <class A, class B> void Check(const A& a, const B& b) {
              1e-12 * std::max(1.0, reference.cwiseAbs().maxCoeff())))
       throw std::runtime_error("native/Eigen product mismatch");
   };
-  check(laine_tomlin::dense::Product(a, b), expected);
+  check(corrected_laine_tomlin::dense::Product(a, b), expected);
   RowMatrix out = RowMatrix::Constant(a.rows(), b.cols(), 0.25);
-  laine_tomlin::dense::Multiply(out, a, b, -0.5, 2);
+  corrected_laine_tomlin::dense::Multiply(out, a, b, -0.5, 2);
   check(out, (0.5 - 0.5 * expected.array()).matrix());
 }
 } // namespace

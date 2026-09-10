@@ -29,11 +29,11 @@
 #include "benchmarks/reference/laine_author_adapter.h"
 #endif
 #ifdef CLQR_BENCHMARK_LAINE_CORRECTED
-#include "external_algorithms/laine_tomlin/problem_conversion.h"
+#include "external_algorithms/corrected_laine_tomlin/problem_conversion.h"
 #endif
 #ifdef CLQR_BENCHMARK_INDEPENDENT_FIXTURES
-#include "external_algorithms/laine_tomlin/test_problem.h"
-#include "external_algorithms/laine_tomlin/problem_conversion.h"
+#include "external_algorithms/corrected_laine_tomlin/test_problem.h"
+#include "external_algorithms/corrected_laine_tomlin/problem_conversion.h"
 #endif
 #if defined(CLQR_BENCHMARK_ADVERSARIAL) && \
     (defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_GTSAM) || \
@@ -463,18 +463,18 @@ private:
 class LaineCorrectedSolver {
 public:
   explicit LaineCorrectedSolver(const Problem &p)
-      : problem_(laine_tomlin::conversion::Convert(p)) {}
+      : problem_(corrected_laine_tomlin::conversion::Convert(p)) {}
   void Solve() {
-    result_ = laine_tomlin::Solve(problem_);
-    if (result_.status != laine_tomlin::Status::kOptimal)
+    result_ = corrected_laine_tomlin::Solve(problem_);
+    if (result_.status != corrected_laine_tomlin::Status::kOptimal)
       throw std::runtime_error(result_.message);
   }
   Trajectory Result() const {
     return EigenTrajectory(result_.states, result_.controls);
   }
 private:
-  laine_tomlin::Problem problem_;
-  laine_tomlin::Result result_;
+  corrected_laine_tomlin::Problem problem_;
+  corrected_laine_tomlin::Result result_;
 };
 #endif
 
@@ -735,8 +735,8 @@ int AdversarialMain(int argc, char **argv) {
       for (unsigned seed = 0; seed < 128; ++seed)
         cases.push_back({std::string(uniform ? "uniform-" : "varying-") +
                              std::to_string(seed),
-                         laine_tomlin::conversion::ToClqr(
-                             laine_tomlin::test::RandomProblem(seed, uniform))});
+                         corrected_laine_tomlin::conversion::ToClqr(
+                             corrected_laine_tomlin::test::RandomProblem(seed, uniform))});
   }
 #endif
   if (!list)

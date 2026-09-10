@@ -14,10 +14,10 @@
 #include <string>
 
 namespace {
-using namespace laine_tomlin;
-using namespace laine_tomlin::audit;
+using namespace corrected_laine_tomlin;
+using namespace corrected_laine_tomlin::audit;
 
-using laine_tomlin::author::MakeTrajectory;
+using corrected_laine_tomlin::author::MakeTrajectory;
 
 Result Run(trajectory::Trajectory &t) {
   t.compute_feedback_policies();
@@ -59,7 +59,7 @@ double AuthorStationarity(const Problem &p, const Result &r,
 Problem Analytic(const std::string &name) {
   if (name == "analytic-redundant-feedback" ||
       name == "analytic-single-feedback") {
-    auto p = laine_tomlin::test::Empty(2, 1, 1);
+    auto p = corrected_laine_tomlin::test::Empty(2, 1, 1);
     p.initial_state[0] = 1;
     for (auto &s : p.stages)
       s.B(0, 0) = 1;
@@ -113,7 +113,7 @@ Problem Analytic(const std::string &name) {
   return p;
 }
 double DenseDifference(const Problem &p, const Result &r) {
-  auto d = laine_tomlin::test::Assemble(p);
+  auto d = corrected_laine_tomlin::test::Assemble(p);
   Matrix scaled = d.J;
   Vector b = d.b;
   for (Eigen::Index i = 0; i < b.size(); ++i) {
@@ -188,11 +188,11 @@ int main(int argc, char **argv) {
     if (name.starts_with("analytic-"))
       p = Analytic(name);
     else if (name.starts_with("random-")) {
-      p = laine_tomlin::test::RandomProblem(std::stoul(name.substr(7)), true);
-      random_native = laine_tomlin::conversion::ToClqr(p);
+      p = corrected_laine_tomlin::test::RandomProblem(std::stoul(name.substr(7)), true);
+      random_native = corrected_laine_tomlin::conversion::ToClqr(p);
       native = &*random_native;
     } else if (name.starts_with("redundant-chain-")) {
-      p = laine_tomlin::test::Empty(std::stoul(name.substr(16)), 1, 1);
+      p = corrected_laine_tomlin::test::Empty(std::stoul(name.substr(16)), 1, 1);
       for (auto &s : p.stages) {
         s.C = Matrix::Ones(1, 1);
         s.D = Matrix::Zero(1, 1);

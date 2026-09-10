@@ -1,8 +1,8 @@
-#ifndef LAINE_TOMLIN_TEST_PROBLEM_H_
-#define LAINE_TOMLIN_TEST_PROBLEM_H_
+#ifndef CORRECTED_LAINE_TOMLIN_TEST_PROBLEM_H_
+#define CORRECTED_LAINE_TOMLIN_TEST_PROBLEM_H_
 #include "solver.h"
 #include <random>
-namespace laine_tomlin::test {
+namespace corrected_laine_tomlin::test {
 using Eigen::Index;
 inline Problem Empty(std::size_t N, Index n, Index m) {
   Problem p;
@@ -143,5 +143,5 @@ inline Problem RandomProblem(unsigned seed, bool uniform = false) {
   p.terminal_d = -p.terminal_C * x;
   return p;
 }
-} // namespace laine_tomlin::test
+} // namespace corrected_laine_tomlin::test
 #endif

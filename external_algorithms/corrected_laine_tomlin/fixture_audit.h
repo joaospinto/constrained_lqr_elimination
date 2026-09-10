@@ -1,5 +1,5 @@
-#ifndef LAINE_TOMLIN_FIXTURE_AUDIT_H_
-#define LAINE_TOMLIN_FIXTURE_AUDIT_H_
+#ifndef CORRECTED_LAINE_TOMLIN_FIXTURE_AUDIT_H_
+#define CORRECTED_LAINE_TOMLIN_FIXTURE_AUDIT_H_
 #include "problem_conversion.h"
 #include "solver.h"
 #include "tests/adversarial_test_support.h"
@@ -23,12 +23,12 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace laine_tomlin::audit {
+namespace corrected_laine_tomlin::audit {
 using Eigen::Index;
-using laine_tomlin::Matrix;
-using laine_tomlin::Vector;
+using corrected_laine_tomlin::Matrix;
+using corrected_laine_tomlin::Vector;
 
-using laine_tomlin::conversion::Convert;
+using corrected_laine_tomlin::conversion::Convert;
 
 inline double Max(const Matrix &a) {
   return !a.allFinite() ? std::numeric_limits<double>::infinity()
@@ -45,8 +45,8 @@ inline std::string CsvMessage(std::string s) {
 
 // Untimed independent optimality audit, NOT solver output: assemble original
 // sparse J' and find multipliers with sparse QR. This never changes the primal.
-inline std::pair<double, double> Audit(const laine_tomlin::Problem &p,
-                                       const laine_tomlin::Result &r) {
+inline std::pair<double, double> Audit(const corrected_laine_tomlin::Problem &p,
+                                       const corrected_laine_tomlin::Result &r) {
   std::vector<Index> xo, uo;
   Index vars = 0, cons = p.initial_state.size() + p.terminal_d.size();
   for (std::size_t t = 0; t < p.Q.size(); ++t) {
@@ -118,5 +118,5 @@ inline std::pair<double, double> Audit(const laine_tomlin::Problem &p,
   return {feasibility, Max(gradient + Jt * dual)};
 }
 
-} // namespace laine_tomlin::audit
+} // namespace corrected_laine_tomlin::audit
 #endif

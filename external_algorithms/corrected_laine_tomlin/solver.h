@@ -1,5 +1,5 @@
-#ifndef EXTERNAL_ALGORITHMS_LAINE_TOMLIN_SOLVER_H_
-#define EXTERNAL_ALGORITHMS_LAINE_TOMLIN_SOLVER_H_
+#ifndef EXTERNAL_ALGORITHMS_CORRECTED_LAINE_TOMLIN_SOLVER_H_
+#define EXTERNAL_ALGORITHMS_CORRECTED_LAINE_TOMLIN_SOLVER_H_
 
 // GCC can diagnose Eigen 3.4's internal triangular-product buffer during SVD
 // instantiation. Scope this upstream-template exception to Eigen's headers;
@@ -19,7 +19,7 @@
 // Our corrected FP64 Laine-Tomlin implementation; see README.md for provenance and
 // corrections to the equations in arXiv:1807.00794v2. No CLQR solver
 // dependency.
-namespace laine_tomlin {
+namespace corrected_laine_tomlin {
 
 using Matrix = Eigen::MatrixXd;
 using Vector = Eigen::VectorXd;
@@ -66,5 +66,5 @@ struct Result {
 // iterative refinement, CLQR fallback, or dense whole-horizon solve.
 Result Solve(const Problem &problem, const Options &options = {});
 
-} // namespace laine_tomlin
+} // namespace corrected_laine_tomlin
 #endif

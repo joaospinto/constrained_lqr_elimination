@@ -3,7 +3,7 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 cc_library(
-    name = "laine_tomlin",
+    name = "corrected_laine_tomlin",
     srcs = ["solver.cc"],
     hdrs = ["solver.h", "dense.h"],
     visibility = ["//visibility:public"],
@@ -24,7 +24,7 @@ cc_binary(
         "//:fp32": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
-    deps = [":laine_tomlin", "//:adversarial_test_support"],
+    deps = [":corrected_laine_tomlin", "//:adversarial_test_support"],
 )
 
 cc_library(
@@ -32,21 +32,21 @@ cc_library(
     testonly = True,
     hdrs = ["problem_conversion.h", "test_problem.h"],
     visibility = ["//:__pkg__"],
-    deps = [":laine_tomlin", "//:clqr"],
+    deps = [":corrected_laine_tomlin", "//:clqr"],
 )
 
 cc_test(
     name = "solver_test",
     size = "small",
     srcs = ["solver_test.cc", "test_problem.h"],
-    deps = [":laine_tomlin"],
+    deps = [":corrected_laine_tomlin"],
 )
 
 cc_test(
     name = "dense_test",
     size = "small",
     srcs = ["dense_test.cc"],
-    deps = [":laine_tomlin"],
+    deps = [":corrected_laine_tomlin"],
 )
 
 cc_test(
@@ -64,5 +64,5 @@ cc_test(
         "//:fp32": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
-    deps = [":laine_tomlin", "//:adversarial_test_support"],
+    deps = [":corrected_laine_tomlin", "//:adversarial_test_support"],
 )

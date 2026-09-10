@@ -1,8 +1,8 @@
-#ifndef LAINE_TOMLIN_PROBLEM_CONVERSION_H_
-#define LAINE_TOMLIN_PROBLEM_CONVERSION_H_
+#ifndef CORRECTED_LAINE_TOMLIN_PROBLEM_CONVERSION_H_
+#define CORRECTED_LAINE_TOMLIN_PROBLEM_CONVERSION_H_
 #include "clqr/clqr.h"
 #include "solver.h"
-namespace laine_tomlin::conversion {
+namespace corrected_laine_tomlin::conversion {
 using Eigen::Index;
 inline Matrix Convert(const clqr::Matrix &a) {
   Matrix b(a.rows(), a.cols());
@@ -17,8 +17,8 @@ inline Vector Convert(const clqr::Vector &a) {
     b[i] = a[i];
   return b;
 }
-inline laine_tomlin::Problem Convert(const clqr::Problem &p) {
-  laine_tomlin::Problem q;
+inline corrected_laine_tomlin::Problem Convert(const clqr::Problem &p) {
+  corrected_laine_tomlin::Problem q;
   for (const auto &Q : p.Q)
     q.Q.push_back(Convert(Q));
   for (const auto &v : p.q)
@@ -27,7 +27,7 @@ inline laine_tomlin::Problem Convert(const clqr::Problem &p) {
   q.terminal_C = Convert(p.terminal_E);
   q.terminal_d = Convert(p.terminal_e);
   for (const auto &s : p.stages) {
-    laine_tomlin::Stage t;
+    corrected_laine_tomlin::Stage t;
     t.A = Convert(s.A);
     t.B = Convert(s.B);
     t.c = Convert(s.c);
@@ -49,7 +49,7 @@ inline laine_tomlin::Problem Convert(const clqr::Problem &p) {
 
 // For independent random-fixture cross-checks only. Coefficients are copied;
 // zero-control rows may remain in C/D rather than being split into E.
-inline clqr::Problem ToClqr(const laine_tomlin::Problem &p) {
+inline clqr::Problem ToClqr(const corrected_laine_tomlin::Problem &p) {
   auto matrix = [](const Matrix &a) {
     clqr::Matrix b(a.rows(), a.cols());
     for (Index i = 0; i < a.rows(); ++i)
@@ -87,5 +87,5 @@ inline clqr::Problem ToClqr(const laine_tomlin::Problem &p) {
   }
   return q;
 }
-} // namespace laine_tomlin::conversion
+} // namespace corrected_laine_tomlin::conversion
 #endif

@@ -15,7 +15,7 @@ No third-party solver source is vendored here.
 | [Vanroye et al.](https://github.com/lvanroye/generalization_riccati) | Positive-definite reduced Hessian and full-row-rank global equality Jacobian | Primal trajectory and original multipliers |
 | [Yang et al., factor graph](https://github.com/ShuoYangRobotics/equality-constraint-LQR-compare) | Equality-constrained dynamic programming represented by Gaussian factors | Primal trajectory |
 | [Laine's original C++ solver](https://github.com/forrestlaine/parallel_lqr) | Constrained dynamic programming; the adapter supports fixed dimensions and executes the original recursion unchanged | Primal trajectory, feedback policies, and original multipliers |
-| [Corrected Laine–Tomlin](../../external_algorithms/laine_tomlin/README.md) | Our corrected implementation, with rank-aware constraint compression and optimized native dense kernels | Primal trajectory and feedback policies |
+| [Corrected Laine–Tomlin](../../external_algorithms/corrected_laine_tomlin/README.md) | Our corrected implementation, with rank-aware constraint compression and optimized native dense kernels | Primal trajectory and feedback policies |
 
 Method assumptions are not accuracy guarantees for every numerical
 implementation. The Laine comparison uses the author's pinned source unchanged;

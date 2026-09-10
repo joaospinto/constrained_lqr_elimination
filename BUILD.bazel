@@ -100,7 +100,7 @@ cc_library(
     name = "cpu_dense_reference_kernels",
     hdrs = ["src/cpu_dense.h", "include/clqr/linalg.h"],
     includes = ["include"],
-    visibility = ["//external_algorithms/laine_tomlin:__pkg__"],
+    visibility = ["//external_algorithms/corrected_laine_tomlin:__pkg__"],
 )
 
 cc_test(
@@ -157,7 +157,7 @@ cc_binary(
         ":fp32": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
-    deps = [":clqr", "//external_algorithms/laine_tomlin:comparison_support"],
+    deps = [":clqr", "//external_algorithms/corrected_laine_tomlin:comparison_support"],
 )
 
 cc_binary(
@@ -229,7 +229,7 @@ py_test(
 
 cc_library(
     name = "adversarial_test_support",
-    visibility = ["//external_algorithms/laine_tomlin:__pkg__"],
+    visibility = ["//external_algorithms/corrected_laine_tomlin:__pkg__"],
     hdrs = ["tests/adversarial_test_support.h"],
     includes = ["tests"],
     testonly = True,

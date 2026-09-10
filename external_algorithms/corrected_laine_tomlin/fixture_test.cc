@@ -10,7 +10,7 @@
 #include <string_view>
 
 namespace {
-using namespace laine_tomlin::audit;
+using namespace corrected_laine_tomlin::audit;
 template <class F> double Time(F solve) {
   using Clock = std::chrono::steady_clock;
   auto ms = [](auto start) {
@@ -50,8 +50,8 @@ int main(int argc, char **argv) {
         cases.push_back(
             {std::string(uniform ? "uniform-" : "varying-") +
                  std::to_string(seed),
-             laine_tomlin::conversion::ToClqr(
-                 laine_tomlin::test::RandomProblem(seed, uniform))});
+             corrected_laine_tomlin::conversion::ToClqr(
+                 corrected_laine_tomlin::test::RandomProblem(seed, uniform))});
   }
   int failures = 0, returned = 0;
   std::cout << std::setprecision(12)
@@ -60,21 +60,21 @@ int main(int argc, char **argv) {
   for (const auto &c : cases) {
     try {
       const auto p = Convert(c.problem);
-      auto r = laine_tomlin::Solve(p);
+      auto r = corrected_laine_tomlin::Solve(p);
       auto expected = c.cpu_status;
       // CLQR can return indefinite Newton directions; this reference minimizes.
       if (c.name == "indefinite-reduced-hessian")
         expected = clqr::SolveStatus::kNumericalFailure;
       const auto mapped = expected == clqr::SolveStatus::kOptimal
-                              ? laine_tomlin::Status::kOptimal
+                              ? corrected_laine_tomlin::Status::kOptimal
                           : expected == clqr::SolveStatus::kInfeasible
-                              ? laine_tomlin::Status::kInfeasible
+                              ? corrected_laine_tomlin::Status::kInfeasible
                           : expected == clqr::SolveStatus::kInvalidInput
-                              ? laine_tomlin::Status::kInvalidInput
-                              : laine_tomlin::Status::kNumericalFailure;
+                              ? corrected_laine_tomlin::Status::kInvalidInput
+                              : corrected_laine_tomlin::Status::kNumericalFailure;
       if (r.status != mapped)
         ++failures;
-      if (r.status != laine_tomlin::Status::kOptimal) {
+      if (r.status != corrected_laine_tomlin::Status::kOptimal) {
         std::cout << c.name << ",rejected,nan,nan,nan,nan,nan,nan,"
                   << CsvMessage(r.message) << '\n';
         continue;
@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
         throw std::runtime_error(native.message);
       double lt_ms = std::numeric_limits<double>::quiet_NaN(), cpu_ms = lt_ms;
       if (benchmark) {
-        lt_ms = Time([&] { r = laine_tomlin::Solve(p); });
+        lt_ms = Time([&] { r = corrected_laine_tomlin::Solve(p); });
         cpu_ms = Time([&] { native = clqr::Solve(c.problem, workspace); });
       }
       const auto [primal, stationarity] = Audit(p, r);

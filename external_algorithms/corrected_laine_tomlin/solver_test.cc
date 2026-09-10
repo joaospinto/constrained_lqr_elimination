@@ -12,9 +12,9 @@
 #include <stdexcept>
 
 namespace {
-using namespace laine_tomlin;
+using namespace corrected_laine_tomlin;
 using Eigen::Index;
-using namespace laine_tomlin::test;
+using namespace corrected_laine_tomlin::test;
 
 void Check(bool ok, const std::string &what) {
   if (!ok)

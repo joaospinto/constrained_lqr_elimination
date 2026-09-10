@@ -181,7 +181,7 @@ bazel-bin/clqr_paper_fixture --suite "$suite" > "$output_dir/cases.json"
   //:cuda_kernel_emulation_extended_test //:paper_results_test //:notebook_paper_test \
   //benchmarks/reference:quadratic_factor_test \
   //benchmarks/reference:stationarity_audit_test \
-  //external_algorithms/laine_tomlin:all
+  //external_algorithms/corrected_laine_tomlin:all
 
 # Build the authors' factor-graph dependency without unused modules or Boost.
 cmake -S "$deps_dir/gtsam" -B "$cache_dir/gtsam-build" \
