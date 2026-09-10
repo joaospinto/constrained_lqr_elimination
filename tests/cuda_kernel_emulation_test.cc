@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "../benchmarks/cuda_benchmark_problem.h"
+#include "../benchmarks/paper_cases.h"
+#include "../benchmarks/scaling_problem.h"
 #include "../src/cuda_solver.cu"
 #include "adversarial_test_support.h"
 #include "cuda_jax_problem.h"
@@ -107,6 +109,73 @@ void Expect(bool condition, const std::string &message) {
     std::cerr << "FAIL: " << message << '\n';
     std::exit(1);
   }
+}
+
+void CheckReducedObjectiveIdentity(
+    const Problem& problem, const std::vector<StateParam>& states,
+    const std::vector<ControlParam>& controls,
+    const std::vector<ReducedStage>& stages, const ReducedTerminal& terminal,
+    const std::string& name) {
+  const auto matrix = [](const Scalar* values, int rows, int cols) {
+    Matrix out(rows, cols);
+    for (int i = 0; i < rows; ++i)
+      for (int j = 0; j < cols; ++j) out(i, j) = values[i * cols + j];
+    return out;
+  };
+  const auto vector = [](const Scalar* values, int rows) {
+    Vector out(rows);
+    for (int i = 0; i < rows; ++i) out[i] = values[i];
+    return out;
+  };
+  const std::size_t N = stages.size();
+  Problem reduced;
+  reduced.stages.resize(N);
+  reduced.Q.resize(N + 1);
+  reduced.q.resize(N + 1);
+  std::vector<Vector> x(N + 1), z(N + 1), t(N + 1), u(N), v(N), y(N);
+  for (std::size_t i = 0; i <= N; ++i) {
+    t[i] = vector(states[i].t, states[i].physical_dim);
+    const int n = states[i].reduced_dim;
+    reduced.Q[i] = matrix(i == N ? terminal.Q : stages[i].Q, n, n);
+    reduced.q[i] = vector(i == N ? terminal.q : stages[i].q, n);
+    if (i < N) {
+      y[i] = vector(controls[i].y, controls[i].physical_dim);
+      auto& s = reduced.stages[i];
+      s.M = matrix(stages[i].M, n, stages[i].m);
+      s.R = matrix(stages[i].R, stages[i].m, stages[i].m);
+      s.r = vector(stages[i].r, stages[i].m);
+    }
+  }
+  const long double kappa = clqr::benchmark::OriginalObjective(problem, t, y);
+  clqr::benchmark::Random random(7901);
+  long double maximum = 0;
+  for (int probe = 0; probe < 4; ++probe) {
+    for (std::size_t i = 0; i <= N; ++i) {
+      const auto& s = states[i];
+      z[i] = random.Vec(s.reduced_dim, probe == 0 ? Scalar{0} : Scalar{0.7});
+      x[i] = matrix(s.T, s.physical_dim, s.reduced_dim) * z[i] + t[i];
+      if (i < N) {
+        const auto& c = controls[i];
+        v[i] = random.Vec(c.reduced_dim, probe == 0 ? Scalar{0} : Scalar{0.4});
+        u[i] = matrix(c.Y, c.physical_dim, c.state_dim) * z[i] +
+               matrix(c.Z, c.physical_dim, c.reduced_dim) * v[i] + y[i];
+      }
+    }
+    const long double original = clqr::benchmark::OriginalObjective(problem, x, u);
+    const long double transformed = clqr::benchmark::OriginalObjective(reduced, z, v);
+    const long double relative = std::abs(original - transformed - kappa) /
+        std::max({1.0L, std::abs(original), std::abs(transformed), std::abs(kappa)});
+#ifdef CLQR_USE_FLOAT
+    constexpr long double tolerance = 5e-4L;
+#else
+    constexpr long double tolerance = 5e-11L;
+#endif
+    Expect(std::isfinite(relative) && relative <= tolerance,
+           name + " reduced-plus-constant objective identity, relative error=" +
+               std::to_string(static_cast<double>(relative)));
+    maximum = std::max(maximum, relative);
+  }
+  std::cout << name << " objective identity: max relative discrepancy=" << maximum << '\n';
 }
 
 bool FinishAllowedDeviceFailure(const DeviceStatus &status,
@@ -1766,6 +1835,8 @@ void RunEmulation(const Problem &problem, const std::string &name,
   if (FinishAllowedDeviceFailure(status, name, "independent reduction",
                                  allowed_failure))
     return;
+  CheckReducedObjectiveIdentity(problem, state_params, control_params, reduced,
+                                reduced_terminal, name);
   bool reduced_a_state = false;
   bool reduced_a_control = false;
   for (const StateParam &param : state_params)
@@ -2271,13 +2342,48 @@ bool FitsAdversarialEmulationStorage(const Problem &problem) {
 
 int main(int argc, char **argv) {
   bool extended = false;
+  bool paper = false;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--extended") {
       extended = true;
+    } else if (std::string(argv[i]) == "--paper") {
+      paper = true;
     } else {
       std::cerr << "unknown argument: " << argv[i] << '\n';
       return 2;
     }
+  }
+  if (paper || extended) {
+#ifdef CLQR_USE_FLOAT
+    if (paper) {
+      std::cerr << "paper fixture emulation requires FP64\n";
+      return 2;
+    }
+#else
+    std::size_t executed = 0;
+    for (const auto &test : clqr::benchmark::PaperCases("all")) {
+      // Keep host-emulation storage bounded; this is not a GPU capacity claim.
+      if (test.horizon > 512 || test.n > kTestStateCapacity)
+        continue;
+      const auto data = clqr::benchmark::MakeScalingProblem(
+          test.horizon, test.n, test.m, test.mixed, test.state);
+      Expect(FitsAdversarialEmulationStorage(data.problem),
+             "paper case fits the emulation backing storage");
+      const Scalar base_tolerance = test.horizon >= 256
+                                        ? kLongHorizonKktComparisonTolerance
+                                        : kKktComparisonTolerance;
+      RunEmulation(
+          data.problem,
+          "paper-" + test.family + "-N" + std::to_string(test.horizon) + "-n" +
+              std::to_string(test.n) + "-pm" + std::to_string(test.mixed) +
+              "-ps" + std::to_string(test.state),
+          false, false, true, Scalar{1e-8} / base_tolerance);
+      ++executed;
+    }
+    std::cout << "all " << executed << " paper CUDA emulation cases passed\n";
+    if (paper)
+      return 0;
+#endif
   }
   TinyCoefficientRrefCase();
   CoordinatePivotingCase();

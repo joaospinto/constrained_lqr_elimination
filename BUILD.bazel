@@ -100,6 +100,22 @@ cc_test(
     }),
 )
 
+cc_library(
+    name = "cpu_elimination_test_sources",
+    testonly = True,
+    hdrs = [
+        "benchmarks/scaling_problem.h",
+        "include/clqr/clqr.h",
+        "include/clqr/linalg.h",
+        "src/cpu_dense.h",
+    ],
+    textual_hdrs = ["src/clqr.cc"],
+    includes = ["include"],
+    defines = select({
+        ":fp32": ["CLQR_USE_FLOAT=1"],
+        "//conditions:default": [],
+    }),
+)
 
 cc_binary(
     name = "clqr_paper_fixture",
@@ -156,7 +172,21 @@ py_binary(
     deps = [":paper_jax_benchmark_lib", requirement("jax-cuda12-plugin"), requirement("jax-cuda12-pjrt")],
 )
 
+py_test(
+    name = "paper_jax_fixture_test",
+    srcs = ["tests/paper_jax_fixture_test.py"],
+    deps = [":paper_jax_benchmark_lib"],
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)
 
+cc_test(
+    name = "reduced_objective_test",
+    srcs = ["tests/reduced_objective_test.cc", "src/linalg.cc"],
+    deps = [":cpu_elimination_test_sources"],
+)
 
 py_test(
     name = "cpu_mixed_cubic_source_audit_test",
@@ -320,6 +350,8 @@ cc_binary(
 cc_library(
     name = "cuda_kernel_emulation_sources",
     hdrs = [
+        "benchmarks/paper_cases.h",
+        "benchmarks/scaling_problem.h",
         "include/clqr/cuda.h",
         "src/cuda_device_io.h",
         "src/cuda_internal.h",

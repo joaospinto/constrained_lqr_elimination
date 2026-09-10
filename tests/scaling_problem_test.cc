@@ -31,6 +31,17 @@ int main() {
       for (int kind = 0; kind < 3; ++kind) {
         const auto data = clqr::benchmark::MakeScalingProblem(
             horizon, n, m, kind == 0 ? 0 : m / 2, kind == 1 ? 0 : m / 2);
+        clqr::test::adversarial::KktPoint planted;
+        planted.states = data.states;
+        planted.controls = data.controls;
+        planted.initial_multiplier = data.dual.initial;
+        planted.dynamics_multipliers = data.dual.dynamics;
+        planted.mixed_multipliers = data.dual.mixed;
+        planted.state_multipliers = data.dual.state;
+        planted.terminal_state_multiplier = data.dual.terminal;
+        if (clqr::test::adversarial::MaxKktResidual(data.problem, planted) >
+            1e-12)
+          throw std::runtime_error("fixture's planted primal-dual certificate");
         clqr::Workspace workspace;
         workspace.Reserve(data.problem);
         const auto result = clqr::Solve(data.problem, workspace);
