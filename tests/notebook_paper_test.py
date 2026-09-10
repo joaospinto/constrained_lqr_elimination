@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -13,6 +14,32 @@ from scripts import notebook_paper
 
 
 class NotebookTest(unittest.TestCase):
+    def test_bazel_version_with_and_without_startup_options(self):
+        root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
+        driver = (root / "scripts/paper_benchmarks.sh").read_text()
+        start = driver.index('bazel_command="$(clqr_notebook_bazel')
+        end = driver.index('\ncd "$repo_dir"', start)
+        # Execute the driver's actual command construction with a stand-in
+        # that reports its argv. This does not start nested Bazel servers.
+        shell = 'clqr_notebook_bazel() { printf "%s\\n" "$CLQR_BAZEL"; }\n'
+        shell += driver[start:end]
+        for explicit_root in (False, True):
+            with self.subTest(explicit_root=explicit_root), \
+                 tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                bazel = work / "fake bazel"
+                bazel.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+                bazel.chmod(0o755)
+                cache = str(work / "private cache") if explicit_root else ""
+                env = dict(os.environ, CLQR_BAZEL=str(bazel),
+                           CLQR_PAPER_BAZEL_ROOT=cache, repo_dir=str(root),
+                           output_dir=str(work))
+                subprocess.run(["bash", "-euo", "pipefail", "-c", shell],
+                               env=env, check=True, capture_output=True, text=True)
+                expected = (["--output_user_root=" + cache] if explicit_root else [])
+                self.assertEqual((work / "platform.txt").read_text().splitlines(),
+                                 expected + ["version"])
+
     def test_results_survive_success_and_failure(self):
         for code in (0, 1):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:

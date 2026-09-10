@@ -164,7 +164,8 @@ if [[ -n "${CLQR_PAPER_BAZEL_ROOT:-}" ]]; then
   bazel_cmd+=(--output_user_root="$CLQR_PAPER_BAZEL_ROOT")
 fi
 trap '"${bazel_cmd[@]}" shutdown || true' EXIT
-"${bazel_cmd[@]}" --version >> "$output_dir/platform.txt"
+# Use the subcommand: --version is not accepted after explicit startup options.
+"${bazel_cmd[@]}" version >> "$output_dir/platform.txt"
 cd "$repo_dir"
 bazel_args=(--config=fp64 --jobs="$jobs" --cxxopt=-march=native)
 targets=(//:clqr_paper_jax_cpu_benchmark //:clqr_paper_fixture)

@@ -26,7 +26,10 @@ py_test(
     name = "notebook_paper_test",
     srcs = ["tests/notebook_paper_test.py", "scripts/notebook_paper.py"],
     main = "tests/notebook_paper_test.py",
-    data = ["notebooks/kaggle_paper_comparison.ipynb"],
+    data = [
+        "notebooks/kaggle_paper_comparison.ipynb",
+        "scripts/paper_benchmarks.sh",
+    ],
 )
 
 whl_filegroup(
