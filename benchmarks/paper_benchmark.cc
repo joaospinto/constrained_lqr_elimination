@@ -28,7 +28,7 @@
 #ifdef CLQR_BENCHMARK_LAINE
 #include "benchmarks/reference/laine_author_adapter.h"
 #endif
-#ifdef CLQR_BENCHMARK_LAINE_REIMPLEMENTATION
+#ifdef CLQR_BENCHMARK_LAINE_CORRECTED
 #include "external_algorithms/laine_tomlin/problem_conversion.h"
 #endif
 #ifdef CLQR_BENCHMARK_INDEPENDENT_FIXTURES
@@ -37,7 +37,7 @@
 #endif
 #if defined(CLQR_BENCHMARK_ADVERSARIAL) && \
     (defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_GTSAM) || \
-     defined(CLQR_BENCHMARK_LAINE_REIMPLEMENTATION))
+     defined(CLQR_BENCHMARK_LAINE_CORRECTED))
 #include "benchmarks/reference/stationarity_audit.h"
 #endif
 
@@ -420,7 +420,7 @@ private:
 };
 #endif
 
-#if defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_LAINE_REIMPLEMENTATION)
+#if defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_LAINE_CORRECTED)
 Trajectory EigenTrajectory(const std::vector<Eigen::VectorXd> &x,
                            const std::vector<Eigen::VectorXd> &u) {
   Trajectory out;
@@ -459,10 +459,10 @@ private:
 };
 #endif
 
-#ifdef CLQR_BENCHMARK_LAINE_REIMPLEMENTATION
-class LaineReferenceSolver {
+#ifdef CLQR_BENCHMARK_LAINE_CORRECTED
+class LaineCorrectedSolver {
 public:
-  explicit LaineReferenceSolver(const Problem &p)
+  explicit LaineCorrectedSolver(const Problem &p)
       : problem_(laine_tomlin::conversion::Convert(p)) {}
   void Solve() {
     result_ = laine_tomlin::Solve(problem_);
@@ -629,7 +629,7 @@ void RunAdversarial(const TestCase &c, const char *backend, int repeats) {
       point.terminal_state_multiplier = dual->terminal;
       unit_kkt = clqr::test::adversarial::MaxKktResidual(p, point, &worst);
     }
-#if defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_GTSAM) || defined(CLQR_BENCHMARK_LAINE_REIMPLEMENTATION)
+#if defined(CLQR_BENCHMARK_LAINE) || defined(CLQR_BENCHMARK_GTSAM) || defined(CLQR_BENCHMARK_LAINE_CORRECTED)
     else {
       clqr::benchmark::reference::Trajectory audited;
       for (const auto &x : trajectory.first)
@@ -715,8 +715,8 @@ int AdversarialMain(int argc, char **argv) {
 #ifdef CLQR_BENCHMARK_LAINE
   backends.push_back("laine_author");
 #endif
-#ifdef CLQR_BENCHMARK_LAINE_REIMPLEMENTATION
-  backends.push_back("laine_reimplementation");
+#ifdef CLQR_BENCHMARK_LAINE_CORRECTED
+  backends.push_back("laine_corrected");
 #endif
   if (!backend.empty() &&
       std::find(backends.begin(), backends.end(), backend) == backends.end())
@@ -769,9 +769,9 @@ int AdversarialMain(int argc, char **argv) {
     if (backend.empty() || backend == "laine_author")
       RunAdversarial<LaineAuthorSolver>(c, "laine_author", repeats);
 #endif
-#ifdef CLQR_BENCHMARK_LAINE_REIMPLEMENTATION
-    if (backend.empty() || backend == "laine_reimplementation")
-      RunAdversarial<LaineReferenceSolver>(c, "laine_reimplementation", repeats);
+#ifdef CLQR_BENCHMARK_LAINE_CORRECTED
+    if (backend.empty() || backend == "laine_corrected")
+      RunAdversarial<LaineCorrectedSolver>(c, "laine_corrected", repeats);
 #endif
   }
   if (!found)
@@ -843,8 +843,8 @@ int main(int argc, char **argv) {
 #ifdef CLQR_BENCHMARK_LAINE
     Run<LaineAuthorSolver>(c, data, "laine_author", repeats, seed);
 #endif
-#ifdef CLQR_BENCHMARK_LAINE_REIMPLEMENTATION
-    Run<LaineReferenceSolver>(c, data, "laine_reimplementation", repeats, seed);
+#ifdef CLQR_BENCHMARK_LAINE_CORRECTED
+    Run<LaineCorrectedSolver>(c, data, "laine_corrected", repeats, seed);
 #endif
   }
   // Keep all numerical outcomes in the CSV, without turning them into test

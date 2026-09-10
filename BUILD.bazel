@@ -140,10 +140,10 @@ cc_binary(
 )
 
 cc_binary(
-    name = "clqr_laine_reimplementation_benchmark",
+    name = "clqr_laine_corrected_benchmark",
     testonly = True,
     srcs = ["benchmarks/paper_benchmark.cc", "benchmarks/paper_cases.h", "benchmarks/scaling_problem.h"],
-    defines = ["CLQR_BENCHMARK_LAINE_REIMPLEMENTATION"],
+    defines = ["CLQR_BENCHMARK_LAINE_CORRECTED"],
     tags = ["manual"],
     target_compatible_with = select({
         ":fp32": ["@platforms//:incompatible"],

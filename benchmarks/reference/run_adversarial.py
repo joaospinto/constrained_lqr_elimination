@@ -14,7 +14,7 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--repeats", type=int, default=21)
     parser.add_argument("--independent", action="store_true",
-                        help="use the opt-in reimplementation's independent fixtures")
+                        help="use the corrected Laine-Tomlin implementation's independent fixtures")
     args = parser.parse_args()
     native = args.build.resolve() / "clqr_adversarial_benchmark"
     if not native.is_file():
@@ -28,7 +28,7 @@ def main():
     for target, backends in (
         ("clqr_adversarial_factor_graph_benchmark", ("factor_graph",)),
         ("clqr_adversarial_laine_benchmark", ("laine_author",)),
-        ("clqr_adversarial_laine_reimplementation_benchmark", ("laine_reimplementation",)),
+        ("clqr_adversarial_laine_corrected_benchmark", ("laine_corrected",)),
     ):
         executable = args.build.resolve() / target
         if executable.is_file():

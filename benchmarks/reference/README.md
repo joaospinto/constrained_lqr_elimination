@@ -14,10 +14,18 @@ No third-party solver source is vendored here.
 | [Vanroye et al.](https://github.com/lvanroye/generalization_riccati) | Positive-definite reduced Hessian and full-row-rank global equality Jacobian | Primal trajectory and original multipliers |
 | [Yang et al., factor graph](https://github.com/ShuoYangRobotics/equality-constraint-LQR-compare) | Equality-constrained dynamic programming represented by Gaussian factors | Primal trajectory |
 | [Laine's original C++ solver](https://github.com/forrestlaine/parallel_lqr) | Constrained dynamic programming; the adapter supports fixed dimensions and executes the original recursion unchanged | Primal trajectory, feedback policies, and original multipliers |
+| [Corrected Laine–Tomlin](../../external_algorithms/laine_tomlin/README.md) | Our corrected implementation, with rank-aware constraint compression and optimized native dense kernels | Primal trajectory and feedback policies |
 
 Method assumptions are not accuracy guarantees for every numerical
 implementation. The Laine comparison uses the author's pinned source unchanged;
 its results are audited rather than assumed accurate.
+
+The corrected Laine–Tomlin solver is separately labeled `laine_corrected`,
+not attributed to the authors' implementation. Enable its CMake targets with
+`CLQR_COMPARE_LAINE_CORRECTED=ON`, or run the manual Bazel target
+`//:clqr_laine_corrected_benchmark`. It still uses Eigen for SVD and Cholesky
+factorization, but shares CLQR's SIMD matrix-product and triangular-solve kernels.
+It does not call the CLQR solver and is not a dependency of the CLQR library.
 
 The [factor-graph paper](https://arxiv.org/abs/2011.01360) formulates
 positive-definite state/control costs and

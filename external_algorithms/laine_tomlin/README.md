@@ -1,6 +1,6 @@
-# Laine–Tomlin reference implementation
+# Corrected Laine–Tomlin implementation
 
-This is **our independent C++ reimplementation** of the sequential constrained
+This is **our corrected C++ implementation** of the sequential constrained
 dynamic-programming method of Forrest Laine and Claire Tomlin, not their source
 code and not the CLQR elimination algorithm. It uses FP64 and Eigen storage,
 SVDs, and Cholesky factorizations. Matrix products and multiple-RHS triangular
@@ -199,15 +199,17 @@ independently audited stationarity, primal difference, CLQR KKT residual where
 available, expected mathematical outcome, and optional author-multiplier
 stationarity. Use `--implicit` to exercise equivalent parameterized endpoint
 inputs. `--multipliers` additionally audits the author's `compute_multipliers`
-and `set_lq_multipliers` outputs; the default audit and timed benchmark assess
-primals, without attributing external QR multipliers to the author solver.
+and `set_lq_multipliers` outputs. This standalone audit defaults to primal-only
+measurements; the paper benchmark instead times the author's multiplier
+recovery and reports its returned-dual KKT residuals. Neither attributes
+external QR multipliers to the author solver.
 `-DAUDIT_EIGEN_ASSERTIONS=ON` enables Eigen assertions in the original sources.
 
 For the identical dense cases used by the paper's comparison harness, run
-`bazel run --config=fp64 //:clqr_laine_reimplementation_benchmark -- --suite dimension`.
+`bazel run --config=fp64 //:clqr_laine_corrected_benchmark -- --suite dimension`.
 The optional CMake harness also provides this target when configured with
-`-DCLQR_COMPARE_LAINE_REIMPLEMENTATION=ON` and `EIGEN_SOURCE_DIR`; no author
-checkout is required. It prints `clqr_cpu` and `laine_reimplementation`
+`-DCLQR_COMPARE_LAINE_CORRECTED=ON` and `EIGEN_SOURCE_DIR`; no author
+checkout is required. It prints `clqr_cpu` and `laine_corrected`
 separately. The latter has no reported-dual KKT
 column; `planted_dual_stationarity_inf` checks each returned primal using the
 fixture's known optimal multipliers. This untimed, linear-horizon certificate

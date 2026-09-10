@@ -1,4 +1,4 @@
-// Adapter for the original author-written solver, not our reimplementation.
+// Adapter for the original author-written solver, not our corrected implementation.
 // Only input coefficients are assigned here. Every DP and forward operation
 // executes in the separately downloaded, unmodified trajectory.cpp.
 #include "../fixture_audit.h"

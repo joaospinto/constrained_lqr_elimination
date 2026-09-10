@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-// Independent FP64 reference implementation; see README.md for provenance and
+// Our corrected FP64 Laine-Tomlin implementation; see README.md for provenance and
 // corrections to the equations in arXiv:1807.00794v2. No CLQR solver
 // dependency.
 namespace laine_tomlin {

@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
   }
   int failures = 0, returned = 0;
   std::cout << std::setprecision(12)
-            << "case,status,laine_ms,clqr_ms,feasibility_inf,audited_"
+            << "case,status,laine_corrected_ms,clqr_ms,feasibility_inf,audited_"
                "stationarity_inf,clqr_kkt_inf,primal_difference,diagnostic\n";
   for (const auto &c : cases) {
     try {
