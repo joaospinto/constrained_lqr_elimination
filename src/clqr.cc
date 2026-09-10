@@ -8,6 +8,8 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "cpu_dense.h"
+
 namespace clqr {
 
 namespace {
@@ -1065,15 +1067,13 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
   }
   Matrix& Q = state.problem.Q[i];
   Vector& q = state.problem.q[i];
-  const Matrix old_Q = Q;
   const Matrix& old_R = s.R;
   const Matrix& old_M = s.M;
-  const Matrix& old_A = s.A;
   const Matrix& old_B = s.B;
   const Vector old_q = q;
   const Vector& old_r = s.r;
   const Vector& old_c = s.c;
-  const std::size_t n = old_Q.rows();
+  const std::size_t n = Q.rows();
   const std::size_t m = old_R.rows();
   const std::size_t next_n = old_B.rows();
   const std::size_t reduced_m = basis.Z.cols();
@@ -1087,42 +1087,27 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
     affine_control_gradient[row] = value + old_r[row];
   }
 
-  for (std::size_t row = 0; row < n; ++row) {
-    for (std::size_t col = 0; col < n; ++col) {
-      Scalar value = old_Q(row, col);
-      for (std::size_t u = 0; u < m; ++u) {
-        value += old_M(row, u) * basis.Y(u, col);
-        value += old_M(col, u) * basis.Y(u, row);
-        value += basis.Y(u, row) * r_times_y(u, col);
-      }
-      Q(row, col) = value;
-    }
-  }
+  detail::NativeGemm<Scalar>(false, false, n, n, m, 1, old_M.data().data(), m,
+                    basis.Y.data().data(), n, 1, Q.data().data(), n);
+  detail::NativeGemm<Scalar>(true, true, n, n, m, 1, basis.Y.data().data(), n,
+                    old_M.data().data(), m, 1, Q.data().data(), n);
+  detail::NativeGemm<Scalar>(true, false, n, n, m, 1, basis.Y.data().data(), n,
+                    r_times_y.data().data(), n, 1, Q.data().data(), n);
   SymmetrizeInPlace(Q);
 
   Matrix new_R(reduced_m, reduced_m);
-  for (std::size_t row = 0; row < reduced_m; ++row) {
-    for (std::size_t col = 0; col < reduced_m; ++col) {
-      Scalar value = Scalar{0};
-      for (std::size_t u = 0; u < m; ++u) {
-        value += basis.Z(u, row) * r_times_z(u, col);
-      }
-      new_R(row, col) = value;
-    }
-  }
+  detail::NativeGemm<Scalar>(true, false, reduced_m, reduced_m, m, 1,
+                    basis.Z.data().data(), reduced_m, r_times_z.data().data(),
+                    reduced_m, 0, new_R.data().data(), reduced_m);
   SymmetrizeInPlace(new_R);
 
   Matrix new_M(n, reduced_m);
-  for (std::size_t row = 0; row < n; ++row) {
-    for (std::size_t col = 0; col < reduced_m; ++col) {
-      Scalar value = Scalar{0};
-      for (std::size_t u = 0; u < m; ++u) {
-        value += old_M(row, u) * basis.Z(u, col);
-        value += basis.Y(u, row) * r_times_z(u, col);
-      }
-      new_M(row, col) = value;
-    }
-  }
+  detail::NativeGemm<Scalar>(false, false, n, reduced_m, m, 1, old_M.data().data(), m,
+                    basis.Z.data().data(), reduced_m, 0, new_M.data().data(),
+                    reduced_m);
+  detail::NativeGemm<Scalar>(true, false, n, reduced_m, m, 1, basis.Y.data().data(), n,
+                    r_times_z.data().data(), reduced_m, 1, new_M.data().data(),
+                    reduced_m);
 
   for (std::size_t row = 0; row < n; ++row) {
     Scalar value = old_q[row];
@@ -1141,23 +1126,12 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
     new_r[row] = value;
   }
 
-  for (std::size_t row = 0; row < next_n; ++row) {
-    for (std::size_t col = 0; col < n; ++col) {
-      Scalar value = old_A(row, col);
-      for (std::size_t u = 0; u < m; ++u)
-        value += old_B(row, u) * basis.Y(u, col);
-      s.A(row, col) = value;
-    }
-  }
+  detail::NativeGemm<Scalar>(false, false, next_n, n, m, 1, old_B.data().data(), m,
+                    basis.Y.data().data(), n, 1, s.A.data().data(), n);
   Matrix new_B(next_n, reduced_m);
-  for (std::size_t row = 0; row < next_n; ++row) {
-    for (std::size_t col = 0; col < reduced_m; ++col) {
-      Scalar value = Scalar{0};
-      for (std::size_t u = 0; u < m; ++u)
-        value += old_B(row, u) * basis.Z(u, col);
-      new_B(row, col) = value;
-    }
-  }
+  detail::NativeGemm<Scalar>(false, false, next_n, reduced_m, m, 1,
+                    old_B.data().data(), m, basis.Z.data().data(), reduced_m,
+                    0, new_B.data().data(), reduced_m);
   for (std::size_t row = 0; row < next_n; ++row) {
     Scalar value = old_c[row];
     for (std::size_t u = 0; u < m; ++u) value += old_B(row, u) * basis.y[u];
@@ -1961,29 +1935,7 @@ void SolveMatrixWithCholeskyRaw(const Scalar* CLQR_RESTRICT lower,
       solve_hxu[control * n + state] = Hxu[state * m + control];
     }
   }
-  for (std::size_t row = 0; row < m; ++row) {
-    CLQR_UNROLL
-    for (std::size_t col = 0; col < n; ++col) {
-      Scalar value = solve_hxu[row * n + col];
-      CLQR_UNROLL
-      for (std::size_t k = 0; k < row; ++k) {
-        value -= lower[row * m + k] * solve_hxu[k * n + col];
-      }
-      solve_hxu[row * n + col] = value / lower[row * m + row];
-    }
-  }
-  for (std::size_t rev = 0; rev < m; ++rev) {
-    const std::size_t row = m - 1 - rev;
-    CLQR_UNROLL
-    for (std::size_t col = 0; col < n; ++col) {
-      Scalar value = solve_hxu[row * n + col];
-      CLQR_UNROLL
-      for (std::size_t k = row + 1; k < m; ++k) {
-        value -= lower[k * m + row] * solve_hxu[k * n + col];
-      }
-      solve_hxu[row * n + col] = value / lower[row * m + row];
-    }
-  }
+  detail::NativeCholeskySolve(lower, m, n, solve_hxu);
 }
 
 bool PivotedLuFactorizeRaw(const Scalar* CLQR_RESTRICT matrix, std::size_t n,
@@ -2930,65 +2882,19 @@ bool ComputeUnconstrainedRiccatiInto(
     const Scalar* CLQR_RESTRICT R_data = s.R.data().data();
     const Scalar* CLQR_RESTRICT M_data = s.M.data().data();
 
-    for (std::size_t row = 0; row < n; ++row) {
-      Scalar* CLQR_RESTRICT out = workspace->A_T_P + row * next_n;
-      for (std::size_t p_row = 0; p_row < next_n; ++p_row) {
-        Scalar value = Scalar{0};
-        const Scalar* CLQR_RESTRICT p_data = P_next + p_row * next_n;
-        CLQR_UNROLL
-        for (std::size_t p_col = 0; p_col < next_n; ++p_col) {
-          value += p_data[p_col] * A_data[p_col * n + row];
-        }
-        out[p_row] = value;
-      }
-    }
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col <= row; ++col) {
-        Scalar value = Q_data[row * n + col];
-        CLQR_UNROLL
-        for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += workspace->A_T_P[row * next_n + shared] *
-                   A_data[shared * n + col];
-        }
-        workspace->Hxx[row * n + col] = value;
-      }
-    }
-
-    for (std::size_t row = 0; row < m; ++row) {
-      Scalar* CLQR_RESTRICT out = workspace->B_T_P + row * next_n;
-      for (std::size_t p_row = 0; p_row < next_n; ++p_row) {
-        Scalar value = Scalar{0};
-        const Scalar* CLQR_RESTRICT p_data = P_next + p_row * next_n;
-        CLQR_UNROLL
-        for (std::size_t p_col = 0; p_col < next_n; ++p_col) {
-          value += p_data[p_col] * B_data[p_col * m + row];
-        }
-        out[p_row] = value;
-      }
-    }
-    for (std::size_t row = 0; row < m; ++row) {
-      for (std::size_t col = 0; col <= row; ++col) {
-        Scalar value = R_data[row * m + col];
-        CLQR_UNROLL
-        for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += workspace->B_T_P[row * next_n + shared] *
-                   B_data[shared * m + col];
-        }
-        workspace->Huu[row * m + col] = value;
-      }
-    }
-
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col < m; ++col) {
-        Scalar value = M_data[row * m + col];
-        CLQR_UNROLL
-        for (std::size_t shared = 0; shared < next_n; ++shared) {
-          value += workspace->A_T_P[row * next_n + shared] *
-                   B_data[shared * m + col];
-        }
-        workspace->Hxu[row * m + col] = value;
-      }
-    }
+    detail::NativeGemm<Scalar>(true, true, n, next_n, next_n, 1, A_data, n, P_next,
+                      next_n, 0, workspace->A_T_P, next_n);
+    detail::NativeGemm<Scalar>(true, true, m, next_n, next_n, 1, B_data, m, P_next,
+                      next_n, 0, workspace->B_T_P, next_n);
+    std::copy_n(Q_data, n * n, workspace->Hxx);
+    std::copy_n(R_data, m * m, workspace->Huu);
+    std::copy_n(M_data, n * m, workspace->Hxu);
+    detail::NativeGemm<Scalar>(false, false, n, n, next_n, 1, workspace->A_T_P, next_n,
+                      A_data, n, 1, workspace->Hxx, n);
+    detail::NativeGemm<Scalar>(false, false, m, m, next_n, 1, workspace->B_T_P, next_n,
+                      B_data, m, 1, workspace->Huu, m);
+    detail::NativeGemm<Scalar>(false, false, n, m, next_n, 1, workspace->A_T_P, next_n,
+                      B_data, m, 1, workspace->Hxu, m);
 
     const bool factor_is_cholesky =
         CholeskyFactorizeRaw(workspace->Huu, m, tolerance, workspace->lower);
@@ -3028,18 +2934,10 @@ bool ComputeUnconstrainedRiccatiInto(
     }
 
     Scalar* CLQR_RESTRICT P = workspace->PPtr(i);
-    for (std::size_t row = 0; row < n; ++row) {
-      for (std::size_t col = 0; col <= row; ++col) {
-        Scalar value = workspace->Hxx[row * n + col];
-        CLQR_UNROLL
-        for (std::size_t control = 0; control < m; ++control) {
-          value -= workspace->Hxu[row * m + control] *
-                   workspace->solve_hxu[control * n + col];
-        }
-        P[row * n + col] = value;
-        if (row != col) P[col * n + row] = value;
-      }
-    }
+    std::copy_n(workspace->Hxx, n * n, P);
+    detail::NativeGemm<Scalar>(false, false, n, n, m, -1, workspace->Hxu, m,
+                      workspace->solve_hxu, n, 1, P, n);
+    MirrorLowerTriangleRaw(P, n);
 
     if (factorization != nullptr) {
       Factorization::Impl::StageData& stage = factorization->stages[i];

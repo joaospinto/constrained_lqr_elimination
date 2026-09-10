@@ -61,6 +61,7 @@ cc_library(
     hdrs = [
         "include/clqr/clqr.h",
         "include/clqr/linalg.h",
+        "src/cpu_dense.h",
     ],
     defines = select({
         ":fp32": ["CLQR_USE_FLOAT=1"],
@@ -73,6 +74,12 @@ cc_library(
 cc_test(
     name = "clqr_test",
     srcs = ["tests/clqr_test.cc"],
+    deps = [":clqr"],
+)
+
+cc_test(
+    name = "cpu_dense_test",
+    srcs = ["tests/cpu_dense_test.cc"],
     deps = [":clqr"],
 )
 

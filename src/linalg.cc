@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "cpu_dense.h"
+
 namespace clqr {
 namespace {
 
@@ -93,12 +95,9 @@ Matrix operator-(const Matrix& a, const Matrix& b) {
 Matrix operator*(const Matrix& a, const Matrix& b) {
   Check(a.cols() == b.rows(), "matrix multiply shape mismatch");
   Matrix out(a.rows(), b.cols());
-  for (std::size_t i = 0; i < a.rows(); ++i) {
-    for (std::size_t k = 0; k < a.cols(); ++k) {
-      const Scalar aik = a(i, k);
-      for (std::size_t j = 0; j < b.cols(); ++j) out(i, j) += aik * b(k, j);
-    }
-  }
+  detail::NativeGemm<Scalar>(false, false, a.rows(), b.cols(), a.cols(), 1,
+                    a.data().data(), a.cols(), b.data().data(), b.cols(), 0,
+                    out.data().data(), out.cols());
   return out;
 }
 
