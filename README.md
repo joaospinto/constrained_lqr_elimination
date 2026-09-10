@@ -200,6 +200,65 @@ bazel test //:adversarial_cpu_extended_test \
   --test_output=errors
 ```
 
+### Same-machine paper comparisons
+
+`bash scripts/paper_benchmarks.sh /path/to/new-results` builds pinned copies
+of the generalized-Riccati, factor-graph, and author-written Laine reference implementations, and
+compares them with the sequential solver on identical FP64 instances. Add
+`--cuda` on a CUDA machine to include native host-input and device-resident
+JAX timings and refresh the original horizon table. The dense comparison
+uses native-architecture Release builds for every C++ implementation.
+The CUDA run also executes native FP64 regressions and all four Compute
+Sanitizer tools on the standard CUDA suite and dense smoke fixtures before
+collecting GPU timings.
+Requires CMake, a C++ compiler, Git, and at least 3 GiB free disk
+space; `CLQR_JOBS` defaults to 4. Set `CLQR_PAPER_SUITE=smoke` for a short run.
+
+The sweeps vary the horizon (through 32768), state/control dimensions, and
+mixed/state constraint counts. Each solve refactors; setup and setup-plus-solve
+times are reported separately. Primal, original-objective, and available
+original KKT residuals are audited outside the timing interval. The
+factor-graph and Laine adapters return only primals, so their unavailable dual residuals are
+reported as `nan`. A separate `planted_dual_stationarity_inf` column checks
+each returned primal against the fixture's known optimal multipliers, without
+attributing those multipliers to the solver. Dense-comparison numerical errors and solver rejections
+remain visible in the CSV and summary without failing the benchmark run. Missing or malformed
+data, regression-test failures, and sanitizer errors still produce a nonzero
+exit status. No runtimes from different hosts are
+combined. Reference code and results stay in the chosen output directory.
+For repeated local runs, `CLQR_PAPER_CACHE_DIR` reuses dependency checkouts
+and builds; the driver verifies their pinned revisions and rejects dirty
+reference sources. Each run still writes to a new results directory.
+The driver also produces `summary.json`; a complete P100 run produces LaTeX
+table files. The summary checks matching cases/seeds, preserves failed or
+inaccurate rows, and uses the first comparison round rather than selecting the
+fastest round. The second round remains available to assess timing variation.
+
+For a local comparison on the shared adversarial unit-test fixtures, build
+the `clqr_adversarial_benchmark` CMake target, then run
+`python3 benchmarks/reference/run_adversarial.py
+<build-directory> <new-results-directory>`. Both rounds report unscaled
+original KKT residuals as well as the unit tests' row-normalized residuals.
+If the factor-graph and Laine adversarial targets are built, the runner includes
+them automatically, isolating crashes and preserving numerical failures.
+
+See the [reference comparison scope](benchmarks/reference/README.md) for
+algorithm assumptions, adapter limitations, and output differences.
+
+The core C++ library and public API remain dependency-free. Its native dense
+kernels use fixed-size SIMD tiles with no heap allocation or matrix-packing
+workspace. External solvers (and their BLASFEO/GTSAM dependencies) are fetched
+and built only by the explicit comparison driver, not by library builds or
+`bazel test //...`. Eigen is a Bazel development dependency used only by the
+reference-adapter tests; it is omitted for downstream library consumers.
+`bazel build //:clqr --ignore_dev_dependency` checks that separation.
+CUDA-resident timing uses the native JAX FFI, excludes compilation and initial placement,
+blocks on every result, and audits that the solver performs no bulk scalar
+host round trip. Its inputs come directly from the C++ fixture generator.
+Sizes rejected by the native CUDA workspace planner are explicitly skipped
+in the JAX run using that same run's capacity report; these are not counted
+as successful solves.
+
 ## CPU backend and native APIs
 
 Build and test either precision:

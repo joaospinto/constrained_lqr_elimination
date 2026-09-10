@@ -16,6 +16,11 @@ config_setting(
     define_values = {"clqr_precision": "fp32"},
 )
 
+py_test(
+    name = "paper_results_test",
+    srcs = ["tests/paper_results_test.py", "scripts/paper_results.py"],
+    main = "tests/paper_results_test.py",
+)
 
 whl_filegroup(
     name = "jaxlib_ffi_header_files",
