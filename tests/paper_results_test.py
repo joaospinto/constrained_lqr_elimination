@@ -11,11 +11,12 @@ from scripts import paper_results as results
 
 
 def row(backend="clqr_cpu"):
-    return dict(backend=backend, family="combined", N="128", n="8", m="4",
-                mixed_rows="1", state_rows="1", seed="20260907", status="ok",
+    return dict(backend=backend, family="horizon", N="128", n="8", m="4",
+                mixed_rows="1", state_rows="2", seed="20260907", status="ok",
                 median_ms="1.2", p10_ms="1.1", p90_ms="1.3",
                 primal_error="1e-12", relative_objective_error="1e-15",
-                feasibility_inf="1e-14", kkt_inf="1e-11", kernel_ms="1.0")
+                feasibility_inf="1e-14", kkt_inf="1e-11", kernel_ms="1.0",
+                dual_error_inf="1e-11")
 
 
 class ResultsTest(unittest.TestCase):
@@ -35,12 +36,15 @@ class ResultsTest(unittest.TestCase):
         for backend in results.PRIMAL_ONLY:
             value = row(backend)
             value["kkt_inf"] = "nan"
+            value["dual_error_inf"] = "nan"
             value["planted_dual_stationarity_inf"] = "1e-12"
             data = results.indexed([value], backend)
             summary = results.summarize({backend: data})[backend]
             self.assertIsNone(summary["maxima"]["kkt_inf"])
             self.assertEqual(summary["maxima"]["planted_dual_stationarity_inf"], 1e-12)
             self.assertNotIn("kkt_inf", summary["nonfinite_measurements"])
+            self.assertNotIn("dual_error_inf", summary["nonfinite_measurements"])
+            self.assertIsNone(summary["maxima"]["dual_error_inf"])
 
     def test_planted_certificate_cannot_hide_inaccuracy(self):
         value = row("laine_author")
@@ -129,6 +133,10 @@ class ResultsTest(unittest.TestCase):
                 self.assertEqual(report["factor_graph"]["counts"][status], 1)
                 self.assertEqual(report["clqr_cpu"]["counts"][status], 1)
                 self.assertEqual(report["laine_author"]["counts"][status], 1)
+                self.assertEqual(report["laine_corrected"]["counts"][status], 1)
+                measured = results.read_csv(path / "measurements.csv")
+                self.assertTrue(all(r["reference_solution"] == "planted_optimum" for r in measured))
+                self.assertEqual(len(measured), len(files) + 1)
 
     def test_nonfinite_errors_are_reported_not_discarded(self):
         value = row()
@@ -140,17 +148,70 @@ class ResultsTest(unittest.TestCase):
         self.assertEqual(report["nonfinite_measurements"]["kkt_inf"], 1)
         json.dumps(report, allow_nan=False)
 
+    def test_cuda_report_retains_actual_hardware(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            files = {}
+            for backend, name in (results.SOURCES | results.OPTIONAL_SOURCES).items():
+                value = row(backend)
+                if backend in results.PRIMAL_ONLY:
+                    value.update(kkt_inf="nan", dual_error_inf="nan")
+                files.setdefault(name, []).append(value)
+            original = dict(N="32", n="8", m="4", p="2", cpp_cpu_ms="3",
+                            cpp_kkt_residual="2e-14", cuda_kernel_ms="1",
+                            cuda_wall_ms="2", cuda_kkt_residual="3e-13",
+                            input_pack_ms="0.4", upload_ms="0.1", download_ms="0.1")
+            files["original_table.csv"] = [dict(original, N=str(2**exponent))
+                                            for exponent in range(5, 15)]
+            for name, rows in files.items():
+                with (path / name).open("w") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=rows[0])
+                    writer.writeheader()
+                    writer.writerows(rows)
+            manifest = [{field: row()[field] for field in results.KEY_FIELDS[:-1]}]
+            (path / "cases.json").write_text(json.dumps(manifest))
+            platform = "CPU: test host\nGPU: NVIDIA B200\nCUDA build architecture: sm_100\n"
+            (path / "platform.txt").write_text(platform)
+            # nvidia-smi separates both its headers and values with comma-space.
+            (path / "gpu.csv").write_text("index, name, compute_cap\n0, NVIDIA B200, 10.0\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(results.main([str(path), "--suite", "smoke",
+                                               "--cuda", "--require-laine"]), 0)
+            report = json.loads((path / "summary.json").read_text())
+            self.assertEqual(report["platform"], platform)
+            self.assertEqual(report["gpus"],
+                             [dict(index="0", name="NVIDIA B200", compute_cap="10.0")])
+
     def test_table_keeps_independent_columns(self):
         data = {}
-        for index, backend in enumerate(results.SOURCES):
+        for index, backend in enumerate(results.SOURCES | results.OPTIONAL_SOURCES):
             value = row(backend)
             value["median_ms"] = str(index + 1)
             data[backend] = {results.key(value): value}
         text = results.comparison_table(data)
-        self.assertIn("128 & 8 & 1 & 1 & 1.000 & 2.000 & 3.000 & 1.000 & 5.000 & 6.000", text)
-        self.assertIn(r"\multicolumn{3}{c|}{CPU}", text)
-        self.assertIn(r"\multicolumn{3}{c|}{Tesla P100}", text)
+        self.assertIn("128 & 8 & 1.000 & 2.000 & 3.000 & 7.000 & 8.000 & 1.000 & 5.000 & 6.000", text)
+        self.assertIn(r"\multicolumn{5}{c|}{CPU}", text)
+        self.assertIn(r"\multicolumn{3}{c|}{GPU}", text)
         self.assertIn(r"6.000 \\", text)
+
+    def test_fixed_ratio_table_selection(self):
+        identities = [("horizon", N, 8, 4, 1, 2, 7)
+                      for N in (128, 512, 2048, 8192, 32768)]
+        identities += [("dimension", 128, n, n // 2, n // 8, n // 4, 7)
+                       for n in (8, 16, 32, 64)]
+        self.assertEqual(sum(map(results.selected, identities)), 8)
+        self.assertFalse(results.selected(("dimension", 128, 32, 16, 4, 4, 7)))
+
+    def test_dual_coordinate_errors_are_data(self):
+        value = row()
+        value["dual_error_inf"] = "1.0"
+        # A coordinate difference alone is not a KKT error gate.
+        data = results.indexed([value], "clqr_cpu")
+        self.assertEqual(results.summarize({"clqr_cpu": data})
+                         ["clqr_cpu"]["maxima"]["dual_error_inf"], 1.0)
+        value["dual_error_inf"] = "nan"
+        with self.assertRaises(ValueError):
+            results.indexed([value], "clqr_cpu")
 
     def test_original_rows_reject_missing_cpu_values(self):
         value = dict(N="32", cpp_cpu_ms=".12345", cpp_kkt_residual="2.04e-14",

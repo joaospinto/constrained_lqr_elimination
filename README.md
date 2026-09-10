@@ -213,17 +213,35 @@ Sanitizer tools on the standard CUDA suite and dense smoke fixtures before
 collecting GPU timings.
 Requires CMake, a C++ compiler, Git, and at least 3 GiB free disk
 space; `CLQR_JOBS` defaults to 4. Set `CLQR_PAPER_SUITE=smoke` for a short run.
+The [paper comparison notebook](notebooks/kaggle_paper_comparison.ipynb)
+runs this workflow from a fresh Kaggle GPU session using an uploaded
+`clqr-source.bundle` snapshot or, by default, current `origin/main`,
+archives the results and logs, and removes its own downloaded/build cache.
+It records CPU topology/affinity/memory and GPU model, compute capability,
+memory, driver, clocks, and CUDA/compiler versions in `platform.txt` and
+`gpu.csv`. CUDA architecture is detected rather than fixed to P100; set
+`CLQR_CUDA_ARCH` explicitly when choosing among heterogeneous GPUs.
 
-The sweeps vary the horizon (through 32768), state/control dimensions, and
-mixed/state constraint counts. Each solve refactors; setup and setup-plus-solve
+The paper sweeps vary the horizon (128, 512, 2048, 8192, 32768 at $n=8$)
+and state dimension (8, 16, 32, 64 at $N=128$), always with
+$m=n/2$, $p_s=n/4$, and $p_m=n/8$. State-only rows at the fixed initial
+state are omitted to avoid introducing artificial redundancy. A separate
+`CLQR_PAPER_SUITE=constraints` diagnostic varies constraint counts.
+The corrected Laine–Tomlin implementation is included separately from the
+author's original, using the optimized native dense kernels.
+Each solve refactors; setup and setup-plus-solve
 times are reported separately. Primal, original-objective, and available
 original KKT residuals are audited outside the timing interval. The original
 Laine adapter includes the author's multiplier recovery in each timed solve
 and reports KKT residuals using those returned multipliers. The factor-graph
-adapter returns only primals, so its unavailable dual residuals are
+and corrected Laine adapters return only primals, so their unavailable dual residuals are
 reported as `nan`. A separate `planted_dual_stationarity_inf` column checks
 each returned primal against the fixture's known optimal multipliers, without
-attributing those multipliers to the solver. Dense-comparison numerical errors and solver rejections
+attributing those multipliers to the solver. `primal_error` and `dual_error_inf`
+are absolute infinity-norm differences from the known planted optimal solution,
+not from an arbitrarily chosen competing solver. Missing dual outputs are `nan`.
+The unified `measurements.csv` retains all these columns; no new measurements
+are inserted into the paper automatically. Dense-comparison numerical errors and solver rejections
 remain visible in the CSV and summary without failing the benchmark run. Missing or malformed
 data, regression-test failures, and sanitizer errors still produce a nonzero
 exit status. No runtimes from different hosts are
@@ -231,7 +249,7 @@ combined. Reference code and results stay in the chosen output directory.
 For repeated local runs, `CLQR_PAPER_CACHE_DIR` reuses dependency checkouts
 and builds; the driver verifies their pinned revisions and rejects dirty
 reference sources. Each run still writes to a new results directory.
-The driver also produces `summary.json`; a complete P100 run produces LaTeX
+The driver also produces `summary.json`; a complete CUDA run produces LaTeX
 table files. The summary checks matching cases/seeds, preserves failed or
 inaccurate rows, and uses the first comparison round rather than selecting the
 fastest round. The second round remains available to assess timing variation.

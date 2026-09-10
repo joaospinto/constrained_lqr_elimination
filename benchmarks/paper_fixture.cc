@@ -67,7 +67,7 @@ int main(int argc, char **argv) {
   const auto data = clqr::benchmark::MakeScalingProblem(c.horizon, c.n, c.m,
                                                         c.mixed, c.state, seed);
   const auto &p = data.problem;
-  std::cout.write("CLQRB001", 8);
+  std::cout.write("CLQRB002", 8);
   Word(c.horizon);
   Word(seed);
   Array(p.initial_state);
@@ -94,6 +94,14 @@ int main(int argc, char **argv) {
     Array(x);
   for (const auto &u : data.controls)
     Array(u);
+  Array(data.dual.initial);
+  Array(data.dual.terminal);
+  for (const auto &lambda : data.dual.dynamics)
+    Array(lambda);
+  for (const auto &mu : data.dual.mixed)
+    Array(mu);
+  for (const auto &eta : data.dual.state)
+    Array(eta);
   if (!std::cout)
     throw std::runtime_error("fixture output failed");
 }

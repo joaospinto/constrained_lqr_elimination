@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #include "benchmarks/scaling_problem.h"
+#include "benchmarks/paper_cases.h"
 #include "tests/adversarial_test_support.h"
 
 namespace {
@@ -25,6 +26,22 @@ int main() {
   static_assert(sizeof(clqr::Scalar) == sizeof(double),
                 "Paper fixtures require FP64");
   constexpr double tolerance = 2e-8;
+  const auto cases = clqr::benchmark::PaperCases("all");
+  if (cases.size() != 9)
+    throw std::runtime_error("paper sweep case count");
+  for (const auto &c : cases)
+    if (c.n % 8 || c.m != c.n / 2 || c.mixed != c.n / 8 ||
+        c.state != c.n / 4 ||
+        (c.family != "horizon" && c.family != "dimension"))
+      throw std::runtime_error("paper dimension ratios");
+  const auto reference = clqr::benchmark::MakeScalingProblem(2, 8, 4, 1, 2);
+  auto changed_dual = reference.dual;
+  changed_dual.dynamics[1][0] += 0.25;
+  if (std::abs(clqr::benchmark::MaxDifference(changed_dual, reference.dual) - 0.25) > 1e-15)
+    throw std::runtime_error("original-coordinate dual error");
+  changed_dual.initial[0] = std::numeric_limits<double>::quiet_NaN();
+  if (!std::isinf(clqr::benchmark::MaxDifference(changed_dual, reference.dual)))
+    throw std::runtime_error("nonfinite dual error hidden");
   for (const std::size_t n : {4, 8, 16, 32}) {
     const std::size_t m = n / 2;
     for (const std::size_t horizon : {0, 1, 17}) {

@@ -82,10 +82,12 @@ def main(default_platform="cpu", argv=None):
     print(f"# native JAX FFI, FP64, device={device}; inputs and outputs remain resident during timing")
     print("# compile, upload, host validation, and download are excluded; each solve includes fresh numerical factorization")
     print("# at least 3 warmups and 100 ms; each repetition blocks on all outputs")
+    print("# primal_error and dual_error_inf: absolute infinity-norm errors against the known planted optimum")
     fields = ["backend", "family", "N", "n", "m", "mixed_rows", "state_rows", "seed",
               "status", "repeats", "median_ms", "p10_ms", "p90_ms", "primal_error",
               "relative_objective_error", "feasibility_inf", "stationarity_inf", "kkt_inf",
-              "scalar_device_to_host_bytes", "scalar_host_to_device_bytes", "metadata_device_to_host_bytes"]
+              "scalar_device_to_host_bytes", "scalar_host_to_device_bytes", "metadata_device_to_host_bytes",
+              "planted_dual_stationarity_inf", "dual_error_inf"]
     writer = csv.DictWriter(sys.stdout, fieldnames=fields)
     writer.writeheader()
     protocol_failed = False
@@ -102,9 +104,9 @@ def main(default_platform="cpu", argv=None):
             writer.writerow(row)
             sys.stdout.flush()
             continue
-        solve = inputs = result = host = p = expected_x = expected_u = None
+        solve = inputs = result = host = p = expected_x = expected_u = expected_dual = None
         try:
-            p, expected_x, expected_u = paper_fixture.problem(fixture, args.suite, case["index"], args.seed)
+            p, expected_x, expected_u, expected_dual = paper_fixture.problem(fixture, args.suite, case["index"], args.seed)
             host = module.pack_problem(p)
             inputs = jax.device_put(host, device)
             jax.block_until_ready(inputs)
@@ -133,10 +135,11 @@ def main(default_platform="cpu", argv=None):
             result = jax.device_get(result)
             if int(result.diagnostics[0]) != 0:
                 raise RuntimeError(f"solver diagnostics {result.diagnostics.tolist()}")
-            residuals = paper_fixture.audit(p, result, expected_x, expected_u)
+            residuals = paper_fixture.audit(p, result, expected_x, expected_u, expected_dual)
             row.update(residuals)
             passed = (residuals["primal_error"] < 1e-6 and
-                      residuals["relative_objective_error"] < 1e-8 and residuals["kkt_inf"] < 1e-8)
+                      residuals["relative_objective_error"] < 1e-8 and residuals["kkt_inf"] < 1e-8 and
+                      residuals["planted_dual_stationarity_inf"] < 1e-8)
             times.sort()
             row.update(status="ok" if passed else "inaccurate", median_ms=times[len(times) // 2],
                        p10_ms=times[len(times) // 10], p90_ms=times[(len(times) - 1) * 9 // 10])
@@ -145,7 +148,7 @@ def main(default_platform="cpu", argv=None):
             print(f"# {case['family']} N={case['N']} n={case['n']}: {str(error).replace(chr(10), ' ')}", flush=True)
         finally:
             # Release inputs/executables on failures as well as successful runs.
-            del solve, inputs, result, host, p, expected_x, expected_u
+            del solve, inputs, result, host, p, expected_x, expected_u, expected_dual
             jax.clear_caches()
         writer.writerow(row)
         sys.stdout.flush()

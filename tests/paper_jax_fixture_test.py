@@ -1,6 +1,13 @@
 import contextlib
 import csv
 import io
+import copy
+import math
+from types import SimpleNamespace
+
+import numpy as np
+from benchmarks import paper_fixture
+from benchmarks.paper_jax_benchmark import _runfiles
 
 from benchmarks.paper_jax_benchmark import _capacity_limits, main
 
@@ -32,3 +39,23 @@ if __name__ == "__main__":
     assert code == 0
     assert len(rows) == 4
     assert all(row["status"] == "ok" for row in rows), rows
+    assert all(float(row["dual_error_inf"]) < 1e-8 for row in rows), rows
+    fixture = next(_runfiles().rglob("clqr_paper_fixture"))
+    for index in (0, 2, 3):
+        p, x, u, dual = paper_fixture.problem(fixture, "smoke", index, 20260907)
+        optimum = SimpleNamespace(states=x, controls=u, **vars(dual))
+        metrics = paper_fixture.audit(p, optimum, x, u, dual)
+        assert metrics["primal_error"] == metrics["dual_error_inf"] == 0
+        assert metrics["kkt_inf"] < 1e-12, metrics
+        changed = copy.deepcopy(optimum)
+        changed.initial_multiplier[0] += 0.25
+        metrics = paper_fixture.audit(p, changed, x, u, dual)
+        assert abs(metrics["dual_error_inf"] - 0.25) < 1e-15
+        assert metrics["primal_error"] == 0
+        assert metrics["stationarity_inf"] > 0.24
+        # Nonfinite outputs are recorded as errors, not dropped or exceptions
+        # that erase timing/other measurements.
+        changed.initial_multiplier[0] = np.nan
+        metrics = paper_fixture.audit(p, changed, x, u, dual)
+        assert math.isinf(metrics["dual_error_inf"])
+        assert math.isinf(metrics["kkt_inf"])

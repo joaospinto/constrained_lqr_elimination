@@ -510,12 +510,12 @@ void Run(const clqr::benchmark::PaperCase &c,
     // without an expensive global factorization or fabricated solver duals.
     const double planted_dual_stationarity =
         Audit(data.problem, result, data.dual).stationarity;
-    double error = 0;
-    for (std::size_t i = 0; i < data.states.size(); ++i)
-      error = std::max(error, InfinityNorm(result.first[i] - data.states[i]));
-    for (std::size_t i = 0; i < data.controls.size(); ++i)
-      error =
-          std::max(error, InfinityNorm(result.second[i] - data.controls[i]));
+    const double error = std::max(
+        clqr::benchmark::MaxDifference(result.first, data.states),
+        clqr::benchmark::MaxDifference(result.second, data.controls));
+    const double dual_error = dual
+        ? clqr::benchmark::MaxDifference(*dual, data.dual)
+        : std::numeric_limits<double>::quiet_NaN();
     const long double reference = clqr::benchmark::OriginalObjective(
         data.problem, data.states, data.controls);
     const long double objective = clqr::benchmark::OriginalObjective(
@@ -553,7 +553,7 @@ void Run(const clqr::benchmark::PaperCase &c,
               << (dual ? std::max(residuals.feasibility, residuals.stationarity)
                        : std::numeric_limits<double>::quiet_NaN())
               << ',' << setup_solve_times[setup_solve_times.size() / 2]
-              << ',' << planted_dual_stationarity << '\n';
+              << ',' << planted_dual_stationarity << ',' << dual_error << '\n';
   } catch (const std::exception &e) {
     std::string message = e.what();
     for (char &ch : message)
@@ -564,7 +564,7 @@ void Run(const clqr::benchmark::PaperCase &c,
         message.find("exceeding device shared-memory resources") !=
             std::string::npos;
     std::cout << (unsupported ? "unsupported" : "failed")
-              << ",0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan\n# "
+              << ",0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan\n# "
               << message << '\n';
   }
   std::cout.flush();
@@ -820,12 +820,14 @@ int main(int argc, char **argv) {
                "other solvers.\n"
                "# planted_dual_stationarity_inf audits each returned primal "
                "with the fixture's known optimal dual, not solver output.\n"
+               "# primal_error and dual_error_inf are absolute infinity-norm "
+               "errors against the known planted optimum, in original coordinates.\n"
                "backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,"
                "setup_ms,"
                "median_ms,p10_ms,p90_ms,primal_error,objective,relative_"
                "objective_error,kernel_ms,"
                "feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,"
-               "planted_dual_stationarity_inf\n";
+               "planted_dual_stationarity_inf,dual_error_inf\n";
   std::cout << std::setprecision(12);
   for (const auto &c : clqr::benchmark::PaperCases(suite)) {
     const auto data = clqr::benchmark::MakeScalingProblem(

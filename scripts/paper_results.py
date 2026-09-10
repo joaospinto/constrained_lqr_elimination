@@ -20,13 +20,15 @@ SOURCES = {
 }
 OPTIONAL_SOURCES = {
     "laine_author": "laine_round1.csv",
+    "laine_corrected": "laine_corrected_round1.csv",
 }
-PRIMAL_ONLY = {"factor_graph"}
+PRIMAL_ONLY = {"factor_graph", "laine_corrected"}
 
 
 def read_csv(path):
-    return list(csv.DictReader(line for line in path.read_text().splitlines()
-                               if line and not line.startswith("#")))
+    return list(csv.DictReader((line for line in path.read_text().splitlines()
+                                if line and not line.startswith("#")),
+                               skipinitialspace=True))
 
 
 def key(row):
@@ -60,6 +62,8 @@ def indexed(rows, backend):
                 errors.append("kkt_inf")
             if "planted_dual_stationarity_inf" in row:
                 errors.append("planted_dual_stationarity_inf")
+            if "dual_error_inf" in row and backend not in PRIMAL_ONLY:
+                errors.append("dual_error_inf")
             for field in errors:
                 if row.get(field, "") == "" or numeric(row, field) < 0:
                     raise ValueError(f"missing/invalid {backend} {field}: {identity}")
@@ -107,11 +111,10 @@ def time_cell(row, field="median_ms"):
 
 
 def selected(identity):
-    family, horizon, n, _, mixed, state, _ = identity
-    return ((family == "combined" and horizon in (128, 2048, 32768)) or
-            (family == "dimension" and n in (16, 32, 64)) or
-            (family == "mixed_rows" and mixed in (0, 2, 6)) or
-            (family == "state_rows" and state in (2, 6)))
+    family, horizon, n, m, mixed, state, _ = identity
+    return (n % 8 == 0 and (m, mixed, state) == (n // 2, n // 8, n // 4) and
+            ((family == "horizon" and n == 8 and horizon in (128, 512, 2048, 8192, 32768)) or
+             (family == "dimension" and horizon == 128 and n in (16, 32, 64))))
 
 
 def comparison_table(data):
@@ -120,29 +123,29 @@ def comparison_table(data):
     print(r"\begin{table*}[!t]", file=output)
     print(r"\centering\footnotesize\setlength{\tabcolsep}{3pt}", file=output)
     print(r"\caption{Same-host FP64 dense comparisons, medians in ms. "
-          r"$p_m,p_s$ are mixed/state equality counts; $m=n/2$. "
+          r"$m=n/2$, $p_s=n/4$, $p_m=n/8$ throughout. "
           r"Each call refactors. CPU columns use prepared representations; "
           r"CUDA wall includes host packing/transfers, whereas JAX retains numerical inputs/outputs on the GPU. "
           r"$\dagger$: accuracy threshold exceeded; \textsc{oom}: out of shared memory; "
           r"\textsc{fail}: unsuccessful solve.}", file=output)
     print(r"\label{tab:dense-comparisons}", file=output)
     print(r"\begin{tabular}{|r|r|r|r|r|r|r|r|r|r|}\hline", file=output)
-    print(r"\multicolumn{4}{|c|}{Problem} & \multicolumn{3}{c|}{CPU} & "
-          r"\multicolumn{3}{c|}{Tesla P100} \\\hline", file=output)
-    print(r"$N$ & $n$ & $p_m$ & $p_s$ & Ours & Vanroye & Factor graph & "
+    print(r"\multicolumn{2}{|c|}{Problem} & \multicolumn{5}{c|}{CPU} & "
+          r"\multicolumn{3}{c|}{GPU} \\\hline", file=output)
+    print(r"$N$ & $n$ & Ours & Vanroye & Factor graph & Laine (author) & Laine (corrected) & "
           r"Kernels & Wall & JAX wall \\\hline", file=output)
     previous = None
     for identity in data["clqr_cpu"]:
         if not selected(identity):
             continue
         family, horizon, n, _, mixed, state, _ = identity
-        group = "rows" if family.endswith("_rows") else family
+        group = family
         if previous and previous != group:
             print(r"\hline", file=output)
         previous = group
-        cells = [str(horizon), str(n), str(mixed), str(state)]
+        cells = [str(horizon), str(n)]
         cells += [time_cell(data[backend][identity]) for backend in
-                  ("clqr_cpu", "gen_riccati", "factor_graph")]
+                  ("clqr_cpu", "gen_riccati", "factor_graph", "laine_author", "laine_corrected")]
         cells += [time_cell(data["clqr_cuda"][identity], "kernel_ms"),
                   time_cell(data["clqr_cuda"][identity]),
                   time_cell(data["clqr_jax_cuda"][identity])]
@@ -160,6 +163,8 @@ def summarize(data):
         fields = ["primal_error", "relative_objective_error", "feasibility_inf", "kkt_inf"]
         if any("planted_dual_stationarity_inf" in row for row in cases.values()):
             fields.append("planted_dual_stationarity_inf")
+        if any("dual_error_inf" in row for row in cases.values()):
+            fields.append("dual_error_inf")
         for field in fields:
             values = [numeric(row, field) for row in cases.values()]
             finite = [value for value in values if math.isfinite(value)]
@@ -172,6 +177,7 @@ def summarize(data):
         # information, not a measured numerical failure.
         if backend in PRIMAL_ONLY:
             nonfinite.pop("kkt_inf")
+            nonfinite.pop("dual_error_inf", None)
         summary[backend] = dict(counts=counts, maxima=maxima,
                                nonfinite_measurements=nonfinite)
     return summary
@@ -206,6 +212,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", type=Path)
     parser.add_argument("--cuda", action="store_true")
+    parser.add_argument("--require-laine", action="store_true",
+                        help="require both the author and corrected Laine measurements")
     parser.add_argument("--suite", default="all",
                         choices=("all", "smoke", "horizon", "dimension", "constraints"))
     args = parser.parse_args(argv)
@@ -215,19 +223,28 @@ def main(argv=None):
             continue
         data[backend] = indexed(read_csv(args.results / name), backend)
     for backend, name in OPTIONAL_SOURCES.items():
-        if (args.results / name).is_file():
+        if args.require_laine or (args.results / name).is_file():
             data[backend] = indexed(read_csv(args.results / name), backend)
     identities = validate_cases(data, json.loads((args.results / "cases.json").read_text()))
     report = summarize(data)
     (args.results / "summary.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    # One convenient long-form table retains all timings and errors. Do not
+    # select a fastest run or mix host measurements when choosing a reference:
+    # these fixtures have an analytically planted primal-dual optimum.
+    rows = [dict(row, reference_solution="planted_optimum")
+            for cases in data.values() for row in cases.values()]
+    fields = list(dict.fromkeys(field for row in rows for field in row))
+    with (args.results / "measurements.csv").open("w") as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
     if args.cuda:
-        # This table is explicitly labeled Tesla P100: do not silently insert
-        # another GPU/host's measurements into the paper.
-        platform = (args.results / "platform.txt").read_text()
-        if "Tesla P100" not in platform or "Linux" not in platform:
-            raise ValueError("the paper table requires the recorded Linux/P100 host")
+        # Preserve the actual hardware identity; never label a Blackwell run
+        # as P100 or silently insert it into an existing paper table.
+        report["platform"] = (args.results / "platform.txt").read_text()
+        report["gpus"] = read_csv(args.results / "gpu.csv")
         if args.suite == "all":
-            if sum(selected(identity) for identity in identities) != 11:
+            if sum(selected(identity) for identity in identities) != 8:
                 raise ValueError("paper table requires the complete all-suite run")
             (args.results / "comparison_table.tex").write_text(comparison_table(data))
         original = read_csv(args.results / "original_table.csv")

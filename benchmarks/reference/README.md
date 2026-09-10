@@ -3,8 +3,9 @@
 The paper driver builds pinned, separately downloaded reference sources and
 times identical FP64 problems on one machine. Only that explicit driver
 fetches the reference checkouts; CMake accepts existing paths and never
-fetches them. Neither library builds nor `bazel test //...` builds any
-external solver. Eigen is marked `dev_dependency = True` for the optional
+fetches them. Library builds do not build any reference solver; `bazel test //...`
+tests our corrected Laine implementation but does not fetch any author's solver.
+Eigen is marked `dev_dependency = True` for the optional
 adapter tests; downstream Bazel consumers do not inherit it.
 No third-party solver source is vendored here.
 
@@ -53,8 +54,19 @@ Reported-dual residuals are `nan` for primal-only adapters.
 For dense planted fixtures, `planted_dual_stationarity_inf` separately
 checks each returned primal using known optimal fixture multipliers. This is a
 linear-horizon validation certificate, not a solver-produced dual estimate.
-Original feasibility, distance to the planted optimum, and objective error are
+`primal_error` and `dual_error_inf` report absolute infinity-norm differences
+against the known planted optimal primal and dual, in original coordinates.
+The reference is not selected using measured speed or a competing solver's
+reported status. Missing returned duals are `nan`, not zero. A multiplier
+coordinate error is not itself a KKT residual: nonunique exact multipliers may
+differ on redundant problems. Original feasibility and objective error are
 also reported. All validation is outside the timed interval.
+
+The default paper suite uses $m=n/2$, $p_s=n/4$, $p_m=n/8$ in separate
+horizon and dimension sweeps. `constraints` remains an opt-in diagnostic,
+not part of that table. Both Laine implementations run in opposite-order
+rounds with CLQR; `measurements.csv` and the generated table use the first
+round, with the second retained separately to show timing variation.
 
 `run_adversarial.py` runs each solver/case in a separate process, in two
 opposite-order rounds. If built, the Laine and factor-graph targets are included

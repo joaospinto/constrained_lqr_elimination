@@ -1,8 +1,10 @@
 #ifndef CLQR_BENCHMARKS_SCALING_PROBLEM_H_
 #define CLQR_BENCHMARKS_SCALING_PROBLEM_H_
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -47,6 +49,39 @@ struct Multipliers {
   Vector initial, terminal;
   std::vector<Vector> dynamics, mixed, state;
 };
+
+inline double MaxDifference(const Vector &a, const Vector &b) {
+  if (a.size() != b.size())
+    throw std::invalid_argument("benchmark reference vector shape mismatch");
+  double error = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const double difference = double(a[i]) - double(b[i]);
+    if (!std::isfinite(difference))
+      return std::numeric_limits<double>::infinity();
+    error = std::max(error, std::abs(difference));
+  }
+  return error;
+}
+
+inline double MaxDifference(const std::vector<Vector> &a,
+                            const std::vector<Vector> &b) {
+  if (a.size() != b.size())
+    throw std::invalid_argument("benchmark reference trajectory shape mismatch");
+  double error = 0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    error = std::max(error, MaxDifference(a[i], b[i]));
+  return error;
+}
+
+// Original, unscaled multiplier coordinates. This is not a stationarity
+// residual; for redundant constraints different exact duals can disagree.
+inline double MaxDifference(const Multipliers &a, const Multipliers &b) {
+  return std::max({MaxDifference(a.initial, b.initial),
+                   MaxDifference(a.terminal, b.terminal),
+                   MaxDifference(a.dynamics, b.dynamics),
+                   MaxDifference(a.mixed, b.mixed),
+                   MaxDifference(a.state, b.state)});
+}
 
 struct ScalingProblem {
   Problem problem;

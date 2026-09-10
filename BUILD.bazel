@@ -22,6 +22,13 @@ py_test(
     main = "tests/paper_results_test.py",
 )
 
+py_test(
+    name = "notebook_paper_test",
+    srcs = ["tests/notebook_paper_test.py", "scripts/notebook_paper.py"],
+    main = "tests/notebook_paper_test.py",
+    data = ["notebooks/kaggle_paper_comparison.ipynb"],
+)
+
 whl_filegroup(
     name = "jaxlib_ffi_header_files",
     pattern = "jaxlib/include/xla/ffi/api/.*\\.h",
@@ -101,6 +108,7 @@ cc_test(
     srcs = [
         "benchmarks/scaling_problem.h",
         "tests/scaling_problem_test.cc",
+        "benchmarks/paper_cases.h",
     ],
     deps = [":clqr", ":adversarial_test_support"],
     # Validates the dense FP64 paper fixtures, including fully constrained

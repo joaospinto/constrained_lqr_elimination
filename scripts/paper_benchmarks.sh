@@ -39,6 +39,15 @@ if (( cuda_run )); then
   command -v nvcc >/dev/null || { echo "missing CUDA compiler: nvcc" >&2; exit 2; }
   command -v compute-sanitizer >/dev/null || { echo "missing compute-sanitizer" >&2; exit 2; }
   nvidia-smi >/dev/null
+  cuda_arch="${CLQR_CUDA_ARCH:-}"
+  if [[ -z "$cuda_arch" ]]; then
+    gpu_caps="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sed 's/[[:space:]]//g' | sort -u)"
+    if [[ ! "$gpu_caps" =~ ^[0-9]+\.[0-9]+$ ]]; then
+      echo "Cannot select one GPU architecture; set CLQR_CUDA_ARCH for the device being tested." >&2
+      exit 2
+    fi
+    cuda_arch="${gpu_caps/./}"
+  fi
 fi
 export PYTHONDONTWRITEBYTECODE=1
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
@@ -100,37 +109,79 @@ case "$(uname -s)-$(uname -m)" in
     fi ;;
 esac
 {
+  printf '=== Source revision and working tree ===\n'
   git -C "$repo_dir" rev-parse HEAD
   git -C "$repo_dir" status --short
+  printf '=== Host platform ===\n'
+  date -u
   uname -a
+  if [[ -r /etc/os-release ]]; then sed -n '1,160p' /etc/os-release; fi
+  printf '=== CPU topology, affinity and memory ===\n'
+  if command -v lscpu >/dev/null; then lscpu; fi
+  if command -v nproc >/dev/null; then
+    printf 'Effective logical CPUs: '; nproc
+    printf 'All logical CPUs: '; nproc --all
+  fi
+  if [[ -r /proc/self/status ]]; then
+    sed -n '/^Cpus_allowed_list:/p;/^Mems_allowed_list:/p' /proc/self/status
+  fi
+  if [[ -r /proc/meminfo ]]; then sed -n '/^MemTotal:/p;/^SwapTotal:/p' /proc/meminfo; fi
+  if command -v free >/dev/null; then free -h; fi
+  if [[ "$(uname -s)" == Darwin ]]; then
+    sysctl hw.model hw.memsize hw.physicalcpu hw.logicalcpu machdep.cpu.brand_string
+  fi
+  printf '=== Toolchain ===\n'
   c++ --version
   cmake --version
+  python3 --version
+  if command -v nvcc >/dev/null; then nvcc --version; fi
+  if command -v compute-sanitizer >/dev/null; then compute-sanitizer --version; fi
   printf 'BLASFEO target: %s\n' "$blasfeo_target"
   printf 'C++ comparison flags: Release -O3 -DNDEBUG -march=native\n'
-  if command -v lscpu >/dev/null; then lscpu; fi
-  if command -v nvidia-smi >/dev/null; then nvidia-smi; fi
+  printf 'OMP_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s MKL_NUM_THREADS=%s\n' \
+    "$OMP_NUM_THREADS" "$OPENBLAS_NUM_THREADS" "$MKL_NUM_THREADS"
+  printf 'Build jobs: %s; suite: %s; repetitions: %s\n' "$jobs" "$suite" "$repeats"
+  printf '=== GPU and driver ===\n'
+  if command -v nvidia-smi >/dev/null; then
+    nvidia-smi
+    nvidia-smi -q
+    nvidia-smi --query-gpu=index,name,uuid,compute_cap,driver_version,pci.bus_id,memory.total \
+      --format=csv > "$output_dir/gpu.csv"
+  fi
+  if (( cuda_run )); then
+    printf 'CUDA build architecture: sm_%s\n' "$cuda_arch"
+    printf 'CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES:-not set}"
+  fi
+  printf '=== Disk ===\n'
   df -h "$output_dir"
 } > "$output_dir/platform.txt"
 
 # Compile and validate before building references or timing long sweeps.
 source "$repo_dir/scripts/notebook_bazel.sh"
 bazel_command="$(clqr_notebook_bazel "$repo_dir" "$output_dir")"
+bazel_cmd=("$bazel_command")
+if [[ -n "${CLQR_PAPER_BAZEL_ROOT:-}" ]]; then
+  bazel_cmd+=(--output_user_root="$CLQR_PAPER_BAZEL_ROOT")
+fi
+trap '"${bazel_cmd[@]}" shutdown || true' EXIT
+"${bazel_cmd[@]}" --version >> "$output_dir/platform.txt"
 cd "$repo_dir"
 bazel_args=(--config=fp64 --jobs="$jobs" --cxxopt=-march=native)
 targets=(//:clqr_paper_jax_cpu_benchmark //:clqr_paper_fixture)
 if (( cuda_run )); then
-  bazel_args+=(--config=cuda --cuda_archs="sm_${CLQR_CUDA_ARCH:-60}")
+  bazel_args+=(--config=cuda --cuda_archs="sm_${cuda_arch}")
   targets+=(//:clqr_paper_cuda_benchmark //:clqr_paper_jax_cuda_benchmark
             //:cuda_solver_test //:adversarial_cuda_extended_test)
 fi
-"$bazel_command" build "${bazel_args[@]}" "${targets[@]}"
+"${bazel_cmd[@]}" build "${bazel_args[@]}" "${targets[@]}"
 bazel-bin/clqr_paper_fixture --suite "$suite" > "$output_dir/cases.json"
-"$bazel_command" test "${bazel_args[@]}" --test_output=errors \
+"${bazel_cmd[@]}" test "${bazel_args[@]}" --test_output=errors \
   //:clqr_test //:workspace_allocation_test //:scaling_problem_test \
   //:reduced_objective_test //:paper_jax_fixture_test \
-  //:cuda_kernel_emulation_extended_test //:paper_results_test \
+  //:cuda_kernel_emulation_extended_test //:paper_results_test //:notebook_paper_test \
   //benchmarks/reference:quadratic_factor_test \
-  //benchmarks/reference:stationarity_audit_test
+  //benchmarks/reference:stationarity_audit_test \
+  //external_algorithms/laine_tomlin:all
 
 # Build the authors' factor-graph dependency without unused modules or Boost.
 cmake -S "$deps_dir/gtsam" -B "$cache_dir/gtsam-build" \
@@ -149,6 +200,7 @@ cmake -S "$repo_dir/benchmarks/reference" -B "$cache_dir/reference-build" \
   -DFACTOR_GRAPH_SOURCE_DIR="$deps_dir/factor_graph" \
   -DLAINE_SOURCE_DIR="$deps_dir/laine_author" \
   -DEIGEN_SOURCE_DIR="$deps_dir/gtsam/gtsam/3rdparty/Eigen" \
+  -DCLQR_COMPARE_LAINE_CORRECTED=ON \
   -DGTSAM_DIR="$cache_dir/gtsam-build"
 cmake --build "$cache_dir/reference-build" -j "$jobs"
 ctest --test-dir "$cache_dir/reference-build" --output-on-failure
@@ -181,6 +233,8 @@ measure references "$cache_dir/reference-build/clqr_reference_benchmark" "${benc
 # Opposite-order rounds make scheduling/clock drift visible.
 measure cpu_round1 "$cache_dir/reference-build/clqr_cpu_benchmark" "${bench_args[@]}"
 measure laine_round1 "$cache_dir/reference-build/clqr_laine_benchmark" "${bench_args[@]}"
+measure laine_corrected_round1 "$cache_dir/reference-build/clqr_laine_corrected_benchmark" "${bench_args[@]}"
+measure laine_corrected_round2 "$cache_dir/reference-build/clqr_laine_corrected_benchmark" "${bench_args[@]}"
 measure laine_round2 "$cache_dir/reference-build/clqr_laine_benchmark" "${bench_args[@]}"
 measure cpu_round2 "$cache_dir/reference-build/clqr_cpu_benchmark" "${bench_args[@]}"
 
@@ -199,12 +253,12 @@ if (( cuda_run )); then
     --capacity-report "$output_dir/cuda_host.csv"
   # Refresh the original table with its original build flags and fixture,
   # separately from the native-tuned dense comparison above.
-  "$bazel_command" build --config=fp64 --config=cuda \
-    --cuda_archs="sm_${CLQR_CUDA_ARCH:-60}" --jobs="$jobs" //:clqr_cuda_benchmark
+  "${bazel_cmd[@]}" build --config=fp64 --config=cuda \
+    --cuda_archs="sm_${cuda_arch}" --jobs="$jobs" //:clqr_cuda_benchmark
   measure original_table bazel-bin/clqr_cuda_benchmark --repeats "$repeats"
 fi
-"$bazel_command" shutdown
-summary_args=(--suite "$suite")
+"${bazel_cmd[@]}" shutdown
+summary_args=(--suite "$suite" --require-laine)
 if (( cuda_run )); then summary_args+=(--cuda); fi
 if ! python3 scripts/paper_results.py "$output_dir" "${summary_args[@]}" \
     > "$output_dir/summary.stdout" 2> "$output_dir/summary.stderr"; then
