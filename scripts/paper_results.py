@@ -21,7 +21,7 @@ SOURCES = {
 OPTIONAL_SOURCES = {
     "laine_author": "laine_round1.csv",
 }
-PRIMAL_ONLY = {"factor_graph", "laine_author"}
+PRIMAL_ONLY = {"factor_graph"}
 
 
 def read_csv(path):

@@ -13,7 +13,7 @@ No third-party solver source is vendored here.
 | CLQR CPU | Stagewise equality constraints, including redundant rows; varying dimensions | Primal trajectory and original multipliers |
 | [Vanroye et al.](https://github.com/lvanroye/generalization_riccati) | Positive-definite reduced Hessian and full-row-rank global equality Jacobian | Primal trajectory and original multipliers |
 | [Yang et al., factor graph](https://github.com/ShuoYangRobotics/equality-constraint-LQR-compare) | Equality-constrained dynamic programming represented by Gaussian factors | Primal trajectory |
-| [Laine's original C++ solver](https://github.com/forrestlaine/parallel_lqr) | Constrained dynamic programming; the adapter supports fixed dimensions and executes the original recursion unchanged | Primal trajectory and feedback policies |
+| [Laine's original C++ solver](https://github.com/forrestlaine/parallel_lqr) | Constrained dynamic programming; the adapter supports fixed dimensions and executes the original recursion unchanged | Primal trajectory, feedback policies, and original multipliers |
 
 Method assumptions are not accuracy guarantees for every numerical
 implementation. The Laine comparison uses the author's pinned source unchanged;
@@ -37,8 +37,12 @@ CLQR and Vanroye use preallocated storage. The factor-graph adapter prepares
 cost square roots during setup. Thus prepared-solve and setup-plus-solve times answer different
 questions, and the solvers do not all provide the same outputs.
 
-Reported-dual `stationarity_inf` and `kkt_inf` are `nan` for primal-only
-adapters. For dense planted fixtures, `planted_dual_stationarity_inf` instead
+The original Laine adapter calls `compute_multipliers()` and
+`set_lq_multipliers()` inside every timed solve. Its `stationarity_inf` and
+`kkt_inf` use those returned multipliers without repair or replacement;
+inaccurate or nonfinite duals remain reported numerical outcomes.
+Reported-dual residuals are `nan` for primal-only adapters.
+For dense planted fixtures, `planted_dual_stationarity_inf` separately
 checks each returned primal using known optimal fixture multipliers. This is a
 linear-horizon validation certificate, not a solver-produced dual estimate.
 Original feasibility, distance to the planted optimum, and objective error are

@@ -217,8 +217,10 @@ space; `CLQR_JOBS` defaults to 4. Set `CLQR_PAPER_SUITE=smoke` for a short run.
 The sweeps vary the horizon (through 32768), state/control dimensions, and
 mixed/state constraint counts. Each solve refactors; setup and setup-plus-solve
 times are reported separately. Primal, original-objective, and available
-original KKT residuals are audited outside the timing interval. The
-factor-graph and Laine adapters return only primals, so their unavailable dual residuals are
+original KKT residuals are audited outside the timing interval. The original
+Laine adapter includes the author's multiplier recovery in each timed solve
+and reports KKT residuals using those returned multipliers. The factor-graph
+adapter returns only primals, so its unavailable dual residuals are
 reported as `nan`. A separate `planted_dual_stationarity_inf` column checks
 each returned primal against the fixture's known optimal multipliers, without
 attributing those multipliers to the solver. Dense-comparison numerical errors and solver rejections

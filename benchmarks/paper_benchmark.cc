@@ -432,14 +432,18 @@ Trajectory EigenTrajectory(const std::vector<clqr::benchmark::reference::Vector>
 class LaineAuthorSolver {
 public:
   explicit LaineAuthorSolver(const Problem &p)
-      : problem_(clqr::benchmark::reference::conversion::Convert(p)),
+      : original_(p), problem_(clqr::benchmark::reference::conversion::Convert(p)),
         trajectory_(clqr::benchmark::reference::author::MakeTrajectory(problem_, false)) {}
   void Solve() { clqr::benchmark::reference::author::Solve(*trajectory_); }
   Trajectory Result() const {
     return EigenTrajectory(trajectory_->open_loop_states,
                            trajectory_->open_loop_controls);
   }
+  Multipliers DualResult() const {
+    return clqr::benchmark::reference::author::CopyMultipliers(original_, *trajectory_);
+  }
 private:
+  const Problem &original_;
   clqr::benchmark::reference::Problem problem_;
   std::unique_ptr<trajectory::Trajectory> trajectory_;
 };
@@ -753,8 +757,9 @@ int main(int argc, char **argv) {
                "repetition.\n"
                "# All backends receive identical data. Validation and result "
                "conversion are untimed.\n"
-               "# CLQR and generalized Riccati also recover duals; the "
-               "factor-graph and Laine adapters return primals only.\n"
+               "# CLQR, generalized Riccati, and the original Laine solver "
+               "also recover duals inside timing. Primal-only backends "
+               "report no solver-dual KKT measurement.\n"
                "# Setup+solve includes representation construction and fresh "
                "workspace allocation; destruction is excluded.\n"
                "# Missing dual/kernel measurements are nan, not inferred from "

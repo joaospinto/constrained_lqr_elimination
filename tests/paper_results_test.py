@@ -44,13 +44,28 @@ class ResultsTest(unittest.TestCase):
 
     def test_planted_certificate_cannot_hide_inaccuracy(self):
         value = row("laine_author")
-        value.update(kkt_inf="nan", planted_dual_stationarity_inf="0.3")
+        value.update(planted_dual_stationarity_inf="0.3")
         with self.assertRaisesRegex(ValueError, "contradicts"):
             results.indexed([value], "laine_author")
         value["status"] = "inaccurate"
         data = results.indexed([value], "laine_author")
         self.assertEqual(results.summarize({"laine_author": data})
                          ["laine_author"]["counts"]["inaccurate"], 1)
+
+    def test_author_dual_errors_are_not_primal_only(self):
+        for residual in ("nan", "inf", "0.3"):
+            with self.subTest(residual=residual):
+                value = row("laine_author")
+                value.update(kkt_inf=residual, planted_dual_stationarity_inf="1e-12")
+                with self.assertRaises(ValueError):
+                    results.indexed([value], "laine_author")
+                # A numerical failure remains benchmark data, not a failed run.
+                value["status"] = "inaccurate"
+                data = results.indexed([value], "laine_author")
+                report = results.summarize({"laine_author": data})["laine_author"]
+                self.assertEqual(report["counts"]["inaccurate"], 1)
+                self.assertEqual(report["nonfinite_measurements"]["kkt_inf"],
+                                 int(residual in ("nan", "inf")))
 
     def test_manifest_detects_case_missing_from_every_backend(self):
         value = row()

@@ -121,6 +121,10 @@ if(LAINE_SOURCE_DIR)
   target_include_directories(clqr_laine_benchmark PRIVATE "${CLQR_ROOT}")
   target_compile_definitions(clqr_laine_benchmark PRIVATE CLQR_BENCHMARK_LAINE)
   target_link_libraries(clqr_laine_benchmark PRIVATE clqr_paper_cpu laine_author_original)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME laine_author_benchmark_test
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/laine_author_benchmark_test.py"
+            "$<TARGET_FILE:clqr_laine_benchmark>")
   add_executable(clqr_adversarial_laine_benchmark ../paper_benchmark.cc)
   target_include_directories(clqr_adversarial_laine_benchmark PRIVATE "${CLQR_ROOT}")
   target_compile_definitions(clqr_adversarial_laine_benchmark PRIVATE

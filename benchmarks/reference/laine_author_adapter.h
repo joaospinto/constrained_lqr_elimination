@@ -1,6 +1,7 @@
 #ifndef CLQR_BENCHMARKS_REFERENCE_LAINE_AUTHOR_ADAPTER_H_
 #define CLQR_BENCHMARKS_REFERENCE_LAINE_AUTHOR_ADAPTER_H_
 #include "benchmarks/reference/eigen_problem.h"
+#include "benchmarks/scaling_problem.h"
 #include "trajectory.h"
 #include <functional>
 #include <memory>
@@ -91,6 +92,34 @@ inline void Solve(trajectory::Trajectory &t) {
   t.compute_feedback_policies();
   t.compute_state_control_dependencies();
   t.set_open_loop_traj();
+  t.compute_multipliers();
+  t.set_lq_multipliers();
+}
+
+// Copy the author's returned duals, without recomputing or repairing them.
+// His dynamics array starts with the initial-condition multiplier; subsequent
+// entries have the same x[t+1]-A*x[t]-B*u[t]-c sign convention as our audit.
+inline clqr::benchmark::Multipliers CopyMultipliers(
+    const clqr::Problem &p, const trajectory::Trajectory &t) {
+  const auto copy = [](const auto &v) {
+    clqr::Vector out(v.size());
+    for (Eigen::Index i = 0; i < v.size(); ++i)
+      out[i] = v[i];
+    return out;
+  };
+  clqr::benchmark::Multipliers out;
+  out.initial = copy(t.lq_dynamics_multipliers.at(0));
+  out.terminal = copy(t.lq_terminal_constraint_multiplier.head(p.terminal_e.size()));
+  for (std::size_t i = 0; i < p.stages.size(); ++i) {
+    out.dynamics.push_back(copy(t.lq_dynamics_multipliers.at(i + 1)));
+    const auto &s = p.stages[i];
+    const auto &mu = t.lq_running_constraint_multipliers.at(i);
+    // Convert() stacks mixed rows first, followed by state-only rows. Ignore
+    // inactive capacity beyond those rows, not any active multiplier.
+    out.mixed.push_back(copy(mu.head(s.d.size())));
+    out.state.push_back(copy(mu.segment(s.d.size(), s.e.size())));
+  }
+  return out;
 }
 } // namespace clqr::benchmark::reference::author
 #endif
