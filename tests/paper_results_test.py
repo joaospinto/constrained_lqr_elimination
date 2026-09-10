@@ -21,6 +21,28 @@ def row(backend="clqr_cpu"):
 
 
 class ResultsTest(unittest.TestCase):
+    def test_selected_cuda_summary_preserves_platform_without_original_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            for backend, filename in (("clqr_cpu", "cpu_round1.csv"),
+                                      ("clqr_cuda", "cuda_host.csv")):
+                value = row(backend)
+                with (work / filename).open("w") as output:
+                    writer = csv.DictWriter(output, fieldnames=value.keys())
+                    writer.writeheader()
+                    writer.writerow(value)
+            (work / "cases.json").write_text(json.dumps([
+                {field: value[field] for field in results.KEY_FIELDS[:-1]}]))
+            (work / "platform.txt").write_text("test hardware")
+            (work / "gpu.csv").write_text("name,compute_cap\nTest GPU,6.0\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = results.main([str(work), "--cuda", "--suite", "smoke",
+                                     "--skip-original-table", "--backends", "clqr_cpu", "clqr_cuda"])
+            self.assertEqual(code, 0)
+            report = json.loads((work / "summary.json").read_text())
+            self.assertEqual(report["platform"], "test hardware")
+            self.assertEqual(report["gpus"][0]["name"], "Test GPU")
+
     def test_scratch_comparison_retains_failed_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
