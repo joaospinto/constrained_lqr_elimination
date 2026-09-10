@@ -86,8 +86,32 @@ inline void NativeGemmImpl(std::size_t rows, std::size_t cols,
       NativeGemmTile<TransposeA, TransposeB, 4, 4>(
           shared, alpha, ai, lda, b + (TransposeB ? j * ldb : j), ldb, beta,
           out + i * ldc + j, ldc);
+    for (; j + 2 <= cols; j += 2)
+      NativeGemmTile<TransposeA, TransposeB, 4, 2>(
+          shared, alpha, ai, lda, b + (TransposeB ? j * ldb : j), ldb, beta,
+          out + i * ldc + j, ldc);
     for (; j < cols; ++j)
       NativeGemmTile<TransposeA, TransposeB, 4, 1>(
+          shared, alpha, ai, lda, b + (TransposeB ? j * ldb : j), ldb, beta,
+          out + i * ldc + j, ldc);
+  }
+  for (; i + 2 <= rows; i += 2) {
+    const T* ai = a + (TransposeA ? i : i * lda);
+    std::size_t j = 0;
+    for (; j + 8 <= cols; j += 8)
+      NativeGemmTile<TransposeA, TransposeB, 2, 8>(
+          shared, alpha, ai, lda, b + (TransposeB ? j * ldb : j), ldb, beta,
+          out + i * ldc + j, ldc);
+    for (; j + 4 <= cols; j += 4)
+      NativeGemmTile<TransposeA, TransposeB, 2, 4>(
+          shared, alpha, ai, lda, b + (TransposeB ? j * ldb : j), ldb, beta,
+          out + i * ldc + j, ldc);
+    for (; j + 2 <= cols; j += 2)
+      NativeGemmTile<TransposeA, TransposeB, 2, 2>(
+          shared, alpha, ai, lda, b + (TransposeB ? j * ldb : j), ldb, beta,
+          out + i * ldc + j, ldc);
+    for (; j < cols; ++j)
+      NativeGemmTile<TransposeA, TransposeB, 2, 1>(
           shared, alpha, ai, lda, b + (TransposeB ? j * ldb : j), ldb, beta,
           out + i * ldc + j, ldc);
   }

@@ -23,8 +23,8 @@ void Near(T actual, long double expected, long double scale = 1) {
 
 template <class T>
 void Products() {
-  for (const std::size_t rows : {0, 1, 3, 4, 5, 8, 17, 33})
-    for (const std::size_t cols : {0, 1, 3, 4, 5, 8, 19, 37})
+  for (const std::size_t rows : {0, 1, 2, 3, 4, 5, 6, 8, 17, 33})
+    for (const std::size_t cols : {0, 1, 2, 3, 4, 5, 6, 8, 10, 19, 37})
       for (const std::size_t shared : {0, 1, 3, 4, 7, 16, 33})
         for (const bool ta : {false, true})
           for (const bool tb : {false, true}) {
