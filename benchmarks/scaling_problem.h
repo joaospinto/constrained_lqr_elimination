@@ -43,10 +43,18 @@ private:
   std::uint64_t state_;
 };
 
+struct Multipliers {
+  Vector initial, terminal;
+  std::vector<Vector> dynamics, mixed, state;
+};
+
 struct ScalingProblem {
   Problem problem;
   std::vector<Vector> states;
   std::vector<Vector> controls;
+  // Known optimal multipliers for independent, untimed validation. These are
+  // fixture data, never inputs to a solver or attributed to its output.
+  Multipliers dual;
 };
 
 // Plant a primal-dual optimum, not merely a feasible trajectory. The Hessian is
@@ -74,6 +82,10 @@ inline ScalingProblem MakeScalingProblem(std::size_t horizon, std::size_t n,
     if (i < horizon)
       out.controls[i] = rng.Vec(m, Scalar{0.4});
   }
+  out.dual.initial = lambda.front();
+  out.dual.dynamics.assign(lambda.begin() + 1, lambda.end());
+  out.dual.mixed.resize(horizon);
+  out.dual.state.resize(horizon);
   p.initial_state = out.states.front();
   p.stages.resize(horizon);
   p.Q.resize(horizon + 1);
@@ -108,6 +120,8 @@ inline ScalingProblem MakeScalingProblem(std::size_t horizon, std::size_t n,
     s.e = Scale(s.E * out.states[i], Scalar{-1});
     const Vector mu = rng.Vec(mixed_rows, Scalar{0.2});
     const Vector eta = rng.Vec(s.E.rows(), Scalar{0.2});
+    out.dual.mixed[i] = mu;
+    out.dual.state[i] = eta;
     p.q[i] = Scale(p.Q[i] * out.states[i] + s.M * out.controls[i], Scalar{-1}) +
              Transpose(s.A) * lambda[i + 1] - lambda[i] - Transpose(s.C) * mu -
              Transpose(s.E) * eta;
@@ -121,9 +135,9 @@ inline ScalingProblem MakeScalingProblem(std::size_t horizon, std::size_t n,
     p.Q.back()(j, j) += Scalar{1};
   p.terminal_E = rng.Mat(horizon == 0 ? 0 : state_rows, n, Scalar{1});
   p.terminal_e = Scale(p.terminal_E * out.states.back(), Scalar{-1});
-  p.q.back() =
-      Scale(p.Q.back() * out.states.back(), Scalar{-1}) - lambda.back() -
-      Transpose(p.terminal_E) * rng.Vec(p.terminal_E.rows(), Scalar{0.2});
+  out.dual.terminal = rng.Vec(p.terminal_E.rows(), Scalar{0.2});
+  p.q.back() = Scale(p.Q.back() * out.states.back(), Scalar{-1}) -
+               lambda.back() - Transpose(p.terminal_E) * out.dual.terminal;
   return out;
 }
 

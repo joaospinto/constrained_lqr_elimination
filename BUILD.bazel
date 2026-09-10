@@ -1,7 +1,7 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("@clqr_pip//:requirements.bzl", "requirement")
 load(
     "@rules_cuda//cuda:defs.bzl",
@@ -15,6 +15,7 @@ config_setting(
     name = "fp32",
     define_values = {"clqr_precision": "fp32"},
 )
+
 
 whl_filegroup(
     name = "jaxlib_ffi_header_files",
@@ -98,6 +99,64 @@ cc_test(
         "//conditions:default": [],
     }),
 )
+
+
+cc_binary(
+    name = "clqr_paper_fixture",
+    srcs = ["benchmarks/paper_fixture.cc", "benchmarks/paper_cases.h", "benchmarks/scaling_problem.h"],
+    deps = [":clqr"],
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_binary(
+    name = "clqr_adversarial_cpu_benchmark",
+    testonly = True,
+    srcs = ["benchmarks/paper_benchmark.cc", "benchmarks/paper_cases.h", "benchmarks/scaling_problem.h"],
+    defines = ["CLQR_BENCHMARK_ADVERSARIAL"],
+    deps = [":clqr", ":adversarial_test_support"],
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)
+
+py_test(
+    name = "adversarial_benchmark_test",
+    srcs = ["tests/adversarial_benchmark_test.py"],
+    data = [":clqr_adversarial_cpu_benchmark"],
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)
+
+py_library(
+    name = "paper_jax_benchmark_lib",
+    srcs = ["benchmarks/paper_fixture.py", "benchmarks/paper_jax_benchmark.py"],
+    data = [":clqr_paper_fixture", ":_clqr", ":_clqr_jax_cpu"],
+    deps = [":clqr_jax_python", requirement("jax"), requirement("numpy")],
+)
+
+py_binary(
+    name = "clqr_paper_jax_cpu_benchmark",
+    srcs = ["benchmarks/paper_jax_cpu.py"],
+    main = "benchmarks/paper_jax_cpu.py",
+    deps = [":paper_jax_benchmark_lib"],
+)
+
+py_binary(
+    name = "clqr_paper_jax_cuda_benchmark",
+    srcs = ["benchmarks/paper_jax_cuda.py"],
+    main = "benchmarks/paper_jax_cuda.py",
+    data = [":_clqr_cuda"],
+    target_compatible_with = requires_cuda(),
+    deps = [":paper_jax_benchmark_lib", requirement("jax-cuda12-plugin"), requirement("jax-cuda12-pjrt")],
+)
+
+
 
 py_test(
     name = "cpu_mixed_cubic_source_audit_test",
@@ -239,6 +298,22 @@ cc_binary(
     ],
     tags = ["manual"],
     target_compatible_with = requires_cuda(),
+    deps = [":clqr_cuda"],
+)
+
+cc_binary(
+    name = "clqr_paper_cuda_benchmark",
+    srcs = [
+        "benchmarks/paper_benchmark.cc",
+        "benchmarks/paper_cases.h",
+        "benchmarks/scaling_problem.h",
+    ],
+    defines = ["CLQR_BENCHMARK_CUDA"],
+    tags = ["manual"],
+    target_compatible_with = requires_cuda() + select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     deps = [":clqr_cuda"],
 )
 

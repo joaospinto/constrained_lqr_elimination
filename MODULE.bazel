@@ -7,6 +7,8 @@ bazel_dep(name = "rules_cc", version = "0.2.17")
 bazel_dep(name = "bazel_skylib", version = "1.8.2")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "rules_cuda", version = "0.3.0")
+# Only optional reference-adapter tests use Eigen; downstream users omit it.
+bazel_dep(name = "eigen", version = "3.4.0.bcr.3", dev_dependency = True)
 
 cuda = use_extension("@rules_cuda//cuda:extensions.bzl", "toolchain")
 cuda.toolkit(

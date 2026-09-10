@@ -28,6 +28,8 @@ jobs:
           disk-cache: ${{ github.workflow }}-${{ runner.os }}-${{ matrix.precision }}
           repository-cache: true
           cache-save: ${{ github.event_name != 'pull_request' }}
+      - name: Build public C++ library without development dependencies
+        run: bazel build //:clqr --ignore_dev_dependency --config=${{ matrix.precision }}
       - name: Test CPU, Python, CUDA stub, and CUDA kernel emulation
         run: >-
           bazel test //...
@@ -72,6 +74,8 @@ jobs:
           //:workspace_allocation_test
           //:cuda_stub_test
           //:cuda_kernel_emulation_test
+          //benchmarks/reference:quadratic_factor_test
+          //benchmarks/reference:stationarity_audit_test
           --config=fp64
           --config=${{ matrix.sanitizer }}
           --test_output=errors
