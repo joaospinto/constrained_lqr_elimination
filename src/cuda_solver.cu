@@ -19,6 +19,10 @@
 #include "cuda_device_io.h"
 #include "cuda_internal.h"
 
+#ifndef CLQR_CUDA_EMULATION
+#include "cuda_shared_memory.h"
+#endif
+
 namespace clqr {
 namespace cuda {
 namespace detail {
@@ -3892,23 +3896,36 @@ void PrepareStageStorage(const Problem &problem, WorkspaceStorage *workspace) {
   workspace->stage_layout_uploaded = false;
 }
 
-void RequireScratchFits(const ScratchRequirements &scratch, int device) {
-  int shared_memory_limit = 0;
-  CudaCheck(cudaDeviceGetAttribute(&shared_memory_limit,
-                                   cudaDevAttrMaxSharedMemoryPerBlock, device),
-            "query CUDA shared-memory limit");
-  constexpr std::size_t kStaticSharedMemoryAllowance = 256;
-  const std::size_t usable_shared_memory =
-      static_cast<std::size_t>(shared_memory_limit) >
-              kStaticSharedMemoryAllowance
-          ? static_cast<std::size_t>(shared_memory_limit) -
-                kStaticSharedMemoryAllowance
-          : 0;
-  Require(scratch.Maximum() <= usable_shared_memory,
-          "active dimensions require " + std::to_string(scratch.Maximum()) +
-              " bytes of dynamic per-block workspace, exceeding device " +
-              "shared-memory resources (" +
-              std::to_string(shared_memory_limit) + " bytes per block)");
+void ConfigureScratchMemory(const ScratchRequirements &scratch, int device) {
+  const int capacity = DeviceSharedMemoryCapacity(device);
+  // Match every dynamic-scratch launch below. Configuration runs only when
+  // preparing a new workspace structure, not in the repeated-solve path.
+#define CLQR_CONFIGURE_SCRATCH(kernel, member)                                 \
+  ConfigureKernelSharedMemory(kernel, #kernel, scratch.member, capacity)
+  CLQR_CONFIGURE_SCRATCH(BuildPrimalLeavesKernel, primal_leaf);
+  CLQR_CONFIGURE_SCRATCH(ReduceRelationLeavesKernel, primal_relation);
+  CLQR_CONFIGURE_SCRATCH(ReduceRelationTreeLevelKernel, primal_relation);
+  CLQR_CONFIGURE_SCRATCH(ExpandRelationContextLevelKernel, primal_relation);
+  CLQR_CONFIGURE_SCRATCH(FinalizeRelationSuffixFromParentsKernel,
+                         primal_relation_final);
+  CLQR_CONFIGURE_SCRATCH(StateParamKernel, state_parameter);
+  CLQR_CONFIGURE_SCRATCH(ReduceStagesKernel, stage_reduction);
+  CLQR_CONFIGURE_SCRATCH(ReduceTerminalKernel, terminal_reduction);
+  CLQR_CONFIGURE_SCRATCH(BuildValueElementsKernel, value_leaf);
+  CLQR_CONFIGURE_SCRATCH(ReduceValueLeavesKernel, value_compose);
+  CLQR_CONFIGURE_SCRATCH(ReduceValueTreeLevelKernel, value_compose);
+  CLQR_CONFIGURE_SCRATCH(ExpandValueContextLevelKernel, value_compose);
+  CLQR_CONFIGURE_SCRATCH(FinalizeValueSuffixFromParentsKernel, value_finalize);
+  CLQR_CONFIGURE_SCRATCH(MatrixFeedbackKernel, feedback);
+  CLQR_CONFIGURE_SCRATCH(InitializeCostateMapsKernel, affine_terms);
+  CLQR_CONFIGURE_SCRATCH(FinalizeFeedbackKernel, affine_terms);
+  CLQR_CONFIGURE_SCRATCH(FinalizeAffinePrefixFromParentsKernel, affine_finalize);
+  CLQR_CONFIGURE_SCRATCH(BuildDualParametersKernel, dual_parameter);
+  CLQR_CONFIGURE_SCRATCH(BuildDualParameterRelationsKernel, dual_relation_leaf);
+  CLQR_CONFIGURE_SCRATCH(ReduceDualTreeLevelKernel, dual_relation);
+  CLQR_CONFIGURE_SCRATCH(SolveDualRootKernel, dual_root);
+  CLQR_CONFIGURE_SCRATCH(ExpandDualTreeLevelKernel, dual_expand);
+#undef CLQR_CONFIGURE_SCRATCH
 }
 
 void BuildCompactOffsets(const Problem &problem, WorkspaceStorage *workspace) {
@@ -4457,7 +4474,7 @@ void PrepareProblemStructure(const Problem &problem, int device,
                              WorkspaceStorage *workspace) {
   workspace->structure_ready = false;
   RefreshScratchPlan(problem, &workspace->structure_key, &workspace->scratch);
-  RequireScratchFits(workspace->scratch, device);
+  ConfigureScratchMemory(workspace->scratch, device);
   const int stage_count = static_cast<int>(problem.stages.size());
   const int node_count = stage_count + 1;
   const CompactEntryCounts entries = CountCompactEntries(problem);

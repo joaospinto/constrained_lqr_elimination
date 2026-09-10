@@ -30,6 +30,13 @@ shares the library's low-level RREF and linear-system primitives.
 | ASan/UBSan | yes | yes | no |
 | memcheck/initcheck/racecheck/synccheck | n/a | n/a | stress notebook |
 
+CUDA shared-memory configuration tests check exact static-plus-dynamic capacity,
+opt-in and legacy-device limits, and independent kernel/device configuration.
+A source audit matches every dynamic-scratch launch to its configuration. The
+native suite solves an n=24 fixture on GPUs with sufficient per-block capacity
+(including workspace shrink/grow reuse), or checks its resource diagnostic on
+smaller GPUs; the same fixture is covered by CPU kernel emulation.
+
 JAX binding validation is separate from the native table. The CPU and CUDA
 binding suites cover eager execution, `jax.jit`, sequential `jax.vmap`, changed
 right-hand sides, heterogeneous dimensions, zero controls, and zero horizons.

@@ -847,6 +847,12 @@ Problem PathologicalScratchProblem() {
 }
 
 void ScratchPlannerTopologyCase() {
+  const auto optin_problem =
+      clqr::benchmark::MakeScalingProblem(8, 24, 12, 3, 6).problem;
+  const std::size_t optin_bytes =
+      sizeof(Scalar) * (16 * 24 * 24 + 10 * 24) + 8 * 4 * 24 + 40;
+  Expect(PlanScratch(optin_problem).Maximum() == optin_bytes,
+         "native opt-in fixture uses the predicted shared-memory footprint");
   constexpr std::size_t kUsableP100SharedBytes = 48 * 1024 - 256;
   const ScratchRequirements pathological =
       PlanScratch(PathologicalScratchProblem());
@@ -2412,6 +2418,8 @@ int main(int argc, char **argv) {
   RunEmulation(
       UniformProblem(1800, 3, kTestStateCapacity, kTestControlCapacity),
       "maximum-active-dimension", false, false);
+  RunEmulation(clqr::benchmark::MakeScalingProblem(8, 24, 12, 3, 6).problem,
+               "opt-in-shared-memory-fixture", true, true);
   RunEmulation(ZeroControlStateConstraintProblem(), "zero-control", true,
                false);
   RunEmulation(ExactDualRelationScratchProblem(), "exact-dual-relation-scratch",

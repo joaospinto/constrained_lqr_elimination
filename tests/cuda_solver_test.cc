@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "../benchmarks/cuda_benchmark_problem.h"
+#include "../benchmarks/scaling_problem.h"
+#include "../src/cuda_shared_memory.h"
 #include "clqr/cuda.h"
 
 namespace {
@@ -422,6 +424,37 @@ void CompareWithCpu(const Problem &problem, const std::string &name,
   }
 }
 
+void OptinSharedMemoryCase() {
+  const Problem problem =
+      clqr::benchmark::MakeScalingProblem(8, 24, 12, 3, 6).problem;
+  int device = 0;
+  clqr::cuda::detail::CheckSharedMemoryApi(cudaGetDevice(&device),
+                                          "query CUDA test device");
+  const int capacity = clqr::cuda::detail::DeviceSharedMemoryCapacity(device);
+  // The uniform relation finalization alone requires this dynamic footprint.
+  // All other planned scratch for this fixture is smaller.
+  constexpr std::size_t required =
+      sizeof(Scalar) * (16 * 24 * 24 + 10 * 24) + 8 * 4 * 24 + 40;
+  if (static_cast<std::size_t>(capacity) < required) {
+    const auto result = clqr::cuda::Solve(problem);
+    Expect(result.status == SolveStatus::kInvalidInput &&
+               result.message.find("shared-memory resources") !=
+                   std::string::npos,
+           "oversized scratch is rejected before launching on smaller GPUs");
+    std::cout << "case: opt-in shared memory (device capacity rejection passed)\n";
+    return;
+  }
+  clqr::cuda::Workspace workspace;
+  clqr::cuda::Solution solution;
+  CompareWithCpu(problem, "opt-in shared memory", nullptr, &workspace,
+                 &solution);
+  CompareWithCpu(clqr::benchmark::MakeScalingProblem(8, 8, 4, 1, 2).problem,
+                 "shared-memory workspace shrinks", nullptr, &workspace,
+                 &solution);
+  CompareWithCpu(problem, "shared-memory workspace grows again", nullptr,
+                 &workspace, &solution);
+}
+
 void NonPositiveDefiniteReducedControlCostCase() {
   Problem problem;
   problem.initial_state = Vector{0.4};
@@ -635,6 +668,7 @@ int main() {
                  "exact dual-relation scratch layout");
   CompareWithCpu(PathologicalScratchProblem(),
                  "topology-tight 45-to-0 scratch planning");
+  OptinSharedMemoryCase();
   const std::size_t many_mixed_rows = 3;
   CompareWithCpu(
       GeneratedProblem(102, 5, 4, 1, many_mixed_rows, ConstraintMode::kMixed),
