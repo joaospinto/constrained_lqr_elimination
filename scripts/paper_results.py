@@ -22,7 +22,7 @@ OPTIONAL_SOURCES = {
     "laine_author": "laine_round1.csv",
     "laine_corrected": "laine_corrected_round1.csv",
 }
-PRIMAL_ONLY = {"factor_graph", "laine_corrected"}
+PRIMAL_ONLY = {"factor_graph"}
 
 
 def read_csv(path):
@@ -113,26 +113,28 @@ def time_cell(row, field="median_ms"):
 def selected(identity):
     family, horizon, n, m, mixed, state, _ = identity
     return (n % 8 == 0 and (m, mixed, state) == (n // 2, n // 8, n // 4) and
-            ((family == "horizon" and n == 8 and horizon in (128, 512, 2048, 8192, 32768)) or
+            ((family == "horizon" and n == 8 and 32 <= horizon <= 32768 and
+              horizon & (horizon - 1) == 0) or
              (family == "dimension" and horizon == 128 and n in (16, 32, 64))))
 
 
 def comparison_table(data):
-    """A predeclared subset; the complete sweep remains in the run CSVs."""
+    """All fixed-ratio horizons plus distinct dimension cases; CSVs retain every backend."""
     output = io.StringIO()
     print(r"\begin{table*}[!t]", file=output)
     print(r"\centering\footnotesize\setlength{\tabcolsep}{3pt}", file=output)
     print(r"\caption{Same-host FP64 dense comparisons, medians in ms. "
-          r"$m=n/2$, $p_s=n/4$, $p_m=n/8$ throughout. "
+          r"$m=n/2$ controls, $p_s=n/4$ state-only equality rows, "
+          r"$p_m=n/8$ mixed state/control equality rows throughout. "
           r"Each call refactors. CPU columns use prepared representations; "
           r"CUDA wall includes host packing/transfers, whereas JAX retains numerical inputs/outputs on the GPU. "
           r"$\dagger$: accuracy threshold exceeded; \textsc{oom}: out of shared memory; "
           r"\textsc{fail}: unsuccessful solve.}", file=output)
     print(r"\label{tab:dense-comparisons}", file=output)
-    print(r"\begin{tabular}{|r|r|r|r|r|r|r|r|r|r|}\hline", file=output)
-    print(r"\multicolumn{2}{|c|}{Problem} & \multicolumn{5}{c|}{CPU} & "
+    print(r"\begin{tabular}{|r|r|r|r|r|r|r|r|r|}\hline", file=output)
+    print(r"\multicolumn{2}{|c|}{Problem} & \multicolumn{4}{c|}{CPU} & "
           r"\multicolumn{3}{c|}{GPU} \\\hline", file=output)
-    print(r"$N$ & $n$ & Ours & Vanroye & Factor graph & Laine (author) & Laine (corrected) & "
+    print(r"$N$ & $n$ & Ours & Vanroye & Yang & Laine--Tomlin & "
           r"Kernels & Wall & JAX wall \\\hline", file=output)
     previous = None
     for identity in data["clqr_cpu"]:
@@ -145,7 +147,7 @@ def comparison_table(data):
         previous = group
         cells = [str(horizon), str(n)]
         cells += [time_cell(data[backend][identity]) for backend in
-                  ("clqr_cpu", "gen_riccati", "factor_graph", "laine_author", "laine_corrected")]
+                  ("clqr_cpu", "gen_riccati", "factor_graph", "laine_author")]
         cells += [time_cell(data["clqr_cuda"][identity], "kernel_ms"),
                   time_cell(data["clqr_cuda"][identity]),
                   time_cell(data["clqr_jax_cuda"][identity])]

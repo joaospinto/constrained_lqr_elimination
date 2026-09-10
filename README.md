@@ -222,6 +222,22 @@ memory, driver, clocks, and CUDA/compiler versions in `platform.txt` and
 `gpu.csv`. CUDA architecture is detected rather than fixed to P100; set
 `CLQR_CUDA_ARCH` explicitly when choosing among heterogeneous GPUs.
 
+The same archiving/cleanup runner works on a Linux CUDA desktop, including
+Blackwell, without a notebook. With Git, CMake, a C++ compiler, Python 3, a
+GPU-compatible CUDA toolkit (including `compute-sanitizer`), Internet access,
+and at least 5 GiB free, run from the repository root:
+
+```sh
+mkdir -p ../clqr-desktop-results
+python3 -u scripts/notebook_paper.py \
+  --work-dir "$(cd ../clqr-desktop-results && pwd)" \
+  --suite all --repeats 11 --jobs 4
+```
+
+It prints the `paper-results.zip` path and removes only that run's private
+dependency/build cache. GPU architecture and system details are detected and
+recorded; no P100-specific architecture flag is needed.
+
 To create a source bundle, run these commands from a full-history clone with
 local `main` at the revision you want to test, choosing an output path outside
 the repository:
@@ -237,7 +253,7 @@ build outputs, or external dependencies, and is not checked into the repository.
 Internet is still required for pinned dependencies. Without an attached bundle,
 the notebook fetches current `origin/main` instead.
 
-The paper sweeps vary the horizon (128, 512, 2048, 8192, 32768 at $n=8$)
+The paper sweeps vary the horizon (every power of two from 32 through 32768 at $n=8$)
 and state dimension (8, 16, 32, 64 at $N=128$), always with
 $m=n/2$, $p_s=n/4$, and $p_m=n/8$. State-only rows at the fixed initial
 state are omitted to avoid introducing artificial redundancy. A separate
@@ -248,8 +264,9 @@ Each solve refactors; setup and setup-plus-solve
 times are reported separately. Primal, original-objective, and available
 original KKT residuals are audited outside the timing interval. The original
 Laine adapter includes the author's multiplier recovery in each timed solve
-and reports KKT residuals using those returned multipliers. The factor-graph
-and corrected Laine adapters return only primals, so their unavailable dual residuals are
+and reports KKT residuals using those returned multipliers. Corrected Laine–Tomlin
+also recovers its own multipliers within timing. The factor-graph adapter
+returns only primals, so its unavailable dual residuals are
 reported as `nan`. A separate `planted_dual_stationarity_inf` column checks
 each returned primal against the fixture's known optimal multipliers, without
 attributing those multipliers to the solver. `primal_error` and `dual_error_inf`

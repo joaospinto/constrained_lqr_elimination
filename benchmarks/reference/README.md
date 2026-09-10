@@ -15,7 +15,7 @@ No third-party solver source is vendored here.
 | [Vanroye et al.](https://github.com/lvanroye/generalization_riccati) | Positive-definite reduced Hessian and full-row-rank global equality Jacobian | Primal trajectory and original multipliers |
 | [Yang et al., factor graph](https://github.com/ShuoYangRobotics/equality-constraint-LQR-compare) | Equality-constrained dynamic programming represented by Gaussian factors | Primal trajectory |
 | [Laine's original C++ solver](https://github.com/forrestlaine/parallel_lqr) | Constrained dynamic programming; the adapter supports fixed dimensions and executes the original recursion unchanged | Primal trajectory, feedback policies, and original multipliers |
-| [Corrected Laine–Tomlin](../../external_algorithms/corrected_laine_tomlin/README.md) | Our corrected implementation, with rank-aware constraint compression and optimized native dense kernels | Primal trajectory and feedback policies |
+| [Corrected Laine–Tomlin](../../external_algorithms/corrected_laine_tomlin/README.md) | Our corrected implementation, with rank-aware constraint compression and optimized native dense kernels | Primal trajectory, feedback policies, and original multipliers |
 
 Method assumptions are not accuracy guarantees for every numerical
 implementation. The Laine comparison uses the author's pinned source unchanged;
@@ -50,6 +50,10 @@ The original Laine adapter calls `compute_multipliers()` and
 `set_lq_multipliers()` inside every timed solve. Its `stationarity_inf` and
 `kkt_inf` use those returned multipliers without repair or replacement;
 inaccurate or nonfinite duals remain reported numerical outcomes.
+Corrected Laine–Tomlin also recovers its own multipliers inside every timed
+solve, reusing its SVD factors without full-rank Gram-matrix solves. Its adapter
+only converts signs and splits mixed/state-only row blocks to the common
+Lagrangian convention; it does not recompute or repair the multipliers.
 Reported-dual residuals are `nan` for primal-only adapters.
 For dense planted fixtures, `planted_dual_stationarity_inf` separately
 checks each returned primal using known optimal fixture multipliers. This is a
@@ -63,10 +67,12 @@ differ on redundant problems. Original feasibility and objective error are
 also reported. All validation is outside the timed interval.
 
 The default paper suite uses $m=n/2$, $p_s=n/4$, $p_m=n/8$ in separate
-horizon and dimension sweeps. `constraints` remains an opt-in diagnostic,
+horizon (every power of two from 32 through 32768) and dimension sweeps.
+`constraints` remains an opt-in diagnostic,
 not part of that table. Both Laine implementations run in opposite-order
-rounds with CLQR; `measurements.csv` and the generated table use the first
-round, with the second retained separately to show timing variation.
+rounds with CLQR; `measurements.csv` uses the first round, with the second
+retained separately to show timing variation. The generated paper table omits
+corrected Laine–Tomlin; its complete measurements remain in the CSVs.
 
 `run_adversarial.py` runs each solver/case in a separate process, in two
 opposite-order rounds. If built, the Laine and factor-graph targets are included

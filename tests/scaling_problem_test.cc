@@ -27,8 +27,14 @@ int main() {
                 "Paper fixtures require FP64");
   constexpr double tolerance = 2e-8;
   const auto cases = clqr::benchmark::PaperCases("all");
-  if (cases.size() != 9)
+  if (cases.size() != 15)
     throw std::runtime_error("paper sweep case count");
+  const auto horizons = clqr::benchmark::PaperCases("horizon");
+  if (horizons.size() != 11)
+    throw std::runtime_error("paper horizon count");
+  for (std::size_t i = 0; i < horizons.size(); ++i)
+    if (horizons[i].horizon != (std::size_t{32} << i))
+      throw std::runtime_error("paper horizon sweep skips a power of two");
   for (const auto &c : cases)
     if (c.n % 8 || c.m != c.n / 2 || c.mixed != c.n / 8 ||
         c.state != c.n / 4 ||

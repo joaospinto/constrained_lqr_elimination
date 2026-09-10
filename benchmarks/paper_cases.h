@@ -20,7 +20,7 @@ inline std::vector<PaperCase> PaperCases(const std::string &suite) {
             {"combined", 17, 8, 4, 1, 1},
             {"zero", 0, 4, 2, 0, 0}};
   if (suite == "horizon" || suite == "all")
-    for (const std::size_t N : {128, 512, 2048, 8192, 32768})
+    for (std::size_t N = 32; N <= 32768; N *= 2)
       cases.push_back({"horizon", N, 8, 4, 1, 2});
   if (suite == "dimension" || suite == "all")
     for (const std::size_t n : {8, 16, 32, 64})

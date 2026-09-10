@@ -71,6 +71,14 @@ class ResultsTest(unittest.TestCase):
                 self.assertEqual(report["nonfinite_measurements"]["kkt_inf"],
                                  int(residual in ("nan", "inf")))
 
+    def test_corrected_laine_returns_duals(self):
+        value = row("laine_corrected")
+        results.indexed([value], "laine_corrected")
+        for field in ("kkt_inf", "dual_error_inf"):
+            changed = dict(value, **{field: "nan"})
+            with self.assertRaises(ValueError):
+                results.indexed([changed], "laine_corrected")
+
     def test_manifest_detects_case_missing_from_every_backend(self):
         value = row()
         data = {"clqr_cpu": results.indexed([value], "clqr_cpu")}
@@ -189,17 +197,21 @@ class ResultsTest(unittest.TestCase):
             value["median_ms"] = str(index + 1)
             data[backend] = {results.key(value): value}
         text = results.comparison_table(data)
-        self.assertIn("128 & 8 & 1.000 & 2.000 & 3.000 & 7.000 & 8.000 & 1.000 & 5.000 & 6.000", text)
-        self.assertIn(r"\multicolumn{5}{c|}{CPU}", text)
+        self.assertIn("128 & 8 & 1.000 & 2.000 & 3.000 & 7.000 & 1.000 & 5.000 & 6.000", text)
+        self.assertIn(r"\multicolumn{4}{c|}{CPU}", text)
+        self.assertIn("Laine--Tomlin", text)
+        self.assertNotIn("corrected", text)
+        self.assertNotIn("author", text)
         self.assertIn(r"\multicolumn{3}{c|}{GPU}", text)
         self.assertIn(r"6.000 \\", text)
 
     def test_fixed_ratio_table_selection(self):
         identities = [("horizon", N, 8, 4, 1, 2, 7)
-                      for N in (128, 512, 2048, 8192, 32768)]
+                      for N in (2**exponent for exponent in range(5, 16))]
         identities += [("dimension", 128, n, n // 2, n // 8, n // 4, 7)
                        for n in (8, 16, 32, 64)]
-        self.assertEqual(sum(map(results.selected, identities)), 8)
+        self.assertEqual(sum(map(results.selected, identities)), 14)
+        self.assertFalse(results.selected(("horizon", 16385, 8, 4, 1, 2, 7)))
         self.assertFalse(results.selected(("dimension", 128, 32, 16, 4, 4, 7)))
 
     def test_dual_coordinate_errors_are_data(self):
