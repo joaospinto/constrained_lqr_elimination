@@ -952,31 +952,35 @@ unsigned char *EmulatedBlockScratch(std::size_t bytes) {
   storage.resize(std::max<std::size_t>(words, 1));
   return reinterpret_cast<unsigned char *>(storage.data());
 }
-#define CLQR_SCRATCH_PARAMS                                                  \
+#define CLQR_SCRATCH_PARAMS                                                    \
   , unsigned char *global_scratch = nullptr, std::size_t global_stride = 0
-#define CLQR_BLOCK_SCRATCH(name, required_bytes)                              \
-  const std::size_t clqr_scratch_bytes = (required_bytes);                    \
-  unsigned char *clqr_shared_data = nullptr;                                 \
-  if constexpr (GlobalScratch) {                                            \
-    if (global_scratch == nullptr) {                                        \
-      global_stride = AlignUp(clqr_scratch_bytes, 16);                        \
-      global_scratch = EmulatedBlockScratch(                                \
+#define CLQR_BLOCK_SCRATCH(name, required_bytes)                               \
+  const std::size_t clqr_scratch_bytes = (required_bytes);                     \
+  unsigned char *clqr_shared_data = nullptr;                                   \
+  if constexpr (GlobalScratch) {                                               \
+    if (global_scratch == nullptr) {                                           \
+      global_stride = AlignUp(clqr_scratch_bytes, 16);                         \
+      global_scratch = EmulatedBlockScratch(                                   \
           (static_cast<std::size_t>(blockIdx.x) + 1) * global_stride);         \
-    }                                                                      \
-  } else {                                                                 \
-    clqr_shared_data = EmulatedBlockScratch(clqr_scratch_bytes);              \
-  }                                                                        \
+    }                                                                          \
+  } else {                                                                     \
+    clqr_shared_data = EmulatedBlockScratch(clqr_scratch_bytes);               \
+  }                                                                            \
   g_emulated_block_scratch_bytes = clqr_scratch_bytes;                         \
-  ScratchArena name { BlockScratchData<GlobalScratch>(                       \
-      clqr_shared_data, global_scratch, global_stride) }
+  ScratchArena name {                                                          \
+    BlockScratchData<GlobalScratch>(clqr_shared_data, global_scratch,          \
+                                    global_stride)                             \
+  }
 #else
-#define CLQR_SCRATCH_PARAMS                                                  \
+#define CLQR_SCRATCH_PARAMS                                                    \
   , unsigned char *global_scratch, std::size_t global_stride
 #define CLQR_BLOCK_SCRATCH(name, required_bytes)                               \
   extern __shared__ __align__(16) unsigned char clqr_shared_memory[];          \
   (void)(required_bytes);                                                      \
-  ScratchArena name { BlockScratchData<GlobalScratch>(                         \
-      clqr_shared_memory, global_scratch, global_stride) }
+  ScratchArena name {                                                          \
+    BlockScratchData<GlobalScratch>(clqr_shared_memory, global_scratch,        \
+                                    global_stride)                             \
+  }
 #endif
 
 __device__ inline Scalar DeviceAbs(Scalar x) { return x < Scalar{0} ? -x : x; }
@@ -2910,28 +2914,29 @@ constexpr std::size_t TimingSlotCount() {
   return static_cast<std::size_t>(TimingSlot::kCount);
 }
 
-#define CLQR_SCRATCH_KERNELS(X) \
-  X(BuildPrimalLeavesKernel, primal_leaf, node_count) \
-  X(ReduceRelationLeavesKernel, primal_relation, node_parents) \
-  X(ReduceRelationTreeLevelKernel, primal_relation, node_parents) \
-  X(ExpandRelationContextLevelKernel, primal_relation, node_parents) \
-  X(FinalizeRelationSuffixFromParentsKernel, primal_relation_final, node_parents) \
-  X(StateParamKernel, state_parameter, node_count) \
-  X(ReduceStagesKernel, stage_reduction, stage_count) \
-  X(ReduceTerminalKernel, terminal_reduction, 1) \
-  X(BuildValueElementsKernel, value_leaf, node_count) \
-  X(ReduceValueLeavesKernel, value_compose, node_parents) \
-  X(ReduceValueTreeLevelKernel, value_compose, node_parents) \
-  X(ExpandValueContextLevelKernel, value_compose, node_parents) \
-  X(FinalizeValueSuffixFromParentsKernel, value_finalize, node_parents) \
-  X(MatrixFeedbackKernel, feedback, stage_count) \
-  X(InitializeCostateMapsKernel, affine_terms, stage_count) \
-  X(FinalizeFeedbackKernel, affine_terms, stage_count) \
-  X(FinalizeAffinePrefixFromParentsKernel, affine_finalize, stage_parents) \
-  X(BuildDualParametersKernel, dual_parameter, stage_count) \
-  X(BuildDualParameterRelationsKernel, dual_relation_leaf, stage_count) \
-  X(ReduceDualTreeLevelKernel, dual_relation, stage_parents) \
-  X(SolveDualRootKernel, dual_root, 1) \
+#define CLQR_SCRATCH_KERNELS(X)                                                \
+  X(BuildPrimalLeavesKernel, primal_leaf, node_count)                          \
+  X(ReduceRelationLeavesKernel, primal_relation, node_parents)                 \
+  X(ReduceRelationTreeLevelKernel, primal_relation, node_parents)              \
+  X(ExpandRelationContextLevelKernel, primal_relation, node_parents)           \
+  X(FinalizeRelationSuffixFromParentsKernel, primal_relation_final,            \
+    node_parents)                                                              \
+  X(StateParamKernel, state_parameter, node_count)                             \
+  X(ReduceStagesKernel, stage_reduction, stage_count)                          \
+  X(ReduceTerminalKernel, terminal_reduction, 1)                               \
+  X(BuildValueElementsKernel, value_leaf, node_count)                          \
+  X(ReduceValueLeavesKernel, value_compose, node_parents)                      \
+  X(ReduceValueTreeLevelKernel, value_compose, node_parents)                   \
+  X(ExpandValueContextLevelKernel, value_compose, node_parents)                \
+  X(FinalizeValueSuffixFromParentsKernel, value_finalize, node_parents)        \
+  X(MatrixFeedbackKernel, feedback, stage_count)                               \
+  X(InitializeCostateMapsKernel, affine_terms, stage_count)                    \
+  X(FinalizeFeedbackKernel, affine_terms, stage_count)                         \
+  X(FinalizeAffinePrefixFromParentsKernel, affine_finalize, stage_parents)     \
+  X(BuildDualParametersKernel, dual_parameter, stage_count)                    \
+  X(BuildDualParameterRelationsKernel, dual_relation_leaf, stage_count)        \
+  X(ReduceDualTreeLevelKernel, dual_relation, stage_parents)                   \
+  X(SolveDualRootKernel, dual_root, 1)                                         \
   X(ExpandDualTreeLevelKernel, dual_expand, stage_parents)
 
 struct KernelScratchPlans {
@@ -3994,10 +3999,10 @@ std::size_t ConfigureScratchMemory(const ScratchRequirements &scratch,
   const std::size_t node_parents = (node_count + 1) / 2;
   const std::size_t stage_parents = (stage_count + 1) / 2;
   std::size_t global_bytes = 0;
-#define CLQR_CONFIGURE_SCRATCH(kernel, member, blocks)                        \
-  plans->kernel = PlanKernelScratch(                                         \
-      kernel<false>, kernel<true>, #kernel, scratch.member, capacity,         \
-      kDefaultGlobalScratch);                                               \
+#define CLQR_CONFIGURE_SCRATCH(kernel, member, blocks)                         \
+  plans->kernel =                                                              \
+      PlanKernelScratch(kernel<false>, kernel<true>, #kernel, scratch.member,  \
+                        capacity, kDefaultGlobalScratch);                      \
   global_bytes = std::max(global_bytes, plans->kernel.GlobalBytes(blocks));
   CLQR_SCRATCH_KERNELS(CLQR_CONFIGURE_SCRATCH)
 #undef CLQR_CONFIGURE_SCRATCH
@@ -4586,17 +4591,17 @@ void PrepareProblemStructure(const Problem &problem, int device,
   workspace->structure_ready = true;
 }
 
-#define CLQR_LAUNCH_SCRATCH(kernel, blocks, ...)                             \
-  do {                                                                     \
-    const auto &clqr_launch = workspace.scratch_launches.kernel;              \
-    if (clqr_launch.global_stride != 0) {                                   \
-      kernel<true><<<blocks, kThreads, 0, stream>>>(                         \
-          __VA_ARGS__, workspace.global_scratch.get(),                      \
-          clqr_launch.global_stride);                                      \
-    } else {                                                               \
-      kernel<false><<<blocks, kThreads, clqr_launch.shared_bytes, stream>>>(  \
-          __VA_ARGS__, nullptr, 0);                                         \
-    }                                                                      \
+#define CLQR_LAUNCH_SCRATCH(kernel, blocks, ...)                               \
+  do {                                                                         \
+    const auto &clqr_launch = workspace.scratch_launches.kernel;               \
+    if (clqr_launch.global_stride != 0) {                                      \
+      kernel<true><<<blocks, kThreads, 0, stream>>>(                           \
+          __VA_ARGS__, workspace.global_scratch.get(),                         \
+          clqr_launch.global_stride);                                          \
+    } else {                                                                   \
+      kernel<false><<<blocks, kThreads, clqr_launch.shared_bytes, stream>>>(   \
+          __VA_ARGS__, nullptr, 0);                                            \
+    }                                                                          \
   } while (false)
 
 SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
@@ -4822,18 +4827,21 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               host_initial.size(), device_status.get());
         }
         CLQR_LAUNCH_SCRATCH(BuildPrimalLeavesKernel, node_count,
-            device_stages.get(), stage_count, device_terminal.get(),
-            options.tolerance, feasibility_consistency_tolerance,
-            relation_a.get(), device_status.get());
+                            device_stages.get(), stage_count,
+                            device_terminal.get(), options.tolerance,
+                            feasibility_consistency_tolerance, relation_a.get(),
+                            device_status.get());
         if (node_count > 1) {
           const int first_parent_count = level_counts[1];
           CLQR_LAUNCH_SCRATCH(ReduceRelationLeavesKernel, first_parent_count,
-              relation_a.get(), node_count, first_parent_count,
-              options.tolerance, feasibility_consistency_tolerance,
-              relation_b.get(), device_status.get());
+                              relation_a.get(), node_count, first_parent_count,
+                              options.tolerance,
+                              feasibility_consistency_tolerance,
+                              relation_b.get(), device_status.get());
           for (std::size_t level = 1; level + 1 < level_counts.size();
                ++level) {
-            CLQR_LAUNCH_SCRATCH(ReduceRelationTreeLevelKernel, level_counts[level + 1],
+            CLQR_LAUNCH_SCRATCH(
+                ReduceRelationTreeLevelKernel, level_counts[level + 1],
                 relation_b.get(), level_offsets[level] - node_count,
                 level_offsets[level + 1] - node_count, level_counts[level],
                 level_counts[level + 1], options.tolerance,
@@ -4843,19 +4851,23 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               relation_b.get(), level_offsets.back() - node_count);
           for (int level = static_cast<int>(level_counts.size()) - 2;
                level >= 1; --level) {
-            CLQR_LAUNCH_SCRATCH(ExpandRelationContextLevelKernel, level_counts[level + 1],relation_b.get(), level_offsets[level] - node_count,
-                          level_offsets[level + 1] - node_count,
-                          level_counts[level], level_counts[level + 1],
-                          options.tolerance, feasibility_consistency_tolerance,
-                          device_status.get());
+            CLQR_LAUNCH_SCRATCH(
+                ExpandRelationContextLevelKernel, level_counts[level + 1],
+                relation_b.get(), level_offsets[level] - node_count,
+                level_offsets[level + 1] - node_count, level_counts[level],
+                level_counts[level + 1], options.tolerance,
+                feasibility_consistency_tolerance, device_status.get());
           }
-          CLQR_LAUNCH_SCRATCH(FinalizeRelationSuffixFromParentsKernel, first_parent_count,relation_a.get(), node_count, relation_b.get(),
-                        first_parent_count, options.tolerance,
-                        feasibility_consistency_tolerance, device_status.get());
+          CLQR_LAUNCH_SCRATCH(
+              FinalizeRelationSuffixFromParentsKernel, first_parent_count,
+              relation_a.get(), node_count, relation_b.get(),
+              first_parent_count, options.tolerance,
+              feasibility_consistency_tolerance, device_status.get());
         }
-        CLQR_LAUNCH_SCRATCH(StateParamKernel, node_count,relation_a.get(), node_count,
-                                     state_params.get(), state_dimensions.get(),
-                                     device_status.get(), options.tolerance);
+        CLQR_LAUNCH_SCRATCH(StateParamKernel, node_count, relation_a.get(),
+                            node_count, state_params.get(),
+                            state_dimensions.get(), device_status.get(),
+                            options.tolerance);
       },
       [&] {
         CudaCheck(cudaMemcpyAsync(workspace.host_status.data(),
@@ -4932,14 +4944,15 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       [&] {
         if (stage_count > 0) {
           CLQR_LAUNCH_SCRATCH(ReduceStagesKernel, stage_count,
-              device_stages.get(), suffix, state_params.get(), stage_count,
-              options.tolerance, feasibility_consistency_tolerance,
-              control_params.get(), reduced_stages.get(),
-              control_dimensions.get(), device_status.get());
+                              device_stages.get(), suffix, state_params.get(),
+                              stage_count, options.tolerance,
+                              feasibility_consistency_tolerance,
+                              control_params.get(), reduced_stages.get(),
+                              control_dimensions.get(), device_status.get());
         }
-        CLQR_LAUNCH_SCRATCH(ReduceTerminalKernel, 1,device_terminal.get(),
-                                         state_params.get(), stage_count,
-                                         reduced_terminal.get());
+        CLQR_LAUNCH_SCRATCH(ReduceTerminalKernel, 1, device_terminal.get(),
+                            state_params.get(), stage_count,
+                            reduced_terminal.get());
         InitialReducedStateKernel<<<1, kThreads, 0, stream>>>(
             state_params.get(), device_initial.get(), reduced_initial.get(),
             options.tolerance, device_status.get());
@@ -5010,9 +5023,9 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
           stage_level_counts[level], stage_level_counts[level + 1],
           device_status.get());
     }
-    CLQR_LAUNCH_SCRATCH(FinalizeAffinePrefixFromParentsKernel, first_parent_count,
-        map_a.get(), stage_count, map_b.get(), first_parent_count,
-        device_status.get());
+    CLQR_LAUNCH_SCRATCH(FinalizeAffinePrefixFromParentsKernel,
+                        first_parent_count, map_a.get(), stage_count,
+                        map_b.get(), first_parent_count, device_status.get());
   };
   QueueTimedKernels(
       workspace, TimingSlot::kRiccati, stream,
@@ -5050,42 +5063,49 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       },
       [&] {
         CLQR_LAUNCH_SCRATCH(BuildValueElementsKernel, node_count,
-            reduced_stages.get(), reduced_terminal.get(), stage_count,
-            options.tolerance, value_a.get(), device_status.get());
+                            reduced_stages.get(), reduced_terminal.get(),
+                            stage_count, options.tolerance, value_a.get(),
+                            device_status.get());
         if (node_count > 1) {
           const int first_parent_count = level_counts[1];
           CLQR_LAUNCH_SCRATCH(ReduceValueLeavesKernel, first_parent_count,
-              value_a.get(), node_count, first_parent_count, options.tolerance,
-              device_status.get(), value_b.get());
+                              value_a.get(), node_count, first_parent_count,
+                              options.tolerance, device_status.get(),
+                              value_b.get());
           for (std::size_t level = 1; level + 1 < level_counts.size();
                ++level) {
-            CLQR_LAUNCH_SCRATCH(ReduceValueTreeLevelKernel, level_counts[level + 1],
-                value_b.get(), level_offsets[level] - node_count,
-                level_offsets[level + 1] - node_count, level_counts[level],
-                level_counts[level + 1], options.tolerance,
-                device_status.get());
+            CLQR_LAUNCH_SCRATCH(ReduceValueTreeLevelKernel,
+                                level_counts[level + 1], value_b.get(),
+                                level_offsets[level] - node_count,
+                                level_offsets[level + 1] - node_count,
+                                level_counts[level], level_counts[level + 1],
+                                options.tolerance, device_status.get());
           }
           InitializeValueContextRootKernel<<<1, kThreads, 0, stream>>>(
               value_b.get(), level_offsets.back() - node_count);
           for (int level = static_cast<int>(level_counts.size()) - 2;
                level >= 1; --level) {
-            CLQR_LAUNCH_SCRATCH(ExpandValueContextLevelKernel, level_counts[level + 1],
-                value_b.get(), level_offsets[level] - node_count,
-                level_offsets[level + 1] - node_count, level_counts[level],
-                level_counts[level + 1], options.tolerance,
-                device_status.get());
+            CLQR_LAUNCH_SCRATCH(ExpandValueContextLevelKernel,
+                                level_counts[level + 1], value_b.get(),
+                                level_offsets[level] - node_count,
+                                level_offsets[level + 1] - node_count,
+                                level_counts[level], level_counts[level + 1],
+                                options.tolerance, device_status.get());
           }
-          CLQR_LAUNCH_SCRATCH(FinalizeValueSuffixFromParentsKernel, first_parent_count,
-              value_a.get(), node_count, value_b.get(), first_parent_count,
-              options.tolerance, device_status.get());
+          CLQR_LAUNCH_SCRATCH(FinalizeValueSuffixFromParentsKernel,
+                              first_parent_count, value_a.get(), node_count,
+                              value_b.get(), first_parent_count,
+                              options.tolerance, device_status.get());
         }
         if (stage_count > 0) {
-          CLQR_LAUNCH_SCRATCH(MatrixFeedbackKernel, stage_count,reduced_stages.get(), value_suffix,
-                                           stage_count, options.tolerance,
-                                           feedback.get(), device_status.get());
+          CLQR_LAUNCH_SCRATCH(MatrixFeedbackKernel, stage_count,
+                              reduced_stages.get(), value_suffix, stage_count,
+                              options.tolerance, feedback.get(),
+                              device_status.get());
           CLQR_LAUNCH_SCRATCH(InitializeCostateMapsKernel, stage_count,
-              reduced_stages.get(), value_suffix, feedback.get(), stage_count,
-              map_a.get(), device_status.get());
+                              reduced_stages.get(), value_suffix,
+                              feedback.get(), stage_count, map_a.get(),
+                              device_status.get());
           queue_affine_prefix_scan();
           const int costate_blocks = (node_count + kThreads - 1) / kThreads;
           RecoverCostatesKernel<<<costate_blocks, kThreads, 0, stream>>>(
@@ -5093,9 +5113,10 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               stage_count, workspace.reduced_value_linear.get(),
               device_status.get());
           CLQR_LAUNCH_SCRATCH(FinalizeFeedbackKernel, stage_count,
-              reduced_stages.get(), value_suffix,
-              workspace.reduced_value_linear.get(), reduced_state_offsets.get(),
-              stage_count, feedback.get(), device_status.get());
+                              reduced_stages.get(), value_suffix,
+                              workspace.reduced_value_linear.get(),
+                              reduced_state_offsets.get(), stage_count,
+                              feedback.get(), device_status.get());
         }
       },
       [] {});
@@ -5184,8 +5205,9 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                     "initialize dual dimensions");
         },
         [&] {
-          CLQR_LAUNCH_SCRATCH(BuildDualParametersKernel, stage_count,
-              device_stages.get(), state_params.get(), value_suffix,
+          CLQR_LAUNCH_SCRATCH(
+              BuildDualParametersKernel, stage_count, device_stages.get(),
+              state_params.get(), value_suffix,
               workspace.reduced_value_linear.get(), reduced_states.get(),
               states.get(), controls.get(), reduced_state_offsets.get(),
               state_offsets.get(), control_offsets.get(), stage_count,
@@ -5257,16 +5279,18 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         },
         [&] {
           CLQR_LAUNCH_SCRATCH(BuildDualParameterRelationsKernel, stage_count,
-              device_stages.get(), device_terminal.get(), dual_params.get(),
-              stage_count, states.get(), controls.get(), state_offsets.get(),
-              control_offsets.get(), multiplier_rank_tolerance,
-              multiplier_leaf_consistency_tolerance, dual_relations,
-              dual_scan_needed.get(), state_dual_params.get(),
-              device_status.get());
+                              device_stages.get(), device_terminal.get(),
+                              dual_params.get(), stage_count, states.get(),
+                              controls.get(), state_offsets.get(),
+                              control_offsets.get(), multiplier_rank_tolerance,
+                              multiplier_leaf_consistency_tolerance,
+                              dual_relations, dual_scan_needed.get(),
+                              state_dual_params.get(), device_status.get());
           if (host_dual_scan_needed != 0) {
             for (std::size_t level = 0; level + 1 < stage_level_counts.size();
                  ++level) {
-              CLQR_LAUNCH_SCRATCH(ReduceDualTreeLevelKernel, stage_level_counts[level + 1],
+              CLQR_LAUNCH_SCRATCH(
+                  ReduceDualTreeLevelKernel, stage_level_counts[level + 1],
                   dual_tree.get(), stage_level_offsets[level],
                   stage_level_offsets[level + 1], stage_level_counts[level],
                   stage_level_counts[level + 1], multiplier_rank_tolerance,
@@ -5274,13 +5298,14 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                   dual_scan_needed.get(), device_status.get());
             }
             const int root_offset = stage_level_offsets.back();
-            CLQR_LAUNCH_SCRATCH(SolveDualRootKernel, 1,
-                dual_tree.get() + root_offset, dual_values.get() + root_offset,
-                dual_scan_needed.get(), device_status.get(),
-                multiplier_rank_tolerance);
+            CLQR_LAUNCH_SCRATCH(
+                SolveDualRootKernel, 1, dual_tree.get() + root_offset,
+                dual_values.get() + root_offset, dual_scan_needed.get(),
+                device_status.get(), multiplier_rank_tolerance);
             for (int level = static_cast<int>(stage_level_counts.size()) - 2;
                  level >= 0; --level) {
-              CLQR_LAUNCH_SCRATCH(ExpandDualTreeLevelKernel, stage_level_counts[level + 1],
+              CLQR_LAUNCH_SCRATCH(
+                  ExpandDualTreeLevelKernel, stage_level_counts[level + 1],
                   dual_tree.get(), stage_level_offsets[level],
                   stage_level_offsets[level + 1], stage_level_counts[level],
                   stage_level_counts[level + 1], multiplier_rank_tolerance,

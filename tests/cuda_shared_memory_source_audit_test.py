@@ -11,9 +11,10 @@ class SharedMemoryLaunchAudit(unittest.TestCase):
             / os.environ["TEST_WORKSPACE"]
             / "src/cuda_solver.cu"
         ).read_text()
+        source = source.replace("\\\n", "")
         configurations = re.findall(r"X\((\w+),\s*(\w+),\s*\w+\)", source)
         self.assertEqual(len(configurations), len(set(configurations)))
-        launches = set(re.findall(r"CLQR_LAUNCH_SCRATCH\((\w+),", source))
+        launches = set(re.findall(r"CLQR_LAUNCH_SCRATCH\(\s*(\w+),", source))
         launches.discard("kernel")
         self.assertTrue(launches)
         self.assertEqual({kernel for kernel, _ in configurations}, launches)
