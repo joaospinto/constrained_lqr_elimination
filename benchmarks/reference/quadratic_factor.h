@@ -1,8 +1,17 @@
 #ifndef CLQR_BENCHMARK_QUADRATIC_FACTOR_H_
 #define CLQR_BENCHMARK_QUADRATIC_FACTOR_H_
 
+// GCC's optimized Eigen 3.4 matrix-vector templates trigger this diagnostic.
+// Keep the exception inside the third-party headers, not our adapter code.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 #include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <cmath>
 #include <limits>
