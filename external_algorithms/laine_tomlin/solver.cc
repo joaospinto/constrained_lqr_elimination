@@ -1,4 +1,5 @@
 #include "solver.h"
+#include "dense.h"
 
 #include <Eigen/Cholesky>
 #include <Eigen/SVD>
@@ -10,6 +11,10 @@
 namespace laine_tomlin {
 namespace {
 using Eigen::Index;
+using dense::AddProduct;
+using dense::Product;
+using RowMatrix =
+    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
 template <class Derived>
 double MaxAbs(const Eigen::MatrixBase<Derived> &value) {
@@ -95,8 +100,8 @@ Status Compress(Matrix &H, Vector &h, const Options &o) {
   const Index rank =
       Rank(svd.singularValues(), o.rank_tolerance * svd.singularValues()[0]);
   const auto U = svd.matrixU().leftCols(rank);
-  const Vector projected = U.transpose() * h;
-  if (MaxAbs(h - U * projected) >
+  const Vector projected = Product(U.transpose(), h);
+  if (MaxAbs(h - Product(U, projected)) >
       o.feasibility_tolerance * std::max(1.0, MaxAbs(h)))
     return Status::kInfeasible;
   H = svd.matrixV().leftCols(rank).transpose();
@@ -131,14 +136,14 @@ Result Solve(const Problem &p, const Options &o) {
   for (std::size_t t = N; t-- > 0;) {
     const auto &s = p.stages[t];
     const Index n = s.A.cols(), m = s.B.cols(), local = s.C.rows();
-    const Matrix VA = V * s.A, VB = V * s.B;
-    const Vector shifted = v + V * s.c;
-    const Matrix Mxx = p.Q[t] + s.A.transpose() * VA;
-    const Matrix Mux = s.S.transpose() + s.B.transpose() * VA;
-    Matrix Muu = s.R + s.B.transpose() * VB;
+    const Matrix VA = Product(V, s.A), VB = Product(V, s.B);
+    const Vector shifted = v + Product(V, s.c);
+    const Matrix Mxx = p.Q[t] + Product(s.A.transpose(), VA);
+    const Matrix Mux = s.S.transpose() + Product(s.B.transpose(), VA);
+    Matrix Muu = s.R + Product(s.B.transpose(), VB);
     Muu = (0.5 * (Muu + Muu.transpose())).eval();
-    const Vector mx = p.q[t] + s.A.transpose() * shifted;
-    const Vector mu = s.r + s.B.transpose() * shifted;
+    const Vector mx = p.q[t] + Product(s.A.transpose(), shifted);
+    const Vector mu = s.r + Product(s.B.transpose(), shifted);
     Matrix Nx(local + H.rows(), n), Nu(local + H.rows(), m);
     Vector b(local + H.rows());
     if (local) {
@@ -150,10 +155,10 @@ Result Solve(const Problem &p, const Options &o) {
     }
     if (H.rows()) {
       if (n)
-        Nx.bottomRows(H.rows()).noalias() = H * s.A;
+        Nx.bottomRows(H.rows()) = Product(H, s.A);
       if (m)
-        Nu.bottomRows(H.rows()).noalias() = H * s.B;
-      b.tail(H.rows()) = h + H * s.c;
+        Nu.bottomRows(H.rows()) = Product(H, s.B);
+      b.tail(H.rows()) = h + Product(H, s.c);
     }
     Equilibrate(Nx, Nu, b);
     if (!Mxx.allFinite() || !Mux.allFinite() || !Muu.allFinite() ||
@@ -176,15 +181,15 @@ Result Solve(const Problem &p, const Options &o) {
           Rank(svd.singularValues(),
                o.rank_tolerance * std::max(1.0, svd.singularValues()[0]));
       const auto U = svd.matrixU().leftCols(rank);
-      const Matrix UNx = U.transpose() * Nx;
-      const Vector Ub = U.transpose() * b;
+      const Matrix UNx = Product(U.transpose(), Nx);
+      const Vector Ub = Product(U.transpose(), b);
       const Matrix inverse_action =
           svd.matrixV().leftCols(rank) *
           svd.singularValues().head(rank).cwiseInverse().asDiagonal();
-      Kp.noalias() = -inverse_action * UNx;
-      kp.noalias() = -inverse_action * Ub;
-      next_H.noalias() -= U * UNx;
-      next_h.noalias() -= U * Ub;
+      dense::Multiply(Kp, inverse_action, UNx, -1, 0);
+      dense::Multiply(kp, inverse_action, Ub, -1, 0);
+      AddProduct(next_H, U, UNx, -1);
+      AddProduct(next_h, U, Ub, -1);
       // Residual components at the SVD rounding level must not be promoted to
       // unit constraints by row equilibration in Compress.
       for (Index i = 0; i < next_H.rows(); ++i) {
@@ -204,27 +209,32 @@ Result Solve(const Problem &p, const Options &o) {
     K = Kp;
     k = kp;
     if (Z.cols()) {
-      const Matrix MZ = Muu * Z;
-      Matrix reduced = Z.transpose() * MZ;
+      const Matrix MZ = Product(Muu, Z);
+      Matrix reduced = Product(Z.transpose(), MZ);
       reduced = (0.5 * (reduced + reduced.transpose())).eval();
       Eigen::LLT<Matrix> llt(reduced);
       if (llt.info() != Eigen::Success)
         return Failure(Status::kNumericalFailure,
                        "non-positive-definite free-control Hessian at stage " +
                            std::to_string(t));
-      Matrix rhs(Z.cols(), n + 1);
+      RowMatrix rhs(Z.cols(), n + 1);
       // The Muu*Kp and Muu*kp terms are essential: Euclidean-orthogonal
       // constrained/free directions need not be Muu-orthogonal.
-      rhs.leftCols(n).noalias() = Z.transpose() * (Mux + Muu * Kp);
-      rhs.col(n).noalias() = Z.transpose() * (mu + Muu * kp);
-      const Matrix correction = llt.solve(rhs);
-      K.noalias() -= Z * correction.leftCols(n);
-      k.noalias() -= Z * correction.col(n);
+      const Matrix matrix_rhs = Mux + Product(Muu, Kp);
+      const Vector vector_rhs = mu + Product(Muu, kp);
+      rhs.leftCols(n) = Product(Z.transpose(), matrix_rhs);
+      rhs.col(n) = Product(Z.transpose(), vector_rhs);
+      const RowMatrix lower = llt.matrixL();
+      clqr::detail::NativeCholeskySolve(lower.data(), lower.rows(), rhs.cols(),
+                                       rhs.data());
+      AddProduct(K, Z, rhs.leftCols(n), -1);
+      AddProduct(k, Z, rhs.col(n), -1);
     }
-    const Matrix cross = Mux.transpose() * K;
-    V = Mxx + cross + cross.transpose() + K.transpose() * (Muu * K);
+    const Matrix cross = Product(Mux.transpose(), K);
+    V = Mxx + cross + cross.transpose() + Product(K.transpose(), Product(Muu, K));
     V = (0.5 * (V + V.transpose())).eval();
-    v = mx + Mux.transpose() * k + K.transpose() * (mu + Muu * k);
+    const Vector shifted_control = mu + Product(Muu, k);
+    v = mx + Product(Mux.transpose(), k) + Product(K.transpose(), shifted_control);
     if (!V.allFinite() || !v.allFinite() || !K.allFinite() || !k.allFinite())
       return Failure(Status::kNumericalFailure,
                      "nonfinite backward recurrence");
@@ -238,7 +248,7 @@ Result Solve(const Problem &p, const Options &o) {
               std::to_string(t));
     result.max_constraint_rows = std::max(result.max_constraint_rows, H.rows());
   }
-  if (MaxAbs(H * p.initial_state + h) >
+  if (MaxAbs(Product(H, p.initial_state) + h) >
       o.feasibility_tolerance *
           std::max({1.0, MaxAbs(h), MaxAbs(p.initial_state)}))
     return Failure(Status::kInfeasible,
@@ -251,15 +261,17 @@ Result Solve(const Problem &p, const Options &o) {
     const auto &s = p.stages[t];
     const Vector &x = result.states[t];
     Vector &u = result.controls[t];
-    u = result.K[t] * x + result.k[t];
-    result.states[t + 1] = s.A * x + s.B * u + s.c;
-    result.objective += 0.5 * x.dot(p.Q[t] * x) + p.q[t].dot(x) +
-                        x.dot(s.S * u) + 0.5 * u.dot(s.R * u) + s.r.dot(u);
+    u = Product(result.K[t], x) + result.k[t];
+    result.states[t + 1] = Product(s.A, x) + Product(s.B, u) + s.c;
+    result.objective +=
+        0.5 * x.dot(Product(p.Q[t], x)) + p.q[t].dot(x) +
+        x.dot(Product(s.S, u)) + 0.5 * u.dot(Product(s.R, u)) + s.r.dot(u);
     if (!u.allFinite() || !result.states[t + 1].allFinite())
       return Failure(Status::kNumericalFailure, "nonfinite trajectory");
   }
   const Vector &last = result.states.back();
-  result.objective += 0.5 * last.dot(p.Q.back() * last) + p.q.back().dot(last);
+  result.objective +=
+      0.5 * last.dot(Product(p.Q.back(), last)) + p.q.back().dot(last);
   if (!std::isfinite(result.objective))
     return Failure(Status::kNumericalFailure, "nonfinite objective");
   result.status = Status::kOptimal;

@@ -2,8 +2,10 @@
 
 This is **our independent C++ reimplementation** of the sequential constrained
 dynamic-programming method of Forrest Laine and Claire Tomlin, not their source
-code and not the CLQR elimination algorithm. It depends on Eigen, uses FP64, and
-does not call or modify the CPU, CUDA, or Metal CLQR solvers. The fixture test
+code and not the CLQR elimination algorithm. It uses FP64 and Eigen storage,
+SVDs, and Cholesky factorizations. Matrix products and multiple-RHS triangular
+solves use CLQR's optimized native CPU kernels; it does not call or modify
+the CPU, CUDA, or Metal CLQR solvers. The fixture test
 alone imports CLQR problem generators and compares the two implementations.
 
 Reference: *Efficient Computation of Feedback Control for Equality-Constrained
@@ -140,6 +142,10 @@ and feasibility tolerances. Constraint compression bounds propagated rows by
 the state dimension. Work is linear in the horizon for bounded stage dimensions
 and constraint counts, with cubic dense stage algebra. Storage is linear in the
 horizon for policies and trajectories; this reference uses dynamic allocations.
+The shared arithmetic kernels allocate no memory, but that does not make the
+reference solver allocation-free. Its Eigen matrices, decompositions, and
+returned trajectories still allocate. Product routing uses existing strides,
+including column-major storage, without packing the matrices.
 
 ## Validation and local comparison
 
@@ -150,7 +156,9 @@ bazel test --config=fp64 //external_algorithms/laine_tomlin:all
 bazel run --config=fp64 //external_algorithms/laine_tomlin:compare -- --benchmark
 ```
 
-`solver_test` checks analytic counterexamples, zero-sized and inconsistent
+`dense_test` checks native-kernel routing for both storage orders, transposes,
+blocks, strided vectors/maps, and zero-sized products. `solver_test` checks
+analytic counterexamples, zero-sized and inconsistent
 problems, bounded constraint propagation at horizon 2048, and 256 deterministic
 random convex problems against an independently assembled dense QP. These tests
 do not link CLQR. `fixture_test` exercises the 74 shared adversarial cases and

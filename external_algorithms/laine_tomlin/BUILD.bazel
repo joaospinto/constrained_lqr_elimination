@@ -5,9 +5,9 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 cc_library(
     name = "laine_tomlin",
     srcs = ["solver.cc"],
-    hdrs = ["solver.h"],
+    hdrs = ["solver.h", "dense.h"],
     visibility = ["//visibility:public"],
-    deps = ["@eigen//:eigen"],
+    deps = ["@eigen//:eigen", "//:cpu_dense_reference_kernels"],
 )
 
 cc_binary(
@@ -39,6 +39,13 @@ cc_test(
     name = "solver_test",
     size = "small",
     srcs = ["solver_test.cc", "test_problem.h"],
+    deps = [":laine_tomlin"],
+)
+
+cc_test(
+    name = "dense_test",
+    size = "small",
+    srcs = ["dense_test.cc"],
     deps = [":laine_tomlin"],
 )
 

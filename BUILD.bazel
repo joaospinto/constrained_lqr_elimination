@@ -89,6 +89,13 @@ cc_test(
     deps = [":clqr"],
 )
 
+cc_library(
+    name = "cpu_dense_reference_kernels",
+    hdrs = ["src/cpu_dense.h", "include/clqr/linalg.h"],
+    includes = ["include"],
+    visibility = ["//external_algorithms/laine_tomlin:__pkg__"],
+)
+
 cc_test(
     name = "scaling_problem_test",
     srcs = [
