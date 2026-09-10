@@ -1,7 +1,17 @@
 #ifndef EXTERNAL_ALGORITHMS_LAINE_TOMLIN_SOLVER_H_
 #define EXTERNAL_ALGORITHMS_LAINE_TOMLIN_SOLVER_H_
 
+// GCC can diagnose Eigen 3.4's internal triangular-product buffer during SVD
+// instantiation. Scope this upstream-template exception to Eigen's headers;
+// uninitialized-variable diagnostics remain enabled for our implementation.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 #include <Eigen/Core>
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <string>
 #include <vector>
