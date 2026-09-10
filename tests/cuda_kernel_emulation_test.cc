@@ -892,7 +892,7 @@ void ScratchPlannerTopologyCase() {
           uniform.primal_relation_final ==
               RelationFinalizeScratchBytes(uniform_relation, &uniform_relation,
                                            terminal_relation) &&
-          uniform.state_parameter == n * sizeof(int) &&
+          uniform.state_parameter == StateParameterScratchBytes(n, n) &&
           uniform.stage_reduction ==
               std::max(StageRelationReductionScratchBytes(
                            8, 13, n, n, "uniform stage-reduction workspace"),
@@ -2177,6 +2177,77 @@ void RunEmulation(const Problem &problem, const std::string &name,
             << "; KKT residual=" << residual << '\n';
 }
 
+void CoordinatePivotingCase() {
+  Scalar matrix[] = {Scalar{1e-4}, Scalar{1},  Scalar{0},    Scalar{0.2},
+                     Scalar{0.3},  Scalar{0},  Scalar{1e-4}, Scalar{1},
+                     Scalar{0.1},  Scalar{0.4}};
+  Scalar factors[2];
+  int pivots[2], pivot_rows[2], rank = 0, best = 0;
+  Launch(1, [&] {
+    RrefBlock(matrix, 2, 5, 4, kTolerance, pivots, pivot_rows, &rank, &best,
+              factors, Scalar{0}, 3);
+  });
+  Expect(rank == 2 && pivots[0] == 1 && pivots[1] == 2,
+         "control parameterization chooses a well-scaled pivot subset");
+  for (const Scalar value : matrix)
+    Expect(std::abs(value) <= Scalar{1},
+           "control coordinate coefficients stay bounded");
+
+  Scalar left[] = {Scalar{1}, Scalar{1024}, Scalar{0}};
+  Scalar rhs[] = {Scalar{-256}};
+  Relation relation{};
+  relation.left_dim = 3;
+  relation.right_dim = 0;
+  relation.rows = 1;
+  relation.left = left;
+  relation.rhs = rhs;
+  Scalar T[9], t[3];
+  int free_columns[3];
+  StateParam param{};
+  param.T = T;
+  param.t = t;
+  param.free_columns = free_columns;
+  DeviceStatus status{};
+  Launch(1, [&] {
+    StateParamKernel(&relation, 1, &param, nullptr, &status, kTolerance);
+  });
+  Expect(status.code == kDeviceOk && param.reduced_dim == 2 &&
+             free_columns[0] == 0 && free_columns[1] == 2,
+         "state parameterization repivots an ill-scaled canonical relation");
+  Expect(g_emulated_block_scratch_bytes == StateParameterScratchBytes(3, 1),
+         "state parameterization scratch matches the actual typed layout");
+  for (int col = 0; col < 2; ++col) {
+    Scalar residual = 0;
+    for (int row = 0; row < 3; ++row) {
+      Expect(std::abs(T[row * 2 + col]) <= Scalar{1},
+             "state basis stays bounded");
+      residual += left[row] * T[row * 2 + col];
+    }
+    Expect(std::abs(residual) < kTolerance,
+           "repivoted state basis spans the same nullspace");
+  }
+  Scalar offset_residual = -rhs[0];
+  for (int row = 0; row < 3; ++row)
+    offset_residual += left[row] * t[row];
+  Expect(std::abs(offset_residual) < kTolerance,
+         "repivoted affine offset satisfies the original equation");
+
+  relation.rows = 0;
+  int dimensions[2] = {-1, -1};
+  Launch(1, [&] {
+    StateParamKernel(&relation, 1, &param, dimensions, &status, kTolerance);
+  });
+  Expect(status.code == kDeviceOk && dimensions[0] == 3 && dimensions[1] == 3,
+         "unconstrained state dimensions are unchanged");
+  for (int row = 0; row < 3; ++row) {
+    Expect(t[row] == Scalar{0} && free_columns[row] == row,
+           "unconstrained state coordinates have zero offset");
+    for (int col = 0; col < 3; ++col)
+      Expect(T[row * 3 + col] == (row == col ? Scalar{1} : Scalar{0}),
+             "unconstrained state coordinates are identity");
+  }
+}
+
 bool FitsAdversarialEmulationStorage(const Problem &problem) {
   if (problem.Q.back().rows() > static_cast<std::size_t>(kTestStateCapacity) ||
       problem.terminal_E.rows() >
@@ -2209,6 +2280,7 @@ int main(int argc, char **argv) {
     }
   }
   TinyCoefficientRrefCase();
+  CoordinatePivotingCase();
   FiniteInputValidationCase();
   DeviceObjectiveCase();
   PivotedLuMultiRhsCase();

@@ -620,6 +620,19 @@ struct ScratchRequirements {
   }
 };
 
+std::size_t StateParameterScratchBytes(std::size_t variables,
+                                       std::size_t rows) {
+  ScratchSize size;
+  size.Add<Scalar>(ScratchCheckedProduct(
+      rows, ScratchCheckedSum({variables, 1}, "state parameter workspace"),
+      "state parameter workspace"));
+  size.Add<Scalar>(rows);
+  size.Add<int>(rows);
+  size.Add<int>(rows);
+  size.Add<int>(variables);
+  return size.bytes;
+}
+
 ScratchRequirements PlanScratch(const Problem &problem) {
   ScratchRequirements result;
   const std::size_t stage_count = problem.stages.size();
@@ -713,10 +726,10 @@ ScratchRequirements PlanScratch(const Problem &problem) {
                    ScratchCheckedSum({terminal_n, 1}, "terminal workspace"),
                    "terminal feasibility workspace"));
 
-  ScratchSize state_parameter;
-  state_parameter.Add<int>(
-      *std::max_element(state_bounds.begin(), state_bounds.end()));
-  result.state_parameter = state_parameter.bytes;
+  const auto state_parameter_variables =
+      *std::max_element(state_bounds.begin(), state_bounds.end());
+  result.state_parameter = StateParameterScratchBytes(
+      state_parameter_variables, state_parameter_variables);
 
   if (node_count > 1) {
     const ScanPlan primal_tree = BuildScanPlan(primal_leaves);
@@ -1137,11 +1150,16 @@ __device__ bool BlockEnabled(const DeviceStatus *status) {
 // retaining a deterministic free-column convention.
 // Generated relations may supply a positive minimum_row_scale to prevent
 // roundoff-level cancellation noise from being normalized to order one.
+// A nonzero priority_pivot_limit enables complete pivot selection within the
+// leading variable block before visiting the remaining columns in order. The
+// physical column order is unchanged; pivot_columns identifies the chosen
+// coordinates. This avoids tiny leading minors in local parameterizations
+// without allowing state columns to replace available control pivots.
 __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
                           int pivot_limit, Scalar tolerance, int *pivot_columns,
                           int *pivot_rows, int *rank, int *best_row,
-                          Scalar *factors,
-                          Scalar minimum_row_scale = Scalar{0}) {
+                          Scalar *factors, Scalar minimum_row_scale = Scalar{0},
+                          int priority_pivot_limit = 0) {
   for (int row = threadIdx.x; row < rows; row += blockDim.x) {
     Scalar scale = Scalar{0};
     for (int col = 0; col < pivot_limit; ++col) {
@@ -1156,15 +1174,21 @@ __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
     *rank = 0;
   WarpSynchronize();
 
-  for (int col = 0; col < pivot_limit; ++col) {
+  for (int position = 0; position < pivot_limit; ++position) {
     if (threadIdx.x == 0) {
       *best_row = -1;
       Scalar best = tolerance;
-      for (int row = *rank; row < rows; ++row) {
-        const Scalar candidate = DeviceAbs(matrix[row * columns + col]);
-        if (candidate > best) {
-          best = candidate;
-          *best_row = row;
+      const int first = position < priority_pivot_limit ? 0 : position;
+      const int last =
+          position < priority_pivot_limit ? priority_pivot_limit : position + 1;
+      for (int col = first; col < last; ++col) {
+        for (int row = *rank; row < rows; ++row) {
+          const Scalar candidate = DeviceAbs(matrix[row * columns + col]);
+          if (candidate > best) {
+            best = candidate;
+            *best_row = row;
+            pivot_rows[*rank] = col;
+          }
         }
       }
     }
@@ -1177,6 +1201,8 @@ __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
       continue;
 
     const int pivot_row = *rank;
+    const int col = pivot_rows[pivot_row];
+    const int first_entry = priority_pivot_limit > 0 ? 0 : col;
     if (selected_row != pivot_row) {
       for (int j = threadIdx.x; j < columns; j += blockDim.x) {
         const Scalar tmp = matrix[pivot_row * columns + j];
@@ -1189,7 +1215,7 @@ __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
     const Scalar pivot = matrix[pivot_row * columns + col];
     // All threads must load the pivot before any thread normalizes its entry.
     WarpSynchronize();
-    for (int j = col + threadIdx.x; j < columns; j += blockDim.x) {
+    for (int j = first_entry + threadIdx.x; j < columns; j += blockDim.x) {
       matrix[pivot_row * columns + j] /= pivot;
     }
     WarpSynchronize();
@@ -1198,10 +1224,10 @@ __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
       factors[row] = row == pivot_row ? Scalar{0} : matrix[row * columns + col];
     }
     WarpSynchronize();
-    for (int index = threadIdx.x; index < rows * (columns - col);
+    for (int index = threadIdx.x; index < rows * (columns - first_entry);
          index += blockDim.x) {
-      const int row = index / (columns - col);
-      const int j = col + index % (columns - col);
+      const int row = index / (columns - first_entry);
+      const int j = first_entry + index % (columns - first_entry);
       if (row != pivot_row) {
         matrix[row * columns + j] -=
             factors[row] * matrix[pivot_row * columns + j];
@@ -2391,32 +2417,79 @@ __global__ void StateParamKernel(const Relation *suffix, int count,
                                  StateParam *params, int *state_dimensions,
                                  DeviceStatus *status, Scalar tolerance) {
   const int index = blockIdx.x;
-  if (index >= count || threadIdx.x != 0 || status->code != kDeviceOk)
+  if (index >= count || !BlockEnabled(status))
     return;
   const Relation &relation = suffix[index];
   if (relation.right_dim != 0 || relation.rows > relation.left_dim) {
     SetFailure(status, kDeviceNumericalFailure, index, 4);
     return;
   }
-  StateParam &out = params[index];
-  out.physical_dim = relation.left_dim;
-  for (int row = 0; row < relation.left_dim; ++row) {
-    out.t[row] = Scalar{0};
+  const int rows = relation.rows;
+  if (rows == 0) {
+    // No equations means identity coordinates; avoid elimination and its
+    // barriers entirely on unconstrained nodes.
+    StateParam &out = params[index];
+    const int n = relation.left_dim;
+    if (threadIdx.x == 0) {
+      out.physical_dim = out.reduced_dim = n;
+      if (state_dimensions != nullptr) {
+        state_dimensions[2 * index] = n;
+        state_dimensions[2 * index + 1] = n;
+      }
+    }
+    for (int row = threadIdx.x; row < n; row += blockDim.x) {
+      out.t[row] = Scalar{0};
+      out.free_columns[row] = row;
+    }
+    for (int entry = threadIdx.x; entry < n * n; entry += blockDim.x)
+      out.T[entry] = entry / n == entry % n ? Scalar{1} : Scalar{0};
+    return;
   }
+  const int columns = relation.left_dim + 1;
+  // A scan relation is already canonical, but its leftmost pivots can define
+  // an arbitrarily ill-conditioned coordinate basis. Repivot its independent
+  // equations before forming T so dense reduced Hessians do not inherit that
+  // avoidable amplification. Free coordinates still have identity rows.
   ScratchSize scratch_size;
+  scratch_size.Add<Scalar>(static_cast<std::size_t>(rows) * columns);
+  scratch_size.Add<Scalar>(rows);
+  scratch_size.Add<int>(rows);
+  scratch_size.Add<int>(rows);
   scratch_size.Add<int>(relation.left_dim);
   CLQR_BLOCK_SCRATCH(scratch, scratch_size.bytes);
+  Scalar *matrix =
+      scratch.Take<Scalar>(static_cast<std::size_t>(rows) * columns);
+  Scalar *factors = scratch.Take<Scalar>(rows);
+  int *pivot_columns = scratch.Take<int>(rows);
+  int *pivot_scratch = scratch.Take<int>(rows);
   int *pivot_row = scratch.Take<int>(relation.left_dim);
+  __shared__ int rank;
+  __shared__ int best_row;
+  for (int entry = threadIdx.x; entry < rows * columns; entry += blockDim.x) {
+    const int row = entry / columns;
+    const int col = entry % columns;
+    matrix[entry] = col == relation.left_dim
+                        ? relation.rhs[row]
+                        : relation.left[row * relation.left_dim + col];
+  }
+  WarpSynchronize();
+  RrefBlock(matrix, rows, columns, relation.left_dim, tolerance, pivot_columns,
+            pivot_scratch, &rank, &best_row, factors, Scalar{0},
+            relation.left_dim);
+  if (threadIdx.x != 0)
+    return;
+  if (rank != rows) {
+    SetFailure(status, kDeviceNumericalFailure, index, 5);
+    return;
+  }
+  StateParam &out = params[index];
+  out.physical_dim = relation.left_dim;
+  for (int row = 0; row < relation.left_dim; ++row)
+    out.t[row] = Scalar{0};
   for (int i = 0; i < relation.left_dim; ++i)
     pivot_row[i] = -1;
   for (int row = 0; row < relation.rows; ++row) {
-    int column = -1;
-    for (int col = 0; col < relation.left_dim; ++col) {
-      if (DeviceAbs(relation.left[row * relation.left_dim + col]) > tolerance) {
-        column = col;
-        break;
-      }
-    }
+    const int column = pivot_columns[row];
     if (column < 0 || pivot_row[column] >= 0) {
       SetFailure(status, kDeviceNumericalFailure, index, 5);
       return;
@@ -2435,12 +2508,11 @@ __global__ void StateParamKernel(const Relation *suffix, int count,
   for (int col = 0; col < relation.left_dim; ++col) {
     if (pivot_row[col] >= 0) {
       const int row = pivot_row[col];
-      const Scalar diagonal = relation.left[row * relation.left_dim + col];
-      out.t[col] = relation.rhs[row] / diagonal;
+      const Scalar diagonal = matrix[row * columns + col];
+      out.t[col] = matrix[row * columns + columns - 1] / diagonal;
       for (int free = 0; free < reduced; ++free) {
         out.T[col * reduced + free] =
-            -relation.left[row * relation.left_dim + out.free_columns[free]] /
-            diagonal;
+            -matrix[row * columns + out.free_columns[free]] / diagonal;
       }
     }
   }
@@ -7646,7 +7718,7 @@ ReduceStagesKernel(const PackedStage *stages, const Relation *suffix,
   WarpSynchronize();
 
   RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
-            pivot_rows, &rank, &best_row, factors);
+            pivot_rows, &rank, &best_row, factors, Scalar{0}, s.m);
   if (threadIdx.x == 0) {
     local_ok = 1;
     if (InconsistentRref(matrix, rows, columns, columns - 1, rank_tolerance,
