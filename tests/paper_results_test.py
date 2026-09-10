@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from scripts import paper_results as results
+from scripts import cuda_scratch_results
 
 
 def row(backend="clqr_cpu"):
@@ -20,6 +21,25 @@ def row(backend="clqr_cpu"):
 
 
 class ResultsTest(unittest.TestCase):
+    def test_scratch_comparison_retains_failed_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            for mode, timing in (("auto", "1.2"), ("global", "2.4")):
+                (work / mode).mkdir()
+                value = dict(row("clqr_cuda"), median_ms=timing, p90_ms=timing,
+                             setup_solve_ms="3.0")
+                failed = dict(value, N="512", status="failed", median_ms="nan",
+                              kernel_ms="nan", kkt_inf="nan")
+                with (work / mode / "cuda_host.csv").open("w") as output:
+                    writer = csv.DictWriter(output, fieldnames=value.keys())
+                    writer.writeheader()
+                    writer.writerows([value, failed])
+            with contextlib.redirect_stdout(io.StringIO()):
+                rows = cuda_scratch_results.compare(work)
+            self.assertEqual(rows[0]["global_over_auto_wall"], 2.0)
+            self.assertEqual(rows[1]["global_over_auto_wall"], "")
+            self.assertEqual(rows[1]["global_status"], "failed")
+
     def test_explicit_cpu_only_selection_needs_no_external_results(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)

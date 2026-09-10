@@ -176,6 +176,7 @@ esac
 for clqr_option in "${clqr_benchmark_options[@]}"; do
   printf '%s=%s\n' "$clqr_option" "${!clqr_option}"
 done > "$output_dir/benchmark_options.txt"
+printf 'CLQR_CUDA_SCRATCH=%s\n' "$CLQR_CUDA_SCRATCH" >> "$output_dir/benchmark_options.txt"
 
 # Compile and validate before building references or timing long sweeps.
 source "$repo_dir/scripts/notebook_bazel.sh"
@@ -188,7 +189,8 @@ trap '"${bazel_cmd[@]}" shutdown || true' EXIT
 # Use the subcommand: --version is not accepted after explicit startup options.
 "${bazel_cmd[@]}" version >> "$output_dir/platform.txt"
 cd "$repo_dir"
-bazel_args=(--config=fp64 --jobs="$jobs" --cxxopt=-march=native)
+bazel_args=(--config=fp64 --jobs="$jobs" --cxxopt=-march=native
+            --define="clqr_cuda_scratch=$CLQR_CUDA_SCRATCH")
 targets=(//:clqr_paper_cpu_benchmark //:clqr_paper_fixture)
 if (( CLQR_RUN_JAX )); then targets+=(//:clqr_paper_jax_cpu_benchmark); fi
 if (( cuda_run )); then
@@ -325,6 +327,7 @@ if (( cuda_run )); then
   # separately from the native-tuned dense comparison above.
   if (( CLQR_RUN_ORIGINAL_TABLE )); then
   "${bazel_cmd[@]}" build --config=fp64 --config=cuda \
+    --define="clqr_cuda_scratch=$CLQR_CUDA_SCRATCH" \
     --cuda_archs="sm_${cuda_arch}" --jobs="$jobs" //:clqr_cuda_benchmark
   measure original_table bazel-bin/clqr_cuda_benchmark --repeats "$repeats"
   fi

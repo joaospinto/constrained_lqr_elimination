@@ -248,6 +248,20 @@ Yang fetch Eigen headers directly, not GTSAM. Selected settings are saved in
 `benchmark_options.txt`; disabled backends are not required by the summary.
 The notebook and desktop runner inherit the same environment variables.
 
+For the CUDA scratch-placement experiment, use
+[`notebooks/kaggle_cuda_scratch.ipynb`](notebooks/kaggle_cuda_scratch.ipynb),
+or run `python3 scripts/notebook_paper.py --work-dir /path/to/results --scratch-comparison`.
+It defaults external solvers, JAX, and the additional original-table sweep off;
+regressions and sanitizers remain on. Automatic placement and forced-global
+placement use identical FP64 fixtures and reuse one build cache. The dimension
+sweep covers $n=8,16,24,32,48,64$ at $N=128,512$, plus $N=32,16384$ at
+$n=8,16$, with the same control/constraint ratios as the paper. The archive
+contains kernel/wall timings, numerical errors, and system information for both
+modes. `scratch_comparison.csv` reports global/automatic timing ratios; values
+above one mean forced-global is slower. This isolates memory placement, not
+performance against an older solver revision. For a single mode, the general
+runner accepts `CLQR_CUDA_SCRATCH=auto` (default) or `global`.
+
 The [paper comparison notebook](notebooks/kaggle_paper_comparison.ipynb)
 runs this workflow from a fresh Kaggle GPU session using an uploaded
 `clqr-source.bundle` snapshot or, by default, current `origin/main`,

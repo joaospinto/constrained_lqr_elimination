@@ -24,7 +24,7 @@ config_setting(
 
 py_test(
     name = "paper_results_test",
-    srcs = ["tests/paper_results_test.py", "scripts/paper_results.py"],
+    srcs = ["tests/paper_results_test.py", "scripts/paper_results.py", "scripts/cuda_scratch_results.py"],
     main = "tests/paper_results_test.py",
 )
 
@@ -34,6 +34,8 @@ py_test(
     main = "tests/notebook_paper_test.py",
     data = [
         "notebooks/kaggle_paper_comparison.ipynb",
+        "notebooks/kaggle_cuda_scratch.ipynb",
+        "scripts/cuda_scratch_benchmarks.sh",
         "scripts/benchmark_options.sh",
         "scripts/notebook_bazel.sh",
         "scripts/paper_benchmarks.sh",

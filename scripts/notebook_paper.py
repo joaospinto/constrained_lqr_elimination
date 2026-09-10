@@ -10,7 +10,8 @@ import tempfile
 import zipfile
 
 
-def run(source, work_dir, *, cuda=True, suite="all", repeats=11, jobs=4):
+def run(source, work_dir, *, cuda=True, suite="all", repeats=11, jobs=4,
+        scratch_comparison=False):
     if shutil.disk_usage(work_dir).free < 5 * 1024**3:
         raise RuntimeError("At least 5 GiB free is required before starting the comparison")
     root = Path(tempfile.mkdtemp(prefix="clqr-paper-", dir=work_dir))
@@ -21,7 +22,8 @@ def run(source, work_dir, *, cuda=True, suite="all", repeats=11, jobs=4):
                CLQR_PAPER_SUITE=suite, CLQR_BENCHMARK_REPEATS=str(repeats),
                CLQR_JOBS=str(jobs),
                PYTHONDONTWRITEBYTECODE="1")
-    command = ["bash", str(source / "scripts/paper_benchmarks.sh"), str(results)]
+    driver = "cuda_scratch_benchmarks.sh" if scratch_comparison else "paper_benchmarks.sh"
+    command = ["bash", str(source / "scripts" / driver), str(results)]
     if cuda:
         command.append("--cuda")
     print(f"Run directory: {root}", flush=True)
@@ -66,15 +68,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, default=Path("/kaggle/working"))
     parser.add_argument("--cpu-only", action="store_true")
-    parser.add_argument("--suite", default="all",
-                        choices=("all", "smoke", "horizon", "dimension", "constraints"))
+    parser.add_argument("--scratch-comparison", action="store_true",
+                        help="compare automatic and forced-global CUDA scratch, without external solvers")
+    parser.add_argument("--suite",
+                        choices=("all", "smoke", "horizon", "dimension", "constraints", "scratch"))
     parser.add_argument("--repeats", type=int, default=11)
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
     args = parser.parse_args()
     if args.repeats < 1 or args.jobs < 1:
         parser.error("repeats and jobs must be positive")
+    if args.scratch_comparison and args.cpu_only:
+        parser.error("--scratch-comparison requires CUDA")
+    suite = args.suite or ("scratch" if args.scratch_comparison else "all")
     return run(Path(__file__).resolve().parents[1], args.work_dir.resolve(),
-               cuda=not args.cpu_only, suite=args.suite, repeats=args.repeats, jobs=args.jobs)
+               cuda=not args.cpu_only, suite=suite, repeats=args.repeats, jobs=args.jobs,
+               scratch_comparison=args.scratch_comparison)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,13 @@ int main() {
   if (cases.size() != 22)
     throw std::runtime_error("paper sweep case count");
   const auto horizons = clqr::benchmark::PaperCases("horizon");
+  const auto scratch = clqr::benchmark::PaperCases("scratch");
+  if (scratch.size() != 16)
+    throw std::runtime_error("scratch sweep case count");
+  for (const auto &c : scratch)
+    if (c.n % 8 || c.m != c.n / 2 || c.mixed != c.n / 8 ||
+        c.state != c.n / 4 || c.family != "scratch")
+      throw std::runtime_error("scratch sweep dimension ratios");
   if (horizons.size() != 22)
     throw std::runtime_error("paper horizon count");
   for (std::size_t i = 0; i < horizons.size(); ++i)
