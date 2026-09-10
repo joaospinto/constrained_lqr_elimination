@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
   }
   int failures = 0, returned = 0;
   std::cout << std::setprecision(12)
-            << "case,status,laine_corrected_ms,clqr_ms,feasibility_inf,audited_"
+            << "case,status,laine_corrected_ms,clqr_ms,feasibility_inf,returned_"
                "stationarity_inf,clqr_kkt_inf,primal_difference,diagnostic\n";
   for (const auto &c : cases) {
     try {
@@ -90,7 +90,7 @@ int main(int argc, char **argv) {
         lt_ms = Time([&] { r = corrected_laine_tomlin::Solve(p); });
         cpu_ms = Time([&] { native = clqr::Solve(c.problem, workspace); });
       }
-      const auto [primal, stationarity] = Audit(p, r);
+      const auto [primal, stationarity] = AuditReturnedMultipliers(p, r);
       const auto point = clqr::test::adversarial::CopyCpuSolution(native);
       std::string worst;
       const auto cpu_kkt =

@@ -69,17 +69,27 @@ void Verify(const Problem &p, const std::string &name) {
             name + ": feedback policy mismatch");
     }
   }
-  // Duals reconstructed solely for the audit; not attributed to this solver.
+  // Audit the returned multipliers in the independently assembled ORIGINAL
+  // KKT equations, not a least-squares dual fitted to the returned primal.
   const Vector gradient = d.Hessian * actual + d.gradient;
-  Vector lambda_scaled = Vector::Zero(scaled.rows());
-  if (scaled.rows()) {
-    Eigen::JacobiSVD<Matrix> dual_svd(
-        scaled.transpose(), Eigen::ComputeThinU | Eigen::ComputeThinV);
-    dual_svd.setThreshold(1e-12);
-    lambda_scaled = dual_svd.solve(-gradient);
+  Check(r.dynamics.size() == p.stages.size() &&
+            r.constraints.size() == p.stages.size() &&
+            r.initial.size() == p.initial_state.size() &&
+            r.terminal.size() == p.terminal_d.size(), name + ": dual shapes");
+  Vector lambda(d.J.rows());
+  Index row = r.initial.size();
+  lambda.head(row) = -r.initial; // oracle uses x[0]-initial_state
+  for (std::size_t t = 0; t < p.stages.size(); ++t) {
+    Check(r.dynamics[t].size() == p.stages[t].A.rows() &&
+              r.constraints[t].size() == p.stages[t].C.rows(),
+          name + ": stage dual shapes");
+    lambda.segment(row, r.dynamics[t].size()) = r.dynamics[t];
+    row += r.dynamics[t].size();
+    lambda.segment(row, r.constraints[t].size()) = r.constraints[t];
+    row += r.constraints[t].size();
   }
-  const double stationarity =
-      Max(gradient + scaled.transpose() * lambda_scaled);
+  lambda.tail(r.terminal.size()) = r.terminal;
+  const double stationarity = Max(gradient + d.J.transpose() * lambda);
   const double primal = Max(d.J * actual + d.b);
   const double difference = Max(actual - optimum);
   worst_primal = std::max(worst_primal, primal);
@@ -201,7 +211,7 @@ int main() {
       Verify(RandomProblem(seed, true), "uniform seed " + std::to_string(seed));
     std::cout << "Laine-Tomlin: analytic, edge, 256 dense-oracle cases passed; "
               << "max original feasibility=" << worst_primal
-              << ", audited stationarity=" << worst_stationarity
+              << ", returned-dual stationarity=" << worst_stationarity
               << ", dense primal difference=" << worst_difference << '\n';
   } catch (const std::exception &e) {
     std::cerr << "FAIL: " << e.what() << '\n';

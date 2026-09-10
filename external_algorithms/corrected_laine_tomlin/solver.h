@@ -56,13 +56,20 @@ struct Result {
   std::vector<Matrix> K;
   std::vector<Vector> k; // u[t] = K[t]*x[t] + k[t]
   std::vector<Vector> states, controls;
+  // Lagrangian: cost + initial'*(initial_state-x[0])
+  // + sum dynamics[t]'*(A*x[t]+B*u[t]+c-x[t+1])
+  // + sum constraints[t]'*(C*x[t]+D*u[t]+d)
+  // + terminal'*(terminal_C*x[N]+terminal_d).
+  // Redundant equalities have nonunique multipliers; no minimum-norm promise.
+  Vector initial, terminal;
+  std::vector<Vector> dynamics, constraints;
   double objective = 0;
   // Largest compressed constraint-to-go row count (never exceeds state dim).
   Eigen::Index max_constraint_rows = 0;
 };
 
 // Requires positive-definite Hessians in the free-control directions. Returns
-// primal trajectories and feedback, not multipliers. No regularization,
+// primal trajectories, feedback, and original-coordinate multipliers. No regularization,
 // iterative refinement, CLQR fallback, or dense whole-horizon solve.
 Result Solve(const Problem &problem, const Options &options = {});
 

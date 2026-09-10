@@ -163,6 +163,17 @@ cc_binary(
     deps = [":clqr", "//external_algorithms/corrected_laine_tomlin:comparison_support"],
 )
 
+py_test(
+    name = "corrected_laine_benchmark_test",
+    size = "small",
+    srcs = ["tests/corrected_laine_benchmark_test.py"],
+    data = [":clqr_laine_corrected_benchmark"],
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)
+
 cc_binary(
     name = "clqr_adversarial_cpu_benchmark",
     testonly = True,

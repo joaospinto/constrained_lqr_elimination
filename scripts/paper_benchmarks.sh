@@ -180,6 +180,7 @@ bazel-bin/clqr_paper_fixture --suite "$suite" > "$output_dir/cases.json"
   //:clqr_test //:workspace_allocation_test //:scaling_problem_test \
   //:reduced_objective_test //:paper_jax_fixture_test \
   //:cuda_kernel_emulation_extended_test //:paper_results_test //:notebook_paper_test \
+  //:corrected_laine_benchmark_test \
   //benchmarks/reference:quadratic_factor_test \
   //benchmarks/reference:stationarity_audit_test \
   //external_algorithms/corrected_laine_tomlin:all

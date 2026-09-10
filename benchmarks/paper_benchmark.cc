@@ -463,7 +463,7 @@ private:
 class LaineCorrectedSolver {
 public:
   explicit LaineCorrectedSolver(const Problem &p)
-      : problem_(corrected_laine_tomlin::conversion::Convert(p)) {}
+      : original_(p), problem_(corrected_laine_tomlin::conversion::Convert(p)) {}
   void Solve() {
     result_ = corrected_laine_tomlin::Solve(problem_);
     if (result_.status != corrected_laine_tomlin::Status::kOptimal)
@@ -472,7 +472,28 @@ public:
   Trajectory Result() const {
     return EigenTrajectory(result_.states, result_.controls);
   }
+  Multipliers DualResult() const {
+    auto copy = [](const auto &v) {
+      Vector out(v.size());
+      for (Eigen::Index i = 0; i < v.size(); ++i)
+        out[i] = v[i];
+      return out;
+    };
+    Multipliers out;
+    // CLQR's benchmark uses x[0]-initial_state and x[t+1]-A*x-B*u-c,
+    // opposite to this solver's documented boundary/dynamics signs.
+    out.initial = clqr::Scale(copy(result_.initial), clqr::Scalar{-1});
+    out.terminal = copy(result_.terminal);
+    for (std::size_t t = 0; t < original_.stages.size(); ++t) {
+      const auto &s = original_.stages[t];
+      out.dynamics.push_back(clqr::Scale(copy(result_.dynamics[t]), clqr::Scalar{-1}));
+      out.mixed.push_back(copy(result_.constraints[t].head(s.C.rows())));
+      out.state.push_back(copy(result_.constraints[t].tail(s.E.rows())));
+    }
+    return out;
+  }
 private:
+  const Problem &original_;
   corrected_laine_tomlin::Problem problem_;
   corrected_laine_tomlin::Result result_;
 };
@@ -811,7 +832,7 @@ int main(int argc, char **argv) {
                "repetition.\n"
                "# All backends receive identical data. Validation and result "
                "conversion are untimed.\n"
-               "# CLQR, generalized Riccati, and the original Laine solver "
+               "# CLQR, generalized Riccati, and both Laine implementations "
                "also recover duals inside timing. Primal-only backends "
                "report no solver-dual KKT measurement.\n"
                "# Setup+solve includes representation construction and fresh "

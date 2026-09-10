@@ -43,6 +43,43 @@ inline std::string CsvMessage(std::string s) {
   return s;
 }
 
+// Direct original-coordinate KKT audit of solver-produced multipliers.
+inline std::pair<double, double> AuditReturnedMultipliers(const Problem &p,
+                                                         const Result &r) {
+  const auto N = p.stages.size();
+  if (r.states.size() != N + 1 || r.controls.size() != N ||
+      r.constraints.size() != N || r.dynamics.size() != N ||
+      r.initial.size() != p.initial_state.size() ||
+      r.terminal.size() != p.terminal_d.size())
+    throw std::runtime_error("invalid returned primal/dual shapes");
+  double feasibility = Max(r.states[0] - p.initial_state), stationarity = 0;
+  for (std::size_t t = 0; t <= N; ++t) {
+    const Vector &x = r.states[t];
+    Vector gx = p.Q[t] * x + p.q[t] - (t ? r.dynamics[t - 1] : r.initial);
+    if (t == N) {
+      gx += p.terminal_C.transpose() * r.terminal;
+      feasibility = std::max(feasibility, Max(p.terminal_C * x + p.terminal_d));
+    } else {
+      const auto &s = p.stages[t];
+      const auto &u = r.controls[t];
+      if (r.dynamics[t].size() != s.A.rows() ||
+          r.constraints[t].size() != s.C.rows())
+        throw std::runtime_error("invalid returned stage dual shapes");
+      gx += s.S * u + s.A.transpose() * r.dynamics[t] +
+            s.C.transpose() * r.constraints[t];
+      const Vector gu = s.R * u + s.r + s.S.transpose() * x +
+                        s.B.transpose() * r.dynamics[t] +
+                        s.D.transpose() * r.constraints[t];
+      stationarity = std::max(stationarity, Max(gu));
+      feasibility = std::max({feasibility,
+          Max(s.A * x + s.B * u + s.c - r.states[t + 1]),
+          Max(s.C * x + s.D * u + s.d)});
+    }
+    stationarity = std::max(stationarity, Max(gx));
+  }
+  return {feasibility, stationarity};
+}
+
 // Untimed independent optimality audit, NOT solver output: assemble original
 // sparse J' and find multipliers with sparse QR. This never changes the primal.
 inline std::pair<double, double> Audit(const corrected_laine_tomlin::Problem &p,

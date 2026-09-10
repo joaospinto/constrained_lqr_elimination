@@ -125,10 +125,13 @@ auto solution = corrected_laine_tomlin::Solve(problem);
 if (solution.status == corrected_laine_tomlin::Status::kOptimal) {
   // solution.states, solution.controls
   // feedback: u[t] = solution.K[t] * x[t] + solution.k[t]
+  // duals: solution.initial, .dynamics[t], .constraints[t], .terminal
 }
 ```
 
-The solver returns **primals and policies, not multipliers**. It does not
+The solver returns primals, policies, and original-coordinate multipliers.
+The Lagrangian signs are documented in `solver.h`; redundant equalities may
+have nonunique multipliers, without a minimum-norm guarantee. It does not
 regularize a singular/indefinite free-control Hessian or apply iterative
 refinement. Its `kOptimal` status denotes successful numerical recursion, not a
 separate whole-horizon KKT certificate. Tests audit original, unscaled
@@ -141,11 +144,32 @@ extension of the policy outside the feasible set. `Options` exposes the rank
 and feasibility tolerances. Constraint compression bounds propagated rows by
 the state dimension. Work is linear in the horizon for bounded stage dimensions
 and constraint counts, with cubic dense stage algebra. Storage is linear in the
-horizon for policies and trajectories; this reference uses dynamic allocations.
+horizon for policies, recovery factors, and trajectories; this reference uses dynamic allocations.
 The shared arithmetic kernels allocate no memory, but that does not make the
 reference solver allocation-free. Its Eigen matrices, decompositions, and
 returned trajectories still allocate. Product routing uses existing strides,
 including column-major storage, without packing the matrices.
+
+### Multiplier recovery
+
+The author's recovery uses full-rank LU solves, including a terminal
+constraint Gram matrix, which is singular for redundant rows. This corrected
+implementation instead reuses its rank-revealing SVDs and carries the adjoints
+of all row-scaling and constraint-compression transformations. It neither
+forms normal equations nor solves a whole-horizon multiplier system.
+
+At a backward stage let `Nu`, `Nx` be the equilibrated stacked local and
+next-stage constraints, `K` the policy, `U` the retained left singular vectors
+of `Nu`, and `H = T*(Nx + Nu*K)` the compressed constraint-to-go matrix.
+For its multiplier `theta`, the stacked multipliers in equilibrated coordinates
+are `gamma = -(Nu^+)'*g_u + (I-U*U')*T'*theta`, where `g_u` is the control
+gradient of the condensed quadratic. The projector is applied through thin
+products, not formed as a constraint-row-square matrix. Row scaling is then
+undone. The local part of `gamma` is returned; its continuation part is passed
+forward. Costates include both the value gradient and the constraint-to-go
+adjoint. The fixed initial state permits choosing its continuation adjoint
+as zero. This recovers a valid multiplier representative while retaining
+linear-horizon work and storage and cubic local dense algebra.
 
 ## Validation and local comparison
 
@@ -162,16 +186,16 @@ analytic counterexamples, zero-sized and inconsistent
 problems, bounded constraint propagation at horizon 2048, and 256 deterministic
 random convex problems against an independently assembled dense QP. These tests
 do not link CLQR. `fixture_test` exercises the 74 shared adversarial cases and
-cross-checks CLQR on the same 256 random problems. It uses an independent
-sparse QR of the original constraint Jacobian transpose to
-audit stationarity. The audit's multipliers are **not solver outputs**, are
-computed outside timing, and never change the primal solution.
+cross-checks CLQR on the same 256 random problems. Both tests check stationarity
+using the corrected solver's returned multipliers in the original, unscaled
+KKT equations. The standalone author audit retains an independent sparse-QR
+primal optimality check; it does not supply multipliers to this solver.
 
 The optional benchmark prints both solvers' times and residuals without failing
-on numerical outcomes. Each timed solve includes fresh factorization and primal
-reconstruction; CLQR also recovers multipliers. Input conversion and validation
+on numerical outcomes. Each timed solve includes fresh factorization, primal
+reconstruction, and multiplier recovery for both methods. Input conversion and validation
 audits are untimed. This reference allocates per solve; CLQR uses its reserved
-workspace. These are not equal-output or allocation-free performance numbers.
+workspace. These are not allocation-free performance numbers.
 The indefinite-Hessian fixture is intentionally rejected here, whereas CLQR
 supports returning an indefinite Newton/KKT direction.
 
@@ -210,8 +234,8 @@ For the identical dense cases used by the paper's comparison harness, run
 The optional CMake harness also provides this target when configured with
 `-DCLQR_COMPARE_LAINE_CORRECTED=ON` and `EIGEN_SOURCE_DIR`; no author
 checkout is required. It prints `clqr_cpu` and `laine_corrected`
-separately. The latter has no reported-dual KKT
-column; `planted_dual_stationarity_inf` checks each returned primal using the
+separately, including their returned-dual KKT residuals and primal/dual errors.
+`planted_dual_stationarity_inf` separately checks each returned primal using the
 fixture's known optimal multipliers. This untimed, linear-horizon certificate
 is not a result returned by those solvers. Local runs do not replace the
 paper's Kaggle measurements.

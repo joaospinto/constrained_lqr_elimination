@@ -59,12 +59,14 @@ bool Valid(const Problem &p, const Options &o) {
 // Normalize equality rows, including rows whose only nonzero is their offset.
 // Scaling changes only the off-feasible-set least-squares extension of a
 // policy.
-void Equilibrate(Matrix &a, Matrix &b, Vector &d) {
+Vector Equilibrate(Matrix &a, Matrix &b, Vector &d) {
+  Vector divisors = Vector::Ones(d.size());
   for (Index i = 0; i < d.size(); ++i) {
     const double scale = std::max(a.cols() ? MaxAbs(a.row(i)) : 0,
                                   b.cols() ? MaxAbs(b.row(i)) : 0);
     const double divisor = scale > 0 ? scale : std::abs(d[i]);
     if (divisor > 0) {
+      divisors[i] = divisor;
       if (a.cols())
         a.row(i) /= divisor;
       if (b.cols())
@@ -72,6 +74,7 @@ void Equilibrate(Matrix &a, Matrix &b, Vector &d) {
       d[i] /= divisor;
     }
   }
+  return divisors;
 }
 
 Index Rank(const Vector &singular, double threshold) {
@@ -82,9 +85,12 @@ Index Rank(const Vector &singular, double threshold) {
 
 // Compress H*x+h=0 with an SVD, retaining an orthonormal row basis. Unlike a
 // full-rank-[H,h] test, the left-null residual also detects 0*x+nonzero=0.
-Status Compress(Matrix &H, Vector &h, const Options &o) {
+// Also retain the adjoint of the compression: H_compressed = lift' * H_input.
+// This maps constraint-to-go multipliers back before row equilibration.
+Status Compress(Matrix &H, Vector &h, Matrix &lift, const Options &o) {
+  lift.resize(H.rows(), 0);
   Matrix empty = Matrix::Zero(H.rows(), 0);
-  Equilibrate(H, empty, h);
+  const Vector divisors = Equilibrate(H, empty, h);
   if (!H.allFinite() || !h.allFinite())
     return Status::kNumericalFailure;
   if (H.rows() == 0)
@@ -106,9 +112,19 @@ Status Compress(Matrix &H, Vector &h, const Options &o) {
     return Status::kInfeasible;
   H = svd.matrixV().leftCols(rank).transpose();
   h = projected.cwiseQuotient(svd.singularValues().head(rank));
-  return H.allFinite() && h.allFinite() ? Status::kOptimal
+  lift = U * svd.singularValues().head(rank).cwiseInverse().asDiagonal();
+  for (Index i = 0; i < lift.rows(); ++i)
+    lift.row(i) /= divisors[i];
+  return H.allFinite() && h.allFinite() && lift.allFinite() ? Status::kOptimal
                                         : Status::kNumericalFailure;
 }
+
+struct DualStage {
+  Matrix control_inverse, continuation_lift, control_gradient;
+  Vector control_offset;
+  Matrix next_value, next_constraints;
+  Vector next_gradient;
+};
 
 Result Failure(Status status, const std::string &message) {
   Result r;
@@ -125,9 +141,11 @@ Result Solve(const Problem &p, const Options &o) {
   Result result;
   result.K.resize(N);
   result.k.resize(N);
+  std::vector<DualStage> dual(N);
+  Matrix terminal_lift;
   Matrix V = p.Q.back(), H = p.terminal_C;
   Vector v = p.q.back(), h = p.terminal_d;
-  const Status terminal_status = Compress(H, h, o);
+  const Status terminal_status = Compress(H, h, terminal_lift, o);
   if (terminal_status != Status::kOptimal)
     return Failure(terminal_status,
                    "inconsistent or nonfinite terminal constraints");
@@ -136,6 +154,10 @@ Result Solve(const Problem &p, const Options &o) {
   for (std::size_t t = N; t-- > 0;) {
     const auto &s = p.stages[t];
     const Index n = s.A.cols(), m = s.B.cols(), local = s.C.rows();
+    auto &recovery = dual[t];
+    recovery.next_value = V;
+    recovery.next_gradient = v;
+    recovery.next_constraints = H;
     const Matrix VA = Product(V, s.A), VB = Product(V, s.B);
     const Vector shifted = v + Product(V, s.c);
     const Matrix Mxx = p.Q[t] + Product(s.A.transpose(), VA);
@@ -160,7 +182,7 @@ Result Solve(const Problem &p, const Options &o) {
         Nu.bottomRows(H.rows()) = Product(H, s.B);
       b.tail(H.rows()) = h + Product(H, s.c);
     }
-    Equilibrate(Nx, Nu, b);
+    const Vector divisors = Equilibrate(Nx, Nu, b);
     if (!Mxx.allFinite() || !Mux.allFinite() || !Muu.allFinite() ||
         !mx.allFinite() || !mu.allFinite() || !Nx.allFinite() ||
         !Nu.allFinite() || !b.allFinite())
@@ -170,6 +192,8 @@ Result Solve(const Problem &p, const Options &o) {
     Vector kp = Vector::Zero(m);
     Matrix next_H = Nx;
     Vector next_h = b;
+    Matrix control_range(Nu.rows(), 0);
+    recovery.control_inverse = Matrix::Zero(Nu.rows(), m);
     if (Nu.rows() && m) {
       // Thin U avoids a quadratic allocation in the number of constraint rows;
       // full V supplies all control null-space directions.
@@ -181,11 +205,13 @@ Result Solve(const Problem &p, const Options &o) {
           Rank(svd.singularValues(),
                o.rank_tolerance * std::max(1.0, svd.singularValues()[0]));
       const auto U = svd.matrixU().leftCols(rank);
+      control_range = U;
       const Matrix UNx = Product(U.transpose(), Nx);
       const Vector Ub = Product(U.transpose(), b);
       const Matrix inverse_action =
           svd.matrixV().leftCols(rank) *
           svd.singularValues().head(rank).cwiseInverse().asDiagonal();
+      recovery.control_inverse = Product(U, inverse_action.transpose());
       dense::Multiply(Kp, inverse_action, UNx, -1, 0);
       dense::Multiply(kp, inverse_action, Ub, -1, 0);
       AddProduct(next_H, U, UNx, -1);
@@ -231,21 +257,39 @@ Result Solve(const Problem &p, const Options &o) {
       AddProduct(k, Z, rhs.col(n), -1);
     }
     const Matrix cross = Product(Mux.transpose(), K);
-    V = Mxx + cross + cross.transpose() + Product(K.transpose(), Product(Muu, K));
+    const Matrix MuuK = Product(Muu, K);
+    V = Mxx + cross + cross.transpose() + Product(K.transpose(), MuuK);
     V = (0.5 * (V + V.transpose())).eval();
     const Vector shifted_control = mu + Product(Muu, k);
+    recovery.control_gradient = Mux + MuuK;
+    recovery.control_offset = shifted_control;
     v = mx + Product(Mux.transpose(), k) + Product(K.transpose(), shifted_control);
     if (!V.allFinite() || !v.allFinite() || !K.allFinite() || !k.allFinite())
       return Failure(Status::kNumericalFailure,
                      "nonfinite backward recurrence");
     H = std::move(next_H);
     h = std::move(next_h);
-    const Status constraint_status = Compress(H, h, o);
+    const Status constraint_status = Compress(H, h, recovery.continuation_lift, o);
     if (constraint_status != Status::kOptimal)
       return Failure(
           constraint_status,
           "inconsistent or nonfinite propagated constraints at stage " +
               std::to_string(t));
+    // If F=Nx+Nu*K and H=T*F, then control stationarity and the
+    // constraint-to-go adjoint theta are satisfied by
+    // gamma = -(Nu^+)'*g_u + (I-U*U')*T'*theta.
+    // Project T' AFTER undoing compression scaling: scaling need not preserve
+    // orthogonality to U. Never materialize the rows-by-rows projector.
+    const Matrix projected_lift =
+        Product(control_range.transpose(), recovery.continuation_lift);
+    AddProduct(recovery.continuation_lift, control_range, projected_lift, -1);
+    for (Index i = 0; i < divisors.size(); ++i) {
+      recovery.control_inverse.row(i) /= divisors[i];
+      recovery.continuation_lift.row(i) /= divisors[i];
+    }
+    if (!recovery.control_inverse.allFinite() ||
+        !recovery.continuation_lift.allFinite())
+      return Failure(Status::kNumericalFailure, "nonfinite multiplier maps");
     result.max_constraint_rows = std::max(result.max_constraint_rows, H.rows());
   }
   if (MaxAbs(Product(H, p.initial_state) + h) >
@@ -257,18 +301,38 @@ Result Solve(const Problem &p, const Options &o) {
   result.states.resize(N + 1);
   result.controls.resize(N);
   result.states[0] = p.initial_state;
+  result.initial = Product(V, p.initial_state) + v;
+  result.dynamics.resize(N);
+  result.constraints.resize(N);
+  // x[0] is fixed, so its constraint-to-go multiplier may be chosen as zero.
+  Vector theta = Vector::Zero(H.rows());
   for (std::size_t t = 0; t < N; ++t) {
     const auto &s = p.stages[t];
     const Vector &x = result.states[t];
     Vector &u = result.controls[t];
     u = Product(result.K[t], x) + result.k[t];
     result.states[t + 1] = Product(s.A, x) + Product(s.B, u) + s.c;
+    const auto &recovery = dual[t];
+    const Vector control_gradient =
+        Product(recovery.control_gradient, x) + recovery.control_offset;
+    const Vector gamma =
+        Product(recovery.continuation_lift, theta) -
+        Product(recovery.control_inverse, control_gradient);
+    result.constraints[t] = gamma.head(s.C.rows());
+    theta = gamma.tail(recovery.next_constraints.rows());
+    result.dynamics[t] =
+        Product(recovery.next_value, result.states[t + 1]) +
+        recovery.next_gradient + Product(recovery.next_constraints.transpose(), theta);
     result.objective +=
         0.5 * x.dot(Product(p.Q[t], x)) + p.q[t].dot(x) +
         x.dot(Product(s.S, u)) + 0.5 * u.dot(Product(s.R, u)) + s.r.dot(u);
-    if (!u.allFinite() || !result.states[t + 1].allFinite())
-      return Failure(Status::kNumericalFailure, "nonfinite trajectory");
+    if (!u.allFinite() || !result.states[t + 1].allFinite() ||
+        !gamma.allFinite() || !result.dynamics[t].allFinite())
+      return Failure(Status::kNumericalFailure, "nonfinite trajectory or multipliers");
   }
+  result.terminal = Product(terminal_lift, theta);
+  if (!result.initial.allFinite() || !result.terminal.allFinite())
+    return Failure(Status::kNumericalFailure, "nonfinite boundary multipliers");
   const Vector &last = result.states.back();
   result.objective +=
       0.5 * last.dot(Product(p.Q.back(), last)) + p.q.back().dot(last);
