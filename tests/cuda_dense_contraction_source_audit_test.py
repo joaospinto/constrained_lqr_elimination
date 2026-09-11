@@ -45,7 +45,10 @@ def test_feedback_hessian_products_are_staged_cubic():
     assert "product[row * columns + col] = value;" in body
     assert "next.J[row * next.left_dim + k] * operand" in body
     assert "s.B[k * s.m + row] * product[k * columns + col]" in body
-    assert 'next, ScratchCheckedSum({m, n}, "feedback workspace")' in source
+    planner = _between(source, "void IncludeReducedStageScratch(",
+                       "ScratchRequirements PlanScratch(")
+    assert 'columns = ScratchCheckedSum({m, n}, "feedback workspace")' in planner
+    assert 'ScratchCheckedProduct(next, columns, "feedback workspace")' in planner
 
 
 def test_stage_reduction_products_are_staged_cubic():
