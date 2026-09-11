@@ -48,6 +48,7 @@ using clqr::metal::detail::KernelParams;
 using clqr::metal::detail::PlanInvocation;
 using clqr::metal::detail::PlanLaneSlicedThreadgroupLanes;
 using clqr::metal::detail::TreePlan;
+using clqr::metal::detail::WithScratch;
 
 std::string ErrorText(NSError *error) {
   if (error == nil)
@@ -924,19 +925,21 @@ ffi::Error SolveMetalImpl(
     if (N < 64u ||
         !EncodeLaneSlicedKernelWithThreadgroupMemory(
             command_buffer, runtime.build_primal_leaves_threadgroup_sliced(),
-            runtime.device(), workspace, feasibility, N + 1,
+            runtime.device(), workspace,
+            WithScratch(feasibility, layout.primal_leaves), N + 1,
             layout.primal_leaf_float_bytes, layout.primal_leaf_integer_bytes)) {
       EncodeKernel(command_buffer, runtime.build_primal_leaves(), workspace,
-                   feasibility, N + 1);
+                   WithScratch(feasibility, layout.primal_leaves), N + 1);
     }
-    EncodeCooperativeReductionTree(command_buffer,
-                                   runtime.reduce_primal_relations(), workspace,
-                                   feasibility, layout.node_tree);
+    EncodeCooperativeReductionTree(
+        command_buffer, runtime.reduce_primal_relations(), workspace,
+        WithScratch(feasibility, layout.primal_relations), layout.node_tree);
     EncodeCooperativeTreeContexts(
         command_buffer, runtime.expand_primal_suffix_context(),
-        runtime.finalize_primal_suffix(), workspace, feasibility,
-        layout.node_tree, layout.node_tree.slots);
-    KernelParams invocation = feasibility;
+        runtime.finalize_primal_suffix(), workspace,
+        WithScratch(feasibility, layout.primal_relations), layout.node_tree,
+        layout.node_tree.slots);
+    KernelParams invocation = WithScratch(feasibility, layout.state_parameters);
     invocation.child_offset = layout.node_tree.offsets[0];
     EncodeKernel(command_buffer, runtime.extract_state_parameters(), workspace,
                  invocation, N + 1);
@@ -951,23 +954,25 @@ ffi::Error SolveMetalImpl(
     EncodeKernel(command_buffer, runtime.initial_reduced_state(), workspace,
                  base, 1);
     EncodeCooperativeKernel(command_buffer, runtime.build_value_leaves(),
-                            workspace, base, N + 1);
+                            workspace, WithScratch(base, layout.value_leaves),
+                            N + 1);
     EncodeCooperativeReductionTreeWithThreadgroupMemory(
         command_buffer, runtime.reduce_value_threadgroup(),
-        runtime.reduce_value(), runtime.device(), workspace, base,
-        layout.node_tree, layout.value_composition_float_bytes);
+        runtime.reduce_value(), runtime.device(), workspace,
+        WithScratch(base, layout.value_compositions), layout.node_tree,
+        layout.value_composition_float_bytes);
     EncodeCooperativeTreeContextsWithThreadgroupMemory(
         command_buffer, runtime.expand_value_context_threadgroup(),
         runtime.expand_value_context(),
         runtime.finalize_value_suffix_threadgroup(),
-        runtime.finalize_value_suffix(), runtime.device(), workspace, base,
-        layout.node_tree, layout.node_tree.slots,
-        layout.value_composition_float_bytes);
+        runtime.finalize_value_suffix(), runtime.device(), workspace,
+        WithScratch(base, layout.value_compositions), layout.node_tree,
+        layout.node_tree.slots, layout.value_composition_float_bytes);
     EncodeCooperativeKernelWithThreadgroupMemory(
         command_buffer, runtime.matrix_feedback(), runtime.device(), workspace,
         base, N, layout.feedback_float_bytes, layout.feedback_integer_bytes);
     EncodeKernel(command_buffer, runtime.initialize_costate_maps(), workspace,
-                 base, N);
+                 WithScratch(base, layout.affine_rhs), N);
     EncodeCooperativeReductionTree(command_buffer, runtime.reduce_affine(),
                                    workspace, base, layout.stage_tree);
     EncodeCooperativeTreeContexts(
@@ -976,8 +981,8 @@ ffi::Error SolveMetalImpl(
         layout.stage_tree.slots);
     EncodeKernel(command_buffer, runtime.recover_costates(), workspace, base,
                  N + 1);
-    EncodeKernel(command_buffer, runtime.finalize_feedback(), workspace, base,
-                 N);
+    EncodeKernel(command_buffer, runtime.finalize_feedback(), workspace,
+                 WithScratch(base, layout.affine_rhs), N);
     EncodeKernel(command_buffer, runtime.initialize_state_maps(), workspace,
                  base, N);
     EncodeCooperativeReductionTree(command_buffer, runtime.reduce_affine(),
@@ -991,25 +996,29 @@ ffi::Error SolveMetalImpl(
     if (N < 64u ||
         !EncodeLaneSlicedKernelWithThreadgroupMemory(
             command_buffer, runtime.build_dual_parameters_threadgroup_sliced(),
-            runtime.device(), workspace, multiplier_tree, N,
+            runtime.device(), workspace,
+            WithScratch(multiplier_tree, layout.dual_parameters), N,
             layout.dual_parameter_float_bytes,
             layout.dual_parameter_integer_bytes)) {
       EncodeKernel(command_buffer, runtime.build_dual_parameters(), workspace,
-                   multiplier_tree, N);
+                   WithScratch(multiplier_tree, layout.dual_parameters), N);
     }
     if (N < 64u ||
         !EncodeLaneSlicedKernelWithThreadgroupMemory(
             command_buffer,
             runtime.build_dual_relation_leaves_threadgroup_sliced(),
-            runtime.device(), workspace, multiplier_leaf, N,
+            runtime.device(), workspace,
+            WithScratch(multiplier_leaf, layout.dual_leaves), N,
             layout.dual_leaf_float_bytes, layout.dual_leaf_integer_bytes)) {
       EncodeKernel(command_buffer, runtime.build_dual_relation_leaves(),
-                   workspace, multiplier_leaf, N);
+                   workspace, WithScratch(multiplier_leaf, layout.dual_leaves),
+                   N);
     }
-    EncodeReductionTree(command_buffer, runtime.reduce_dual_relations(),
-                        workspace, multiplier_tree, layout.stage_tree);
+    EncodeReductionTree(
+        command_buffer, runtime.reduce_dual_relations(), workspace,
+        WithScratch(multiplier_tree, layout.dual_relations), layout.stage_tree);
     if (!layout.stage_tree.counts.empty()) {
-      invocation = multiplier_tree;
+      invocation = WithScratch(multiplier_tree, layout.dual_solves);
       invocation.child_offset = layout.stage_tree.offsets.back();
       invocation.parent_offset = layout.stage_tree.offsets.back();
       EncodeKernel(command_buffer, runtime.solve_dual_root(), workspace,
@@ -1018,7 +1027,7 @@ ffi::Error SolveMetalImpl(
     if (!layout.stage_tree.counts.empty()) {
       if (layout.stage_tree.counts.size() > 1) {
         for (std::size_t level = layout.stage_tree.counts.size() - 2;;) {
-          invocation = multiplier_tree;
+          invocation = WithScratch(multiplier_tree, layout.dual_solves);
           invocation.child_offset = layout.stage_tree.offsets[level];
           invocation.parent_offset = layout.stage_tree.offsets[level + 1];
           invocation.child_count = layout.stage_tree.counts[level];

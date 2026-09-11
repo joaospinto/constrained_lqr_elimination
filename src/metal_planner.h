@@ -126,6 +126,19 @@ inline bool HasCooperativeThreadgroupOccupancy(
          dynamic_bytes <= per_group_limit - static_bytes;
 }
 
+struct ScratchShape {
+  std::uint32_t floats = 0;
+  std::uint32_t integers = 0;
+  std::size_t slots = 0;
+};
+
+inline KernelParams WithScratch(KernelParams params,
+                                const ScratchShape &scratch) {
+  params.float_scratch_stride = scratch.floats;
+  params.int_scratch_stride = scratch.integers;
+  return params;
+}
+
 struct InvocationLayout {
   KernelParams params{};
   std::size_t input_floats = 0;
@@ -151,6 +164,11 @@ struct InvocationLayout {
   std::size_t dual_solve_integer_bytes = 0;
   TreePlan node_tree;
   TreePlan stage_tree;
+  ScratchShape primal_leaves, primal_relations, state_parameters;
+  ScratchShape value_leaves, value_compositions, affine_rhs;
+  ScratchShape dual_parameters, dual_leaves, dual_relations, dual_solves;
+  std::size_t float_scratch_entries = 0;
+  std::size_t integer_scratch_entries = 0;
 };
 
 inline InvocationLayout
@@ -342,14 +360,37 @@ PlanInvocation(std::uint32_t stage_count, std::uint32_t state_capacity,
       threadgroup_bytes(product({sizeof(float), dual_solve_scratch}));
   layout.dual_solve_integer_bytes = threadgroup_bytes(
       product({sizeof(std::int32_t), sum({dual_capacity, 4})}));
-  const std::size_t float_scratch_stride = std::max(
-      {primal_leaf_scratch, primal_relation_scratch, stage_reduction_scratch,
-       terminal_reduction_scratch, feedback_scratch, value_composition_scratch,
-       value_leaf_scratch, dual_parameter_scratch, dual_leaf_scratch,
-       dual_relation_scratch, dual_solve_scratch, nx});
-  p.float_scratch_stride =
-      CheckedU32(float_scratch_stride, "float scratch stride");
-  p.float_scratch = workspace.Add(product({N1, p.float_scratch_stride}));
+  // Each dispatch supplies its own stride. Reuse the maximum simultaneous
+  // requirement, not (maximum stride across all phases) * (N+1). Reduction
+  // and expansion dispatches have at most ceil(leaves/2) concurrent slots.
+  // Stage/terminal reduction and feedback use threadgroup memory only.
+  const auto scratch = [&](std::size_t floats, std::size_t ints,
+                           std::size_t slots) {
+    layout.float_scratch_entries =
+        std::max(layout.float_scratch_entries, product({floats, slots}));
+    layout.integer_scratch_entries =
+        std::max(layout.integer_scratch_entries, product({ints, slots}));
+    return ScratchShape{CheckedU32(floats, "float scratch stride"),
+                        CheckedU32(ints, "integer scratch stride"), slots};
+  };
+  const std::size_t node_parents = N1 / 2 + N1 % 2;
+  const std::size_t stage_parents = N / 2 + N % 2;
+  layout.primal_leaves = scratch(primal_leaf_scratch, sum({nu, two_nx}), N1);
+  layout.primal_relations =
+      scratch(primal_relation_scratch, two_nx, node_parents);
+  layout.state_parameters = scratch(0, nx, N1);
+  layout.value_leaves = scratch(value_leaf_scratch, 0, N);
+  layout.value_compositions =
+      scratch(value_composition_scratch, 0, node_parents);
+  layout.affine_rhs = scratch(nx, 0, N);
+  layout.dual_parameters = scratch(dual_parameter_scratch, dual_capacity, N);
+  layout.dual_leaves =
+      scratch(dual_leaf_scratch, sum({nx, state_dual_capacity, two_dual}), N);
+  layout.dual_relations = scratch(dual_relation_scratch, 0, stage_parents);
+  layout.dual_solves =
+      scratch(dual_solve_scratch, dual_capacity,
+              N != 0 ? std::max(std::size_t{1}, stage_parents) : 0);
+  p.float_scratch = workspace.Add(layout.float_scratch_entries);
   layout.workspace_floats = workspace.size();
 
   ArenaSizer integers;
@@ -368,12 +409,7 @@ PlanInvocation(std::uint32_t stage_count, std::uint32_t state_capacity,
   p.state_dual_param_meta = integers.Add(product({3, N}));
   p.dual_relation_meta = integers.Add(product({3, stage_slots}));
   p.dual_node_meta = integers.Add(product({2, stage_slots}));
-  const std::size_t int_scratch_stride =
-      std::max({sum({nu, two_nx}), sum({nx, state_dual_capacity, two_dual}),
-                dual_capacity});
-  p.int_scratch_stride =
-      CheckedU32(int_scratch_stride, "integer scratch stride");
-  p.int_scratch = integers.Add(product({N1, p.int_scratch_stride}));
+  p.int_scratch = integers.Add(layout.integer_scratch_entries);
   layout.workspace_ints = integers.size();
   return layout;
 }

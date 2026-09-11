@@ -61,6 +61,31 @@ int main() {
   Expect(normal.dual_relation_integer_bytes == 64);
   Expect(normal.dual_solve_float_bytes == 2400);
   Expect(normal.dual_solve_integer_bytes == 64);
+  for (std::size_t N : {0, 1, 2, 3, 127, 128, 1024}) {
+    const auto layout = PlanInvocation(N, 8, 4, 2, 2, 2, 1.0e-5f);
+    std::size_t floats = 0, integers = 0;
+    for (const auto &shape :
+         {layout.primal_leaves, layout.primal_relations,
+          layout.state_parameters, layout.value_leaves,
+          layout.value_compositions, layout.affine_rhs, layout.dual_parameters,
+          layout.dual_leaves, layout.dual_relations, layout.dual_solves}) {
+      floats = std::max(floats, shape.slots * shape.floats);
+      integers = std::max(integers, shape.slots * shape.integers);
+      const auto params =
+          clqr::metal::detail::WithScratch(layout.params, shape);
+      Expect(params.float_scratch_stride == shape.floats);
+      Expect(params.int_scratch_stride == shape.integers);
+    }
+    Expect(floats == layout.float_scratch_entries);
+    Expect(integers == layout.integer_scratch_entries);
+    Expect(layout.primal_relations.slots == (N + 2) / 2);
+    Expect(layout.dual_relations.slots == (N + 1) / 2);
+    if (N >= 128) {
+      // The largest scratch is used by pairwise relation composition, not
+      // every leaf. Do not multiply that stride by all N+1 stages again.
+      Expect(floats < (N + 1) * layout.dual_relations.floats * 3 / 4);
+    }
+  }
   for (const std::size_t bytes :
        {normal.reduced_stage_float_bytes, normal.reduced_stage_integer_bytes,
         normal.reduced_terminal_float_bytes,
