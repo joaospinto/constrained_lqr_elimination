@@ -940,8 +940,10 @@ unsigned char *EmulatedBlockScratch(std::size_t bytes) {
   return reinterpret_cast<unsigned char *>(storage.data());
 }
 #define CLQR_SCRATCH_PARAMS                                                    \
-  , unsigned char *global_scratch = nullptr, std::size_t global_stride = 0
+  , unsigned char *global_scratch = nullptr, std::size_t global_stride = 0,    \
+                  int first_block = 0
 #define CLQR_BLOCK_SCRATCH(name, required_bytes)                               \
+  (void)first_block;                                                           \
   const std::size_t clqr_scratch_bytes = (required_bytes);                     \
   unsigned char *clqr_shared_data = nullptr;                                   \
   if constexpr (GlobalScratch) {                                               \
@@ -960,8 +962,9 @@ unsigned char *EmulatedBlockScratch(std::size_t bytes) {
   }
 #else
 #define CLQR_SCRATCH_PARAMS                                                    \
-  , unsigned char *global_scratch, std::size_t global_stride
+  , unsigned char *global_scratch, std::size_t global_stride, int first_block
 #define CLQR_BLOCK_SCRATCH(name, required_bytes)                               \
+  (void)first_block;                                                           \
   extern __shared__ __align__(16) unsigned char clqr_shared_memory[];          \
   (void)(required_bytes);                                                      \
   ScratchArena name {                                                          \
@@ -1981,7 +1984,7 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage *stages, int stage_cou
                         Scalar rank_tolerance, Scalar consistency_tolerance,
                         Relation *leaves, DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index > stage_count)
     return;
   if (!BlockEnabled(status))
@@ -2237,7 +2240,7 @@ __global__ void ReduceRelationLeavesKernel(const Relation *leaves, int count, in
                            Scalar rank_tolerance, Scalar consistency_tolerance,
                            Relation *parents, DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count)
     return;
   if (!BlockEnabled(status))
@@ -2279,7 +2282,7 @@ __global__ void ReduceRelationTreeLevelKernel(Relation *tree, int child_offset,
                                               Scalar consistency_tolerance,
                                               DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count)
     return;
   if (!BlockEnabled(status))
@@ -2326,7 +2329,7 @@ __global__ void ExpandRelationContextLevelKernel(
     int parent_count, Scalar rank_tolerance, Scalar consistency_tolerance,
     DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count)
     return;
   if (!BlockEnabled(status))
@@ -2370,7 +2373,7 @@ __global__ void FinalizeRelationSuffixFromParentsKernel(
     int parent_count, Scalar rank_tolerance, Scalar consistency_tolerance,
     DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count)
     return;
   if (!BlockEnabled(status))
@@ -2460,7 +2463,7 @@ __global__ void StateParamKernel(const Relation *suffix, int count,
                                  StateParam *params, int *state_dimensions,
                                  DeviceStatus *status, Scalar tolerance
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= count || !BlockEnabled(status))
     return;
   const Relation &relation = suffix[index];
@@ -2581,49 +2584,57 @@ namespace detail {
 namespace {
 
 template <bool GlobalScratch>
-__global__ void ReduceStagesKernel(const PackedStage *, const Relation *,
-                                   const StateParam *, int, Scalar, Scalar,
-                                   ControlParam *, ReducedStage *, int *,
-                                   DeviceStatus *, unsigned char *, std::size_t);
+__global__ void
+ReduceStagesKernel(const PackedStage *, const Relation *, const StateParam *,
+                   int, Scalar, Scalar, ControlParam *, ReducedStage *, int *,
+                   DeviceStatus *, unsigned char *, std::size_t, int);
 template <bool GlobalScratch>
 __global__ void ReduceTerminalKernel(const PackedTerminal *, const StateParam *,
-                                     int, ReducedTerminal *, unsigned char *, std::size_t);
+                                     int, ReducedTerminal *, unsigned char *,
+                                     std::size_t, int);
 __global__ void InitialReducedStateKernel(const StateParam *, const Scalar *,
                                           Scalar *, Scalar, DeviceStatus *);
 template <bool GlobalScratch>
 __global__ void BuildValueElementsKernel(const ReducedStage *,
                                          const ReducedTerminal *, int, Scalar,
-                                         ValueElement *, DeviceStatus *, unsigned char *, std::size_t);
+                                         ValueElement *, DeviceStatus *,
+                                         unsigned char *, std::size_t, int);
 template <bool GlobalScratch>
 __global__ void ReduceValueLeavesKernel(const ValueElement *, int, int, Scalar,
-                                        DeviceStatus *, ValueElement *, unsigned char *, std::size_t);
+                                        DeviceStatus *, ValueElement *,
+                                        unsigned char *, std::size_t, int);
 template <bool GlobalScratch>
 __global__ void ReduceValueTreeLevelKernel(ValueElement *, int, int, int, int,
-                                           Scalar, DeviceStatus *, unsigned char *, std::size_t);
+                                           Scalar, DeviceStatus *,
+                                           unsigned char *, std::size_t, int);
 __global__ void InitializeValueContextRootKernel(ValueElement *, int);
 template <bool GlobalScratch>
 __global__ void ExpandValueContextLevelKernel(ValueElement *, int, int, int,
-                                              int, Scalar, DeviceStatus *, unsigned char *, std::size_t);
+                                              int, Scalar, DeviceStatus *,
+                                              unsigned char *, std::size_t,
+                                              int);
 template <bool GlobalScratch>
-__global__ void FinalizeValueSuffixFromParentsKernel(ValueElement *, int,
-                                                     const ValueElement *, int,
-                                                     Scalar, DeviceStatus *, unsigned char *, std::size_t);
+__global__ void
+FinalizeValueSuffixFromParentsKernel(ValueElement *, int, const ValueElement *,
+                                     int, Scalar, DeviceStatus *,
+                                     unsigned char *, std::size_t, int);
 template <bool GlobalScratch>
 __global__ void MatrixFeedbackKernel(const ReducedStage *, const ValueElement *,
-                                     int, Scalar, Feedback *, DeviceStatus *, unsigned char *, std::size_t);
+                                     int, Scalar, Feedback *, DeviceStatus *,
+                                     unsigned char *, std::size_t, int);
 template <bool GlobalScratch>
-__global__ void InitializeCostateMapsKernel(const ReducedStage *,
-                                            const ValueElement *,
-                                            const Feedback *, int, AffineMap *,
-                                            DeviceStatus *, unsigned char *, std::size_t);
+__global__ void
+InitializeCostateMapsKernel(const ReducedStage *, const ValueElement *,
+                            const Feedback *, int, AffineMap *, DeviceStatus *,
+                            unsigned char *, std::size_t, int);
 __global__ void RecoverCostatesKernel(const AffineMap *,
                                       const ReducedTerminal *, const int *, int,
                                       Scalar *, DeviceStatus *);
 template <bool GlobalScratch>
-__global__ void FinalizeFeedbackKernel(const ReducedStage *,
-                                       const ValueElement *, const Scalar *,
-                                       const int *, int, Feedback *,
-                                       DeviceStatus *, unsigned char *, std::size_t);
+__global__ void
+FinalizeFeedbackKernel(const ReducedStage *, const ValueElement *,
+                       const Scalar *, const int *, int, Feedback *,
+                       DeviceStatus *, unsigned char *, std::size_t, int);
 __global__ void InitializeAffineMapsKernel(const Feedback *, int, AffineMap *,
                                            DeviceStatus *);
 __global__ void ReduceAffineLeavesKernel(const AffineMap *, int, int,
@@ -2634,9 +2645,10 @@ __global__ void InitializeAffineContextRootKernel(AffineMap *, int);
 __global__ void ExpandAffineContextLevelKernel(AffineMap *, int, int, int, int,
                                                DeviceStatus *);
 template <bool GlobalScratch>
-__global__ void FinalizeAffinePrefixFromParentsKernel(AffineMap *, int,
-                                                      const AffineMap *, int,
-                                                      DeviceStatus *, unsigned char *, std::size_t);
+__global__ void
+FinalizeAffinePrefixFromParentsKernel(AffineMap *, int, const AffineMap *, int,
+                                      DeviceStatus *, unsigned char *,
+                                      std::size_t, int);
 __global__ void ReconstructPrimalKernel(const AffineMap *, const StateParam *,
                                         const ControlParam *, const Feedback *,
                                         const Scalar *, const int *,
@@ -2644,16 +2656,17 @@ __global__ void ReconstructPrimalKernel(const AffineMap *, const StateParam *,
                                         Scalar *, Scalar *, Scalar *,
                                         DeviceStatus *);
 template <bool GlobalScratch>
-__global__ void BuildDualParametersKernel(const PackedStage *, const StateParam *,
-                          const ValueElement *, const Scalar *, const Scalar *,
-                          const Scalar *, const Scalar *, const int *,
-                          const int *, const int *, int, Scalar, Scalar,
-                          DualParam *, int *, int *, DeviceStatus *, unsigned char *, std::size_t);
+__global__ void BuildDualParametersKernel(
+    const PackedStage *, const StateParam *, const ValueElement *,
+    const Scalar *, const Scalar *, const Scalar *, const Scalar *, const int *,
+    const int *, const int *, int, Scalar, Scalar, DualParam *, int *, int *,
+    DeviceStatus *, unsigned char *, std::size_t, int);
 template <bool GlobalScratch>
 __global__ void BuildDualParameterRelationsKernel(
     const PackedStage *, const PackedTerminal *, const DualParam *, int,
     const Scalar *, const Scalar *, const int *, const int *, Scalar, Scalar,
-    DualRelation *, const int *, StateDualParam *, DeviceStatus *, unsigned char *, std::size_t);
+    DualRelation *, const int *, StateDualParam *, DeviceStatus *,
+    unsigned char *, std::size_t, int);
 __global__ void RecoverParameterizedMultipliersKernel(
     const DualParam *, const StateDualParam *, const DualNodeValue *,
     const int *, const int *, const int *, int, Scalar *, Scalar *, Scalar *,
@@ -2667,16 +2680,18 @@ RecoverInitialMultiplierKernel(const PackedStage *, const PackedTerminal *, int,
 template <bool GlobalScratch>
 __global__ void ReduceDualTreeLevelKernel(const DualRelation *, int, int, int,
                                           int, Scalar, Scalar, DualRelation *,
-                                          const int *, DeviceStatus *, unsigned char *, std::size_t);
+                                          const int *, DeviceStatus *,
+                                          unsigned char *, std::size_t, int);
 template <bool GlobalScratch>
 __global__ void SolveDualRootKernel(const DualRelation *, DualNodeValue *,
-                                    const int *, DeviceStatus *, Scalar, unsigned char *, std::size_t);
+                                    const int *, DeviceStatus *, Scalar,
+                                    unsigned char *, std::size_t, int);
 template <bool GlobalScratch>
-__global__ void ExpandDualTreeLevelKernel(const DualRelation *, int, int, int,
-                                          int, Scalar, Scalar,
-                                          const DualNodeValue *,
-                                          DualNodeValue *, const int *,
-                                          DeviceStatus *, unsigned char *, std::size_t);
+__global__ void
+ExpandDualTreeLevelKernel(const DualRelation *, int, int, int, int, Scalar,
+                          Scalar, const DualNodeValue *, DualNodeValue *,
+                          const int *, DeviceStatus *, unsigned char *,
+                          std::size_t, int);
 __global__ void BuildObjectiveTermsKernel(const PackedStage *, int,
                                           const PackedTerminal *,
                                           const Scalar *, const Scalar *,
@@ -3937,7 +3952,7 @@ std::size_t ConfigureScratchMemory(const ScratchRequirements &scratch,
 #define CLQR_CONFIGURE_SCRATCH(kernel, member, blocks)                         \
   plans->kernel =                                                              \
       PlanKernelScratch(kernel<false>, kernel<true>, #kernel, scratch.member,  \
-                        capacity);                                             \
+                        capacity, device, kThreads);                           \
   global_bytes = std::max(global_bytes, plans->kernel.GlobalBytes(blocks));
   CLQR_SCRATCH_KERNELS(CLQR_CONFIGURE_SCRATCH)
 #undef CLQR_CONFIGURE_SCRATCH
@@ -4530,12 +4545,15 @@ void PrepareProblemStructure(const Problem &problem, int device,
   do {                                                                         \
     const auto &clqr_launch = workspace.scratch_launches.kernel;               \
     if (clqr_launch.global_stride != 0) {                                      \
-      kernel<true><<<blocks, kThreads, 0, stream>>>(                           \
-          __VA_ARGS__, workspace.global_scratch.get(),                         \
-          clqr_launch.global_stride);                                          \
+      ForEachGlobalScratchLaunch(                                              \
+          clqr_launch, blocks, [&](int first, int count) {                     \
+            kernel<true><<<count, kThreads, 0, stream>>>(                      \
+                __VA_ARGS__, workspace.global_scratch.get(),                   \
+                clqr_launch.global_stride, first);                             \
+          });                                                                  \
     } else {                                                                   \
       kernel<false><<<blocks, kThreads, clqr_launch.shared_bytes, stream>>>(   \
-          __VA_ARGS__, nullptr, 0);                                            \
+          __VA_ARGS__, nullptr, 0, 0);                                         \
     }                                                                          \
   } while (false)
 
@@ -5988,7 +6006,7 @@ __global__ void FinalizeAffinePrefixFromParentsKernel(AffineMap *leaves, int cou
                                       const AffineMap *parent_contexts,
                                       int parent_count, DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count)
     return;
   if (!BlockEnabled(status))
@@ -6103,7 +6121,7 @@ __global__ void BuildDualParametersKernel(
     Scalar consistency_tolerance, DualParam *params, int *scan_needed,
     int *dual_dimensions, DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= stage_count)
     return;
   if (!BlockEnabled(status))
@@ -6259,7 +6277,7 @@ __global__ void BuildDualParameterRelationsKernel(
     const int *scan_needed, StateDualParam *state_params,
     DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int relation_index = blockIdx.x;
+  const int relation_index = (first_block + blockIdx.x);
   if (relation_index >= stage_count)
     return;
   if (!BlockEnabled(status))
@@ -6535,7 +6553,7 @@ __global__ void ReduceDualTreeLevelKernel(const DualRelation *tree, int child_of
                           DualRelation *mutable_tree, const int *scan_needed,
                           DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count || *scan_needed == 0)
     return;
   if (!BlockEnabled(status))
@@ -6576,7 +6594,7 @@ __global__ void SolveDualRootKernel(const DualRelation *relation,
                                     const int *scan_needed,
                                     DeviceStatus *status, Scalar tolerance
     CLQR_SCRATCH_PARAMS) {
-  if (blockIdx.x != 0 || *scan_needed == 0)
+  if ((first_block + blockIdx.x) != 0 || *scan_needed == 0)
     return;
   if (!BlockEnabled(status))
     return;
@@ -6644,7 +6662,7 @@ __global__ void ExpandDualTreeLevelKernel(
     Scalar consistency_tolerance, const DualNodeValue *parent_values,
     DualNodeValue *values, const int *scan_needed, DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count || *scan_needed == 0)
     return;
   if (!BlockEnabled(status))
@@ -6773,7 +6791,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
                                          ValueElement *elements,
                                          DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index > stage_count)
     return;
   if (!BlockEnabled(status))
@@ -7108,7 +7126,7 @@ __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
                                         DeviceStatus *status,
                                         ValueElement *parents
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count)
     return;
   if (!BlockEnabled(status))
@@ -7145,7 +7163,7 @@ __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
                                            int parent_count, Scalar tolerance,
                                            DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count)
     return;
   if (!BlockEnabled(status))
@@ -7189,7 +7207,7 @@ __global__ void ExpandValueContextLevelKernel(
     ValueElement *tree, int child_offset, int parent_offset, int child_count,
     int parent_count, Scalar tolerance, DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count)
     return;
   if (!BlockEnabled(status))
@@ -7230,7 +7248,7 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
     ValueElement *leaves, int count, const ValueElement *parent_contexts,
     int parent_count, Scalar tolerance, DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= parent_count)
     return;
   if (!BlockEnabled(status))
@@ -7426,7 +7444,7 @@ __global__ void MatrixFeedbackKernel(const ReducedStage *stages,
                                      int stage_count, Scalar tolerance,
                                      Feedback *feedback, DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= stage_count)
     return;
   if (!BlockEnabled(status))
@@ -7461,7 +7479,7 @@ __global__ void InitializeCostateMapsKernel(const ReducedStage *stages,
                                             int stage_count, AffineMap *maps,
                                             DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= stage_count)
     return;
   if (!BlockEnabled(status))
@@ -7536,7 +7554,7 @@ __global__ void FinalizeFeedbackKernel(const ReducedStage *stages,
                                        int stage_count, Feedback *feedback,
                                        DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= stage_count)
     return;
   if (!BlockEnabled(status))
@@ -7621,7 +7639,7 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
                    ControlParam *control_params, ReducedStage *reduced,
                    int *control_dimensions, DeviceStatus *status
     CLQR_SCRATCH_PARAMS) {
-  const int index = blockIdx.x;
+  const int index = (first_block + blockIdx.x);
   if (index >= stage_count)
     return;
   if (!BlockEnabled(status))

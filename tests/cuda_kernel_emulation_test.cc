@@ -1454,6 +1454,31 @@ template <typename Function> void Launch(int blocks, Function function) {
   }
 }
 
+bool g_test_global_scratch = false;
+int g_test_first_block = 0;
+
+template <typename Function> void LaunchScratch(int blocks, Function function) {
+  if (!g_test_global_scratch) {
+    Launch(blocks, function);
+    return;
+  }
+  // Deliberately small and non-power-of-two: exercise offsets and partial
+  // launches at every tree level, independently of the test horizon.
+  for (int first = 0; first < blocks; first += 3) {
+    g_test_first_block = first;
+    Launch(std::min(3, blocks - first), function);
+  }
+  g_test_first_block = 0;
+}
+
+#define EMULATED_SCRATCH_KERNEL(kernel, ...)                                   \
+  do {                                                                         \
+    if (g_test_global_scratch)                                                 \
+      kernel<true>(__VA_ARGS__, nullptr, 0, g_test_first_block);               \
+    else                                                                       \
+      kernel<false>(__VA_ARGS__);                                              \
+  } while (false)
+
 void FiniteInputValidationCase() {
   Scalar problem_data[]{Scalar{1}, std::numeric_limits<Scalar>::quiet_NaN()};
   Scalar initial_state[]{Scalar{2}};
@@ -1562,9 +1587,9 @@ void NonPositiveDefiniteReducedControlCostCase() {
                             kTestStateCapacity, kTestStateCapacity);
   }
   DeviceStatus status{kDeviceOk, -1, 0};
-  Launch(2, [&] {
-    BuildValueElementsKernel(&stage, &terminal, 1, kTolerance, elements.data(),
-                             &status);
+  LaunchScratch(2, [&] {
+    EMULATED_SCRATCH_KERNEL(BuildValueElementsKernel, &stage, &terminal, 1,
+                            kTolerance, elements.data(), &status);
   });
   Expect(status.code == kDeviceNumericalFailure,
          "non-positive-definite reduced control cost status");
@@ -1738,22 +1763,25 @@ void RunEmulation(const Problem &problem, const std::string &name,
                         relation_b_storage.data() + node * kTestRelationEntries,
                         kTestStateCapacity, kTestStateCapacity);
   }
-  Launch(nodes, [&] {
-    BuildPrimalLeavesKernel(stages.data(), horizon, &terminal, rank_tolerance,
+  LaunchScratch(nodes, [&] {
+    EMULATED_SCRATCH_KERNEL(BuildPrimalLeavesKernel, stages.data(), horizon,
+                            &terminal, rank_tolerance,
                             feasibility_consistency_tolerance,
                             relation_a.data(), &status);
   });
   if (nodes > 1) {
     const int first_parent_count = node_level_counts[1];
-    Launch(first_parent_count, [&] {
-      ReduceRelationLeavesKernel(relation_a.data(), nodes, first_parent_count,
-                                 rank_tolerance, feasibility_consistency_tolerance,
-                                 relation_b.data(), &status);
+    LaunchScratch(first_parent_count, [&] {
+      EMULATED_SCRATCH_KERNEL(ReduceRelationLeavesKernel, relation_a.data(),
+                              nodes, first_parent_count, rank_tolerance,
+                              feasibility_consistency_tolerance,
+                              relation_b.data(), &status);
     });
     for (std::size_t level = 1; level + 1 < node_level_counts.size(); ++level) {
-      Launch(node_level_counts[level + 1], [&] {
-        ReduceRelationTreeLevelKernel(
-            relation_b.data(), node_level_offsets[level] - nodes,
+      LaunchScratch(node_level_counts[level + 1], [&] {
+        EMULATED_SCRATCH_KERNEL(
+            ReduceRelationTreeLevelKernel, relation_b.data(),
+            node_level_offsets[level] - nodes,
             node_level_offsets[level + 1] - nodes, node_level_counts[level],
             node_level_counts[level + 1], rank_tolerance,
             feasibility_consistency_tolerance, &status);
@@ -1765,18 +1793,20 @@ void RunEmulation(const Problem &problem, const std::string &name,
     });
     for (int level = static_cast<int>(node_level_counts.size()) - 2; level >= 1;
          --level) {
-      Launch(node_level_counts[level + 1], [&] {
-        ExpandRelationContextLevelKernel(
-            relation_b.data(), node_level_offsets[level] - nodes,
+      LaunchScratch(node_level_counts[level + 1], [&] {
+        EMULATED_SCRATCH_KERNEL(
+            ExpandRelationContextLevelKernel, relation_b.data(),
+            node_level_offsets[level] - nodes,
             node_level_offsets[level + 1] - nodes, node_level_counts[level],
             node_level_counts[level + 1], rank_tolerance,
             feasibility_consistency_tolerance, &status);
       });
     }
-    Launch(first_parent_count, [&] {
-      FinalizeRelationSuffixFromParentsKernel(
-          relation_a.data(), nodes, relation_b.data(), first_parent_count,
-          rank_tolerance, feasibility_consistency_tolerance, &status);
+    LaunchScratch(first_parent_count, [&] {
+      EMULATED_SCRATCH_KERNEL(FinalizeRelationSuffixFromParentsKernel,
+                              relation_a.data(), nodes, relation_b.data(),
+                              first_parent_count, rank_tolerance,
+                              feasibility_consistency_tolerance, &status);
     });
   }
   Relation *suffix = relation_a.data();
@@ -1797,9 +1827,10 @@ void RunEmulation(const Problem &problem, const std::string &name,
     state_params[node].t =
         state_t.data() + static_cast<std::size_t>(node) * kTestStateCapacity;
   }
-  Launch(nodes, [&] {
-    StateParamKernel(suffix, nodes, state_params.data(), nullptr, &status,
-                     rank_tolerance);
+  LaunchScratch(nodes, [&] {
+    EMULATED_SCRATCH_KERNEL(StateParamKernel, suffix, nodes,
+                            state_params.data(), nullptr, &status,
+                            rank_tolerance);
   });
   if (FinishAllowedDeviceFailure(status, name, "feasibility scan",
                                  allowed_failure))
@@ -1861,14 +1892,15 @@ void RunEmulation(const Problem &problem, const std::string &name,
   reduced_terminal.Q = reduced_terminal_Q.data();
   reduced_terminal.q = reduced_terminal_q.data();
   std::vector<Scalar> reduced_initial(kTestStateCapacity);
-  Launch(horizon, [&] {
-    ReduceStagesKernel(stages.data(), suffix, state_params.data(), horizon,
-                       rank_tolerance, feasibility_consistency_tolerance,
-                       control_params.data(), reduced.data(), nullptr, &status);
+  LaunchScratch(horizon, [&] {
+    EMULATED_SCRATCH_KERNEL(
+        ReduceStagesKernel, stages.data(), suffix, state_params.data(), horizon,
+        rank_tolerance, feasibility_consistency_tolerance,
+        control_params.data(), reduced.data(), nullptr, &status);
   });
-  Launch(1, [&] {
-    ReduceTerminalKernel(&terminal, state_params.data(), horizon,
-                         &reduced_terminal);
+  LaunchScratch(1, [&] {
+    EMULATED_SCRATCH_KERNEL(ReduceTerminalKernel, &terminal,
+                            state_params.data(), horizon, &reduced_terminal);
   });
   Launch(1, [&] {
     InitialReducedStateKernel(state_params.data(), initial.data(),
@@ -1936,9 +1968,10 @@ void RunEmulation(const Problem &problem, const std::string &name,
     feedback[stage].offset =
         feedback_offset.data() + index * kTestStateCapacity;
   }
-  Launch(nodes, [&] {
-    BuildValueElementsKernel(reduced.data(), &reduced_terminal, horizon,
-                             rank_tolerance, value_a.data(), &status);
+  LaunchScratch(nodes, [&] {
+    EMULATED_SCRATCH_KERNEL(BuildValueElementsKernel, reduced.data(),
+                            &reduced_terminal, horizon, rank_tolerance,
+                            value_a.data(), &status);
   });
   if (FinishAllowedDeviceFailure(status, name, "value base", allowed_failure))
     return;
@@ -1947,14 +1980,16 @@ void RunEmulation(const Problem &problem, const std::string &name,
   g_value_matrix_factorizations = 0;
   if (nodes > 1) {
     const int first_parent_count = node_level_counts[1];
-    Launch(first_parent_count, [&] {
-      ReduceValueLeavesKernel(value_a.data(), nodes, first_parent_count,
-                              rank_tolerance, &status, value_b.data());
+    LaunchScratch(first_parent_count, [&] {
+      EMULATED_SCRATCH_KERNEL(ReduceValueLeavesKernel, value_a.data(), nodes,
+                              first_parent_count, rank_tolerance, &status,
+                              value_b.data());
     });
     for (std::size_t level = 1; level + 1 < node_level_counts.size(); ++level) {
-      Launch(node_level_counts[level + 1], [&] {
-        ReduceValueTreeLevelKernel(
-            value_b.data(), node_level_offsets[level] - nodes,
+      LaunchScratch(node_level_counts[level + 1], [&] {
+        EMULATED_SCRATCH_KERNEL(
+            ReduceValueTreeLevelKernel, value_b.data(),
+            node_level_offsets[level] - nodes,
             node_level_offsets[level + 1] - nodes, node_level_counts[level],
             node_level_counts[level + 1], rank_tolerance, &status);
       });
@@ -1965,26 +2000,27 @@ void RunEmulation(const Problem &problem, const std::string &name,
     });
     for (int level = static_cast<int>(node_level_counts.size()) - 2; level >= 1;
          --level) {
-      Launch(node_level_counts[level + 1], [&] {
-        ExpandValueContextLevelKernel(
-            value_b.data(), node_level_offsets[level] - nodes,
+      LaunchScratch(node_level_counts[level + 1], [&] {
+        EMULATED_SCRATCH_KERNEL(
+            ExpandValueContextLevelKernel, value_b.data(),
+            node_level_offsets[level] - nodes,
             node_level_offsets[level + 1] - nodes, node_level_counts[level],
             node_level_counts[level + 1], rank_tolerance, &status);
       });
     }
-    Launch(first_parent_count, [&] {
-      FinalizeValueSuffixFromParentsKernel(value_a.data(), nodes,
-                                           value_b.data(), first_parent_count,
-                                           rank_tolerance, &status);
+    LaunchScratch(first_parent_count, [&] {
+      EMULATED_SCRATCH_KERNEL(FinalizeValueSuffixFromParentsKernel,
+                              value_a.data(), nodes, value_b.data(),
+                              first_parent_count, rank_tolerance, &status);
     });
   }
   if (FinishAllowedDeviceFailure(status, name, "value scan", allowed_failure))
     return;
   Expect(g_value_matrix_factorizations == g_value_matrix_combinations,
          name + " uses exactly one LU factorization per matrix composition");
-  Launch(horizon, [&] {
-    MatrixFeedbackKernel(reduced.data(), value_suffix, horizon, rank_tolerance,
-                         feedback.data(), &status);
+  LaunchScratch(horizon, [&] {
+    EMULATED_SCRATCH_KERNEL(MatrixFeedbackKernel, reduced.data(), value_suffix,
+                            horizon, rank_tolerance, feedback.data(), &status);
   });
   if (FinishAllowedDeviceFailure(status, name, "feedback solve",
                                  allowed_failure))
@@ -2044,9 +2080,10 @@ void RunEmulation(const Problem &problem, const std::string &name,
             stage_level_counts[level + 1], &status);
       });
     }
-    Launch(first_parent_count, [&] {
-      FinalizeAffinePrefixFromParentsKernel(map_a.data(), horizon, map_b.data(),
-                                            first_parent_count, &status);
+    LaunchScratch(first_parent_count, [&] {
+      EMULATED_SCRATCH_KERNEL(FinalizeAffinePrefixFromParentsKernel,
+                              map_a.data(), horizon, map_b.data(),
+                              first_parent_count, &status);
     });
   };
 
@@ -2063,9 +2100,10 @@ void RunEmulation(const Problem &problem, const std::string &name,
     control_offsets[index] = index * kTestControlCapacity;
 
   std::vector<Scalar> reduced_value_linear(reduced_state_offsets.back());
-  Launch(horizon, [&] {
-    InitializeCostateMapsKernel(reduced.data(), value_suffix, feedback.data(),
-                                horizon, map_a.data(), &status);
+  LaunchScratch(horizon, [&] {
+    EMULATED_SCRATCH_KERNEL(InitializeCostateMapsKernel, reduced.data(),
+                            value_suffix, feedback.data(), horizon,
+                            map_a.data(), &status);
   });
   run_affine_prefix_scan();
   Launch(nodes, [&] {
@@ -2073,10 +2111,11 @@ void RunEmulation(const Problem &problem, const std::string &name,
                           reduced_state_offsets.data(), horizon,
                           reduced_value_linear.data(), &status);
   });
-  Launch(horizon, [&] {
-    FinalizeFeedbackKernel(
-        reduced.data(), value_suffix, reduced_value_linear.data(),
-        reduced_state_offsets.data(), horizon, feedback.data(), &status);
+  LaunchScratch(horizon, [&] {
+    EMULATED_SCRATCH_KERNEL(FinalizeFeedbackKernel, reduced.data(),
+                            value_suffix, reduced_value_linear.data(),
+                            reduced_state_offsets.data(), horizon,
+                            feedback.data(), &status);
   });
   if (FinishAllowedDeviceFailure(status, name, "affine Riccati recovery",
                                  allowed_failure))
@@ -2208,49 +2247,50 @@ void RunEmulation(const Problem &problem, const std::string &name,
   }
   int dual_scan_needed = 0;
   if (horizon > 0) {
-    Launch(horizon, [&] {
-      BuildDualParametersKernel(
-          stages.data(), state_params.data(), value_suffix,
-          reduced_value_linear.data(), reduced_states.data(), states.data(),
-          controls.data(), reduced_state_offsets.data(), state_offsets.data(),
-          control_offsets.data(), horizon, multiplier_rank_tolerance,
-          multiplier_consistency_tolerance, dual_params.data(),
-          &dual_scan_needed, nullptr, &status);
+    LaunchScratch(horizon, [&] {
+      EMULATED_SCRATCH_KERNEL(
+          BuildDualParametersKernel, stages.data(), state_params.data(),
+          value_suffix, reduced_value_linear.data(), reduced_states.data(),
+          states.data(), controls.data(), reduced_state_offsets.data(),
+          state_offsets.data(), control_offsets.data(), horizon,
+          multiplier_rank_tolerance, multiplier_consistency_tolerance,
+          dual_params.data(), &dual_scan_needed, nullptr, &status);
     });
-    Launch(horizon, [&] {
-      BuildDualParameterRelationsKernel(
-          stages.data(), &terminal, dual_params.data(), horizon, states.data(),
-          controls.data(), state_offsets.data(), control_offsets.data(),
+    LaunchScratch(horizon, [&] {
+      EMULATED_SCRATCH_KERNEL(
+          BuildDualParameterRelationsKernel, stages.data(), &terminal,
+          dual_params.data(), horizon, states.data(), controls.data(),
+          state_offsets.data(), control_offsets.data(),
           multiplier_rank_tolerance, multiplier_leaf_consistency_tolerance,
           dual_tree.data(), &dual_scan_needed, state_dual_params.data(),
           &status);
     });
     for (std::size_t level = 0; level + 1 < stage_level_counts.size();
          ++level) {
-      Launch(stage_level_counts[level + 1], [&] {
-        ReduceDualTreeLevelKernel(
-            dual_tree.data(), stage_level_offsets[level],
-            stage_level_offsets[level + 1], stage_level_counts[level],
-            stage_level_counts[level + 1], multiplier_rank_tolerance,
-            multiplier_consistency_tolerance, dual_tree.data(),
-            &dual_scan_needed, &status);
+      LaunchScratch(stage_level_counts[level + 1], [&] {
+        EMULATED_SCRATCH_KERNEL(
+            ReduceDualTreeLevelKernel, dual_tree.data(),
+            stage_level_offsets[level], stage_level_offsets[level + 1],
+            stage_level_counts[level], stage_level_counts[level + 1],
+            multiplier_rank_tolerance, multiplier_consistency_tolerance,
+            dual_tree.data(), &dual_scan_needed, &status);
       });
     }
     const int root = stage_level_offsets.back();
-    Launch(1, [&] {
-      SolveDualRootKernel(dual_tree.data() + root, dual_values.data() + root,
-                          &dual_scan_needed, &status,
-                          multiplier_rank_tolerance);
+    LaunchScratch(1, [&] {
+      EMULATED_SCRATCH_KERNEL(SolveDualRootKernel, dual_tree.data() + root,
+                              dual_values.data() + root, &dual_scan_needed,
+                              &status, multiplier_rank_tolerance);
     });
     for (int level = static_cast<int>(stage_level_counts.size()) - 2;
          level >= 0; --level) {
-      Launch(stage_level_counts[level + 1], [&] {
-        ExpandDualTreeLevelKernel(
-            dual_tree.data(), stage_level_offsets[level],
-            stage_level_offsets[level + 1], stage_level_counts[level],
-            stage_level_counts[level + 1], multiplier_rank_tolerance,
-            multiplier_consistency_tolerance, dual_values.data(),
-            dual_values.data(), &dual_scan_needed, &status);
+      LaunchScratch(stage_level_counts[level + 1], [&] {
+        EMULATED_SCRATCH_KERNEL(
+            ExpandDualTreeLevelKernel, dual_tree.data(),
+            stage_level_offsets[level], stage_level_offsets[level + 1],
+            stage_level_counts[level], stage_level_counts[level + 1],
+            multiplier_rank_tolerance, multiplier_consistency_tolerance,
+            dual_values.data(), dual_values.data(), &dual_scan_needed, &status);
       });
     }
     Launch(horizon, [&] {
@@ -2321,8 +2361,9 @@ void CoordinatePivotingCase() {
   param.t = t;
   param.free_columns = free_columns;
   DeviceStatus status{};
-  Launch(1, [&] {
-    StateParamKernel(&relation, 1, &param, nullptr, &status, kTolerance);
+  LaunchScratch(1, [&] {
+    EMULATED_SCRATCH_KERNEL(StateParamKernel, &relation, 1, &param, nullptr,
+                            &status, kTolerance);
   });
   Expect(status.code == kDeviceOk && param.reduced_dim == 2 &&
              free_columns[0] == 0 && free_columns[1] == 2,
@@ -2347,8 +2388,9 @@ void CoordinatePivotingCase() {
 
   relation.rows = 0;
   int dimensions[2] = {-1, -1};
-  Launch(1, [&] {
-    StateParamKernel(&relation, 1, &param, dimensions, &status, kTolerance);
+  LaunchScratch(1, [&] {
+    EMULATED_SCRATCH_KERNEL(StateParamKernel, &relation, 1, &param, dimensions,
+                            &status, kTolerance);
   });
   Expect(status.code == kDeviceOk && dimensions[0] == 3 && dimensions[1] == 3,
          "unconstrained state dimensions are unchanged");
@@ -2459,6 +2501,15 @@ int main(int argc, char **argv) {
   ScratchPlannerTopologyCase();
   NonPositiveDefiniteReducedControlCostCase();
   RunEmulation(MakeProblem(), "rank-deficient constrained", true, true);
+  g_test_global_scratch = true;
+  RunEmulation(MakeProblem(), "bounded-global-rank-deficient", true, true);
+  RunEmulation(HeterogeneousDimensionProblem(), "bounded-global-heterogeneous",
+               false, false);
+  RunEmulation(ZeroHorizonProblem(), "bounded-global-zero-horizon", false,
+               false);
+  RunEmulation(ExactDualRelationScratchProblem(), "bounded-global-dual-scan",
+               true, false);
+  g_test_global_scratch = false;
   RunEmulation(SingleAffineSourceProblem(AffineSource::kStateCost),
                "state-gradient-only", false, false);
   RunEmulation(SingleAffineSourceProblem(AffineSource::kControlCost),

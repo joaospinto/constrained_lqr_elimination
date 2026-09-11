@@ -13,6 +13,7 @@ constexpr cudaError_t cudaSuccess = 0;
 enum cudaDeviceAttr {
   cudaDevAttrMaxSharedMemoryPerBlock,
   cudaDevAttrMaxSharedMemoryPerBlockOptin,
+  cudaDevAttrMultiProcessorCount,
 };
 enum cudaFuncAttribute { cudaFuncAttributeMaxDynamicSharedMemorySize };
 struct cudaFuncAttributes {
@@ -31,8 +32,12 @@ int optin_capacity = optin;
 int set_calls = 0;
 int last_set = 0;
 int queried_device = -1;
+int multiprocessors = 56;
+int resident_blocks = 32;
+int occupancy_queries = 0;
 cudaError_t error = cudaSuccess;
 cudaError_t set_error = cudaSuccess;
+cudaError_t occupancy_error = cudaSuccess;
 std::array<std::array<cudaFuncAttributes, 2>, 2> attributes{};
 
 cudaFuncAttributes &Attributes(Kernel kernel) {
@@ -45,8 +50,12 @@ void Reset() {
   set_calls = 0;
   last_set = 0;
   queried_device = -1;
+  multiprocessors = 56;
+  resident_blocks = 32;
+  occupancy_queries = 0;
   error = cudaSuccess;
   set_error = cudaSuccess;
+  occupancy_error = cudaSuccess;
   attributes = {};
 }
 } // namespace mock
@@ -56,9 +65,27 @@ const char *cudaGetErrorString(cudaError_t) { return "mock CUDA error"; }
 cudaError_t cudaDeviceGetAttribute(int *out, cudaDeviceAttr attribute,
                                    int device) {
   mock::queried_device = device;
-  *out = attribute == cudaDevAttrMaxSharedMemoryPerBlock ? mock::ordinary
-                                                         : mock::optin_capacity;
+  switch (attribute) {
+  case cudaDevAttrMaxSharedMemoryPerBlock:
+    *out = mock::ordinary;
+    break;
+  case cudaDevAttrMaxSharedMemoryPerBlockOptin:
+    *out = mock::optin_capacity;
+    break;
+  case cudaDevAttrMultiProcessorCount:
+    *out = mock::multiprocessors;
+    break;
+  }
   return mock::error;
+}
+
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    int *out, mock::Kernel kernel, int threads, std::size_t shared_bytes) {
+  if (kernel != mock::SecondKernel || threads != 32 || shared_bytes != 0)
+    std::abort();
+  ++mock::occupancy_queries;
+  *out = mock::resident_blocks;
+  return mock::occupancy_error;
 }
 
 cudaError_t cudaFuncGetAttributes(cudaFuncAttributes *out,
@@ -83,6 +110,7 @@ cudaError_t cudaFuncSetAttribute(mock::Kernel kernel,
 namespace {
 using clqr::cuda::detail::ConfigureKernelSharedMemory;
 using clqr::cuda::detail::DeviceSharedMemoryCapacity;
+using clqr::cuda::detail::ForEachGlobalScratchLaunch;
 using clqr::cuda::detail::PlanKernelScratch;
 
 void Expect(bool condition, const char *message) {
@@ -206,25 +234,32 @@ void ApiErrorCase() {
 void GlobalFallbackCase() {
   mock::Reset();
   auto plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
-                               1024, mock::ordinary);
+                                1024, mock::ordinary, 0, 32);
   Expect(plan.shared_bytes == 1024 && plan.global_stride == 0 &&
-             plan.GlobalBytes(100) == 0,
+             plan.GlobalBytes(100) == 0 && mock::occupancy_queries == 0,
          "fitting kernels do not allocate global scratch");
-  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
-                           76001, mock::ordinary);
+  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test", 76001,
+                           mock::ordinary, 1, 32);
   Expect(plan.shared_bytes == 0 && plan.global_stride == 76016 &&
-             plan.GlobalBytes(65) == 76016 * 65 && mock::set_calls == 0,
+             plan.GlobalBytes(65) == 76016 * 65 && mock::set_calls == 0 &&
+             plan.global_block_limit == 56 * 32 && mock::queried_device == 1,
          "oversized kernels use aligned per-block global slices");
-  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
-                           76001, mock::optin);
+  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test", 76001,
+                           mock::optin, 0, 32);
   Expect(plan.shared_bytes == 76001 && plan.global_stride == 0 &&
              mock::set_calls == 1,
          "opt-in shared memory is preferred when it fits");
-  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
-                           76001, mock::ordinary);
+  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test", 76001,
+                           mock::ordinary, 0, 32);
+  Expect(
+      plan.GlobalBytes(std::numeric_limits<std::size_t>::max()) ==
+          76016 * 56 * 32,
+      "global scratch does not grow with the horizon beyond one device wave");
   bool overflow = false;
   try {
-    (void)plan.GlobalBytes(std::numeric_limits<std::size_t>::max());
+    auto oversized = plan;
+    oversized.global_stride = std::numeric_limits<std::size_t>::max();
+    (void)oversized.GlobalBytes(2);
   } catch (const std::invalid_argument &) {
     overflow = true;
   }
@@ -232,12 +267,55 @@ void GlobalFallbackCase() {
   overflow = false;
   try {
     (void)PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
-                           std::numeric_limits<std::size_t>::max(),
-                           mock::ordinary);
+                            std::numeric_limits<std::size_t>::max(),
+                            mock::ordinary, 0, 32);
   } catch (const std::invalid_argument &) {
     overflow = true;
   }
   Expect(overflow, "global alignment addition is checked");
+}
+
+void BoundedLaunchCase() {
+  mock::Reset();
+  mock::multiprocessors = 2;
+  mock::resident_blocks = 3;
+  auto plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
+                                76001, mock::ordinary, 0, 32);
+  for (int blocks : {0, 1, 5, 6, 7, 17, 32, 33, 257, 32769}) {
+    int covered = 0;
+    int launches = 0;
+    ForEachGlobalScratchLaunch(plan, blocks, [&](int first, int count) {
+      Expect(first == covered && count > 0 && count <= 6,
+             "scratch launches cover contiguous, disjoint logical blocks");
+      Expect(plan.GlobalBytes(blocks) >= plan.global_stride * count,
+             "each physical block has its own allocated scratch slice");
+      covered += count;
+      ++launches;
+    });
+    Expect(covered == blocks && launches == (blocks + 5) / 6,
+           "bounded launches cover zero, odd, and full-wave extents exactly");
+  }
+  for (int bad_count : {0, -1, std::numeric_limits<int>::max()}) {
+    mock::multiprocessors = bad_count;
+    bool rejected = false;
+    try {
+      (void)PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
+                              76001, mock::ordinary, 0, 32);
+    } catch (const std::runtime_error &) {
+      rejected = true;
+    }
+    Expect(rejected, "invalid or overflowing device concurrency is rejected");
+  }
+  mock::Reset();
+  mock::occupancy_error = 1;
+  bool rejected = false;
+  try {
+    (void)PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
+                            76001, mock::ordinary, 0, 32);
+  } catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  Expect(rejected, "kernel occupancy query failure is propagated");
 }
 } // namespace
 
@@ -248,5 +326,6 @@ int main() {
   KernelAndDeviceIsolationCase();
   ApiErrorCase();
   GlobalFallbackCase();
+  BoundedLaunchCase();
   std::cout << "CUDA shared-memory configuration tests passed\n";
 }

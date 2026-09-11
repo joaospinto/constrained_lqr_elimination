@@ -24,10 +24,33 @@ class SharedMemoryLaunchAudit(unittest.TestCase):
         )
         self.assertEqual(set(definitions), launches)
         self.assertNotRegex(source, r"<<<[^>]*scratch\.\w+")
-        self.assertIn("kernel<true><<<blocks, kThreads, 0, stream>>>", source)
+        self.assertIn("kernel<true><<<count, kThreads, 0, stream>>>", source)
+        self.assertTrue(
+            re.search(r"ForEachGlobalScratchLaunch\(\s*clqr_launch, blocks,", source),
+            "global scratch launches must use the bounded launch iterator",
+        )
+        self.assertIn("clqr_launch.global_stride, first)", source)
         self.assertIn("workspace.global_scratch.get()", source)
         self.assertIn("plans->kernel.GlobalBytes(blocks)", source)
         self.assertNotIn("kStaticSharedMemoryAllowance", source)
+
+        # Scratch offsets use the physical block; logical stage/tree indices
+        # include the launch offset. Catch an unconverted scratch kernel.
+        for kernel in definitions:
+            match = re.search(
+                rf"__global__ void {kernel}\([^{{}};]*CLQR_SCRATCH_PARAMS\)\s*{{",
+                source,
+            )
+            start = match.end()
+            depth = 1
+            end = start
+            while depth:
+                depth += (source[end] == "{") - (source[end] == "}")
+                end += 1
+            body = source[start:end]
+            self.assertNotIn(
+                "blockIdx.x", body.replace("(first_block + blockIdx.x)", ""), kernel
+            )
 
 
 if __name__ == "__main__":

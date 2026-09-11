@@ -133,7 +133,9 @@ the selected GPU's shared-memory capacity and each kernel's static usage, and
 opts into larger dynamic shared-memory allocations when needed and supported.
 Each launch still requests only its planned scratch size. Kernels whose dense
 scratch exceeds the per-block limit use separate per-block slices of reusable
-global device workspace instead. Small static shared scalars remain shared.
+global device workspace instead. That scratch pool is bounded by the selected
+GPU's concurrent block capacity and reused between ordered launches; it does
+not grow with the horizon. Small static shared scalars remain shared.
 The fallback preserves the algorithm and numerical choices, but its memory
 traffic can cost performance. There is no capacity flag to rebuild; total
 device-memory availability still limits the problem size.
