@@ -613,15 +613,6 @@ struct ScratchRequirements {
   std::size_t dual_relation = 0;
   std::size_t dual_root = 0;
   std::size_t dual_expand = 0;
-
-  [[maybe_unused]] std::size_t Maximum() const {
-    return std::max({primal_leaf, primal_relation, primal_relation_final,
-                     state_parameter, stage_reduction, terminal_reduction,
-                     value_leaf, value_compose, value_finalize, feedback,
-                     affine_terms, affine_finalize, dual_parameter,
-                     dual_relation_leaf, dual_relation, dual_root,
-                     dual_expand});
-  }
 };
 
 std::size_t StateParameterScratchBytes(std::size_t variables,

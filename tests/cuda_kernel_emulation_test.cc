@@ -25,6 +25,18 @@ using clqr::Vector;
 using namespace clqr::cuda;
 using namespace clqr::cuda::detail;
 
+std::size_t MaximumScratchBytes(const ScratchRequirements &scratch) {
+  return std::max({scratch.primal_leaf, scratch.primal_relation,
+                   scratch.primal_relation_final, scratch.state_parameter,
+                   scratch.stage_reduction, scratch.terminal_reduction,
+                   scratch.value_leaf, scratch.value_compose,
+                   scratch.value_finalize, scratch.feedback,
+                   scratch.affine_terms, scratch.affine_finalize,
+                   scratch.dual_parameter, scratch.dual_relation_leaf,
+                   scratch.dual_relation, scratch.dual_root,
+                   scratch.dual_expand});
+}
+
 template <typename T>
 concept HasAffineRightEndpoint = requires(T value) { value.b; };
 
@@ -867,12 +879,12 @@ void ScratchPlannerTopologyCase() {
       clqr::benchmark::MakeScalingProblem(8, 24, 12, 3, 6).problem;
   const std::size_t optin_bytes =
       sizeof(Scalar) * (16 * 24 * 24 + 10 * 24) + 8 * 4 * 24 + 40;
-  Expect(PlanScratch(optin_problem).Maximum() == optin_bytes,
+  Expect(MaximumScratchBytes(PlanScratch(optin_problem)) == optin_bytes,
          "native opt-in fixture uses the predicted shared-memory footprint");
   constexpr std::size_t kUsableP100SharedBytes = 48 * 1024 - 256;
   const ScratchRequirements pathological =
       PlanScratch(PathologicalScratchProblem());
-  Expect(pathological.Maximum() <= kUsableP100SharedBytes,
+  Expect(MaximumScratchBytes(pathological) <= kUsableP100SharedBytes,
          "topology-aware scratch accepts a 45-to-0 state transition");
   Expect(DenseEliminationScratchBytes(4 * 45, 3 * 45 + 1,
                                       "legacy synthetic workspace") >
@@ -1034,14 +1046,16 @@ void ScratchPlannerTopologyCase() {
     plan_builds +=
         RefreshScratchPlan(uniform_problem, &cached_key, &cached_scratch);
   }
-  Expect(plan_builds == 1 && cached_scratch.Maximum() == uniform.Maximum(),
+  Expect(plan_builds == 1 &&
+             MaximumScratchBytes(cached_scratch) == MaximumScratchBytes(uniform),
          "same-shape workspace reuse builds the scratch plan only once");
   const Problem changed_problem =
       clqr::benchmark::StateOnlyProblem(8, n + 1, 4, 2);
   plan_builds +=
       RefreshScratchPlan(changed_problem, &cached_key, &cached_scratch);
   Expect(plan_builds == 2 &&
-             cached_scratch.Maximum() == PlanScratch(changed_problem).Maximum(),
+             MaximumScratchBytes(cached_scratch) ==
+                 MaximumScratchBytes(PlanScratch(changed_problem)),
          "a dimension change rebuilds the cached scratch plan");
 }
 
