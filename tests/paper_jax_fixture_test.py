@@ -79,6 +79,25 @@ if __name__ == "__main__":
     assert "compiling JAX solve" in progress.getvalue()
     assert "DONE status=ok" in progress.getvalue()
     assert "[case" not in output.getvalue()
+    # An unsuccessful warmup must be reported, not repeated and timed.
+    failed_output = io.StringIO()
+    failed_progress = io.StringIO()
+    failed_solve = mock.Mock(return_value=SimpleNamespace(
+        diagnostics=np.array([3, 0, 0], dtype=np.int32)))
+    failed_jit = SimpleNamespace(lower=lambda *a: SimpleNamespace(
+        compile=lambda: failed_solve))
+    with contextlib.redirect_stdout(failed_output), contextlib.redirect_stderr(failed_progress), \
+            mock.patch.object(jax, "jit", return_value=failed_jit), \
+            mock.patch.object(jax, "block_until_ready", side_effect=lambda value: value):
+        code = main("cpu", ["--suite", "smoke", "--case-index", "0", "--repeats", "2"])
+    assert code == 0
+    assert failed_solve.call_count == 1
+    assert "warmup solver diagnostics [3, 0, 0]" in failed_output.getvalue()
+    assert "timing resident solves" not in failed_progress.getvalue()
+    failed_rows = list(csv.DictReader(line for line in failed_output.getvalue().splitlines()
+                                    if line and not line.startswith("#")))
+    assert len(failed_rows) == 1 and failed_rows[0]["status"] == "failed"
+    assert failed_rows[0]["repeats"] == "0"
     fixture = next(_runfiles().rglob("clqr_paper_fixture"))
     for index in (0, 2, 3):
         p, x, u, dual = paper_fixture.problem(fixture, "smoke", index, 20260907)

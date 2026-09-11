@@ -48,6 +48,15 @@ def indexed(rows, backend):
     for row in rows:
         if row["backend"] != backend:
             continue
+        # Older two-sample runs selected the minimum for p90 but the maximum
+        # for the median. Repair only that exact bug, using retained samples;
+        # never invent missing timings or relax the integrity checks below.
+        if row.get("repeats") == "2" and row.get("solve_samples_ms"):
+            samples = sorted(float(x) for x in row["solve_samples_ms"].split(";"))
+            if (len(samples) == 2 and all(math.isfinite(x) and x >= 0 for x in samples)
+                    and numeric(row, "p10_ms") == numeric(row, "p90_ms") == samples[0]
+                    and numeric(row, "median_ms") == samples[1]):
+                row = dict(row, p90_ms=str(samples[1]))
         identity = key(row)
         if identity in result:
             raise ValueError(f"duplicate {backend} case: {identity}")

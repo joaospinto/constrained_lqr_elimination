@@ -176,6 +176,9 @@ private:
 class CudaSolver {
 public:
   explicit CudaSolver(const Problem &p) : p_(p) {
+    // Compare native CUDA and JAX using the CPU/JAX rank tolerance, not the
+    // different default of the native CUDA public API.
+    options_.tolerance = clqr::SolveOptions{}.tolerance;
     workspace_.Reserve(p, options_);
   }
   void Solve() {
@@ -611,7 +614,7 @@ void Run(const clqr::benchmark::PaperCase &c,
               << setup_ms << ',' << times[times.size() / 2] << ','
               << (times.size() > 1 ? times[times.size() / 10]
                                   : std::numeric_limits<double>::quiet_NaN()) << ','
-              << (times.size() > 1 ? times[(times.size() - 1) * 9 / 10]
+              << (times.size() > 1 ? times[times.size() * 9 / 10]
                                   : std::numeric_limits<double>::quiet_NaN()) << ',' << error << ','
               << objective << ',' << obj_error << ','
               << (kernel_times.empty()

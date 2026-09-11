@@ -139,6 +139,11 @@ def main(default_platform="cpu", argv=None):
             solve = jax.jit(module.solve).lower(inputs).compile()
             progress("warmup (1 solve)")
             result = jax.block_until_ready(solve(inputs))
+            # Check the untimed warmup before reusing its workspace. In
+            # particular, an allocation failure is not a timing sample.
+            diagnostics = np.asarray(jax.device_get(result.diagnostics))
+            if int(diagnostics[0]) != 0:
+                raise RuntimeError(f"warmup solver diagnostics {diagnostics.tolist()}")
             times = []
             total_ms = 0.0
             sampling = (f"{args.repeats} calls" if args.repeats is not None else
@@ -175,7 +180,7 @@ def main(default_platform="cpu", argv=None):
             times.sort()
             row.update(status="ok" if passed else "inaccurate", median_ms=times[len(times) // 2],
                        p10_ms=times[len(times) // 10] if len(times) > 1 else math.nan,
-                       p90_ms=times[(len(times) - 1) * 9 // 10] if len(times) > 1 else math.nan)
+                       p90_ms=times[len(times) * 9 // 10] if len(times) > 1 else math.nan)
         except Exception as error:
             row["status"] = "failed"
             print(f"# {case['family']} N={case['N']} n={case['n']}: {str(error).replace(chr(10), ' ')}", flush=True)

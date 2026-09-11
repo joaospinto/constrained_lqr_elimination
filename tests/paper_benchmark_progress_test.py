@@ -9,6 +9,18 @@ import unittest
 
 
 class NativeProgressTest(unittest.TestCase):
+    def test_two_sample_quantiles_are_ordered(self):
+        root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
+        result = subprocess.run(
+            [str(root / "clqr_paper_cpu_benchmark"), "--suite", "smoke", "--repeats", "2"],
+            capture_output=True, text=True, check=True, timeout=30)
+        for row in csv.DictReader(l for l in result.stdout.splitlines() if l and not l.startswith("#")):
+            samples = sorted(float(x) for x in row["solve_samples_ms"].split(";"))
+            self.assertEqual(len(samples), 2)
+            self.assertEqual(float(row["p10_ms"]), samples[0])
+            self.assertEqual(float(row["median_ms"]), samples[1])
+            self.assertEqual(float(row["p90_ms"]), samples[1])
+
     def test_progress_is_separate_from_measurements(self):
         root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
         result = subprocess.run(

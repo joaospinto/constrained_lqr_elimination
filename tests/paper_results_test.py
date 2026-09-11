@@ -20,6 +20,17 @@ def row(backend="clqr_cpu"):
 
 
 class ResultsTest(unittest.TestCase):
+    def test_repairs_only_known_two_sample_quantile_bug(self):
+        value = dict(row(), repeats="2", median_ms="1.3", p10_ms="1.1",
+                     p90_ms="1.1", solve_samples_ms="1.3;1.1")
+        fixed = next(iter(results.indexed([value], "clqr_cpu").values()))
+        self.assertEqual(float(fixed["p90_ms"]), 1.3)
+        self.assertEqual(value["p90_ms"], "1.1")
+        for change in (dict(solve_samples_ms=""), dict(solve_samples_ms="1.2;1.3"),
+                       dict(repeats="3")):
+            with self.assertRaisesRegex(ValueError, "unordered"):
+                results.indexed([dict(value, **change)], "clqr_cpu")
+
     def test_separate_and_combined_reference_files(self):
         for separate in (False, True):
             with self.subTest(separate=separate), tempfile.TemporaryDirectory() as directory:
