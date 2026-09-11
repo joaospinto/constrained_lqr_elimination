@@ -4,7 +4,9 @@ import io
 import copy
 import math
 from types import SimpleNamespace
+from unittest import mock
 
+import jax
 import numpy as np
 from benchmarks import paper_fixture
 from benchmarks.paper_jax_benchmark import _runfiles
@@ -30,7 +32,34 @@ if __name__ == "__main__":
     check_capacity_report()
     output = io.StringIO()
     progress = io.StringIO()
-    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(progress):
+    compiled_calls = []
+    original_jit = jax.jit
+
+    def counting_jit(function, *args, **kwargs):
+        wrapped = original_jit(function, *args, **kwargs)
+        if function.__module__ != "clqr.jax" or function.__name__ != "solve":
+            return wrapped
+
+        def lower(*inputs, **options):
+            lowered = wrapped.lower(*inputs, **options)
+
+            def compile_counted():
+                compiled = lowered.compile()
+                compiled_calls.append(0)
+                index = len(compiled_calls) - 1
+
+                def counted(*values):
+                    compiled_calls[index] += 1
+                    return compiled(*values)
+
+                return counted
+
+            return SimpleNamespace(compile=compile_counted)
+
+        return SimpleNamespace(lower=lower)
+
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(progress), \
+            mock.patch.object(jax, "jit", side_effect=counting_jit):
         code = main("cpu", ["--suite", "smoke", "--repeats", "1"])
     print(output.getvalue(), end="")
     rows = list(csv.DictReader(line for line in output.getvalue().splitlines()
@@ -39,6 +68,10 @@ if __name__ == "__main__":
     # This regression test must still enforce correctness on its smoke cases.
     assert code == 0
     assert len(rows) == 4
+    # Exactly one warmup and one measured invocation, including the tiny
+    # zero-horizon case: no minimum-duration warmup loop remains.
+    assert compiled_calls == [2, 2, 2, 2], compiled_calls
+    assert progress.getvalue().count("warmup (1 solve)") == len(rows)
     assert all(row["status"] == "ok" for row in rows), rows
     assert all(float(row["dual_error_inf"]) < 1e-8 for row in rows), rows
     assert "[case 1/4] clqr_jax_cpu N=1 n=4 m=2 generating fixture" in progress.getvalue()

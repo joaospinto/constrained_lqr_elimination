@@ -268,7 +268,7 @@ and at least 5 GiB free, run from the repository root:
 mkdir -p ../clqr-desktop-results
 python3 -u scripts/notebook_paper.py \
   --work-dir "$(cd ../clqr-desktop-results && pwd)" \
-  --suite all --repeats 11 --jobs 4
+  --suite all --jobs 4
 ```
 
 It prints the `paper-results.zip` path and removes only that run's private
@@ -305,8 +305,16 @@ All measured cases remain in the CSVs even when the generated paper table
 selects only $n=8,16$.
 The corrected Laine–Tomlin implementation is included separately from the
 author's original, using the optimized native dense kernels.
-Each solve refactors; setup and setup-plus-solve
-times are reported separately. Primal, original-objective, and available
+Each native or JAX paper-comparison case performs exactly one untimed warmup
+solve before measuring repeated-use latency. Individual solves are timed until
+their cumulative measured time reaches one second, finishing the current solve
+and imposing no minimum repetition count. Set `CLQR_BENCHMARK_SECONDS` to change
+that target; an explicit `CLQR_BENCHMARK_REPEATS` or runner `--repeats` selects
+fixed-count sampling for diagnostics. Prepared solve and setup-plus-solve each
+have their own duration target. CSVs retain actual sample counts and individual
+times in chronological order; variability is unavailable for a single sample.
+Each solve refactors; setup and setup-plus-solve times are reported separately.
+Primal, original-objective, and available
 original KKT residuals are audited outside the timing interval. The original
 Laine adapter includes the author's multiplier recovery in each timed solve
 and reports KKT residuals using those returned multipliers. Corrected Laine–Tomlin
@@ -329,7 +337,13 @@ reference sources. Each run still writes to a new results directory.
 The driver also produces `summary.json`; a complete CUDA run produces LaTeX
 table files. The summary checks matching cases/seeds, preserves failed or
 inaccurate rows, and uses the first comparison round rather than selecting the
-fastest round. The second round remains available to assess timing variation.
+fastest round. Each backend is measured once by default; set
+`CLQR_BENCHMARK_ROUNDS=2` for an additional, reverse-order CPU comparison round.
+Each paper benchmark invocation selects one backend, never an implicit CPU
+baseline alongside another method. The driver isolates each backend/case in a
+subprocess, retaining its raw CSV/log and updating the combined CSV after every
+case; a killed process cannot discard the remaining cases in its sweep.
+The separate original-table reproduction retains its fixed-count protocol.
 
 For a local comparison on the shared adversarial unit-test fixtures, build
 the `clqr_adversarial_benchmark` CMake target, then run

@@ -10,7 +10,7 @@ import tempfile
 import zipfile
 
 
-def run(source, work_dir, *, cuda=True, suite="all", repeats=11, jobs=4):
+def run(source, work_dir, *, cuda=True, suite="all", repeats=None, jobs=4):
     if shutil.disk_usage(work_dir).free < 5 * 1024**3:
         raise RuntimeError("At least 5 GiB free is required before starting the comparison")
     root = Path(tempfile.mkdtemp(prefix="clqr-paper-", dir=work_dir))
@@ -18,9 +18,11 @@ def run(source, work_dir, *, cuda=True, suite="all", repeats=11, jobs=4):
     env = dict(os.environ, CLQR_PAPER_CACHE_DIR=str(cache),
                CLQR_PAPER_BAZEL_ROOT=str(cache / "bazel"),
                BAZELISK_HOME=str(cache / "bazelisk"),
-               CLQR_PAPER_SUITE=suite, CLQR_BENCHMARK_REPEATS=str(repeats),
+               CLQR_PAPER_SUITE=suite,
                CLQR_JOBS=str(jobs),
                PYTHONDONTWRITEBYTECODE="1")
+    if repeats is not None:
+        env["CLQR_BENCHMARK_REPEATS"] = str(repeats)
     command = ["bash", str(source / "scripts/paper_benchmarks.sh"), str(results)]
     if cuda:
         command.append("--cuda")
@@ -68,10 +70,11 @@ def main():
     parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument("--suite", default="all",
                         choices=("all", "smoke", "horizon", "dimension", "constraints"))
-    parser.add_argument("--repeats", type=int, default=11)
+    parser.add_argument("--repeats", type=int,
+                        help="override duration-based sampling with a fixed count")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
     args = parser.parse_args()
-    if args.repeats < 1 or args.jobs < 1:
+    if (args.repeats is not None and args.repeats < 1) or args.jobs < 1:
         parser.error("repeats and jobs must be positive")
     return run(Path(__file__).resolve().parents[1], args.work_dir.resolve(),
                cuda=not args.cpu_only, suite=args.suite, repeats=args.repeats, jobs=args.jobs)

@@ -28,6 +28,7 @@ py_test(
         "tests/notebook_paper_test.py",
         "scripts/notebook_paper.py",
         "scripts/benchmark_progress.py",
+        "scripts/paper_sweep.py",
     ],
     main = "tests/notebook_paper_test.py",
     data = [

@@ -21,14 +21,22 @@ fi
 mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
 jobs="${CLQR_JOBS:-4}"
-repeats="${CLQR_BENCHMARK_REPEATS:-11}"
+repeats="${CLQR_BENCHMARK_REPEATS:-}"
+min_seconds="${CLQR_BENCHMARK_SECONDS:-1}"
+rounds="${CLQR_BENCHMARK_ROUNDS:-1}"
 suite="${CLQR_PAPER_SUITE:-all}"
-for value in "$jobs" "$repeats"; do
+for value in "$jobs" "${repeats:-1}" "$rounds"; do
   if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
-    echo "jobs and repeats must be positive integers" >&2
+    echo "jobs, repeats and rounds must be positive integers" >&2
     exit 2
   fi
 done
+python3 - "$min_seconds" <<'PY'
+import math, sys
+value = float(sys.argv[1])
+if not math.isfinite(value) or value <= 0:
+    sys.exit("CLQR_BENCHMARK_SECONDS must be finite and positive")
+PY
 available_kb="$(df -Pk "$output_dir" | awk 'NR==2 {print $4}')"
 if (( available_kb < 3 * 1024 * 1024 )); then
   echo "at least 3 GiB of free disk space is required for the reference builds" >&2
@@ -158,7 +166,8 @@ esac
   printf 'C++ comparison flags: Release -O3 -DNDEBUG -march=native\n'
   printf 'OMP_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s MKL_NUM_THREADS=%s\n' \
     "$OMP_NUM_THREADS" "$OPENBLAS_NUM_THREADS" "$MKL_NUM_THREADS"
-  printf 'Build jobs: %s; suite: %s; repetitions: %s\n' "$jobs" "$suite" "$repeats"
+  printf 'Build jobs: %s; suite: %s; fixed repetitions: %s; minimum measured seconds: %s; rounds: %s\n' \
+    "$jobs" "$suite" "${repeats:-not set}" "$min_seconds" "$rounds"
   printf '=== GPU and driver ===\n'
   if command -v nvidia-smi >/dev/null; then
     nvidia-smi
@@ -176,6 +185,8 @@ esac
 for clqr_option in "${clqr_benchmark_options[@]}"; do
   printf '%s=%s\n' "$clqr_option" "${!clqr_option}"
 done > "$output_dir/benchmark_options.txt"
+printf 'CLQR_BENCHMARK_REPEATS=%s\nCLQR_BENCHMARK_SECONDS=%s\nCLQR_BENCHMARK_ROUNDS=%s\n' \
+  "$repeats" "$min_seconds" "$rounds" >> "$output_dir/benchmark_options.txt"
 
 # Compile and validate before building references or timing long sweeps.
 source "$repo_dir/scripts/notebook_bazel.sh"
@@ -276,31 +287,58 @@ check_log() {
     failed=1
   fi
 }
-bench_args=(--suite "$suite" --repeats "$repeats")
+sweep() {
+  local name="$1" backends="$2" kind="$3"
+  shift 3
+  local backend_args=()
+  read -r -a backend_args <<< "$backends"
+  local sweep_command=(python3 "$repo_dir/scripts/paper_sweep.py" --name "$name"
+      --manifest "$output_dir/cases.json" --stdout "$output_dir/$name.csv"
+      --stderr "$output_dir/$name.stderr")
+  if [[ "$kind" == jax ]]; then sweep_command+=(--jax); fi
+  if ! "${sweep_command[@]}" --backends "${backend_args[@]}" -- "$@"; then
+    printf 'CHECK FAILED: %s (individual failures recorded; all cases attempted)\n' "$name" >&2
+    failed=1
+  fi
+}
+bench_args=(--suite "$suite" --min-seconds "$min_seconds")
+if [[ -n "$repeats" ]]; then bench_args+=(--repeats "$repeats"); fi
 enabled_backends=(clqr_cpu)
+reference_backends=()
+if (( CLQR_RUN_VANROYE )); then reference_backends+=(gen_riccati); fi
+if (( CLQR_RUN_YANG )); then reference_backends+=(factor_graph); fi
 if (( CLQR_RUN_VANROYE || CLQR_RUN_YANG )); then
-  measure references "$cache_dir/reference-build/clqr_reference_benchmark" "${bench_args[@]}"
+  sweep references "${reference_backends[*]}" native \
+    "$cache_dir/reference-build/clqr_reference_benchmark" "${bench_args[@]}"
 fi
 if (( CLQR_RUN_VANROYE )); then enabled_backends+=(gen_riccati); fi
 if (( CLQR_RUN_YANG )); then enabled_backends+=(factor_graph); fi
-# Opposite-order rounds make scheduling/clock drift visible.
-measure cpu_round1 "$cpu_benchmark" "${bench_args[@]}"
-if (( CLQR_RUN_LAINE )); then
-  measure laine_round1 "$cache_dir/reference-build/clqr_laine_benchmark" "${bench_args[@]}"
-  enabled_backends+=(laine_author)
-fi
-if (( CLQR_RUN_CORRECTED_LAINE )); then
-  measure laine_corrected_round1 "$cache_dir/reference-build/clqr_laine_corrected_benchmark" "${bench_args[@]}"
-  measure laine_corrected_round2 "$cache_dir/reference-build/clqr_laine_corrected_benchmark" "${bench_args[@]}"
-  enabled_backends+=(laine_corrected)
-fi
-if (( CLQR_RUN_LAINE )); then
-  measure laine_round2 "$cache_dir/reference-build/clqr_laine_benchmark" "${bench_args[@]}"
-fi
-measure cpu_round2 "$cpu_benchmark" "${bench_args[@]}"
+# One default sweep per backend. Optional extra CPU comparison rounds reverse
+# their order; linked reference executables no longer repeat our CPU timings.
+for ((round=1; round<=rounds; ++round)); do
+  order=(cpu laine laine_corrected)
+  if (( round % 2 == 0 )); then order=(laine_corrected laine cpu); fi
+  for method in "${order[@]}"; do
+    case "$method" in
+      cpu) sweep "cpu_round$round" clqr_cpu native "$cpu_benchmark" "${bench_args[@]}" ;;
+      laine)
+        if (( CLQR_RUN_LAINE )); then
+          sweep "laine_round$round" laine_author native \
+            "$cache_dir/reference-build/clqr_laine_benchmark" "${bench_args[@]}"
+        fi ;;
+      laine_corrected)
+        if (( CLQR_RUN_CORRECTED_LAINE )); then
+          sweep "laine_corrected_round$round" laine_corrected native \
+            "$cache_dir/reference-build/clqr_laine_corrected_benchmark" "${bench_args[@]}"
+        fi ;;
+    esac
+  done
+done
+if (( CLQR_RUN_LAINE )); then enabled_backends+=(laine_author); fi
+if (( CLQR_RUN_CORRECTED_LAINE )); then enabled_backends+=(laine_corrected); fi
 
 if (( CLQR_RUN_JAX )); then
-  measure jax_cpu bazel-bin/clqr_paper_jax_cpu_benchmark "${bench_args[@]}"
+  sweep jax_cpu clqr_jax_cpu jax bazel-bin/clqr_paper_jax_cpu_benchmark "${bench_args[@]}"
   enabled_backends+=(clqr_jax_cpu)
 fi
 if (( cuda_run )); then
@@ -313,13 +351,13 @@ if (( cuda_run )); then
     check_log "cuda_regression_${sanitizer}" compute-sanitizer --tool "$sanitizer" \
       --error-exitcode=99 bazel-bin/cuda_solver_test
     check_log "cuda_${sanitizer}" compute-sanitizer --tool "$sanitizer" \
-      --error-exitcode=99 bazel-bin/clqr_paper_cuda_benchmark --suite smoke --repeats 1
+      --error-exitcode=99 bazel-bin/clqr_paper_cuda_benchmark --suite smoke --repeats 1 --backend clqr_cuda
   done
   fi
-  measure cuda_host bazel-bin/clqr_paper_cuda_benchmark "${bench_args[@]}"
+  sweep cuda_host clqr_cuda native bazel-bin/clqr_paper_cuda_benchmark "${bench_args[@]}"
   enabled_backends+=(clqr_cuda)
   if (( CLQR_RUN_JAX )); then
-  measure cuda_resident bazel-bin/clqr_paper_jax_cuda_benchmark "${bench_args[@]}" \
+  sweep cuda_resident clqr_jax_cuda jax bazel-bin/clqr_paper_jax_cuda_benchmark "${bench_args[@]}" \
     --capacity-report "$output_dir/cuda_host.csv"
     enabled_backends+=(clqr_jax_cuda)
   fi
@@ -328,7 +366,7 @@ if (( cuda_run )); then
   if (( CLQR_RUN_ORIGINAL_TABLE )); then
   "${bazel_cmd[@]}" build --config=fp64 --config=cuda \
     --cuda_archs="sm_${cuda_arch}" --jobs="$jobs" //:clqr_cuda_benchmark
-  measure original_table bazel-bin/clqr_cuda_benchmark --repeats "$repeats"
+  measure original_table bazel-bin/clqr_cuda_benchmark --repeats "${repeats:-11}"
   fi
 fi
 "${bazel_cmd[@]}" shutdown

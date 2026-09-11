@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -502,7 +503,8 @@ private:
 template <class Solver>
 void Run(const clqr::benchmark::PaperCase &c,
          const clqr::benchmark::ScalingProblem &data, const char *backend,
-         int repeats, std::uint64_t seed, std::size_t index, std::size_t count) {
+         int repeats, double min_seconds, std::uint64_t seed,
+         std::size_t index, std::size_t count) {
   const auto started = Clock::now();
   const auto progress = [&](const std::string &phase) {
     std::cerr << "[case " << index + 1 << '/' << count << "] " << backend
@@ -512,32 +514,47 @@ void Run(const clqr::benchmark::PaperCase &c,
                      Clock::now() - started).count()
               << "s)\n";
   };
+  const auto more_samples = [&](std::size_t count, double total_ms) {
+    return repeats > 0 ? count < static_cast<std::size_t>(repeats)
+                       : total_ms < 1000 * min_seconds;
+  };
+  const auto sample_list = [](const std::vector<double>& samples) {
+    std::ostringstream out;
+    out << std::setprecision(12);
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+      if (i) out << ';';
+      out << samples[i];
+    }
+    return out.str();
+  };
   progress("setup");
   std::cout << backend << ',' << c.family << ',' << c.horizon << ',' << c.n
             << ',' << c.m << ',' << c.mixed << ',' << c.state << ',' << seed
             << ',';
   try {
     const auto begin = Clock::now();
-    Solver solver(data.problem);
+    std::optional<Solver> solver(std::in_place, data.problem);
     const double setup_ms = Milliseconds(begin);
-    progress("warmup");
-    const auto warmup_start = Clock::now();
-    for (int i = 0; i < 3 || Milliseconds(warmup_start) < 100.0; ++i)
-      solver.Solve();
+    progress("warmup (1 solve)");
+    solver->Solve();
     std::vector<double> times, kernel_times, setup_solve_times;
-    progress("timing " + std::to_string(repeats) + " prepared solves");
-    for (int i = 0; i < repeats; ++i) {
+    const std::string sampling = repeats > 0 ? std::to_string(repeats) + " calls"
+        : "at least " + std::to_string(min_seconds) + " measured seconds";
+    progress("timing prepared solves: " + sampling);
+    double total_ms = 0;
+    while (more_samples(times.size(), total_ms)) {
       const auto start = Clock::now();
-      solver.Solve();
+      solver->Solve();
       times.push_back(Milliseconds(start));
-      if constexpr (requires { solver.KernelMs(); })
-        kernel_times.push_back(solver.KernelMs());
+      total_ms += times.back();
+      if constexpr (requires { solver->KernelMs(); })
+        kernel_times.push_back(solver->KernelMs());
     }
     progress("validation");
-    const auto result = solver.Result();
+    const auto result = solver->Result();
     std::optional<Multipliers> dual;
-    if constexpr (requires { solver.DualResult(); })
-      dual = solver.DualResult();
+    if constexpr (requires { solver->DualResult(); })
+      dual = solver->DualResult();
     const Residuals residuals = Audit(data.problem, result, dual);
     // A linear-horizon certificate using the known planted dual. This checks
     // every backend's returned primal, including primal-only references,
@@ -565,20 +582,30 @@ void Run(const clqr::benchmark::PaperCase &c,
     // square roots for the factor graph). Also report a repeated setup+solve
     // measurement so that the prepared-representation timing does not hide it.
     // Destruction and extraction into a common output container are excluded.
-    progress("timing " + std::to_string(repeats) + " setup+solve calls");
-    for (int i = 0; i < repeats; ++i) {
+    // Do not keep a second (potentially multi-GiB) workspace resident while
+    // measuring fresh allocation. The validation outputs above own their data.
+    solver.reset();
+    progress("timing setup+solve: " + sampling);
+    total_ms = 0;
+    while (more_samples(setup_solve_times.size(), total_ms)) {
       const auto start = Clock::now();
       Solver fresh(data.problem);
       fresh.Solve();
       setup_solve_times.push_back(Milliseconds(start));
+      total_ms += setup_solve_times.back();
     }
+    const auto solve_samples = sample_list(times);
+    const auto setup_samples = sample_list(setup_solve_times);
+    const auto kernel_samples = sample_list(kernel_times);
     std::sort(times.begin(), times.end());
     std::sort(kernel_times.begin(), kernel_times.end());
     std::sort(setup_solve_times.begin(), setup_solve_times.end());
-    std::cout << (valid ? "ok" : "inaccurate") << ',' << repeats << ','
+    std::cout << (valid ? "ok" : "inaccurate") << ',' << times.size() << ','
               << setup_ms << ',' << times[times.size() / 2] << ','
-              << times[times.size() / 10] << ','
-              << times[(times.size() - 1) * 9 / 10] << ',' << error << ','
+              << (times.size() > 1 ? times[times.size() / 10]
+                                  : std::numeric_limits<double>::quiet_NaN()) << ','
+              << (times.size() > 1 ? times[(times.size() - 1) * 9 / 10]
+                                  : std::numeric_limits<double>::quiet_NaN()) << ',' << error << ','
               << objective << ',' << obj_error << ','
               << (kernel_times.empty()
                       ? std::numeric_limits<double>::quiet_NaN()
@@ -588,7 +615,9 @@ void Run(const clqr::benchmark::PaperCase &c,
               << (dual ? std::max(residuals.feasibility, residuals.stationarity)
                        : std::numeric_limits<double>::quiet_NaN())
               << ',' << setup_solve_times[setup_solve_times.size() / 2]
-              << ',' << planted_dual_stationarity << ',' << dual_error << '\n';
+              << ',' << planted_dual_stationarity << ',' << dual_error
+              << ',' << setup_solve_times.size() << ',' << solve_samples
+              << ',' << setup_samples << ',' << kernel_samples << '\n';
     progress(valid ? "DONE status=ok" : "DONE status=inaccurate");
   } catch (const std::exception &e) {
     std::string message = e.what();
@@ -600,7 +629,7 @@ void Run(const clqr::benchmark::PaperCase &c,
         message.find("exceeding device shared-memory resources") !=
             std::string::npos;
     std::cout << (unsupported ? "unsupported" : "failed")
-              << ",0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan\n# "
+              << ",0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,0,,,\n# "
               << message << '\n';
     progress(std::string("DONE status=") + (unsupported ? "unsupported: " : "failed: ") +
              message);
@@ -759,6 +788,11 @@ int AdversarialMain(int argc, char **argv) {
   if (!backend.empty() &&
       std::find(backends.begin(), backends.end(), backend) == backends.end())
     throw std::invalid_argument("unknown backend: " + backend);
+  if (backend.empty() && !list) {
+    if (backends.size() != 1)
+      throw std::invalid_argument("select exactly one backend with --backend");
+    backend = backends.front();
+  }
 #ifndef CLQR_BENCHMARK_GEN_RICCATI
   if (backend == "gen_riccati")
     throw std::invalid_argument("gen_riccati is not linked in this build");
@@ -826,7 +860,10 @@ int main(int argc, char **argv) {
   return AdversarialMain(argc, argv);
 #endif
   std::string suite = "smoke";
-  int repeats = 11;
+  int repeats = 0;
+  double min_seconds = 1;
+  int case_index = -1;
+  std::string backend;
   std::uint64_t seed = 20260907;
   for (int i = 1; i < argc; ++i) {
     const std::string option = argv[i];
@@ -834,16 +871,53 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("missing option value");
     if (option == "--suite")
       suite = argv[++i];
-    else if (option == "--repeats")
+    else if (option == "--repeats") {
       repeats = std::stoi(argv[++i]);
+      if (repeats < 1)
+        throw std::invalid_argument("repeats must be positive");
+    } else if (option == "--min-seconds")
+      min_seconds = std::stod(argv[++i]);
     else if (option == "--seed")
       seed = std::stoull(argv[++i]);
+    else if (option == "--backend")
+      backend = argv[++i];
+    else if (option == "--case-index")
+      case_index = std::stoi(argv[++i]);
     else
       throw std::invalid_argument("unknown option: " + option);
   }
-  if (repeats < 1)
-    throw std::invalid_argument("repeats must be positive");
-  std::cout << "# FP64; at least 3 warmups and 100 ms; setup includes "
+  if (!std::isfinite(min_seconds) || min_seconds <= 0)
+    throw std::invalid_argument("min-seconds must be finite and positive");
+  std::vector<std::string> backends = {
+#ifdef CLQR_BENCHMARK_GEN_RICCATI
+    "gen_riccati",
+#endif
+#ifdef CLQR_BENCHMARK_GTSAM
+    "factor_graph",
+#endif
+#ifdef CLQR_BENCHMARK_CUDA
+    "clqr_cuda",
+#endif
+#ifdef CLQR_BENCHMARK_LAINE
+    "laine_author",
+#endif
+#ifdef CLQR_BENCHMARK_LAINE_CORRECTED
+    "laine_corrected",
+#endif
+  };
+  if (backends.empty()) backends.push_back("clqr_cpu");
+  if (backend.empty()) {
+    if (backends.size() != 1)
+      throw std::invalid_argument("select exactly one backend with --backend");
+    backend = backends.front();
+  }
+  if (!backend.empty() &&
+      std::find(backends.begin(), backends.end(), backend) == backends.end())
+    throw std::invalid_argument("backend is not linked in this build: " + backend);
+  const auto cases = clqr::benchmark::PaperCases(suite);
+  if (case_index < -1 || case_index >= static_cast<int>(cases.size()))
+    throw std::invalid_argument("case-index is outside the suite");
+  std::cout << "# FP64; exactly one untimed warmup solve; setup includes "
                "representation/storage preparation; "
                "solve includes a fresh factorization and primal solve on every "
                "repetition.\n"
@@ -860,36 +934,50 @@ int main(int argc, char **argv) {
                "with the fixture's known optimal dual, not solver output.\n"
                "# primal_error and dual_error_inf are absolute infinity-norm "
                "errors against the known planted optimum, in original coordinates.\n"
+               "# Samples are individually timed; sample-list columns retain "
+               "chronological times in ms separated by semicolons. "
+               "Timing quantiles are unavailable for a single sample.\n";
+  std::cout << "# min_seconds=" << min_seconds << "; fixed_repeats=" << repeats
+            << " (0 means duration-based); each timing phase uses its own budget.\n"
                "backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,"
                "setup_ms,"
                "median_ms,p10_ms,p90_ms,primal_error,objective,relative_"
                "objective_error,kernel_ms,"
                "feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,"
-               "planted_dual_stationarity_inf,dual_error_inf\n";
+               "planted_dual_stationarity_inf,dual_error_inf,setup_solve_repeats,"
+               "solve_samples_ms,setup_solve_samples_ms,kernel_samples_ms\n";
   std::cout << std::setprecision(12);
-  const auto cases = clqr::benchmark::PaperCases(suite);
+  std::cout.flush();
   for (std::size_t index = 0; index < cases.size(); ++index) {
+    if (case_index >= 0 && index != static_cast<std::size_t>(case_index))
+      continue;
     const auto &c = cases[index];
     std::cerr << "[case " << index + 1 << '/' << cases.size()
               << "] generating fixture N=" << c.horizon << " n=" << c.n
               << " m=" << c.m << '\n';
     const auto data = clqr::benchmark::MakeScalingProblem(
         c.horizon, c.n, c.m, c.mixed, c.state, seed);
-    Run<CpuSolver>(c, data, "clqr_cpu", repeats, seed, index, cases.size());
+    if (backend == "clqr_cpu")
+      Run<CpuSolver>(c, data, "clqr_cpu", repeats, min_seconds, seed, index, cases.size());
 #ifdef CLQR_BENCHMARK_GEN_RICCATI
-    Run<RiccatiSolver>(c, data, "gen_riccati", repeats, seed, index, cases.size());
+    if (backend == "gen_riccati")
+      Run<RiccatiSolver>(c, data, "gen_riccati", repeats, min_seconds, seed, index, cases.size());
 #endif
 #ifdef CLQR_BENCHMARK_GTSAM
-    Run<FactorGraphSolver>(c, data, "factor_graph", repeats, seed, index, cases.size());
+    if (backend == "factor_graph")
+      Run<FactorGraphSolver>(c, data, "factor_graph", repeats, min_seconds, seed, index, cases.size());
 #endif
 #ifdef CLQR_BENCHMARK_CUDA
-    Run<CudaSolver>(c, data, "clqr_cuda", repeats, seed, index, cases.size());
+    if (backend == "clqr_cuda")
+      Run<CudaSolver>(c, data, "clqr_cuda", repeats, min_seconds, seed, index, cases.size());
 #endif
 #ifdef CLQR_BENCHMARK_LAINE
-    Run<LaineAuthorSolver>(c, data, "laine_author", repeats, seed, index, cases.size());
+    if (backend == "laine_author")
+      Run<LaineAuthorSolver>(c, data, "laine_author", repeats, min_seconds, seed, index, cases.size());
 #endif
 #ifdef CLQR_BENCHMARK_LAINE_CORRECTED
-    Run<LaineCorrectedSolver>(c, data, "laine_corrected", repeats, seed, index, cases.size());
+    if (backend == "laine_corrected")
+      Run<LaineCorrectedSolver>(c, data, "laine_corrected", repeats, min_seconds, seed, index, cases.size());
 #endif
   }
   // Keep all numerical outcomes in the CSV, without turning them into test

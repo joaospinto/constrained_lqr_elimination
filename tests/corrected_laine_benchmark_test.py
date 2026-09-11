@@ -18,6 +18,8 @@ class BenchmarkTest(unittest.TestCase):
         rows = list(csv.DictReader(io.StringIO("\n".join(
             line for line in output.splitlines() if not line.startswith("#")))))
         corrected = [r for r in rows if r["backend"] == "laine_corrected"]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(corrected), len(rows))  # No implicit CPU sweep.
         self.assertEqual({r["family"] for r in corrected},
                          {"state", "mixed", "combined", "zero"})
         for row in corrected:

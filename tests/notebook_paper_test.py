@@ -14,6 +14,7 @@ import zipfile
 
 from scripts import notebook_paper
 from scripts import benchmark_progress
+from scripts import paper_sweep
 
 
 class NotebookTest(unittest.TestCase):
@@ -87,7 +88,7 @@ class NotebookTest(unittest.TestCase):
                 source = work / "source"
                 (source / "scripts").mkdir(parents=True)
                 for name in ("paper_benchmarks.sh", "benchmark_options.sh",
-                             "notebook_bazel.sh", "benchmark_progress.py"):
+                             "notebook_bazel.sh", "benchmark_progress.py", "paper_sweep.py"):
                     shutil.copy(root / "scripts" / name, source / "scripts" / name)
                 (source / ".bazelversion").write_text("9.1.1\n")
                 (source / "bazel-bin").mkdir()
@@ -101,8 +102,18 @@ from pathlib import Path
 name, *args = sys.argv[1:]
 with open(os.environ["CALL_LOG"], "a") as f:
     f.write(json.dumps([name, *args]) + "\\n")
-if name == "python3" and args[0].endswith("benchmark_progress.py"):
+if name == "python3" and args[0].endswith(("benchmark_progress.py", "paper_sweep.py")):
     os.execv(sys.executable, [sys.executable, *args])
+case = dict(index=0, family="horizon", N=32, n=8, m=4, mixed_rows=1, state_rows=2)
+if name == "clqr_paper_fixture":
+    print(json.dumps([case]))
+if "--backend" in args:
+    import csv
+    row = dict(backend=args[args.index("--backend")+1], seed="20260907",
+               status="ok", repeats=1, **{k:v for k,v in case.items() if k != "index"})
+    writer = csv.DictWriter(sys.stdout, fieldnames=row.keys())
+    writer.writeheader()
+    writer.writerow(row)
 if name == "git" and args[0] == "init":
     Path(args[-1]).mkdir(parents=True)
 if name == "git" and "fetch" in args:
@@ -143,9 +154,17 @@ if name == "cmake" and "-B" in args:
                                          str(work / "results")], env=env,
                                         capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("[cpu_round1] START", result.stdout)
-                self.assertIn("[cpu_round2] COMPLETE", result.stdout)
+                self.assertIn("[cpu_round1/clqr_cpu/0] START", result.stdout,
+                              result.stderr + log.read_text())
+                self.assertNotIn("cpu_round2", result.stdout)
                 calls = [json.loads(line) for line in log.read_text().splitlines()]
+                measured = [call for call in calls if "--backend" in call and call[0] != "python3"]
+                backends = [call[call.index("--backend") + 1] for call in measured]
+                self.assertEqual(backends.count("clqr_cpu"), 1)
+                self.assertEqual(len(set(backends)), len(backends))
+                self.assertTrue(all("--case-index" in call for call in measured))
+                self.assertTrue(all("--min-seconds" in call for call in measured))
+                self.assertTrue(all("--repeats" not in call for call in measured))
                 fetched = {Path(call[-1]).name for call in calls
                            if call[:2] == ["git", "init"]}
                 self.assertEqual(fetched, expected)
@@ -161,6 +180,46 @@ if name == "cmake" and "-B" in args:
                                      checkout in expected)
                 options = (work / "results/benchmark_options.txt").read_text()
                 self.assertIn("CLQR_RUN_JAX=0", options)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process signal semantics")
+    def test_sweep_preserves_later_cases_after_fatal_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            manifest = work / "cases.json"
+            cases = [dict(index=i, family="horizon", N=32 * 2**i, n=8, m=4,
+                          mixed_rows=1, state_rows=2) for i in range(3)]
+            manifest.write_text(json.dumps(cases))
+            child = """import csv, json, os, signal, sys
+args = sys.argv
+index = int(args[args.index('--case-index')+1])
+if index == 1: os.kill(os.getpid(), signal.SIGKILL)
+case = json.loads(open(args[1]).read())[index]
+case.pop('index')
+row = dict(backend=args[args.index('--backend')+1], seed=20260907,
+           status='ok', repeats=40000, median_ms=0.025,
+           solve_samples_ms=';'.join(['0.025'] * 40000), **case)
+writer = csv.DictWriter(sys.stdout, fieldnames=row.keys())
+writer.writeheader()
+writer.writerow(row)
+"""
+            console = io.StringIO()
+            with contextlib.redirect_stdout(console):
+                code = paper_sweep.run(
+                    [sys.executable, "-c", child, str(manifest)], manifest=manifest,
+                    backends=["clqr_cpu"], name="cpu_round1", output=work / "result.csv",
+                    errors=work / "result.stderr")
+            import csv
+            with (work / "result.csv").open() as output:
+                rows = list(csv.DictReader(output))
+            self.assertEqual(code, 1)
+            self.assertEqual([row["status"] for row in rows], ["ok", "failed", "ok"])
+            self.assertEqual([int(row["N"]) for row in rows], [32, 64, 128])
+            self.assertIn("137", rows[1]["diagnostic"])
+            self.assertEqual(len(rows[0]["solve_samples_ms"].split(';')), 40000)
+            self.assertIn("CASE 2/3: clqr_cpu N=64 n=8 m=4", console.getvalue())
+            self.assertIn("SAVED 2/3: clqr_cpu status=failed", console.getvalue())
+            self.assertIn("SAVED 3/3: clqr_cpu status=ok", console.getvalue())
+            self.assertIn("SWEEP COMPLETE: 3/3 cases saved", console.getvalue())
 
     def test_invalid_benchmark_switch_is_rejected(self):
         root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]

@@ -4,6 +4,7 @@ import argparse
 import csv
 import importlib
 import importlib.util
+import math
 import os
 from pathlib import Path
 import sys
@@ -42,6 +43,7 @@ def _extension(root, name):
 def _capacity_limits(path, seed):
     if path is None:
         return set()
+    csv.field_size_limit(sys.maxsize)  # Native CSVs retain individual timings.
     with path.open() as source:
         rows = csv.DictReader(line for line in source if not line.startswith("#"))
         return {(row["family"], *(int(row[field]) for field in
@@ -55,12 +57,17 @@ def main(default_platform="cpu", argv=None):
     parser.add_argument("--platform", choices=("cpu", "cuda"), default=default_platform)
     parser.add_argument("--suite", default="all")
     parser.add_argument("--seed", type=int, default=20260907)
-    parser.add_argument("--repeats", type=int, default=11)
+    parser.add_argument("--repeats", type=int,
+                        help="explicit fixed-count override, primarily for smoke tests")
+    parser.add_argument("--min-seconds", type=float, default=1.0)
+    parser.add_argument("--case-index", type=int, default=-1)
     parser.add_argument("--capacity-report", type=Path,
                         help="same-run native CUDA CSV; skip sizes rejected by its workspace planner")
     args = parser.parse_args(argv)
-    if args.repeats < 1:
+    if args.repeats is not None and args.repeats < 1:
         parser.error("repeats must be positive")
+    if not math.isfinite(args.min_seconds) or args.min_seconds <= 0:
+        parser.error("min-seconds must be finite and positive")
     if args.capacity_report and args.platform != "cuda":
         parser.error("a capacity report applies only to the CUDA backend")
     capacity_limits = _capacity_limits(args.capacity_report, args.seed)
@@ -81,18 +88,24 @@ def main(default_platform="cpu", argv=None):
 
     print(f"# native JAX FFI, FP64, device={device}; inputs and outputs remain resident during timing")
     print("# compile, upload, host validation, and download are excluded; each solve includes fresh numerical factorization")
-    print("# at least 3 warmups and 100 ms; each repetition blocks on all outputs")
+    print("# exactly one untimed warmup solve; each repetition blocks on all outputs")
+    print(f"# min_seconds={args.min_seconds}; fixed_repeats={args.repeats}; "
+          "individual samples are retained chronologically in ms separated by semicolons")
     print("# primal_error and dual_error_inf: absolute infinity-norm errors against the known planted optimum")
     fields = ["backend", "family", "N", "n", "m", "mixed_rows", "state_rows", "seed",
               "status", "repeats", "median_ms", "p10_ms", "p90_ms", "primal_error",
               "relative_objective_error", "feasibility_inf", "stationarity_inf", "kkt_inf",
               "scalar_device_to_host_bytes", "scalar_host_to_device_bytes", "metadata_device_to_host_bytes",
-              "planted_dual_stationarity_inf", "dual_error_inf"]
+              "planted_dual_stationarity_inf", "dual_error_inf", "solve_samples_ms"]
     writer = csv.DictWriter(sys.stdout, fieldnames=fields)
     writer.writeheader()
     protocol_failed = False
     cases = paper_fixture.cases(fixture, args.suite)
+    if args.case_index < -1 or args.case_index >= len(cases):
+        parser.error("case-index is outside the suite")
     for index, case in enumerate(cases, 1):
+        if args.case_index >= 0 and case["index"] != args.case_index:
+            continue
         started = time.perf_counter()
 
         def progress(phase):
@@ -101,7 +114,7 @@ def main(default_platform="cpu", argv=None):
                   f"(elapsed {time.perf_counter() - started:.1f}s)",
                   file=sys.stderr, flush=True)
 
-        row = dict(backend="clqr_jax_" + args.platform, seed=args.seed, repeats=args.repeats,
+        row = dict(backend="clqr_jax_" + args.platform, seed=args.seed, repeats=0,
                    **{key: value for key, value in case.items() if key != "index"})
         identity = (case["family"], *(case[field] for field in
                     ("N", "n", "m", "mixed_rows", "state_rows")))
@@ -124,18 +137,21 @@ def main(default_platform="cpu", argv=None):
             jax.block_until_ready(inputs)
             progress("compiling JAX solve")
             solve = jax.jit(module.solve).lower(inputs).compile()
-            progress("warmup")
-            start = time.perf_counter()
-            warmed = 0
-            while warmed < 3 or time.perf_counter() - start < 0.1:
-                result = jax.block_until_ready(solve(inputs))
-                warmed += 1
+            progress("warmup (1 solve)")
+            result = jax.block_until_ready(solve(inputs))
             times = []
-            progress(f"timing {args.repeats} resident solves")
-            for _ in range(args.repeats):
+            total_ms = 0.0
+            sampling = (f"{args.repeats} calls" if args.repeats is not None else
+                        f"at least {args.min_seconds} measured seconds")
+            progress(f"timing resident solves: {sampling}")
+            while (len(times) < args.repeats if args.repeats is not None else
+                   total_ms < args.min_seconds * 1000):
                 start = time.perf_counter_ns()
                 result = jax.block_until_ready(solve(inputs))
                 times.append((time.perf_counter_ns() - start) / 1e6)
+                total_ms += times[-1]
+            row["repeats"] = len(times)
+            row["solve_samples_ms"] = ";".join(format(t, ".12g") for t in times)
             progress("validation")
             # Read the handler's audit before transferring the results for validation.
             if cuda:
@@ -158,7 +174,8 @@ def main(default_platform="cpu", argv=None):
                       residuals["planted_dual_stationarity_inf"] < 1e-8)
             times.sort()
             row.update(status="ok" if passed else "inaccurate", median_ms=times[len(times) // 2],
-                       p10_ms=times[len(times) // 10], p90_ms=times[(len(times) - 1) * 9 // 10])
+                       p10_ms=times[len(times) // 10] if len(times) > 1 else math.nan,
+                       p90_ms=times[(len(times) - 1) * 9 // 10] if len(times) > 1 else math.nan)
         except Exception as error:
             row["status"] = "failed"
             print(f"# {case['family']} N={case['N']} n={case['n']}: {str(error).replace(chr(10), ' ')}", flush=True)

@@ -7,6 +7,7 @@ import io
 import json
 import math
 from pathlib import Path
+import sys
 
 
 KEY_FIELDS = ("family", "N", "n", "m", "mixed_rows", "state_rows", "seed")
@@ -26,6 +27,8 @@ PRIMAL_ONLY = {"factor_graph"}
 
 
 def read_csv(path):
+    # Retained individual timings can exceed CSV's default field-size limit.
+    csv.field_size_limit(sys.maxsize)
     return list(csv.DictReader((line for line in path.read_text().splitlines()
                                 if line and not line.startswith("#")),
                                skipinitialspace=True))
@@ -52,10 +55,15 @@ def indexed(rows, backend):
         if status not in ("ok", "inaccurate", "unsupported", "failed"):
             raise ValueError(f"unknown benchmark status: {status}")
         if status in ("ok", "inaccurate"):
-            for field in ("median_ms", "p10_ms", "p90_ms"):
+            single_sample = row.get("repeats") == "1"
+            unavailable_spread = single_sample and all(
+                math.isnan(numeric(row, field)) for field in ("p10_ms", "p90_ms"))
+            for field in (("median_ms",) if unavailable_spread else
+                          ("median_ms", "p10_ms", "p90_ms")):
                 if not math.isfinite(numeric(row, field)) or numeric(row, field) < 0:
                     raise ValueError(f"invalid {backend} {field}: {identity}")
-            if not numeric(row, "p10_ms") <= numeric(row, "median_ms") <= numeric(row, "p90_ms"):
+            if not unavailable_spread and not (
+                    numeric(row, "p10_ms") <= numeric(row, "median_ms") <= numeric(row, "p90_ms")):
                 raise ValueError(f"unordered timing quantiles: {identity}")
             errors = ["primal_error", "relative_objective_error", "feasibility_inf"]
             if backend not in PRIMAL_ONLY:

@@ -20,6 +20,25 @@ def row(backend="clqr_cpu"):
 
 
 class ResultsTest(unittest.TestCase):
+    def test_long_individual_sample_list_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / "measurements.csv"
+            value = row()
+            value["solve_samples_ms"] = ";".join(["0.025"] * 40000)
+            with filename.open("w") as output:
+                writer = csv.DictWriter(output, fieldnames=value)
+                writer.writeheader()
+                writer.writerow(value)
+            self.assertEqual(results.read_csv(filename), [value])
+
+    def test_one_sample_has_no_variability_estimate(self):
+        value = row()
+        value.update(repeats="1", p10_ms="nan", p90_ms="nan")
+        self.assertEqual(len(results.indexed([value], "clqr_cpu")), 1)
+        value["repeats"] = "2"
+        with self.assertRaises(ValueError):
+            results.indexed([value], "clqr_cpu")
+
     def test_selected_cuda_summary_preserves_platform_without_original_table(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
