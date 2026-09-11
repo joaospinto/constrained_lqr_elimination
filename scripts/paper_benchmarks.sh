@@ -219,8 +219,14 @@ bazel-bin/clqr_paper_fixture --suite "$suite" > "$output_dir/cases.json"
 if (( CLQR_RUN_TESTS )); then
   tests=(//:clqr_test //:workspace_allocation_test //:scaling_problem_test
          //:reduced_objective_test //:cuda_kernel_emulation_extended_test
+         //:cpu_rank_tolerance_test //:cuda_feasibility_rank_test
+         //:cuda_stage_layout_test //:cuda_buffer_test
          //:paper_results_test //:notebook_paper_test)
-  if (( CLQR_RUN_JAX )); then tests+=(//:paper_jax_fixture_test); fi
+  if (( CLQR_RUN_JAX )); then
+    tests+=(//:paper_jax_fixture_test //:jax_binding_test //:jax_ffi_problem_test
+            //:jax_cuda_transfer_audit_test)
+    if (( cuda_run )); then tests+=(//:jax_cuda_binding_test); fi
+  fi
   if (( CLQR_RUN_CORRECTED_LAINE )); then
     tests+=(//:corrected_laine_benchmark_test //external_algorithms/corrected_laine_tomlin:all)
   fi
@@ -348,6 +354,7 @@ if (( cuda_run )); then
   if (( CLQR_RUN_TESTS )); then
     check_log cuda_validation bazel-bin/cuda_solver_test
     check_log cuda_extended_validation bazel-bin/adversarial_cuda_extended_test --extended
+    check_log cuda_rank_tolerance bazel-bin/cuda_solver_test --rank-regression
   fi
   if (( CLQR_RUN_SANITIZERS )); then
   for sanitizer in memcheck initcheck racecheck synccheck; do

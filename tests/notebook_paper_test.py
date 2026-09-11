@@ -269,6 +269,38 @@ writer.writerow(row)
                 self.assertEqual((work / "platform.txt").read_text().splitlines(),
                                  expected + ["version"])
 
+    def test_driver_selects_jax_and_rank_regressions(self):
+        root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
+        driver = (root / "scripts/paper_benchmarks.sh").read_text()
+        start = driver.index('if (( CLQR_RUN_TESTS )); then\n  tests=')
+        end = driver.index("\n# Build the authors' factor-graph dependency", start)
+        shell = 'capture_bazel() { printf "%s\\n" "$@"; }\n'
+        shell += 'bazel_cmd=(capture_bazel); bazel_args=(--config=fp64)\n'
+        shell += driver[start:end]
+        for run_tests in (0, 1):
+            for run_jax in (0, 1):
+                for cuda in (0, 1):
+                    with self.subTest(tests=run_tests, jax=run_jax, cuda=cuda):
+                        env = dict(os.environ, CLQR_RUN_TESTS=str(run_tests),
+                                   CLQR_RUN_JAX=str(run_jax), cuda_run=str(cuda),
+                                   CLQR_RUN_CORRECTED_LAINE="0",
+                                   CLQR_RUN_YANG="0", CLQR_RUN_LAINE="0")
+                        result = subprocess.run(
+                            ["bash", "-euo", "pipefail", "-c", shell], env=env,
+                            capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        targets = result.stdout.splitlines()
+                        for name in ("cpu_rank_tolerance_test", "cuda_feasibility_rank_test",
+                                     "cuda_stage_layout_test", "cuda_buffer_test"):
+                            self.assertEqual("//:" + name in targets, bool(run_tests))
+                        self.assertEqual("//:jax_binding_test" in targets,
+                                         bool(run_tests and run_jax))
+                        self.assertEqual("//:jax_cuda_binding_test" in targets,
+                                         bool(run_tests and run_jax and cuda))
+        self.assertIn(
+            "check_log cuda_rank_tolerance bazel-bin/cuda_solver_test --rank-regression",
+            driver)
+
     def test_results_survive_success_and_failure(self):
         for code in (0, 1):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:

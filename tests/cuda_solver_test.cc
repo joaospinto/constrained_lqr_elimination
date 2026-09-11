@@ -255,8 +255,11 @@ Problem PathologicalScratchProblem() {
 
 Scalar TestMaxAbs(const Vector &vector) {
   Scalar value = 0.0;
-  for (std::size_t i = 0; i < vector.size(); ++i)
+  for (std::size_t i = 0; i < vector.size(); ++i) {
+    if (!std::isfinite(vector[i]))
+      return std::numeric_limits<Scalar>::infinity();
     value = std::max(value, std::abs(vector[i]));
+  }
   return value;
 }
 
@@ -274,6 +277,8 @@ Scalar MaxScaledMixedResidual(const Stage &stage, const Vector &state,
       value += stage.D(row, col) * control[col];
       scale = std::max(scale, std::abs(stage.D(row, col)));
     }
+    if (!std::isfinite(value))
+      return std::numeric_limits<Scalar>::infinity();
     residual = std::max(residual, std::abs(value) / scale);
   }
   return residual;
@@ -289,6 +294,8 @@ Scalar MaxScaledStateResidual(const Matrix &matrix, const Vector &offset,
       value += matrix(row, col) * state[col];
       scale = std::max(scale, std::abs(matrix(row, col)));
     }
+    if (!std::isfinite(value))
+      return std::numeric_limits<Scalar>::infinity();
     residual = std::max(residual, std::abs(value) / scale);
   }
   return residual;
@@ -659,15 +666,50 @@ void InvalidDeviceCases() {
          "out-of-range CUDA device index is invalid input");
 }
 
+void RankToleranceCase() {
+#ifndef CLQR_USE_FLOAT
+  const auto data = clqr::benchmark::MakeScalingProblem(2048, 32, 16, 4, 8);
+  clqr::cuda::Workspace workspace;
+  clqr::cuda::Solution solution;
+  for (const Scalar tolerance : {1e-12, 1e-11, 1e-10, 1e-9, 1e-8}) {
+    std::cout << "case: N=2048 n=32 rank tolerance=" << tolerance << std::endl;
+    clqr::cuda::Options options;
+    options.tolerance = tolerance;
+    clqr::cuda::Solve(data.problem, workspace, solution, options);
+    Expect(solution.status == SolveStatus::kOptimal, solution.message);
+    const double primal_error = std::max(
+        clqr::benchmark::MaxDifference(solution.states, data.states),
+        clqr::benchmark::MaxDifference(solution.controls, data.controls));
+    std::string equation;
+    const Scalar kkt = MaxKktResidual(data.problem, solution, &equation);
+    std::cout << "  KKT=" << kkt << " in " << equation
+              << "; primal error=" << primal_error << std::endl;
+    Expect(primal_error <= 1e-8 && std::isfinite(kkt) && kkt <= 1e-8,
+           "native CUDA rank-tolerance regression");
+  }
+#else
+  std::cout << "rank-tolerance sweep requires FP64\n";
+#endif
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  const bool rank_regression =
+      argc == 2 && std::string(argv[1]) == "--rank-regression";
+  Expect(argc == 1 || rank_regression,
+         "usage: cuda_solver_test [--rank-regression]");
   if (!clqr::cuda::Available()) {
+    Expect(!rank_regression, "rank-tolerance regression requires a CUDA GPU");
     std::cout << "CUDA test skipped: " << clqr::cuda::DeviceDescription()
               << "\n";
     return 0;
   }
   std::cout << "testing " << clqr::cuda::DeviceDescription() << "\n";
+  if (rank_regression) {
+    RankToleranceCase();
+    return 0;
+  }
   CompareWithCpu(GeneratedProblem(1, 5, 4, 3, 0, ConstraintMode::kNone),
                  "unconstrained");
   CompareWithCpu(GeneratedProblem(2, 6, 4, 2, 1, ConstraintMode::kState),
