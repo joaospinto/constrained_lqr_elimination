@@ -199,8 +199,58 @@ def test_cuda_zero_horizon():
     np.testing.assert_allclose(result.states[0], problem["initial_state"])
 
 
+def test_cuda_reuses_uniform_layout_after_rank_changes():
+    clqr_jax = _load_modules()
+    device = _cuda_device()
+    dtype = np.dtype(clqr_jax.scalar_dtype)
+    if dtype == np.dtype(np.float64):
+        jax.config.update("jax_enable_x64", True)
+    problem = {
+        "initial_state": np.array([0.0, 0.5], dtype=dtype),
+        "stages": [
+            {
+                "A": np.eye(2, dtype=dtype),
+                "B": np.eye(2, dtype=dtype),
+                "c": np.zeros(2, dtype=dtype),
+                "R": np.eye(2, dtype=dtype),
+                "M": np.zeros((2, 2), dtype=dtype),
+                "r": np.zeros(2, dtype=dtype),
+                "C": np.array([[0.0, 1.0]], dtype=dtype),
+                "D": np.array([[0.0, 1.0]], dtype=dtype),
+                "E": np.array([[1.0, 0.0]], dtype=dtype),
+            }
+            for _ in range(3)
+        ],
+        "Q": [np.eye(2, dtype=dtype) for _ in range(4)],
+        "q": [np.zeros(2, dtype=dtype) for _ in range(4)],
+    }
+    packed = clqr_jax.pack_problem(problem, dtype=dtype)
+    free = packed._replace(factors=packed.factors._replace(
+        C=np.zeros_like(packed.factors.C),
+        D=np.zeros_like(packed.factors.D),
+        E=np.zeros_like(packed.factors.E),
+    ))
+    solve = jax.jit(clqr_jax.solve)
+    cpu_device = jax.devices("cpu")[0]
+    atol = 2e-4 if dtype == np.dtype(np.float32) else 1e-9
+    for value in (packed, free, packed, free):
+        cpu = solve(jax.device_put(value, cpu_device))
+        gpu = solve(jax.device_put(value, device))
+        assert int(gpu.status) == clqr_jax.SolveStatus.OPTIMAL
+        for actual, expected in zip(gpu, cpu):
+            np.testing.assert_allclose(actual, expected, atol=atol)
+    invalid = free._replace(factors=free.factors._replace(
+        Q=np.full_like(free.factors.Q, np.nan),
+    ))
+    rejected = solve(jax.device_put(invalid, device))
+    assert int(rejected.status) == clqr_jax.SolveStatus.INVALID_INPUT
+    restored = solve(jax.device_put(packed, device))
+    assert int(restored.status) == clqr_jax.SolveStatus.OPTIMAL
+
+
 if __name__ == "__main__":
     test_cuda_eager_jit_and_new_rhs()
     test_cuda_matches_cpu_for_heterogeneous_dimensions()
     test_cuda_sequential_vmap()
     test_cuda_zero_horizon()
+    test_cuda_reuses_uniform_layout_after_rank_changes()

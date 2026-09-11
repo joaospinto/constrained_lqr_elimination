@@ -47,7 +47,6 @@ constexpr Scalar kMinimumDualRelationRowScale = 1e-14;
 #endif
 constexpr Scalar kScalarMax = std::numeric_limits<Scalar>::max();
 
-#ifndef CLQR_CUDA_EMULATION
 template <typename T>
 __device__ T *DeviceOffset(T *pointer, std::size_t offset) {
   return offset == 0 ? pointer : pointer + offset;
@@ -74,12 +73,45 @@ __device__ void CopyPaddedVector(const Scalar *source, Scalar *target,
 __global__ void PackPaddedProblemKernel(PaddedDeviceProblem input,
                                         PackedStage *stages, int stage_count,
                                         PackedTerminal *terminal,
-                                        Scalar *initial_state) {
+                                        Scalar *initial_state,
+                                        bool direct_input = false) {
   const int index = blockIdx.x;
   const std::size_t nx = input.state_capacity;
   const std::size_t nu = input.control_capacity;
   const std::size_t nc = input.mixed_capacity;
   const std::size_t ne = input.state_constraint_capacity;
+  if (direct_input) {
+    // Bind to this invocation's arrays on the device; no scalar input copy or
+    // host upload of O(N) pointer records is required for repeated JAX calls.
+    if (threadIdx.x == 0) {
+      const std::size_t i = static_cast<std::size_t>(index);
+      if (index < stage_count) {
+        PackedStage &s = stages[index];
+        s.A = DeviceOffset(input.A, i * nx * nx);
+        s.B = DeviceOffset(input.B, i * nx * nu);
+        s.c = DeviceOffset(input.c, i * nx);
+        s.Q = DeviceOffset(input.Q, i * nx * nx);
+        s.R = DeviceOffset(input.R, i * nu * nu);
+        s.M = DeviceOffset(input.M, i * nx * nu);
+        s.q = DeviceOffset(input.q, i * nx);
+        s.r = DeviceOffset(input.r, i * nu);
+        s.C = DeviceOffset(input.C, i * nc * nx);
+        s.D = DeviceOffset(input.D, i * nc * nu);
+        s.d = DeviceOffset(input.d, i * nc);
+        s.E = DeviceOffset(input.E, i * ne * nx);
+        s.e = DeviceOffset(input.e, i * ne);
+      } else if (index == stage_count) {
+        terminal->Q = DeviceOffset(input.Q, i * nx * nx);
+        terminal->q = DeviceOffset(input.q, i * nx);
+        terminal->E = input.terminal_E;
+        terminal->e = input.terminal_e;
+      }
+    }
+    if (index == 0)
+      CopyPaddedVector(input.initial_state, initial_state,
+                       static_cast<int>(nx));
+    return;
+  }
   if (index < stage_count) {
     const PackedStage &stage = stages[index];
     const std::size_t stage_index = static_cast<std::size_t>(index);
@@ -132,6 +164,7 @@ __global__ void PackPaddedProblemKernel(PaddedDeviceProblem input,
   }
 }
 
+#ifndef CLQR_CUDA_EMULATION
 __global__ void ScatterPaddedSolutionKernel(
     const PackedStage *stages, int stage_count, const PackedTerminal *terminal,
     const int *state_offsets, const int *control_offsets,
@@ -1221,6 +1254,50 @@ __global__ void CheckFiniteInputsKernel(const Scalar *problem_data,
       return;
     }
   }
+}
+
+__device__ bool FiniteInputSpan(const Scalar *data, std::size_t count) {
+  for (std::size_t i = threadIdx.x; i < count; i += blockDim.x)
+    if (!DeviceFinite(data[i]))
+      return false;
+  return true;
+}
+
+__global__ void CheckFiniteDirectInputsKernel(const PackedStage *stages,
+                                              int stage_count,
+                                              const PackedTerminal *terminal,
+                                              const Scalar *initial_state,
+                                              DeviceStatus *status) {
+  const int index = blockIdx.x;
+  bool finite = true;
+  if (index < stage_count) {
+    const PackedStage &s = stages[index];
+    const std::size_t n = s.n, next = s.next_n, m = s.m;
+    finite &= FiniteInputSpan(s.A, next * n);
+    finite &= FiniteInputSpan(s.B, next * m);
+    finite &= FiniteInputSpan(s.c, next);
+    finite &= FiniteInputSpan(s.Q, n * n);
+    finite &= FiniteInputSpan(s.R, m * m);
+    finite &= FiniteInputSpan(s.M, n * m);
+    finite &= FiniteInputSpan(s.q, n);
+    finite &= FiniteInputSpan(s.r, m);
+    finite &= FiniteInputSpan(s.C, s.mixed * n);
+    finite &= FiniteInputSpan(s.D, s.mixed * m);
+    finite &= FiniteInputSpan(s.d, s.mixed);
+    finite &= FiniteInputSpan(s.E, s.state * n);
+    finite &= FiniteInputSpan(s.e, s.state);
+  } else if (index == stage_count) {
+    const std::size_t n = terminal->n;
+    finite &= FiniteInputSpan(terminal->Q, n * n);
+    finite &= FiniteInputSpan(terminal->q, n);
+    finite &= FiniteInputSpan(terminal->E, terminal->state * n);
+    finite &= FiniteInputSpan(terminal->e, terminal->state);
+  }
+  if (index == 0)
+    finite &= FiniteInputSpan(initial_state,
+                              stage_count == 0 ? terminal->n : stages[0].n);
+  if (!finite)
+    SetFailure(status, kDeviceInvalidInput, index, 21);
 }
 
 // A global failure can be reported by another block at any time.  Sampling it
@@ -3077,6 +3154,7 @@ struct WorkspaceStorage {
   KernelScratchPlans scratch_launches;
   DeviceBuffer<unsigned char> global_scratch;
   bool structure_ready = false;
+  bool direct_device_input = false;
   bool relation_layout_uploaded = false;
 
   ~WorkspaceStorage() {
@@ -4580,8 +4658,10 @@ void BuildTreeLevels(int leaf_count, std::vector<int> *offsets,
 }
 
 void PrepareProblemStructure(const Problem &problem, int device,
-                             WorkspaceStorage *workspace) {
+                             WorkspaceStorage *workspace,
+                             bool direct_device_input = false) {
   workspace->structure_ready = false;
+  workspace->direct_device_input = direct_device_input;
   RefreshScratchPlan(problem, &workspace->structure_key, &workspace->scratch);
   const std::size_t global_scratch_bytes = ConfigureScratchMemory(
       workspace->scratch, device, problem.stages.size(),
@@ -4591,7 +4671,7 @@ void PrepareProblemStructure(const Problem &problem, int device,
   const CompactEntryCounts entries = CountCompactEntries(problem);
   workspace->Reserve(device, stage_count, node_count, entries.states,
                      entries.controls, entries.mixed, entries.state_constraints,
-                     entries.problem_data,
+                     direct_device_input ? 0 : entries.problem_data,
                      static_cast<int>(problem.initial_state.size()),
                      static_cast<int>(problem.terminal_E.rows()));
   if (global_scratch_bytes > 0)
@@ -4617,8 +4697,25 @@ void PrepareProblemStructure(const Problem &problem, int device,
                   &workspace->stage_level_counts);
   if (PrepareRelationStorage(problem, workspace))
     workspace->relation_layout_uploaded = false;
-  Require(PackProblemData(problem, workspace, false, true),
-          "internal CUDA problem binding failed");
+  if (direct_device_input) {
+    for (std::size_t i = 0; i < problem.stages.size(); ++i) {
+      const Stage &s = problem.stages[i];
+      PackedStage &out = workspace->host_stages[i];
+      out = {};
+      out.n = static_cast<int>(s.A.cols());
+      out.next_n = static_cast<int>(s.A.rows());
+      out.m = static_cast<int>(s.B.cols());
+      out.mixed = static_cast<int>(s.C.rows());
+      out.state = static_cast<int>(s.E.rows());
+    }
+    workspace->host_terminal[0] = {};
+    workspace->host_terminal[0].n = static_cast<int>(problem.Q.back().rows());
+    workspace->host_terminal[0].state =
+        static_cast<int>(problem.terminal_E.rows());
+  } else {
+    Require(PackProblemData(problem, workspace, false, true),
+            "internal CUDA problem binding failed");
+  }
   workspace->structure_ready = true;
 }
 
@@ -4653,6 +4750,9 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
             "SolvePreparedView requires Workspace::Reserve first");
     Require(workspace.device == options.device,
             "prepared CUDA workspace device differs from solve options");
+    Require(device_input != nullptr || !workspace.direct_device_input,
+            "reserve the CUDA workspace for host input before a prepared host "
+            "solve");
   } else {
     structure_matches =
         ValidateCudaProblem(problem, options, workspace.structure_key, false);
@@ -4666,7 +4766,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     }
   }
   CudaCheck(cudaSetDevice(options.device), "cudaSetDevice");
-  if (!prepared && (!workspace.structure_ready || !structure_matches))
+  if (!prepared && (!workspace.structure_ready || !structure_matches ||
+                    workspace.direct_device_input))
     PrepareProblemStructure(problem, options.device, &workspace);
   const auto total_start = std::chrono::steady_clock::now();
   result.status = SolveStatus::kInvalidInput;
@@ -4784,7 +4885,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     if (device_input != nullptr) {
       PackPaddedProblemKernel<<<node_count, kThreads, 0, stream>>>(
           *device_input, device_stages.get(), stage_count,
-          device_terminal.get(), device_initial.get());
+          device_terminal.get(), device_initial.get(),
+          workspace.direct_device_input);
     } else if (packed_input_entries > 0) {
       CudaCheck(cudaMemcpyAsync(workspace.device_problem_data.get(),
                                 workspace.host_problem_data.data(),
@@ -4820,7 +4922,11 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                   "initialize reduced state dimensions");
       },
       [&] {
-        if (finite_input_blocks > 0) {
+        if (workspace.direct_device_input) {
+          CheckFiniteDirectInputsKernel<<<node_count, kThreads, 0, stream>>>(
+              device_stages.get(), stage_count, device_terminal.get(),
+              device_initial.get(), device_status.get());
+        } else if (finite_input_blocks > 0) {
           CheckFiniteInputsKernel<<<finite_input_blocks, kThreads, 0, stream>>>(
               workspace.device_problem_data.get(),
               workspace.host_problem_data.size(), device_initial.get(),
@@ -5568,7 +5674,8 @@ void Workspace::Reserve(const Problem &problem, const Options &options) {
                     "a CUDA workspace cannot be reused across devices");
   }
   detail::CudaCheck(cudaSetDevice(options.device), "cudaSetDevice");
-  if (!impl_->storage.structure_ready || !structure_matches) {
+  if (!impl_->storage.structure_ready || !structure_matches ||
+      impl_->storage.direct_device_input) {
     detail::PrepareProblemStructure(problem, options.device, &impl_->storage);
   }
 }
@@ -5813,8 +5920,17 @@ SolveStatus SolvePackedDevice(const Problem &structure, Workspace &workspace,
   try {
     ValidatePaddedDeviceIo(structure, input, output);
     output_validated = true;
-    if (!workspace.impl_->storage.structure_ready)
-      workspace.Reserve(structure, options);
+    auto &storage = workspace.impl_->storage;
+    const bool direct = CanReadDeviceInputDirectly(structure, input);
+    if (!storage.structure_ready || storage.direct_device_input != direct) {
+      ValidateCudaProblem(structure, options, storage.structure_key, true);
+      int device_count = 0;
+      CudaCheck(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
+      Require(options.device < device_count,
+              "CUDA device index is out of range");
+      CudaCheck(cudaSetDevice(options.device), "cudaSetDevice");
+      PrepareProblemStructure(structure, options.device, &storage, direct);
+    }
     SolveImpl(structure, workspace.impl_->storage, result, options, true,
               stream, &input);
   } catch (const DeviceAllocationError &error) {

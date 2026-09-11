@@ -42,6 +42,10 @@ native sanitizer runs check device memory and synchronization.
 JAX binding validation is separate from the native table. The CPU and CUDA
 binding suites cover eager execution, `jax.jit`, sequential `jax.vmap`, changed
 right-hand sides, heterogeneous dimensions, zero controls, and zero horizons.
+Uniform CUDA inputs also cover matrix/rank changes in a reused workspace and
+recovery after rejected nonfinite input. Emulation checks direct input pointer
+rebinding, active-field validation, and ignored constraint padding. Dense phase
+layouts are tested with exact allocations and retired-buffer aliases.
 The native Metal binding suite additionally covers all constraint families,
 rank deficiency and failure statuses, deterministic property cases, workspace
 reuse, and horizons through 1025 under its FP32-only precision contract.

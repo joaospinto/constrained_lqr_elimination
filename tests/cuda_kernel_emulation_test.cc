@@ -1573,6 +1573,138 @@ void FiniteInputValidationCase() {
          "device input validation accepts finite values");
 }
 
+void DirectDeviceInputCase() {
+  constexpr std::size_t n = 3, mixed = 2, state = 3;
+  for (int horizon : {0, 3}) {
+    for (std::size_t m : {0, 2}) {
+      Problem shape;
+      shape.Q.assign(horizon + 1, Matrix(n, n));
+      shape.stages.resize(horizon);
+      std::vector<PackedStage> stages(horizon);
+      for (int i = 0; i < horizon; ++i) {
+        shape.stages[i].A = Matrix(n, n);
+        shape.stages[i].B = Matrix(n, m);
+        stages[i] = {};
+        stages[i].n = stages[i].next_n = n;
+        stages[i].m = m;
+        stages[i].mixed = i % (mixed + 1);
+        stages[i].state = i % (state + 1);
+      }
+      PackedTerminal terminal{};
+      terminal.n = n;
+      terminal.state = 1;
+      PaddedDeviceProblem input{};
+      input.state_capacity = n;
+      input.control_capacity = m;
+      input.mixed_capacity = mixed;
+      input.state_constraint_capacity = state;
+      input.terminal_constraint_capacity = 2;
+      struct Field {
+        const Scalar *PaddedDeviceProblem::*input;
+        const Scalar *PackedStage::*stage;
+        std::size_t stride;
+      };
+      const Field fields[]{
+          {&PaddedDeviceProblem::A, &PackedStage::A, n * n},
+          {&PaddedDeviceProblem::B, &PackedStage::B, n * m},
+          {&PaddedDeviceProblem::c, &PackedStage::c, n},
+          {&PaddedDeviceProblem::Q, &PackedStage::Q, n * n},
+          {&PaddedDeviceProblem::R, &PackedStage::R, m * m},
+          {&PaddedDeviceProblem::M, &PackedStage::M, n * m},
+          {&PaddedDeviceProblem::q, &PackedStage::q, n},
+          {&PaddedDeviceProblem::r, &PackedStage::r, m},
+          {&PaddedDeviceProblem::C, &PackedStage::C, mixed * n},
+          {&PaddedDeviceProblem::D, &PackedStage::D, mixed * m},
+          {&PaddedDeviceProblem::d, &PackedStage::d, mixed},
+          {&PaddedDeviceProblem::E, &PackedStage::E, state * n},
+          {&PaddedDeviceProblem::e, &PackedStage::e, state}};
+      std::vector<std::vector<Scalar>> arrays(std::size(fields));
+      for (std::size_t f = 0; f < std::size(fields); ++f) {
+        arrays[f].assign((horizon + 1) * fields[f].stride, Scalar{1});
+        input.*fields[f].input = arrays[f].data();
+      }
+      Scalar terminal_E[2 * n]{}, terminal_e[2]{};
+      Scalar initial[n]{Scalar{1}, Scalar{2}, Scalar{3}}, imported_initial[n]{};
+      input.terminal_E = terminal_E;
+      input.terminal_e = terminal_e;
+      input.initial_state = initial;
+      Expect(CanReadDeviceInputDirectly(shape, input),
+             "uniform direct device layout");
+      auto padded = input;
+      ++padded.state_capacity;
+      Expect(!CanReadDeviceInputDirectly(shape, padded),
+             "padded row-stride fallback");
+      if (horizon > 0) {
+        shape.stages[1].B = Matrix(n, m + 1);
+        Expect(!CanReadDeviceInputDirectly(shape, input),
+               "heterogeneous control fallback");
+        shape.stages[1].B = Matrix(n, m);
+      }
+      // Values outside active constraint rows must not be validated or read.
+      const Scalar nan = std::numeric_limits<Scalar>::quiet_NaN();
+      terminal_E[n] = terminal_e[1] = nan;
+      for (int i = 0; i < horizon; ++i) {
+        for (std::size_t f = 8; f < std::size(fields); ++f) {
+          const std::size_t capacity = f < 11 ? mixed : state;
+          const std::size_t rows = f < 11 ? stages[i].mixed : stages[i].state;
+          const std::size_t columns = fields[f].stride / capacity;
+          std::fill(arrays[f].begin() + i * fields[f].stride + rows * columns,
+                    arrays[f].begin() + (i + 1) * fields[f].stride, nan);
+        }
+      }
+      // Rebind to entirely new input allocations on the second invocation.
+      auto replacements = arrays;
+      for (int repeat = 0; repeat < 2; ++repeat) {
+        if (repeat)
+          for (std::size_t f = 0; f < std::size(fields); ++f)
+            input.*fields[f].input = replacements[f].data();
+        Launch(horizon + 1, [&] {
+          PackPaddedProblemKernel(input, stages.data(), horizon, &terminal,
+                                  imported_initial, true);
+        });
+        for (int i = 0; i < horizon; ++i)
+          for (const Field &f : fields)
+            Expect(stages[i].*f.stage ==
+                       DeviceOffset(input.*f.input, i * f.stride),
+                   "direct device field aliases current input");
+        Expect(terminal.Q == input.Q + horizon * n * n &&
+                   terminal.q == input.q + horizon * n &&
+                   terminal.E == input.terminal_E &&
+                   terminal.e == input.terminal_e,
+               "direct terminal fields alias current input");
+        Expect(std::equal(initial, initial + n, imported_initial),
+               "direct initial-state copy");
+        DeviceStatus status{};
+        Launch(horizon + 1, [&] {
+          CheckFiniteDirectInputsKernel(stages.data(), horizon, &terminal,
+                                        imported_initial, &status);
+        });
+        Expect(status.code == kDeviceOk,
+               "direct validation ignores constraint padding");
+        const auto check_invalid = [&](Scalar *value) {
+          const Scalar saved = *value;
+          *value = nan;
+          status = {};
+          Launch(horizon + 1, [&] {
+            CheckFiniteDirectInputsKernel(stages.data(), horizon, &terminal,
+                                          imported_initial, &status);
+          });
+          Expect(status.code == kDeviceInvalidInput && status.detail == 21,
+                 "direct validation rejects active non-finite values");
+          *value = saved;
+        };
+        check_invalid(const_cast<Scalar *>(terminal.Q));
+        check_invalid(terminal_e);
+        check_invalid(imported_initial);
+        if (horizon > 0)
+          for (const Field &f : fields)
+            if (f.stride)
+              check_invalid(const_cast<Scalar *>(stages.back().*f.stage));
+      }
+    }
+  }
+}
+
 void DeviceObjectiveCase() {
   Scalar Q[]{Scalar{2}, Scalar{1}, Scalar{1}, Scalar{4}};
   Scalar R[]{Scalar{3}};
@@ -2491,6 +2623,7 @@ int main(int argc, char **argv) {
   PivotSelectionOrderCase();
   CoordinatePivotingCase();
   FiniteInputValidationCase();
+  DirectDeviceInputCase();
   DeviceObjectiveCase();
   PivotedLuMultiRhsCase();
   OrthogonalEchelonCase();

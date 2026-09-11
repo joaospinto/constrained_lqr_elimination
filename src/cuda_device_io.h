@@ -35,6 +35,21 @@ struct PaddedDeviceProblem {
   const Scalar *initial_state = nullptr;
 };
 
+// Full state/control widths make each active matrix row contiguous in the
+// caller's arrays. Constraint row counts may still vary between stages.
+inline bool CanReadDeviceInputDirectly(const Problem &problem,
+                                       const PaddedDeviceProblem &input) {
+  if (problem.Q.back().rows() != input.state_capacity)
+    return false;
+  for (const Stage &stage : problem.stages) {
+    if (stage.A.cols() != input.state_capacity ||
+        stage.A.rows() != input.state_capacity ||
+        stage.B.cols() != input.control_capacity)
+      return false;
+  }
+  return true;
+}
+
 struct PaddedDeviceSolution {
   std::int32_t *diagnostics = nullptr;
   Scalar *objective = nullptr;
@@ -56,7 +71,9 @@ struct DeviceTransferAudit {
 
 // Executes the same native CUDA solver used by SolvePreparedView, but imports
 // and exports padded scalar arrays entirely on the supplied device stream.
-// Only compact structural/status metadata may cross to the host. The first
+// Full-width state/control arrays are read directly; heterogeneous padded rows
+// are compacted on device. Only compact structural/status metadata may cross
+// to the host. The first
 // call reserves `workspace`; subsequent calls require the same structure,
 // matching SolvePreparedView's contract.
 // Device allocation failures throw with requested/free/total byte diagnostics;

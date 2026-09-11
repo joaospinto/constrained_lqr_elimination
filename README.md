@@ -68,6 +68,8 @@ records, and scan coefficients are packed from the runtime dimensions of the
 individual stages. Kernels loop over and factor only active state, control,
 constraint, and reduced dimensions; no padded dense algebra is performed and
 there are no build-time dimension capacities.
+JAX calls with full-width state/control arrays read those arrays directly;
+heterogeneous padded row strides are compacted on the device.
 Later phases reuse completed feasibility/value scan buffers and primal
 parameterization storage. Reduced-stage and feedback layouts use the active
 dimensions once those ranks are known; layouts that do not fit the retired
