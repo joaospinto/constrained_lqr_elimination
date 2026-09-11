@@ -66,10 +66,10 @@ coordinate error is not itself a KKT residual: nonunique exact multipliers may
 differ on redundant problems. Original feasibility and objective error are
 also reported. All validation is outside the timed interval.
 
-The default paper suite uses $m=n/2$, $p_s=n/4$, $p_m=n/8$ in separate
-horizon sweeps (every power of two from 32 through 32768 at both $n=8,16$).
-`dimension` and `constraints` remain opt-in diagnostics,
-not part of that table. Both Laine implementations run in opposite-order
+The default paper suite uses the complete 66-case $(N,n)$ grid and fixed
+dimension ratios documented in the [repository README](../../README.md).
+Smaller `horizon`, `dimension`, and `constraints` sweeps remain opt-in
+diagnostics. Both Laine implementations run in opposite-order
 rounds with CLQR; `measurements.csv` uses the first round, with the second
 retained separately to show timing variation. The generated paper table omits
 corrected Laine–Tomlin; its complete measurements remain in the CSVs.

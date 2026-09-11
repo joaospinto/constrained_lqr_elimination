@@ -206,24 +206,22 @@ void ApiErrorCase() {
 void GlobalFallbackCase() {
   mock::Reset();
   auto plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
-                               1024, mock::ordinary, false);
+                               1024, mock::ordinary);
   Expect(plan.shared_bytes == 1024 && plan.global_stride == 0 &&
              plan.GlobalBytes(100) == 0,
          "fitting kernels do not allocate global scratch");
   plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
-                           76001, mock::ordinary, false);
+                           76001, mock::ordinary);
   Expect(plan.shared_bytes == 0 && plan.global_stride == 76016 &&
              plan.GlobalBytes(65) == 76016 * 65 && mock::set_calls == 0,
          "oversized kernels use aligned per-block global slices");
   plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
-                           76001, mock::optin, false);
+                           76001, mock::optin);
   Expect(plan.shared_bytes == 76001 && plan.global_stride == 0 &&
              mock::set_calls == 1,
          "opt-in shared memory is preferred when it fits");
-  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test", 1024,
-                           mock::optin, true);
-  Expect(plan.shared_bytes == 0 && plan.global_stride == 1024,
-         "forced-global mode isolates the memory-placement comparison");
+  plan = PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
+                           76001, mock::ordinary);
   bool overflow = false;
   try {
     (void)plan.GlobalBytes(std::numeric_limits<std::size_t>::max());
@@ -235,7 +233,7 @@ void GlobalFallbackCase() {
   try {
     (void)PlanKernelScratch(mock::FirstKernel, mock::SecondKernel, "test",
                            std::numeric_limits<std::size_t>::max(),
-                           mock::ordinary, false);
+                           mock::ordinary);
   } catch (const std::invalid_argument &) {
     overflow = true;
   }

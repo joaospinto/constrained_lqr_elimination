@@ -219,7 +219,7 @@ def main(argv=None):
                         help="require only these explicitly selected backends")
     parser.add_argument("--skip-original-table", action="store_true")
     parser.add_argument("--suite", default="all",
-                        choices=("all", "smoke", "horizon", "dimension", "constraints", "scratch"))
+                        choices=("all", "smoke", "horizon", "dimension", "constraints"))
     args = parser.parse_args(argv)
     data = {}
     if args.backends is not None and "clqr_cpu" not in args.backends:
@@ -236,6 +236,13 @@ def main(argv=None):
         if requested:
             data[backend] = indexed(read_csv(args.results / name), backend)
     identities = validate_cases(data, json.loads((args.results / "cases.json").read_text()))
+    if args.suite == "all":
+        expected_cases = {
+            ("horizon", 2**exponent, n, n // 2, n // 8, n // 4)
+            for n in (8, 16, 24, 32, 48, 64) for exponent in range(5, 16)
+        }
+        if {identity[:-1] for identity in identities} != expected_cases:
+            raise ValueError(f"{args.suite} suite requires the complete 66-case (N,n) grid")
     report = summarize(data)
     (args.results / "summary.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     # One convenient long-form table retains all timings and errors. Do not
@@ -254,12 +261,6 @@ def main(argv=None):
         report["platform"] = (args.results / "platform.txt").read_text()
         report["gpus"] = read_csv(args.results / "gpu.csv")
         if args.suite == "all":
-            expected_cases = {
-                ("horizon", 2**exponent, n, n // 2, n // 8, n // 4)
-                for n in (8, 16) for exponent in range(5, 16)
-            }
-            if {identity[:-1] for identity in identities} != expected_cases:
-                raise ValueError("paper table requires the complete all-suite run")
             table_backends = {"clqr_cpu", "gen_riccati", "factor_graph",
                               "laine_author", "clqr_cuda", "clqr_jax_cuda"}
             if table_backends <= data.keys():

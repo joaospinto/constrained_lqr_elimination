@@ -138,10 +138,6 @@ The fallback preserves the algorithm and numerical choices, but its memory
 traffic can cost performance. There is no capacity flag to rebuild; total
 device-memory availability still limits the problem size.
 
-For a controlled memory-placement comparison,
-`--define=clqr_cuda_scratch=global` forces dense scratch into global memory.
-The default automatically selects shared memory whenever it fits.
-
 The CUDA benchmark uses `SolvePreparedView`, reuses reserved storage, and
 reports both end-to-end wall time and pure kernel time. Wall time includes host
 packing, all transfers, synchronization, kernels, and construction of the
@@ -248,20 +244,6 @@ Yang fetch Eigen headers directly, not GTSAM. Selected settings are saved in
 `benchmark_options.txt`; disabled backends are not required by the summary.
 The notebook and desktop runner inherit the same environment variables.
 
-For the CUDA scratch-placement experiment, use
-[`notebooks/kaggle_cuda_scratch.ipynb`](notebooks/kaggle_cuda_scratch.ipynb),
-or run `python3 scripts/notebook_paper.py --work-dir /path/to/results --scratch-comparison`.
-It defaults external solvers, JAX, and the additional original-table sweep off;
-regressions and sanitizers remain on. Automatic placement and forced-global
-placement use identical FP64 fixtures and reuse one build cache. The dimension
-sweep covers $n=8,16,24,32,48,64$ at $N=128,512$, plus $N=32,16384$ at
-$n=8,16$, with the same control/constraint ratios as the paper. The archive
-contains kernel/wall timings, numerical errors, and system information for both
-modes. `scratch_comparison.csv` reports global/automatic timing ratios; values
-above one mean forced-global is slower. This isolates memory placement, not
-performance against an older solver revision. For a single mode, the general
-runner accepts `CLQR_CUDA_SCRATCH=auto` (default) or `global`.
-
 The [paper comparison notebook](notebooks/kaggle_paper_comparison.ipynb)
 runs this workflow from a fresh Kaggle GPU session using an uploaded
 `clqr-source.bundle` snapshot or, by default, current `origin/main`,
@@ -302,12 +284,19 @@ build outputs, or external dependencies, and is not checked into the repository.
 Internet is still required for pinned dependencies. Without an attached bundle,
 the notebook fetches current `origin/main` instead.
 
-The paper sweeps vary the horizon (every power of two from 32 through 32768
-at both $n=8$ and $n=16$), always with
+The default `all` suite crosses every power-of-two horizon from 32 through
+32768 with every state dimension $n=8,16,24,32,48,64$ (66 cases), always with
 $m=n/2$, $p_s=n/4$, and $p_m=n/8$. State-only rows at the fixed initial
-state are omitted to avoid introducing artificial redundancy. A separate
+state are omitted to avoid introducing artificial redundancy. Large cases can
+take substantially longer or exceed available memory; reported failures remain
+in the results. A separate
 `CLQR_PAPER_SUITE=constraints` diagnostic varies constraint counts;
-`CLQR_PAPER_SUITE=dimension` measures $n=8,16,32,64$ at $N=128$.
+`CLQR_PAPER_SUITE=dimension` measures all six state dimensions at $N=128$;
+`CLQR_PAPER_SUITE=horizon` restricts the horizon sweep to $n=8,16$.
+The archiving runner accepts the corresponding `--suite` options. Smaller
+diagnostics are opt-in: complete-grid runs never silently omit a pair.
+All measured cases remain in the CSVs even when the generated paper table
+selects only $n=8,16$.
 The corrected Laine–Tomlin implementation is included separately from the
 author's original, using the optimized native dense kernels.
 Each solve refactors; setup and setup-plus-solve

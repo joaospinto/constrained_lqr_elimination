@@ -19,7 +19,7 @@ class SharedMemoryLaunchAudit(unittest.TestCase):
         self.assertTrue(launches)
         self.assertEqual({kernel for kernel, _ in configurations}, launches)
         definitions = re.findall(
-            r"template <bool GlobalScratch = kDefaultGlobalScratch>\s*"
+            r"template <bool GlobalScratch = false>\s*"
             r"__global__ void (\w+)\([^{};]*CLQR_SCRATCH_PARAMS\)\s*{", source
         )
         self.assertEqual(set(definitions), launches)

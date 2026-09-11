@@ -16,52 +16,6 @@ from scripts import notebook_paper
 
 
 class NotebookTest(unittest.TestCase):
-    def test_scratch_driver_defaults_and_cache_reuse(self):
-        root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
-        with tempfile.TemporaryDirectory() as directory:
-            work = Path(directory)
-            scripts = work / "source/scripts"
-            scripts.mkdir(parents=True)
-            for name in ("cuda_scratch_benchmarks.sh", "benchmark_options.sh"):
-                shutil.copy(root / "scripts" / name, scripts / name)
-            (scripts / "paper_benchmarks.sh").write_text('''#!/bin/bash
-printf '%s,%s,%s,%s,%s,%s,%s,%s\\n' "$CLQR_CUDA_SCRATCH" "$CLQR_RUN_EXTERNAL" \\
-  "$CLQR_RUN_YANG" "$CLQR_RUN_JAX" "$CLQR_RUN_TESTS" "$CLQR_RUN_SANITIZERS" \\
-  "$CLQR_PAPER_CACHE_DIR" "$CLQR_PAPER_SUITE" >> "$CALL_LOG"
-[[ "$CLQR_CUDA_SCRATCH" != auto ]] # failure must not suppress the other mode
-''')
-            tools = work / "tools"
-            tools.mkdir()
-            python = tools / "python3"
-            python.write_text('#!/bin/sh\nexit 0\n')
-            python.chmod(0o755)
-            log = work / "calls"
-            env = {key: value for key, value in os.environ.items()
-                   if not key.startswith("CLQR_")}
-            env.update(PATH=str(tools) + os.pathsep + env["PATH"], CALL_LOG=str(log))
-            result = subprocess.run(["bash", str(scripts / "cuda_scratch_benchmarks.sh"),
-                                     str(work / "results"), "--cuda"], env=env,
-                                    capture_output=True, text=True)
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            calls = [line.split(",") for line in log.read_text().splitlines()]
-            self.assertEqual([call[:6] for call in calls],
-                             [["auto", "0", "0", "0", "1", "1"],
-                              ["global", "0", "0", "0", "1", "1"]])
-            self.assertEqual(calls[0][6:], calls[1][6:])
-            self.assertEqual(calls[0][-1], "scratch")
-
-    def test_scratch_notebook_is_fresh_and_native_only(self):
-        root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
-        notebook = json.loads((root / "notebooks/kaggle_cuda_scratch.ipynb").read_text())
-        cell, = [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]
-        code = "".join(cell["source"])
-        compile(code, "kaggle_cuda_scratch.ipynb", "exec")
-        self.assertEqual(cell["outputs"], [])
-        self.assertIsNone(cell["execution_count"])
-        self.assertIn('setdefault("CLQR_RUN_EXTERNAL", "0")', code)
-        self.assertIn('"--scratch-comparison"', code)
-        self.assertIn('"FETCH_HEAD"', code)
-
     def test_backend_switches_skip_fetch_build_and_execution(self):
         root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
         configurations = (
@@ -252,6 +206,10 @@ if name == "cmake" and "-B" in args:
         compile(code, "kaggle_paper_comparison.ipynb", "exec")
         self.assertIn('get("CLQR_REVISION", "main")', code)
         self.assertIn("notebook_paper.py", code)
+        for option in ("EXTERNAL", "JAX", "TESTS", "SANITIZERS", "ORIGINAL_TABLE"):
+            self.assertIn(f'setdefault("CLQR_RUN_{option}", "1")', code)
+        for method in ("VANROYE", "YANG", "LAINE", "CORRECTED_LAINE"):
+            self.assertIn(f'"{method}"', code)
 
 
 if __name__ == "__main__":

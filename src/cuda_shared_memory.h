@@ -82,13 +82,12 @@ void ConfigureKernelSharedMemory(Kernel kernel, const char *name,
 template <typename Kernel>
 KernelScratchLaunch PlanKernelScratch(Kernel shared_kernel, Kernel global_kernel,
                                      const char *name, std::size_t bytes,
-                                     int device_capacity, bool force_global) {
+                                     int device_capacity) {
   cudaFuncAttributes attributes{};
   CheckSharedMemoryApi(cudaFuncGetAttributes(&attributes, shared_kernel),
                        "query CUDA shared-scratch kernel attributes");
   const auto capacity = static_cast<std::size_t>(std::max(device_capacity, 0));
-  if ((!force_global || bytes == 0) &&
-      attributes.sharedSizeBytes <= capacity &&
+  if (attributes.sharedSizeBytes <= capacity &&
       bytes <= capacity - attributes.sharedSizeBytes) {
     ConfigureKernelSharedMemory(shared_kernel, name, bytes, device_capacity);
     return {bytes, 0};

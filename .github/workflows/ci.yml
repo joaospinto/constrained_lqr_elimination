@@ -50,12 +50,6 @@ jobs:
             //:jax_metal_source_audit_test \
             --config=fp32 \
             --test_output=errors
-      - name: Test forced-global CUDA scratch emulation
-        run: >-
-          bazel test //:cuda_kernel_emulation_extended_test
-          //:cuda_shared_memory_test //:cuda_shared_memory_source_audit_test
-          --config=${{ matrix.precision }} --define=clqr_cuda_scratch=global
-          --test_output=errors
   sanitizers:
     name: ubuntu / ${{ matrix.sanitizer }}
     runs-on: ubuntu-latest

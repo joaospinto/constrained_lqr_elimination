@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <set>
 #include <stdexcept>
+#include <utility>
 
-#include "benchmarks/scaling_problem.h"
 #include "benchmarks/paper_cases.h"
+#include "benchmarks/scaling_problem.h"
 #include "tests/adversarial_test_support.h"
 
 namespace {
@@ -27,27 +29,33 @@ int main() {
                 "Paper fixtures require FP64");
   constexpr double tolerance = 2e-8;
   const auto cases = clqr::benchmark::PaperCases("all");
-  if (cases.size() != 22)
-    throw std::runtime_error("paper sweep case count");
   const auto horizons = clqr::benchmark::PaperCases("horizon");
-  const auto scratch = clqr::benchmark::PaperCases("scratch");
-  if (scratch.size() != 16)
-    throw std::runtime_error("scratch sweep case count");
-  for (const auto &c : scratch)
-    if (c.n % 8 || c.m != c.n / 2 || c.mixed != c.n / 8 ||
-        c.state != c.n / 4 || c.family != "scratch")
-      throw std::runtime_error("scratch sweep dimension ratios");
+  std::set<std::pair<std::size_t, std::size_t>> expected_grid;
+  for (const std::size_t n : {8, 16, 24, 32, 48, 64})
+    for (std::size_t N = 32; N <= 32768; N *= 2)
+      expected_grid.emplace(N, n);
+  std::set<std::pair<std::size_t, std::size_t>> actual_grid;
+  for (const auto &c : cases) {
+    actual_grid.emplace(c.horizon, c.n);
+    if (c.m != c.n / 2 || c.mixed != c.n / 8 || c.state != c.n / 4 ||
+        c.family != "horizon")
+      throw std::runtime_error("paper grid dimension ratios/family");
+  }
+  if (cases.size() != 66 || actual_grid != expected_grid)
+    throw std::runtime_error("paper grid has missing or duplicate (N,n) pairs");
+  const auto dimensions = clqr::benchmark::PaperCases("dimension");
+  if (dimensions.size() != 6)
+    throw std::runtime_error("paper dimension sweep count");
+  for (std::size_t i = 0; i < dimensions.size(); ++i)
+    if (dimensions[i].horizon != 128 ||
+        dimensions[i].n != clqr::benchmark::kPaperStateDimensions[i])
+      throw std::runtime_error("paper dimension sweep skips a state dimension");
   if (horizons.size() != 22)
     throw std::runtime_error("paper horizon count");
   for (std::size_t i = 0; i < horizons.size(); ++i)
     if (horizons[i].horizon != (std::size_t{32} << (i % 11)) ||
         horizons[i].n != (i < 11 ? 8 : 16))
       throw std::runtime_error("paper horizon sweep skips a power of two");
-  for (const auto &c : cases)
-    if (c.n % 8 || c.m != c.n / 2 || c.mixed != c.n / 8 ||
-        c.state != c.n / 4 ||
-        c.family != "horizon")
-      throw std::runtime_error("paper dimension ratios");
   const auto reference = clqr::benchmark::MakeScalingProblem(2, 8, 4, 1, 2);
   auto changed_dual = reference.dual;
   changed_dual.dynamics[1][0] += 0.25;
