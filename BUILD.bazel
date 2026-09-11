@@ -83,6 +83,7 @@ cc_library(
     ],
     hdrs = [
         "include/clqr/clqr.h",
+        "include/clqr/detail/cpu_elimination_storage.h",
         "include/clqr/linalg.h",
         "src/cpu_dense.h",
     ],
@@ -136,6 +137,7 @@ cc_library(
     hdrs = [
         "benchmarks/scaling_problem.h",
         "include/clqr/clqr.h",
+        "include/clqr/detail/cpu_elimination_storage.h",
         "include/clqr/linalg.h",
         "src/cpu_dense.h",
     ],
@@ -155,6 +157,12 @@ cc_binary(
         ":fp32": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
+)
+
+cc_test(
+    name = "cpu_workspace_layout_test",
+    srcs = ["tests/cpu_workspace_layout_test.cc", "src/linalg.cc"],
+    deps = [":cpu_elimination_test_sources"],
 )
 
 cc_binary(

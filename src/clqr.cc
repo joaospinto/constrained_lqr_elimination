@@ -69,16 +69,12 @@ namespace {
 #define CLQR_UNROLL
 #endif
 
-struct StateMap {
-  Matrix linear;
-  Vector offset;
-};
-
-struct ControlMap {
-  Matrix state_linear;
-  Matrix control_linear;
-  Vector offset;
-};
+using detail::AffineStateBasis;
+using detail::ControlMap;
+using detail::EliminationStageTrace;
+using detail::MixedElimination;
+using detail::OrthogonalOperations;
+using detail::StateMap;
 
 struct WorkingProblem {
   WorkspaceVector<Stage> stages;
@@ -86,47 +82,6 @@ struct WorkingProblem {
   WorkspaceVector<Vector> q;
   Matrix terminal_E;
   Vector terminal_e;
-};
-
-struct OrthogonalOperations {
-  // Row k stores Householder reflector k from column k onward. Its otherwise
-  // unused columns [0,k) store R(0:k,k), the strict upper triangle of R.
-  Matrix reflectors;
-  Vector betas;
-  Vector diagonal;
-  Vector row_scales;
-  std::size_t rank = 0;
-};
-
-struct AffineStateBasis {
-  Matrix T;
-  Vector offset;
-  OrthogonalOperations rhs_operations;
-  WorkspaceVector<std::size_t> free_rows;
-  WorkspaceVector<std::size_t> pivot_rows;
-  bool active = false;
-  bool infeasible = false;
-  bool redundant = false;
-  std::string message;
-};
-
-struct MixedElimination {
-  Matrix Y;
-  Matrix Z;
-  Vector y;
-  Matrix state_C;
-  Vector state_d;
-  OrthogonalOperations rhs_operations;
-  WorkspaceVector<std::size_t> pivot_columns;
-  WorkspaceVector<std::size_t> state_transformed_rows;
-  bool active = false;
-  bool infeasible = false;
-  bool redundant = false;
-  std::string message;
-};
-
-struct EliminationStageTrace {
-  MixedElimination mixed;
 };
 
 struct WorkingState {
@@ -1145,6 +1100,10 @@ bool EliminateMixedStageWithMaps(WorkingState& state, std::size_t i,
   s.D = Matrix(0, s.B.cols());
   s.d = Vector(0);
   AppendStateConstraints(s, basis.state_C, basis.state_d);
+  // Only the transformed-row indices and orthogonal operations are needed
+  // for recovery/replay; the residual relation has already been consumed.
+  basis.state_C = Matrix();
+  basis.state_d = Vector();
 
   const ControlMap& old_map = state.control_maps[i];
   const std::size_t old_control_cols = ControlLinearCols(old_map, m);
@@ -1368,6 +1327,118 @@ void EliminateConstraintsRightToLeft(WorkingState& state, Scalar tolerance,
   }
 }
 
+std::size_t EliminationScratchBytes(const Problem& problem) {
+  const std::size_t n_terminal = problem.Q.back().rows();
+  std::size_t bytes = detail::EliminationTerminalScratchBytes(
+      n_terminal, problem.terminal_E.rows());
+  std::size_t next_pivots = std::min(n_terminal, problem.terminal_E.rows());
+  for (std::size_t i = problem.stages.size(); i-- > 0;) {
+    const Stage& s = problem.stages[i];
+    bytes = std::max(bytes, detail::EliminationStageScratchBytes(
+                                s.A.cols(), s.A.rows(), s.B.cols(), s.C.rows(),
+                                s.E.rows(), next_pivots));
+    next_pivots = std::min(s.A.cols(), s.E.rows() + s.C.rows() + next_pivots);
+  }
+  return bytes;
+}
+
+// Copy construction selects the active (persistent) allocator recursively.
+// Move assignment alone would retain pointers and allocators into scratch.
+template <typename T>
+void PersistEliminationData(T* value) {
+  T copy(*value);
+  *value = std::move(copy);
+}
+
+template <typename T>
+T PersistentCopy(const T& value, WorkspaceArena* arena) {
+  ScopedWorkspaceArena persistent(arena);
+  return T(value);
+}
+
+WorkingState InitializeAndEliminate(const Problem& problem, Scalar tolerance,
+                                    std::string* error,
+                                    NewtonKktDiagnostics* diagnostics) {
+  WorkspaceArena* persistent = ActiveWorkspaceArena();
+  if (persistent == nullptr) {
+    WorkingState state = Initialize(problem);
+    EliminateConstraintsRightToLeft(state, tolerance, error, diagnostics);
+    return state;
+  }
+
+  const std::size_t bytes = EliminationScratchBytes(problem);
+  // Declare scratch before state so exceptional exits destroy any scratch-
+  // backed containers before destroying their allocator's arena.
+  ScopedWorkspaceScratch scratch(bytes);
+  WorkingState state;
+  const std::size_t N = problem.stages.size();
+  state.problem.stages.resize(N);
+  state.problem.Q.resize(N + 1);
+  state.problem.q.resize(N + 1);
+  state.state_maps.resize(N + 1);
+  state.control_maps.resize(N);
+  state.state_bases.resize(N + 1);
+  state.elimination_traces.resize(N);
+  {
+    ScopedWorkspaceArena use_scratch(scratch.arena());
+    state.problem.Q[N] = Matrix(problem.Q[N]);
+    state.problem.q[N] = Vector(problem.q[N]);
+    state.problem.terminal_E = Matrix(problem.terminal_E);
+    state.problem.terminal_e = Vector(problem.terminal_e);
+    state.state_maps[N] = StateMap{};
+    state.state_bases[N] = AffineStateBasis{};
+    if (problem.terminal_E.rows() != 0) {
+      state.state_bases[N] = StateBasis(problem.terminal_E, problem.terminal_e,
+                                        problem.Q[N].rows(), tolerance);
+      CheckStateBasis(state.state_bases[N], N, error, diagnostics);
+      ApplyTerminalStateBasis(state, state.state_bases[N], tolerance);
+    }
+  }
+  PersistEliminationData(&state.problem.Q[N]);
+  PersistEliminationData(&state.problem.q[N]);
+  PersistEliminationData(&state.problem.terminal_E);
+  PersistEliminationData(&state.problem.terminal_e);
+  PersistEliminationData(&state.state_maps[N]);
+  PersistEliminationData(&state.state_bases[N]);
+
+  for (std::size_t i = N; i-- > 0;) {
+    scratch.Clear();
+    {
+      ScopedWorkspaceArena use_scratch(scratch.arena());
+      // Initialize only this stage; input matrices from all other stages are
+      // borrowed from problem, not copied into the solve's persistent arena.
+      state.problem.stages[i] = Stage(problem.stages[i]);
+      state.problem.Q[i] = Matrix(problem.Q[i]);
+      state.problem.q[i] = Vector(problem.q[i]);
+      state.state_maps[i] = StateMap{};
+      state.state_bases[i] = AffineStateBasis{};
+      state.elimination_traces[i] = EliminationStageTrace{};
+      const std::size_t n = problem.stages[i].A.cols();
+      const std::size_t m = problem.stages[i].B.cols();
+      state.control_maps[i] = ControlMap{Matrix(m, n), Matrix(), Vector(m)};
+      const AffineStateBasis& next = state.state_bases[i + 1];
+      if (next.active && !StateBasisIsIdentity(next, tolerance))
+        ApplyNextStateBasisToStage(state, i, next, tolerance);
+      EliminateMixedStageWithMaps(state, i, tolerance, error, diagnostics);
+      Stage& s = state.problem.stages[i];
+      if (s.E.rows() != 0) {
+        state.state_bases[i] = StateBasis(s.E, s.e, s.A.cols(), tolerance);
+        CheckStateBasis(state.state_bases[i], i, error, diagnostics);
+        ApplyCurrentStateBasisToStage(state, i, state.state_bases[i],
+                                      tolerance);
+      }
+    }
+    PersistEliminationData(&state.problem.stages[i]);
+    PersistEliminationData(&state.problem.Q[i]);
+    PersistEliminationData(&state.problem.q[i]);
+    PersistEliminationData(&state.state_maps[i]);
+    PersistEliminationData(&state.control_maps[i]);
+    PersistEliminationData(&state.state_bases[i]);
+    PersistEliminationData(&state.elimination_traces[i]);
+  }
+  return state;
+}
+
 bool AnyOriginalConstraints(const Problem& problem) {
   if (problem.terminal_E.rows() > 0) return true;
   for (const Stage& stage : problem.stages) {
@@ -1405,12 +1476,21 @@ void BuildConstrainedReplayCache(ConstrainedFactorData* data,
                                  Scalar tolerance) {
   const std::size_t N = data->original.stages.size();
   data->replay_stages.resize(N);
+  WorkspaceArena* persistent = ActiveWorkspaceArena();
+  std::size_t scratch_bytes = 0;
+  for (const Stage& s : data->original.stages)
+    scratch_bytes = std::max(
+        scratch_bytes,
+        detail::ReplayMatrixScratchBytes(s.A.cols(), s.A.rows(), s.B.cols()));
+  ScopedWorkspaceScratch scratch(scratch_bytes);
   for (std::size_t i = 0; i < N; ++i) {
+    scratch.Clear();
+    ScopedWorkspaceArena use_scratch(scratch.arena());
     const Stage& original = data->original.stages[i];
     const AffineStateBasis& next = data->reduced.state_bases[i + 1];
     const MixedElimination& mixed =
         data->reduced.elimination_traces[i].mixed;
-    ConstrainedReplayStage& replay = data->replay_stages[i];
+    ConstrainedReplayStage replay;
 
     Matrix A_after_next = original.A;
     replay.B_after_next_basis = original.B;
@@ -1423,6 +1503,7 @@ void BuildConstrainedReplayCache(ConstrainedFactorData* data,
       replay.A_before_current_basis = std::move(A_after_next);
       replay.Q_before_current_basis = data->original.Q[i];
       replay.M_before_current_basis = original.M;
+      data->replay_stages[i] = PersistentCopy(replay, persistent);
       continue;
     }
 
@@ -1436,6 +1517,7 @@ void BuildConstrainedReplayCache(ConstrainedFactorData* data,
                    Transpose(m_times_y) + Transpose(mixed.Y) * r_times_y);
     replay.M_before_current_basis =
         original.M * mixed.Z + Transpose(mixed.Y) * r_times_z;
+    data->replay_stages[i] = PersistentCopy(replay, persistent);
   }
 
   if (N == 0) {
@@ -1539,7 +1621,17 @@ bool ReplayConstrainedRhs(const Factorization::Impl& factorization,
     affine->q[N] = rhs.q[N];
   }
 
+  WorkspaceArena* persistent = ActiveWorkspaceArena();
+  std::size_t scratch_bytes = 0;
+  for (const Stage& s : original.stages)
+    scratch_bytes = std::max(
+        scratch_bytes,
+        detail::ReplayRhsScratchBytes(s.A.cols(), s.A.rows(), s.B.cols(),
+                                      s.C.rows(), s.E.rows()));
+  ScopedWorkspaceScratch scratch(scratch_bytes);
   for (std::size_t reverse = 0; reverse < N; ++reverse) {
+    scratch.Clear();
+    ScopedWorkspaceArena use_scratch(scratch.arena());
     const std::size_t i = N - 1 - reverse;
     const Stage& stage = original.stages[i];
     const StageRhs& stage_rhs = rhs.stages[i];
@@ -1633,7 +1725,8 @@ bool ReplayConstrainedRhs(const Factorization::Impl& factorization,
               replay.Q_before_current_basis(row, col) * current_offset[col];
         }
       }
-      affine->q[i] = TransposeMultiply(current.T, q_before_current);
+      affine->q[i] = PersistentCopy(
+          TransposeMultiply(current.T, q_before_current), persistent);
       for (std::size_t control = 0; control < r_before_current.size();
            ++control) {
         for (std::size_t state = 0; state < current_offset.size(); ++state) {
@@ -1642,7 +1735,7 @@ bool ReplayConstrainedRhs(const Factorization::Impl& factorization,
               current_offset[state];
         }
       }
-      affine->r[i] = std::move(r_before_current);
+      affine->r[i] = PersistentCopy(r_before_current, persistent);
       for (std::size_t row = 0; row < c_before_current.size(); ++row) {
         for (std::size_t state = 0; state < current_offset.size(); ++state) {
           c_before_current[row] +=
@@ -1650,11 +1743,11 @@ bool ReplayConstrainedRhs(const Factorization::Impl& factorization,
               current_offset[state];
         }
       }
-      affine->c[i] = std::move(c_before_current);
+      affine->c[i] = PersistentCopy(c_before_current, persistent);
     } else {
-      affine->q[i] = std::move(q_before_current);
-      affine->r[i] = std::move(r_before_current);
-      affine->c[i] = std::move(c_before_current);
+      affine->q[i] = PersistentCopy(q_before_current, persistent);
+      affine->r[i] = PersistentCopy(r_before_current, persistent);
+      affine->c[i] = PersistentCopy(c_before_current, persistent);
     }
 
     if (mixed.active) {
@@ -1665,9 +1758,9 @@ bool ReplayConstrainedRhs(const Factorization::Impl& factorization,
           }
         }
       }
-      affine->control_offsets[i] = std::move(y);
+      affine->control_offsets[i] = PersistentCopy(y, persistent);
     } else {
-      affine->control_offsets[i] = Vector(stage.B.cols());
+      affine->control_offsets[i].resize(stage.B.cols());
     }
   }
 
@@ -2498,99 +2591,31 @@ void AddSolutionViewStorageBound(const Problem& problem, std::size_t* offset) {
   AddObjects<VectorView>(offset, N);
 }
 
-void AddWorkingProblemStorageBound(const Problem& problem,
-                                   std::size_t* offset) {
+void AddEliminationStorageBound(const Problem& problem, std::size_t* offset) {
   const std::size_t N = problem.stages.size();
   AddObjects<Stage>(offset, N);
-  for (const Stage& stage : problem.stages)
-    AddScalars(offset, StageStorageScalars(stage));
   AddObjects<Matrix>(offset, N + 1);
   AddObjects<Vector>(offset, N + 1);
-  for (std::size_t i = 0; i <= N; ++i) {
-    AddScalars(offset, MatrixScalars(problem.Q[i]) + problem.q[i].size());
-  }
-  AddScalars(offset,
-             MatrixScalars(problem.terminal_E) + problem.terminal_e.size());
-
   AddObjects<StateMap>(offset, N + 1);
-  for (std::size_t i = 0; i <= N; ++i) {
-    const std::size_t n =
-        (i == N) ? problem.Q.back().rows() : problem.stages[i].A.cols();
-    AddScalars(offset, n * n + n);
-  }
   AddObjects<ControlMap>(offset, N);
-  for (const Stage& stage : problem.stages) {
-    const std::size_t n = stage.A.cols();
-    const std::size_t m = stage.B.cols();
-    AddScalars(offset, m * n + m * m + m);
+  AddObjects<AffineStateBasis>(offset, N + 1);
+  AddObjects<EliminationStageTrace>(offset, N);
+  const std::size_t terminal_n = problem.Q.back().rows();
+  AddWorkspaceBytes(
+      offset, alignof(std::size_t),
+      detail::EliminatedTerminalBytes(terminal_n, problem.terminal_E.rows()));
+  std::size_t next_pivots = std::min(terminal_n, problem.terminal_E.rows());
+  for (std::size_t i = N; i-- > 0;) {
+    const Stage& s = problem.stages[i];
+    AddWorkspaceBytes(
+        offset, alignof(std::size_t),
+        detail::EliminatedStageBound(s.A.cols(), s.A.rows(), s.B.cols(),
+                                     s.C.rows(), s.E.rows(), next_pivots));
+    next_pivots = std::min(s.A.cols(), s.E.rows() + s.C.rows() + next_pivots);
   }
-}
-
-std::size_t MixedEliminationStageScalars(const WorkspaceDimensionSummary& dims,
-                                         std::size_t mixed_rows_bound,
-                                         std::size_t state_rows_bound) {
-  const std::size_t n = dims.max_state;
-  const std::size_t next_n = dims.max_next_state;
-  const std::size_t m = dims.max_control;
-  const std::size_t p = std::max<std::size_t>(1, mixed_rows_bound);
-  const std::size_t f = m;
-  std::size_t scalars = 0;
-  scalars += 2 * p * (m + n + 1 + p);    // orthogonal echelon form and trace
-  scalars += m * n + m * f + m;          // Y, Z, y
-  scalars += m * p + p * n + p + p * p;  // RHS pullback and residual relation
-  scalars += n * n + m * m + n * m + next_n * m + n + m + next_n;  // old copies
-  scalars += 8 * n * n + 4 * m * m + 6 * n * m + 2 * next_n * n +
-             2 * next_n * m + 3 * next_n + 4 * n + 4 * m;        // temporaries
-  scalars += (state_rows_bound + p) * n + state_rows_bound + p;  // appended E/e
-  scalars += 2 * (m * n) + 2 * (m * m) + 3 * m;                  // control maps
-  return scalars;
-}
-
-std::size_t StateEliminationStageScalars(const WorkspaceDimensionSummary& dims,
-                                         std::size_t state_rows_bound,
-                                         std::size_t state_pivot_bound) {
-  const std::size_t n = dims.max_state;
-  const std::size_t next_n = dims.max_next_state;
-  const std::size_t m = dims.max_control;
-  const std::size_t p = std::max<std::size_t>(1, state_rows_bound);
-  const std::size_t pivots = std::max<std::size_t>(1, state_pivot_bound);
-  std::size_t scalars = 0;
-  scalars += 2 * p * (n + 1 + p) + n * n + n + n * p;
-  scalars +=
-      3 * next_n * n + 3 * next_n * m + 4 * next_n;  // dynamics and extras
-  scalars +=
-      8 * n * n + 4 * n * m + 2 * m * n + 4 * n + 2 * m;    // cost temporaries
-  scalars += (pivots + dims.max_mixed_rows) * (n + m + 1);  // appended C/D/d
-  scalars += 3 * n * n + 2 * n + 2 * m * n + m * m + m;  // state/control maps
-  return scalars;
-}
-
-void AddEliminationStorageBound(const Problem& problem,
-                                const SolveOptions& options,
-                                const WorkspaceDimensionSummary& dims,
-                                std::size_t* offset) {
-  (void)problem;
-  (void)options;
-  const std::size_t mixed_rows_bound =
-      dims.max_mixed_rows + dims.max_next_state;
-  const std::size_t state_rows_bound =
-      std::max(dims.max_terminal_rows, dims.max_state_rows + mixed_rows_bound);
-  const std::size_t state_pivot_bound =
-      std::min(dims.max_state, state_rows_bound);
-  const std::size_t mixed_stage_scalars =
-      MixedEliminationStageScalars(dims, mixed_rows_bound, state_rows_bound);
-  const std::size_t state_stage_scalars =
-      StateEliminationStageScalars(dims, state_rows_bound, state_pivot_bound);
-  AddObjects<AffineStateBasis>(offset, dims.stages + 1);
-  AddObjects<EliminationStageTrace>(offset, dims.stages);
-  AddScalars(offset, (dims.stages + 1) *
-                         (2 * state_rows_bound * (dims.max_state + 1) +
-                          dims.max_state * dims.max_state + dims.max_state));
-  AddIndices(offset, (dims.stages + 1) * 3 * dims.max_state);
-  AddScalars(offset, dims.stages * state_stage_scalars);
-  AddScalars(offset, dims.stages * mixed_stage_scalars);
-  AddIndices(offset, dims.stages * (3 * dims.max_control + mixed_rows_bound +
-                                    3 * dims.max_state));
+  AddWorkspaceBytes(
+      offset, alignof(std::size_t),
+      EliminationScratchBytes(problem) + alignof(std::max_align_t));
 }
 
 void AddRecoveryStorageBound(const Problem& problem,
@@ -2603,7 +2628,7 @@ void AddRecoveryStorageBound(const Problem& problem,
       40 *
       (dims.max_state + dims.max_next_state + dims.max_control +
        dims.max_mixed_rows + dims.max_state_rows + dims.max_terminal_rows + 1);
-  AddScalars(offset, N * local_vector_bound);
+  AddScalars(offset, local_vector_bound);
   AddScalars(offset, 4 * dims.terminal_state *
                          (dims.terminal_state + dims.max_terminal_rows + 1));
   if (N == 0) {
@@ -2618,18 +2643,68 @@ void AddRecoveryStorageBound(const Problem& problem,
   AddSolutionStorageBound(problem, offset);
 }
 
+std::size_t RecoveryScratchBytes(const Problem& problem) {
+  std::size_t bytes = 0;
+  for (const Stage& s : problem.stages) {
+    bytes = std::max(bytes,
+                     detail::MixedRecoveryScratchBytes(s.B.cols(), s.C.rows()));
+    bytes = std::max(
+        bytes, detail::PullbackScratchBytes(s.A.cols(), s.A.rows(), s.B.cols(),
+                                            s.C.rows(), s.E.rows()));
+  }
+  return bytes;
+}
+
 std::size_t ConstrainedWorkspaceRequiredBytes(const Problem& problem,
                                               const SolveOptions& options) {
+  (void)options;
   const WorkspaceDimensionSummary dims = SummarizeWorkspaceDimensions(problem);
   std::size_t offset = 0;
-  AddWorkingProblemStorageBound(problem, &offset);
-  AddEliminationStorageBound(problem, options, dims, &offset);
+  AddEliminationStorageBound(problem, &offset);
+  AddWorkspaceBytes(
+      &offset, alignof(std::size_t),
+      detail::InitialParametrizationBytes(problem.initial_state.size()));
+  AddWorkspaceBytes(&offset, alignof(std::max_align_t),
+                    RecoveryScratchBytes(problem) + alignof(std::max_align_t));
   AddWorkspaceBytes(&offset, alignof(std::size_t),
                     RiccatiWorkspace::RequiredBytes(problem.stages));
   AddSolutionStorageBound(problem, &offset);
   AddRecoveryStorageBound(problem, dims, &offset);
   AddSolutionViewStorageBound(problem, &offset);
   return offset;
+}
+
+std::size_t ConstrainedFactoredSolveRequiredBytes(const Problem& problem) {
+  const auto dims = SummarizeWorkspaceDimensions(problem);
+  const std::size_t N = dims.stages;
+  std::size_t bytes = 0;
+  // RHS replay c/q/r, state/control offsets, and reduced initial state.
+  AddObjects<Vector>(&bytes, 5 * N + 2);
+  AddScalars(&bytes, 2 * dims.total_state + 2 * dims.total_control +
+                         dims.total_dynamics + problem.initial_state.size());
+  // Cached affine Riccati p/k and the reduced primal/costate trajectory.
+  AddObjects<Vector>(&bytes, 5 * N + 2);
+  AddScalars(&bytes, 2 * dims.total_state + 2 * dims.total_control +
+                         dims.total_dynamics + dims.max_control);
+  // Reverse elimination needs one offset cotangent per original state.
+  AddObjects<Vector>(&bytes, N + 1);
+  AddScalars(&bytes, dims.total_state);
+  AddSolutionStorageBound(problem, &bytes);
+  AddSolutionViewStorageBound(problem, &bytes);
+  // Terminal RHS replay/recovery and initial multiplier expressions are local
+  // vectors; a cached solve never allocates constraint matrices or factors.
+  AddScalars(&bytes, 40 * (dims.max_state + dims.max_next_state +
+                           dims.max_control + dims.max_mixed_rows +
+                           dims.max_state_rows + dims.max_terminal_rows + 1));
+  std::size_t scratch_bytes = RecoveryScratchBytes(problem);
+  for (const Stage& s : problem.stages)
+    scratch_bytes = std::max(
+        scratch_bytes,
+        detail::ReplayRhsScratchBytes(s.A.cols(), s.A.rows(), s.B.cols(),
+                                      s.C.rows(), s.E.rows()));
+  AddWorkspaceBytes(&bytes, alignof(std::max_align_t),
+                    scratch_bytes + alignof(std::max_align_t));
+  return bytes;
 }
 
 std::size_t WorkspaceRequiredBytesInternal(
@@ -2682,59 +2757,46 @@ void AddFactorCacheStorageBound(const Problem& problem,
                                 const WorkspaceDimensionSummary& dims,
                                 std::size_t* offset) {
   const std::size_t N = problem.stages.size();
+  const bool constrained = AnyOriginalConstraints(problem);
   AddObjects<Factorization::Impl::StageData>(offset, N);
   for (std::size_t i = 0; i < N; ++i) {
     const Stage& stage = problem.stages[i];
     const std::size_t n = stage.A.cols();
     const std::size_t next_n = stage.A.rows();
     const std::size_t m = stage.B.cols();
+    // Constrained factorization transfers the already-retained reduced input
+    // matrices into the cache instead of copying them a second time.
     const std::size_t scalars =
-        next_n * (n + m) + 2 * n * n + 3 * n * m + 2 * m * m;
+        n * n + 2 * n * m + m * m +
+        (constrained ? 0 : next_n * (n + m) + n * n + n * m + m * m);
     AddScalars(offset, scalars);
     AddIndices(offset, m);
   }
-  AddScalars(offset, dims.terminal_state * dims.terminal_state);
+  if (!constrained)
+    AddScalars(offset, dims.terminal_state * dims.terminal_state);
   AddIndices(offset, 2 * N + 1);
   AddWorkspaceBytes(offset, alignof(std::size_t),
                     RiccatiWorkspace::RequiredBytes(problem.stages));
 }
 
-void AddTerminalEliminationStorageBound(
-    const WorkspaceDimensionSummary& dims, std::size_t* offset) {
-  const std::size_t n = dims.terminal_state;
-  const std::size_t rows = dims.max_terminal_rows;
-  if (rows == 0) return;
-  const std::size_t rank = std::min(n, rows);
-  // StateBasis: augmented and restored echelon matrices, reflectors, QR
-  // vectors, the state basis, and its offset. AddEliminationStorageBound
-  // already includes this storage, but counting it again makes this phase
-  // independently conservative and covers all monotonic-arena temporaries.
-  AddScalars(offset, 2 * rows * (n + 1) + rank * rows + 2 * rank + rows +
-                         n * n + n);
-  AddIndices(offset, 2 * n + 2 * rank);
-  // ApplyTerminalStateBasis: copies plus every matrix/vector temporary in the
-  // quadratic, affine, and state-map pullbacks. This uses the full-state
-  // dimension as the worst-case number of free coordinates.
-  AddScalars(offset, 7 * n * n + 5 * n);
-}
 
 void AddConstrainedReplayStorageBound(const Problem& problem,
                                       const WorkspaceDimensionSummary& dims,
                                       std::size_t* offset) {
   const std::size_t N = problem.stages.size();
   AddObjects<ConstrainedReplayStage>(offset, N);
+  std::size_t scratch_bytes = 0;
   for (const Stage& stage : problem.stages) {
     const std::size_t n = stage.A.cols();
     const std::size_t next_n = stage.A.rows();
     const std::size_t m = stage.B.cols();
-    // BuildConstrainedReplayCache retains four matrices and forms its
-    // products through the allocation-backed linalg operators. Count every
-    // possible output and temporary, including the Rows copies used by a
-    // non-identity next-state basis.
-    const std::size_t replay_scalars =
-        4 * next_n * n + 2 * next_n * m + 7 * n * n + 6 * n * m + m * m;
-    AddScalars(offset, replay_scalars);
+    // Only the four replay matrices survive; products reuse stage scratch.
+    AddScalars(offset, next_n * (n + m) + n * n + n * m);
+    scratch_bytes =
+        std::max(scratch_bytes, detail::ReplayMatrixScratchBytes(n, next_n, m));
   }
+  AddWorkspaceBytes(offset, alignof(std::max_align_t),
+                    scratch_bytes + alignof(std::max_align_t));
   if (N == 0) {
     const std::size_t n = dims.terminal_state;
     const std::size_t t = dims.max_terminal_rows;
@@ -2747,6 +2809,7 @@ void AddConstrainedReplayStorageBound(const Problem& problem,
 
 std::size_t FactorizationWorkspaceRequiredBytesInternal(
     const Problem& problem, const SolveOptions& options) {
+  (void)options;
   static_assert(sizeof(Factorization::Impl::StageData) +
                         sizeof(ConstrainedReplayStage) + sizeof(Stage) +
                         sizeof(Matrix) + sizeof(Vector) <=
@@ -2763,9 +2826,7 @@ std::size_t FactorizationWorkspaceRequiredBytesInternal(
   if (AnyOriginalConstraints(problem)) {
     AddObjects<ConstrainedFactorData>(&offset, 1);
     AddMatrixOnlyProblemStorageBound(problem, &offset);
-    AddWorkingProblemStorageBound(problem, &offset);
-    AddEliminationStorageBound(problem, options, dims, &offset);
-    AddTerminalEliminationStorageBound(dims, &offset);
+    AddEliminationStorageBound(problem, &offset);
     AddConstrainedReplayStorageBound(problem, dims, &offset);
   }
   AddFactorCacheStorageBound(problem, dims, &offset);
@@ -2855,7 +2916,8 @@ bool ComputeUnconstrainedRiccatiInto(
     const WorkspaceVector<Stage>& stages, const WorkspaceVector<Matrix>& Q,
     const WorkspaceVector<Vector>& q, Scalar tolerance,
     RiccatiWorkspace* workspace, NewtonKktDiagnostics* diagnostics,
-    Factorization::Impl* factorization = nullptr, bool compute_affine = true) {
+    Factorization::Impl* factorization = nullptr, bool compute_affine = true,
+    bool copy_input_matrices = true) {
   const std::size_t N = stages.size();
   if (N == 0) return true;
   {
@@ -2941,11 +3003,13 @@ bool ComputeUnconstrainedRiccatiInto(
 
     if (factorization != nullptr) {
       Factorization::Impl::StageData& stage = factorization->stages[i];
-      stage.A = s.A;
-      stage.B = s.B;
-      stage.Q = Q[i];
-      stage.R = s.R;
-      stage.M = s.M;
+      if (copy_input_matrices) {
+        stage.A = s.A;
+        stage.B = s.B;
+        stage.Q = Q[i];
+        stage.R = s.R;
+        stage.M = s.M;
+      }
       CopyRawToMatrix(P, n, n, &stage.P);
       CopyRawToMatrix(K, m, n, &stage.K);
       CopyRawToMatrix(workspace->Hxu, n, m, &stage.Hxu);
@@ -2972,20 +3036,40 @@ bool ComputeUnconstrainedRiccatiInto(
 bool BuildMatrixFactors(const WorkspaceVector<Stage>& stages,
                         const WorkspaceVector<Matrix>& Q,
                         const WorkspaceVector<Vector>& q, Scalar tolerance,
-                        Factorization::Impl* factorization) {
+                        Factorization::Impl* factorization,
+                        WorkingProblem* transfer = nullptr) {
   factorization->stages.resize(stages.size());
-  factorization->terminal_Q = Q.back();
+  if (transfer == nullptr) factorization->terminal_Q = Q.back();
+  const std::size_t bytes = RiccatiWorkspace::RequiredBytes(stages);
+  ScopedWorkspaceScratch scratch(bytes);
   RiccatiWorkspace workspace;
-  workspace.Reserve(stages);
+  if (scratch.arena() != nullptr)
+    workspace.Assign(stages, static_cast<unsigned char*>(scratch.data()),
+                     bytes);
+  else
+    workspace.Reserve(stages);
   NewtonKktDiagnostics diagnostics;
   if (!ComputeUnconstrainedRiccatiInto(stages, Q, q, tolerance, &workspace,
-                                       &diagnostics, factorization, false)) {
+                                       &diagnostics, factorization, false,
+                                       transfer == nullptr)) {
     factorization->newton_kkt_singular = diagnostics.singular;
     factorization->newton_kkt_wrong_inertia = diagnostics.wrong_inertia;
     factorization->newton_kkt_diagnostic = JoinMessages(diagnostics.messages);
     factorization->status = SolveStatus::kNumericalFailure;
     factorization->message = "reduced control Hessian is not positive definite";
     return false;
+  }
+  if (transfer != nullptr) {
+    factorization->terminal_Q = std::move(transfer->Q.back());
+    for (std::size_t i = 0; i < stages.size(); ++i) {
+      auto& source = transfer->stages[i];
+      auto& target = factorization->stages[i];
+      target.A = std::move(source.A);
+      target.B = std::move(source.B);
+      target.Q = std::move(transfer->Q[i]);
+      target.R = std::move(source.R);
+      target.M = std::move(source.M);
+    }
   }
   factorization->newton_kkt_singular = diagnostics.singular;
   factorization->newton_kkt_wrong_inertia = diagnostics.wrong_inertia;
@@ -3234,15 +3318,14 @@ ReducedSolution SolveUnconstrained(const WorkspaceVector<Stage>& stages,
                                    NewtonKktDiagnostics* diagnostics,
                                    bool recover_dynamics = false) {
   const std::size_t N = stages.size();
+  const std::size_t bytes = RiccatiWorkspace::RequiredBytes(stages);
+  ScopedWorkspaceScratch scratch(bytes);
   RiccatiWorkspace workspace;
-  if (WorkspaceArena* arena = ActiveWorkspaceArena(); arena != nullptr) {
-    const std::size_t bytes = RiccatiWorkspace::RequiredBytes(stages);
-    auto* data = static_cast<unsigned char*>(
-        arena->Allocate(bytes, alignof(std::size_t)));
-    workspace.Assign(stages, data, bytes);
-  } else {
+  if (scratch.arena() != nullptr)
+    workspace.Assign(stages, static_cast<unsigned char*>(scratch.data()),
+                     bytes);
+  else
     workspace.Reserve(stages);
-  }
   if (N == 0) {
     ReducedSolution sol;
     sol.x.push_back(initial_state);
@@ -3418,7 +3501,11 @@ bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out,
     out->dynamics_multipliers[N - 1][row] = -value;
   }
 
+  WorkspaceArena* persistent = ActiveWorkspaceArena();
+  ScopedWorkspaceScratch scratch(RecoveryScratchBytes(original));
   for (std::size_t rev = 0; rev < N; ++rev) {
+    scratch.Clear();
+    ScopedWorkspaceArena use_scratch(scratch.arena());
     const std::size_t i = N - 1 - rev;
     const Stage& stage = original.stages[i];
     const Vector& y = out->dynamics_multipliers[i];
@@ -3431,7 +3518,7 @@ bool RecoverMixedOnlyMultipliers(const Problem& original, Solution* out,
                  std::to_string(i);
         return false;
       }
-      out->mixed_multipliers[i] = std::move(solve.x);
+      out->mixed_multipliers[i] = PersistentCopy(solve.x, persistent);
     }
 
     Vector& previous =
@@ -3560,7 +3647,11 @@ bool RecoverEliminatedMultipliers(const Problem& original,
   // Constraint elimination runs right to left.  Its transpose therefore runs
   // left to right, carrying the cotangent of each suffix-state offset to the
   // node where that offset was formed.
+  WorkspaceArena* persistent = ActiveWorkspaceArena();
+  ScopedWorkspaceScratch scratch(RecoveryScratchBytes(original));
   for (std::size_t i = 0; i < N; ++i) {
+    scratch.Clear();
+    ScopedWorkspaceArena use_scratch(scratch.arena());
     const Stage& original_stage = original.stages[i];
     const EliminationStageTrace& trace = working.elimination_traces[i];
     const AffineStateBasis& current = working.state_bases[i];
@@ -3618,11 +3709,13 @@ bool RecoverEliminatedMultipliers(const Problem& original,
       }
       bar_d = ApplyOrthogonalTranspose(mixed.rhs_operations,
                                        std::move(reduced_rhs_cotangent));
-      out->state_multipliers[i] = Slice(bar_e, 0, original_state_rows);
-      out->mixed_multipliers[i] = Slice(bar_d, 0, original_stage.C.rows());
+      out->state_multipliers[i] =
+          PersistentCopy(Slice(bar_e, 0, original_state_rows), persistent);
+      out->mixed_multipliers[i] =
+          PersistentCopy(Slice(bar_d, 0, original_stage.C.rows()), persistent);
     } else {
       out->state_multipliers[i] = bar_e;
-      out->mixed_multipliers[i] = Vector(0);
+      out->mixed_multipliers[i].resize(0);
       bar_d = Vector(0);
     }
 
@@ -3656,7 +3749,8 @@ bool RecoverEliminatedMultipliers(const Problem& original,
             "multiplier dynamics shape mismatch");
       original_c = std::move(bar_c);
     }
-    out->dynamics_multipliers[i] = Scale(original_c, -Scalar{1});
+    out->dynamics_multipliers[i] =
+        PersistentCopy(Scale(original_c, -Scalar{1}), persistent);
   }
 
   const AffineStateBasis& terminal = working.state_bases[N];
@@ -3871,15 +3965,14 @@ Solution SolveMixedOnlyIdentityState(const Problem& original,
                                      NewtonKktDiagnostics* diagnostics) {
   const WorkspaceVector<Stage>& stages = state.problem.stages;
   const std::size_t N = stages.size();
+  const std::size_t bytes = RiccatiWorkspace::RequiredBytes(stages);
+  ScopedWorkspaceScratch scratch(bytes);
   RiccatiWorkspace workspace;
-  if (WorkspaceArena* arena = ActiveWorkspaceArena(); arena != nullptr) {
-    const std::size_t bytes = RiccatiWorkspace::RequiredBytes(stages);
-    auto* data = static_cast<unsigned char*>(
-        arena->Allocate(bytes, alignof(std::size_t)));
-    workspace.Assign(stages, data, bytes);
-  } else {
+  if (scratch.arena() != nullptr)
+    workspace.Assign(stages, static_cast<unsigned char*>(scratch.data()),
+                     bytes);
+  else
     workspace.Reserve(stages);
-  }
   if (!ComputeUnconstrainedRiccatiInto(stages, state.problem.Q, state.problem.q,
                                        tolerance, &workspace, diagnostics)) {
     throw std::runtime_error(
@@ -4141,11 +4234,11 @@ void PopulateFactorization(const Problem& problem, const SolveOptions& options,
       impl->constrained = constrained;
       impl->constrained_owns_memory = constrained_owns_memory;
       constrained->original = MatrixOnlyProblem(problem);
-      constrained->reduced = Initialize(constrained->original);
       NewtonKktDiagnostics elimination_diagnostics;
       std::string error;
-      EliminateConstraintsRightToLeft(constrained->reduced, options.tolerance,
-                                      &error, &elimination_diagnostics);
+      constrained->reduced =
+          InitializeAndEliminate(constrained->original, options.tolerance,
+                                 &error, &elimination_diagnostics);
       if (!error.empty()) {
         throw std::runtime_error(error);
       }
@@ -4160,7 +4253,8 @@ void PopulateFactorization(const Problem& problem, const SolveOptions& options,
               : JoinMessages(elimination_diagnostics.messages);
       const bool matrix_factorization_succeeded = BuildMatrixFactors(
           constrained->reduced.problem.stages, constrained->reduced.problem.Q,
-          constrained->reduced.problem.q, options.tolerance, impl);
+          constrained->reduced.problem.q, options.tolerance, impl,
+          &constrained->reduced.problem);
       impl->newton_kkt_singular =
           impl->newton_kkt_singular || elimination_singular;
       impl->newton_kkt_wrong_inertia =
@@ -4197,7 +4291,7 @@ void PopulateFactorization(const Problem& problem, const SolveOptions& options,
     }
     if (impl->constrained != nullptr) {
       impl->required_solve_bytes =
-          WorkspaceRequiredBytesInternal(impl->constrained->original, options);
+          ConstrainedFactoredSolveRequiredBytes(impl->constrained->original);
     } else {
       impl->required_solve_bytes = FactoredSolveRequiredBytes(*impl);
     }
@@ -4543,10 +4637,9 @@ static Solution SolveInternalResult(const Problem& problem,
         return out;
       }
     }
-    WorkingState state = Initialize(problem);
     std::string error;
-    EliminateConstraintsRightToLeft(state, options.tolerance, &error,
-                                    &diagnostics);
+    WorkingState state = InitializeAndEliminate(problem, options.tolerance,
+                                                &error, &diagnostics);
     LinearParametrization initial = ReducedInitialState(
         problem, state.state_maps.front(), options.tolerance);
     if (initial.inconsistent) {

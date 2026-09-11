@@ -131,6 +131,38 @@ void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
 void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
 
 int main() {
+  {
+    alignas(std::max_align_t) std::array<unsigned char, 256> memory{};
+    clqr::WorkspaceArena arena(memory.data(), memory.size());
+    clqr::ScopedWorkspaceArena active(&arena);
+    auto* persistent = static_cast<unsigned char*>(arena.Allocate(32, 16));
+    persistent[0] = 19;
+    {
+      clqr::ScopedWorkspaceScratch scratch(64);
+      Expect(scratch.data() == memory.data() + 192, "scratch uses arena tail");
+      scratch.arena()->Allocate(64, 16);
+      scratch.Clear();
+      scratch.arena()->Allocate(64, 16);
+      {
+        clqr::ScopedWorkspaceScratch nested(32);
+        Expect(nested.data() == memory.data() + 160,
+               "nested scratch is disjoint");
+        arena.Allocate(128, 16);
+        bool rejected = false;
+        try {
+          arena.Allocate(1, 1);
+        } catch (const std::bad_alloc&) {
+          rejected = true;
+        }
+        Expect(rejected, "persistent storage cannot overlap scratch");
+      }
+      arena.Allocate(32, 16);
+    }
+    arena.Allocate(64, 16);
+    Expect(
+        arena.used() == 256 && persistent[0] == 19,
+        "releasing scratch preserves persistent storage and restores capacity");
+  }
   constexpr std::size_t kMaximumSize = std::numeric_limits<std::size_t>::max();
   static_assert(
       Workspace::RequiredBytesUniform(0, kMaximumSize, 0) == kMaximumSize,

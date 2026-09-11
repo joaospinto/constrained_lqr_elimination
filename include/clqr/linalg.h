@@ -31,11 +31,12 @@ class WorkspaceArena {
     data_ = reinterpret_cast<unsigned char*>(memory);
     size_ = bytes;
     used_ = 0;
+    limit_ = bytes;
   }
   void Clear() { used_ = 0; }
   void* Allocate(std::size_t bytes, std::size_t alignment) {
     const std::size_t aligned = Align(used_, alignment);
-    if (aligned > size_ || bytes > size_ - aligned) throw std::bad_alloc();
+    if (aligned > limit_ || bytes > limit_ - aligned) throw std::bad_alloc();
     void* out = data_ + aligned;
     used_ = aligned + bytes;
     return out;
@@ -56,10 +57,43 @@ class WorkspaceArena {
   unsigned char* data_ = nullptr;
   std::size_t size_ = 0;
   std::size_t used_ = 0;
+  std::size_t limit_ = 0;
+
+  friend class ScopedWorkspaceScratch;
 };
 
 WorkspaceArena* ActiveWorkspaceArena();
 void SetActiveWorkspaceArena(WorkspaceArena* arena);
+
+// Persistent arrays grow from the front; scoped scratch grows from the back.
+// Releasing scratch cannot invalidate a persistent allocation made meanwhile.
+class ScopedWorkspaceScratch {
+ public:
+  explicit ScopedWorkspaceScratch(std::size_t bytes)
+      : parent_(ActiveWorkspaceArena()) {
+    if (parent_ == nullptr) return;
+    previous_limit_ = parent_->limit_;
+    constexpr std::size_t alignment = alignof(std::max_align_t);
+    if (bytes > previous_limit_) throw std::bad_alloc();
+    const std::size_t begin = (previous_limit_ - bytes) & ~(alignment - 1);
+    if (begin < parent_->used_) throw std::bad_alloc();
+    parent_->limit_ = begin;
+    arena_.Reset(parent_->data_ + begin, bytes);
+  }
+  ~ScopedWorkspaceScratch() {
+    if (parent_ != nullptr) parent_->limit_ = previous_limit_;
+  }
+  ScopedWorkspaceScratch(const ScopedWorkspaceScratch&) = delete;
+  ScopedWorkspaceScratch& operator=(const ScopedWorkspaceScratch&) = delete;
+  WorkspaceArena* arena() { return parent_ != nullptr ? &arena_ : nullptr; }
+  void* data() { return arena_.data_; }
+  void Clear() { arena_.Clear(); }
+
+ private:
+  WorkspaceArena* parent_ = nullptr;
+  std::size_t previous_limit_ = 0;
+  WorkspaceArena arena_;
+};
 
 class ScopedWorkspaceArena {
  public:

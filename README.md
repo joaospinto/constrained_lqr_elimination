@@ -458,7 +458,11 @@ constexpr std::size_t kBytes =
     clqr::SolveWorkspace::num_bytes(16, 4, 2, 1);
 ```
 
-The workspace API covers constrained and unconstrained problems. Unconstrained problems use
+The workspace API covers constrained and unconstrained problems. Temporary dense
+storage is reused between elimination stages; only the reduced matrices, maps,
+and recovery data are retained across the horizon. Reservations are conservative
+over possible constraint ranks and grow linearly with the number of stages.
+Unconstrained problems use
 the raw Riccati path directly. Constrained problems activate the workspace arena and run the
 constraint-elimination algorithm, including the reduced Riccati solve and multiplier recovery.
 
@@ -518,6 +522,9 @@ state dimension, control dimension, mixed rows per stage, state-only rows per
 stage, and terminal rows. Runtime `num_bytes(problem)` supports heterogeneous
 dimensions and returns a tighter bound. `FactorizationWorkspace::reserve`
 provides the corresponding one-allocation owning path.
+After factorization, `SolveWorkspace::num_bytes(factors)` reserves only the
+affine replay, trajectory, and recovery storage; it does not reserve the matrix
+factorization workspace again.
 
 An externally backed `FactorizationWorkspace` must outlive its
 `Factorization`. Destroy the factorization before reassigning, reserving, or

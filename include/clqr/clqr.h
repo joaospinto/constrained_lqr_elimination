@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "clqr/detail/cpu_elimination_storage.h"
 #include "clqr/linalg.h"
 
 namespace clqr {
@@ -315,90 +316,47 @@ class Workspace {
         stages * mixed_constraints_per_stage;
     const std::size_t total_state_multiplier_scalars =
         stages * state_constraints_per_stage;
-    const std::size_t mixed_rows_bound =
-        mixed_constraints_per_stage + state_dim;
-    const std::size_t state_rows_bound = Max(
-        terminal_constraints, state_constraints_per_stage + mixed_rows_bound);
-    const std::size_t state_pivot_bound = Min(state_dim, state_rows_bound);
-    const std::size_t mixed_stage_ops = stages;
-    const std::size_t mixed_stage_scalars =
-        2 * mixed_rows_bound *
-            (control_dim + state_dim + 1 + mixed_rows_bound) +
-        control_dim * state_dim + control_dim * control_dim + control_dim +
-        control_dim * mixed_rows_bound + mixed_rows_bound * state_dim +
-        mixed_rows_bound + mixed_rows_bound * mixed_rows_bound +
-        state_dim * state_dim + control_dim * control_dim +
-        state_dim * control_dim + state_dim * control_dim + state_dim +
-        control_dim + state_dim + 8 * state_dim * state_dim +
-        4 * control_dim * control_dim + 6 * state_dim * control_dim +
-        2 * state_dim * state_dim + 2 * state_dim * control_dim +
-        3 * state_dim + 4 * state_dim + 4 * control_dim +
-        (state_rows_bound + mixed_rows_bound) * state_dim + state_rows_bound +
-        mixed_rows_bound + 2 * control_dim * state_dim +
-        2 * control_dim * control_dim + 3 * control_dim;
-    const std::size_t state_stage_scalars =
-        2 * state_rows_bound * (state_dim + 1 + state_rows_bound) +
-        state_dim * state_dim + state_dim + state_dim * state_rows_bound +
-        3 * state_dim * state_dim + 3 * state_dim * control_dim +
-        4 * state_dim + 8 * state_dim * state_dim +
-        4 * state_dim * control_dim + 2 * control_dim * state_dim +
-        4 * state_dim + 2 * control_dim +
-        (state_pivot_bound + mixed_constraints_per_stage) *
-            (state_dim + control_dim + 1) +
-        3 * state_dim * state_dim + 2 * state_dim +
-        2 * control_dim * state_dim + control_dim * control_dim + control_dim;
     const std::size_t pullback_stage_scalars =
         40 * (2 * state_dim + control_dim + mixed_constraints_per_stage +
               state_constraints_per_stage + terminal_constraints + 1);
-    std::size_t bytes = 0;
-    bytes = AddAligned(bytes, alignof(Stage), sizeof(Stage) * stages);
-    bytes =
-        AddAligned(bytes, alignof(Vector), sizeof(Vector) * (10 * stages + 2));
-    bytes =
-        AddAligned(bytes, alignof(Matrix), sizeof(Matrix) * (8 * stages + 2));
+    // Same retained-array and stage-scratch ledger as the runtime planner.
+    // A shape-only bound allows every next state to be fully constrained.
+    std::size_t bytes =
+        sizeof(Stage) * stages +
+        (sizeof(Matrix) + sizeof(Vector) + sizeof(detail::StateMap) +
+         sizeof(detail::AffineStateBasis)) *
+            (stages + 1) +
+        (sizeof(detail::ControlMap) + sizeof(detail::EliminationStageTrace)) *
+            stages;
+    bytes = AddAligned(
+        bytes, alignof(std::size_t),
+        stages * detail::EliminatedStageBound(state_dim, state_dim, control_dim,
+                                              mixed_constraints_per_stage,
+                                              state_constraints_per_stage,
+                                              state_dim) +
+            detail::EliminatedTerminalBytes(state_dim, terminal_constraints));
+    bytes = AddAligned(
+        bytes, alignof(std::size_t),
+        Max(detail::EliminationStageScratchBytes(
+                state_dim, state_dim, control_dim, mixed_constraints_per_stage,
+                state_constraints_per_stage, state_dim),
+            detail::EliminationTerminalScratchBytes(state_dim,
+                                                    terminal_constraints)) +
+            alignof(std::max_align_t));
     bytes = AddAligned(bytes, alignof(std::size_t),
-                       sizeof(std::size_t) * (6 * stages + 3));
-    bytes =
-        AddAligned(bytes, alignof(Scalar), sizeof(Scalar) * (80 * stages + 32));
+                       detail::InitialParametrizationBytes(state_dim));
     bytes = AddAligned(
-        bytes, alignof(Scalar),
-        sizeof(Scalar) * stages *
-            (state_dim * state_dim + state_dim * control_dim + state_dim +
-             state_dim * state_dim + control_dim * control_dim +
-             state_dim * control_dim + state_dim + control_dim +
-             mixed_constraints_per_stage * state_dim +
-             mixed_constraints_per_stage * control_dim +
-             mixed_constraints_per_stage +
-             state_constraints_per_stage * state_dim +
-             state_constraints_per_stage));
-    bytes = AddAligned(bytes, alignof(Scalar),
-                       sizeof(Scalar) * (state_dim * state_dim + state_dim +
-                                         terminal_constraints * state_dim +
-                                         terminal_constraints));
-    bytes = AddAligned(
-        bytes, alignof(Scalar),
-        sizeof(Scalar) * ((stages + 1) * (state_dim * state_dim + state_dim) +
-                          stages * (control_dim * state_dim +
-                                    control_dim * control_dim + control_dim)));
-    bytes =
-        AddAligned(bytes, alignof(Scalar),
-                   sizeof(Scalar) *
-                       ((stages + 1) * (2 * state_rows_bound * (state_dim + 1) +
-                                        state_dim * state_dim + state_dim) +
-                        stages * state_stage_scalars +
-                        mixed_stage_ops * mixed_stage_scalars));
-    bytes =
-        AddAligned(bytes, alignof(std::size_t),
-                   sizeof(std::size_t) *
-                       ((stages + 1) * 3 * state_dim +
-                        mixed_stage_ops * (3 * control_dim + mixed_rows_bound +
-                                           3 * state_dim)));
-    bytes =
-        AddAligned(bytes, alignof(Matrix), sizeof(Matrix) * (4 * stages + 2));
-    bytes =
-        AddAligned(bytes, alignof(Vector), sizeof(Vector) * (4 * stages + 2));
+        bytes, alignof(std::max_align_t),
+        Max(detail::MixedRecoveryScratchBytes(control_dim,
+                                              mixed_constraints_per_stage),
+            detail::PullbackScratchBytes(state_dim, state_dim, control_dim,
+                                         mixed_constraints_per_stage,
+                                         state_constraints_per_stage)) +
+            alignof(std::max_align_t));
     bytes = AddAligned(bytes, alignof(std::size_t),
                        RequiredBytesUniform(stages, state_dim, control_dim));
+    bytes =
+        AddAligned(bytes, alignof(Vector), sizeof(Vector) * (5 * stages + 1));
     bytes = AddAligned(bytes, alignof(VectorView),
                        sizeof(VectorView) * (stages + 1));
     bytes = AddAligned(bytes, alignof(VectorView), sizeof(VectorView) * stages);
@@ -424,7 +382,7 @@ class Workspace {
         bytes, alignof(Scalar),
         sizeof(Scalar) *
             (total_dynamics_scalars + total_state_scalars +
-             stages * pullback_stage_scalars +
+             pullback_stage_scalars +
              4 * state_dim * (state_dim + terminal_constraints + 1)));
     if (stages == 0) {
       // Match the runtime constrained-workspace bound for the terminal-only
@@ -578,18 +536,24 @@ constexpr std::size_t FactorizationWorkspace::num_bytes(
   const std::size_t p = mixed_constraints_per_stage;
   const std::size_t e = state_constraints_per_stage;
   const std::size_t t = terminal_constraints;
-  const std::size_t cache_stage_scalars = 3 * n * n + 4 * n * m + 2 * m * m;
-  std::size_t extra_scalars = stages * cache_stage_scalars + n * n;
+  const std::size_t cache_stage_scalars =
+      constrained ? n * n + 2 * n * m + m * m
+                  : 3 * n * n + 4 * n * m + 2 * m * m;
+  std::size_t extra_scalars =
+      stages * cache_stage_scalars + (constrained ? 0 : n * n);
   std::size_t extra_indices = stages * m + 2 * stages + 1;
   if (constrained) {
     const std::size_t matrix_only_stage_scalars =
         n * n + 2 * n * m + m * m + p * (n + m) + e * n + 2 * (n + m + p + e);
     const std::size_t matrix_only_node_scalars = n * n + 2 * n;
-    const std::size_t replay_stage_scalars =
-        11 * n * n + 8 * n * m + m * m;
+    const std::size_t replay_stage_scalars = 2 * n * n + 2 * n * m;
     extra_scalars +=
         stages * (matrix_only_stage_scalars + replay_stage_scalars) +
         stage_count * matrix_only_node_scalars + t * n + 2 * t + 2 * n;
+    // One reusable region for replay-cache products, not one per stage.
+    extra_scalars += (detail::ReplayMatrixScratchBytes(n, n, m) +
+                      alignof(std::max_align_t) + sizeof(Scalar) - 1) /
+                     sizeof(Scalar);
     if (t != 0) {
       const std::size_t rank = n < t ? n : t;
       extra_scalars += 8 * n * n + 6 * n + 2 * t * (n + 1) +
