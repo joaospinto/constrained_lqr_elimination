@@ -232,6 +232,39 @@ void TinyCoefficientRrefCase() {
          "RREF removes a coefficient below its rank tolerance");
 }
 
+void PivotSelectionOrderCase() {
+  threadIdx.x = 0;
+  blockDim.x = 1;
+  constexpr int rows = 7;
+  constexpr int columns = 8;
+  const Scalar matrix[rows * columns]{
+      0, 4, 1, -4, 0, 9, 9, 0,  4, 0, 0, 0, 0, 9, 0, 0, 0, 4, 0,
+      0, 0, 9, 0,  0, 0, 0, -4, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 9,
+      0, 0, 0, 0,  0, 0, 0, -9, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0};
+  for (int rank = 0; rank <= rows; ++rank) {
+    for (int first = 0; first < columns; ++first) {
+      for (int last = first; last <= columns; ++last) {
+        for (Scalar tolerance : {Scalar{0}, Scalar{1}, Scalar{4}, Scalar{10}}) {
+          Scalar best = tolerance;
+          int expected = std::numeric_limits<int>::max();
+          for (int col = first; col < last; ++col) {
+            for (int row = rank; row < rows; ++row) {
+              const Scalar candidate = std::abs(matrix[row * columns + col]);
+              if (candidate > best) {
+                best = candidate;
+                expected = col * rows + row;
+              }
+            }
+          }
+          Expect(SelectRrefPivotBlock(matrix, rows, columns, rank, first, last,
+                                      tolerance) == expected,
+                 "coalesced pivot traversal preserves serial tie-breaking");
+        }
+      }
+    }
+  }
+}
+
 void PivotedLuMultiRhsCase() {
 #ifdef CLQR_USE_FLOAT
   constexpr Scalar solve_tolerance = 1e-5f;
@@ -2485,6 +2518,7 @@ int main(int argc, char **argv) {
 #endif
   }
   TinyCoefficientRrefCase();
+  PivotSelectionOrderCase();
   CoordinatePivotingCase();
   FiniteInputValidationCase();
   DeviceObjectiveCase();

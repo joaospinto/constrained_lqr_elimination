@@ -1019,6 +1019,64 @@ __device__ int WarpBroadcastLaneZero(int value) {
 #endif
 }
 
+// Deterministic argmax: ties retain the earliest column-major candidate,
+// matching the serial pivot search exactly (including equal-magnitude pivots).
+__device__ int WarpMaximumIndex(Scalar value, int index) {
+#ifndef CLQR_CUDA_EMULATION
+  constexpr unsigned kFullWarp = 0xffffffffu;
+  for (int offset = 16; offset > 0; offset /= 2) {
+    const Scalar other_value = __shfl_down_sync(kFullWarp, value, offset);
+    const int other_index = __shfl_down_sync(kFullWarp, index, offset);
+    if (other_value > value || (other_value == value && other_index < index)) {
+      value = other_value;
+      index = other_index;
+    }
+  }
+#else
+  (void)value;
+#endif
+  return WarpBroadcastLaneZero(index);
+}
+
+__device__ int SelectRrefPivotBlock(const Scalar *matrix, int rows, int columns,
+                                    int rank, int first, int last,
+                                    Scalar tolerance) {
+  Scalar best = tolerance;
+  int best_index = std::numeric_limits<int>::max();
+  const int width = last - first;
+  const int entries = (rows - rank) * width;
+  // Retain the short serial search for tiny blocks; a warp-wide argmax would
+  // add more instructions than these few comparisons save.
+  if (entries <= kThreads) {
+    if (threadIdx.x == 0) {
+      for (int col = first; col < last; ++col) {
+        for (int row = rank; row < rows; ++row) {
+          const Scalar candidate = DeviceAbs(matrix[row * columns + col]);
+          if (candidate > best) {
+            best = candidate;
+            best_index = col * rows + row;
+          }
+        }
+      }
+    }
+    return WarpBroadcastLaneZero(best_index);
+  }
+  // Contiguous columns give coalesced accesses for complete pivot selection.
+  // The ordinal, rather than the traversal order, breaks magnitude ties.
+  for (int linear = threadIdx.x; linear < entries; linear += blockDim.x) {
+    const int row = rank + linear / width;
+    const int col = first + linear % width;
+    const Scalar candidate = DeviceAbs(matrix[row * columns + col]);
+    const int index = col * rows + row;
+    if (candidate > best ||
+        (candidate == best && candidate > tolerance && index < best_index)) {
+      best = candidate;
+      best_index = index;
+    }
+  }
+  return WarpMaximumIndex(best, best_index);
+}
+
 __device__ void WarpSynchronize() {
 #ifndef CLQR_CUDA_EMULATION
   __syncwarp();
@@ -1206,21 +1264,16 @@ __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
   WarpSynchronize();
 
   for (int position = 0; position < pivot_limit; ++position) {
+    const int first = position < priority_pivot_limit ? 0 : position;
+    const int last =
+        position < priority_pivot_limit ? priority_pivot_limit : position + 1;
+    const int selected = SelectRrefPivotBlock(matrix, rows, columns, *rank,
+                                              first, last, tolerance);
     if (threadIdx.x == 0) {
       *best_row = -1;
-      Scalar best = tolerance;
-      const int first = position < priority_pivot_limit ? 0 : position;
-      const int last =
-          position < priority_pivot_limit ? priority_pivot_limit : position + 1;
-      for (int col = first; col < last; ++col) {
-        for (int row = *rank; row < rows; ++row) {
-          const Scalar candidate = DeviceAbs(matrix[row * columns + col]);
-          if (candidate > best) {
-            best = candidate;
-            *best_row = row;
-            pivot_rows[*rank] = col;
-          }
-        }
+      if (selected != std::numeric_limits<int>::max()) {
+        *best_row = selected % rows;
+        pivot_rows[*rank] = selected / rows;
       }
     }
     WarpSynchronize();
