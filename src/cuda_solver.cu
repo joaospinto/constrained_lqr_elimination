@@ -2973,6 +2973,7 @@ struct WorkspaceStorage {
   DeviceBuffer<ValueElement> value_leaves;
   DeviceBuffer<ValueElement> value_scan;
   DeviceBuffer<Scalar> value_data;
+  std::size_t value_internal_offset = 0;
   DeviceBuffer<Feedback> feedback;
   DeviceBuffer<AffineMap> map_leaves;
   DeviceBuffer<AffineMap> map_scan;
@@ -4352,6 +4353,7 @@ bool PrepareValueStorage(WorkspaceStorage *workspace, int stage_count,
   std::size_t entries = 0;
   for (const ValueCapacity &capacity : leaf_capacity)
     CheckedAccumulate(capacity.Entries(), &entries, "value layout");
+  workspace->value_internal_offset = entries;
   for (const ValueCapacity &capacity : internal_capacity)
     CheckedAccumulate(capacity.Entries(), &entries, "value layout");
   workspace->value_data.Reserve(entries);
@@ -4410,7 +4412,14 @@ bool PrepareMapStorage(WorkspaceStorage *workspace, int stage_count,
     CheckedAccumulate(capacity.Entries(), &entries, "map layout");
   for (const MapCapacity &capacity : internal_capacity)
     CheckedAccumulate(capacity.Entries(), &entries, "map layout");
-  workspace->map_data.Reserve(entries);
+  // The value scan's internal nodes are dead before either affine scan starts.
+  // Keep the value leaves (suffix Hessians) intact for feedback and dual
+  // recovery, and reuse only the internal-node tail. Nonuniform layouts that
+  // need a larger affine tree retain a separate exact-sized allocation.
+  workspace->map_data.ReserveReusing(
+      workspace->value_data.get() + workspace->value_internal_offset,
+      workspace->value_data.count() - workspace->value_internal_offset,
+      entries);
   Scalar *cursor = workspace->map_data.get();
   for (int stage = 0; stage < stage_count; ++stage)
     BindMapStorage(&workspace->host_map_leaves[stage], &cursor,

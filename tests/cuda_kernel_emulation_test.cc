@@ -2069,19 +2069,26 @@ void RunEmulation(const Problem &problem, const std::string &name,
   }
   std::vector<AffineMap> map_a(horizon),
       map_b(std::max(stage_tree_size - std::max(horizon, 1), 1));
-  std::vector<Scalar> map_a_storage(static_cast<std::size_t>(horizon) *
-                                    kTestMapEntries);
-  std::vector<Scalar> map_b_storage(map_b.size() * kTestMapEntries);
+  const std::size_t map_leaf_entries =
+      static_cast<std::size_t>(horizon) * kTestMapEntries;
+  const std::size_t map_entries =
+      map_leaf_entries + map_b.size() * kTestMapEntries;
+  std::vector<Scalar> separate_map_storage;
+  Scalar *map_storage = value_b_storage.data();
+  if (map_entries > value_b_storage.size()) {
+    separate_map_storage.resize(map_entries);
+    map_storage = separate_map_storage.data();
+  }
   for (int stage = 0; stage < horizon; ++stage) {
     BindAffineMapScratch(&map_a[stage],
-                         map_a_storage.data() +
+                         map_storage +
                              static_cast<std::size_t>(stage) * kTestMapEntries,
                          kTestStateCapacity, kTestStateCapacity);
   }
   for (std::size_t node = 0; node < map_b.size(); ++node) {
-    BindAffineMapScratch(&map_b[node],
-                         map_b_storage.data() + node * kTestMapEntries,
-                         kTestStateCapacity, kTestStateCapacity);
+    BindAffineMapScratch(
+        &map_b[node], map_storage + map_leaf_entries + node * kTestMapEntries,
+        kTestStateCapacity, kTestStateCapacity);
   }
   const auto run_affine_prefix_scan = [&] {
     if (horizon <= 1)

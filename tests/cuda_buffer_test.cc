@@ -83,4 +83,33 @@ int main() {
   buffer.Bind(borrowed, 4);
   buffer.Release();
   Expect(mock::frees == 2);
+  const int allocations_before_reuse = mock::allocations;
+  double first_scratch[8]{};
+  double second_scratch[16]{};
+  buffer.ReserveReusing(first_scratch, 8, 6);
+  Expect(buffer.get() == first_scratch && buffer.count() == 6 &&
+         mock::allocations == allocations_before_reuse);
+  buffer.ReserveReusing(second_scratch, 16, 12);
+  Expect(buffer.get() == second_scratch && buffer.count() == 12 &&
+         mock::frees == 2);
+  // Old borrowed capacity is 12, but the current scratch has only four slots.
+  buffer.ReserveReusing(first_scratch, 4, 6);
+  Expect(buffer.get() != first_scratch && buffer.get() != second_scratch &&
+         buffer.count() == 6 &&
+         mock::allocations == allocations_before_reuse + 1);
+  const double *owned = buffer.get();
+  buffer.ReserveReusing(first_scratch, 4, 5);
+  Expect(buffer.get() == owned &&
+         mock::allocations == allocations_before_reuse + 1);
+  buffer.ReserveReusing(second_scratch, 16, 12);
+  Expect(buffer.get() == second_scratch && mock::frees == 3);
+  mock::fail = true;
+  try {
+    buffer.ReserveReusing(first_scratch, 4, 6);
+  } catch (const clqr::cuda::detail::DeviceAllocationError &) {
+  }
+  Expect(buffer.get() == nullptr && buffer.count() == 0 && mock::frees == 3);
+  mock::fail = false;
+  buffer.ReserveReusing(first_scratch, 8, 6);
+  Expect(buffer.get() == first_scratch && buffer.count() == 6);
 }

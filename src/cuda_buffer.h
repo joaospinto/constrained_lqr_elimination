@@ -77,6 +77,19 @@ public:
     count_ = std::max<std::size_t>(count, 1);
     owns_ = false;
   }
+  // Reuse phase-disjoint storage when it fits; otherwise retain a separately
+  // owned allocation. A previous borrowed view may refer to a resized arena,
+  // so it must not satisfy an owned fallback reservation by its old capacity.
+  void ReserveReusing(T *scratch, std::size_t scratch_count,
+                      std::size_t count) {
+    if (count <= scratch_count) {
+      Bind(scratch, count);
+    } else {
+      if (!owns_)
+        Release();
+      Reserve(count);
+    }
+  }
   void Release() {
     if (owns_ && data_ != nullptr)
       cudaFree(data_);
