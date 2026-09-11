@@ -349,6 +349,7 @@ cuda_library(
         "src/cuda_buffer.h",
         "src/cuda_internal.h",
         "src/cuda_shared_memory.h",
+        "src/cuda_stage_layout.h",
     ],
     alwayslink = True,
     copts = [
@@ -458,6 +459,7 @@ cc_library(
         "src/cuda_device_io.h",
         "src/cuda_internal.h",
         "tests/emulated_cuda/cuda_runtime.h",
+        "src/cuda_stage_layout.h",
     ],
     includes = [
         "include",
@@ -485,6 +487,16 @@ cc_test(
         "tests/emulated_cuda/cuda_runtime.h",
     ],
     includes = ["tests/emulated_cuda"],
+)
+
+cc_test(
+    name = "cuda_stage_layout_test",
+    srcs = [
+        "src/cuda_internal.h",
+        "src/cuda_stage_layout.h",
+        "tests/cuda_stage_layout_test.cc",
+    ],
+    deps = [":clqr_cuda_stub"],
 )
 
 py_test(

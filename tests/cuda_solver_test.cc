@@ -609,6 +609,43 @@ void InfeasibleCase() {
          "inconsistent redundant rows are infeasible");
 }
 
+void ReusedRankLayoutCase() {
+  const Problem constrained =
+      GeneratedProblem(151, 7, 5, 3, 2, ConstraintMode::kAlternating);
+  Problem free = constrained;
+  for (auto &stage : free.stages) {
+    for (Matrix *matrix : {&stage.C, &stage.D, &stage.E})
+      std::fill(matrix->data().begin(), matrix->data().end(), Scalar{0});
+    std::fill(stage.d.begin(), stage.d.end(), Scalar{0});
+    std::fill(stage.e.begin(), stage.e.end(), Scalar{0});
+  }
+  std::fill(free.terminal_E.data().begin(), free.terminal_E.data().end(),
+            Scalar{0});
+  std::fill(free.terminal_e.begin(), free.terminal_e.end(), Scalar{0});
+  clqr::cuda::Workspace workspace;
+  clqr::cuda::Solution solution;
+  CompareWithCpu(constrained, "cached layout constrained rank", nullptr,
+                 &workspace, &solution);
+  // A failed reduction must not leave a cache key referring to old backing
+  // strides when the next solve returns to its previous numerical ranks.
+  Problem invalid = free;
+  for (auto &stage : invalid.stages) {
+    auto &R = stage.R;
+    std::fill(R.data().begin(), R.data().end(), Scalar{0});
+    for (std::size_t i = 0; i < R.rows(); ++i)
+      R(i, i) = Scalar{-1000};
+  }
+  clqr::cuda::Solve(invalid, workspace, solution);
+  Expect(solution.status == SolveStatus::kNumericalFailure,
+         "cached layout changed-rank reduction failure");
+  CompareWithCpu(constrained, "cached layout after changed-rank failure",
+                 nullptr, &workspace, &solution);
+  CompareWithCpu(free, "cached layout free rank", nullptr, &workspace,
+                 &solution);
+  CompareWithCpu(constrained, "cached layout restored rank", nullptr,
+                 &workspace, &solution);
+}
+
 void InvalidDeviceCases() {
   const Problem problem = ZeroHorizonProblem();
   clqr::cuda::Options options;
@@ -680,6 +717,7 @@ int main() {
                  "reusable workspace cached layout", nullptr,
                  &reusable_cuda_workspace, &reusable_cuda_solution);
   WorkspaceBackedViewCase();
+  ReusedRankLayoutCase();
   LongHorizonCase();
   InfeasibleCase();
   InvalidDeviceCases();

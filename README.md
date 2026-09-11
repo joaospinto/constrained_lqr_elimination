@@ -68,13 +68,18 @@ records, and scan coefficients are packed from the runtime dimensions of the
 individual stages. Kernels loop over and factor only active state, control,
 constraint, and reduced dimensions; no padded dense algebra is performed and
 there are no build-time dimension capacities.
+Later phases reuse completed feasibility/value scan buffers and primal
+parameterization storage. Reduced-stage and feedback layouts use the active
+dimensions once those ranks are known; layouts that do not fit the retired
+storage receive separate, conservatively sized allocations.
 
 Every horizon-dependent device dependency is a balanced-tree reduction or
 expansion. Feasibility propagation, the conditional-value solve, primal
 reconstruction, and multiplier recovery each use at most a constant multiple
-of `ceil(log2(N + 1))` kernel rounds plus a constant number of independent
-per-stage kernels. No device kernel iterates over the horizon. Consequently,
-for fixed local dimensions, the device algorithm has `O(log N)` parallel time,
+of `ceil(log2(N + 1))` dependent tree levels plus a constant number of independent
+per-stage phases. A level may use multiple launches to bound global scratch
+on a fixed GPU. No device kernel iterates over the horizon. Consequently,
+for fixed local dimensions, the device algorithm has `O(log N)` parallel depth,
 `O(N)` work, and `O(N)` storage. End-to-end API wall time additionally includes
 serial host packing, compact-storage planning, transfers, and result
 construction; these costs are reported separately from pure kernel time.

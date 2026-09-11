@@ -22,6 +22,7 @@
 #ifndef CLQR_CUDA_EMULATION
 #include "cuda_buffer.h"
 #include "cuda_shared_memory.h"
+#include "cuda_stage_layout.h"
 #endif
 
 namespace clqr {
@@ -2961,14 +2962,23 @@ struct WorkspaceStorage {
   DeviceBuffer<DeviceStatus> device_status;
   DeviceBuffer<Relation> relation_leaves;
   DeviceBuffer<Relation> relation_scan;
-  DeviceBuffer<Scalar> relation_data;
+  DeviceBuffer<Scalar> relation_leaf_data;
+  DeviceBuffer<Scalar> relation_internal_data;
   DeviceBuffer<StateParam> state_params;
   DeviceBuffer<ControlParam> control_params;
   DeviceBuffer<ReducedStage> reduced_stages;
   DeviceBuffer<ReducedTerminal> reduced_terminal;
-  DeviceBuffer<std::byte> stage_layout_arena;
-  DeviceBuffer<Scalar> stage_data;
-  DeviceBuffer<int> stage_indices;
+  DeviceBuffer<std::byte> state_layout_arena;
+  DeviceBuffer<std::byte> reduction_layout_arena;
+  DeviceBuffer<std::byte> feedback_layout_arena;
+  DeviceBuffer<std::byte> dual_parameter_arena;
+  DeviceBuffer<std::byte> state_dual_parameter_arena;
+  std::size_t reduction_layout_bytes = 0;
+  std::size_t dual_parameter_layout_bytes = 0;
+  bool dual_parameter_layout_ready = false;
+  std::vector<int> reduction_state_layout_key;
+  std::vector<int> feedback_control_layout_key;
+  std::vector<int> state_dual_layout_key;
   DeviceBuffer<Scalar> reduced_initial;
   DeviceBuffer<ValueElement> value_leaves;
   DeviceBuffer<ValueElement> value_scan;
@@ -3058,7 +3068,6 @@ struct WorkspaceStorage {
   std::vector<int> stage_level_offsets;
   std::vector<int> stage_level_counts;
   std::vector<int> relation_layout_key;
-  std::vector<int> stage_layout_key;
   bool stage_layout_uploaded = false;
   std::vector<int> value_layout_key;
   std::vector<int> map_layout_key;
@@ -3812,187 +3821,178 @@ CompactEntryCounts CountCompactEntries(const Problem &problem) {
   return counts;
 }
 
-template <typename T> T *TakeStorage(T **cursor, std::size_t count) {
-  T *result = *cursor;
-  *cursor += count;
-  return result;
+// Size and bind with the same field traversal, including alignment between
+// integer indices and scalar matrices.
+template <typename Layout>
+std::size_t BindDenseArena(DeviceBuffer<std::byte> *arena, std::byte *scratch,
+                           std::size_t scratch_bytes, Layout layout) {
+  DenseLayoutCursor plan;
+  layout(plan);
+  arena->ReserveReusing(scratch, scratch_bytes, plan.bytes());
+  DenseLayoutCursor bind(arena->get());
+  layout(bind);
+  Require(bind.bytes() == plan.bytes(), "internal CUDA dense layout mismatch");
+  return plan.bytes();
 }
 
-// Bind every small dense object to a compact runtime-sized slice.  The slices
-// use the physical dimensions as safe capacities; kernels continue to perform
-// arithmetic only over their active reduced dimensions.
 void PrepareStageStorage(const Problem &problem, WorkspaceStorage *workspace) {
-  const std::size_t stage_count = problem.stages.size();
-  const std::size_t node_count = stage_count + 1;
-  std::vector<int> layout_key;
-  layout_key.reserve(5 * stage_count + 2);
-  for (const Stage &stage : problem.stages) {
-    layout_key.push_back(static_cast<int>(stage.A.cols()));
-    layout_key.push_back(static_cast<int>(stage.A.rows()));
-    layout_key.push_back(static_cast<int>(stage.B.cols()));
-    layout_key.push_back(static_cast<int>(stage.C.rows()));
-    layout_key.push_back(static_cast<int>(stage.E.rows()));
-  }
-  layout_key.push_back(static_cast<int>(problem.Q.back().rows()));
-  layout_key.push_back(static_cast<int>(problem.terminal_E.rows()));
-  if (layout_key == workspace->stage_layout_key)
-    return;
-  std::size_t scalar_entries = 0;
-  std::size_t index_entries = 0;
-  auto scalars = [&](std::size_t count) {
-    CheckedAccumulate(count, &scalar_entries, "stage workspace");
+  const auto layout = [&](DenseLayoutCursor &cursor) {
+    for (std::size_t node = 0; node <= problem.stages.size(); ++node) {
+      const std::size_t n = node == problem.stages.size()
+                                ? problem.Q.back().rows()
+                                : problem.stages[node].A.cols();
+      workspace->host_state_params[node] = LayoutStateParameter(cursor, n);
+    }
   };
-  auto indices = [&](std::size_t count) {
-    CheckedAccumulate(count, &index_entries, "stage index workspace");
-  };
-  auto square = [&](std::size_t dimension) {
-    return CheckedProduct(dimension, dimension, "dense workspace");
-  };
-  auto rectangle = [&](std::size_t rows, std::size_t columns) {
-    return CheckedProduct(rows, columns, "dense workspace");
-  };
-
-  for (std::size_t node = 0; node < node_count; ++node) {
-    const std::size_t n = node == stage_count ? problem.Q.back().rows()
-                                              : problem.stages[node].A.cols();
-    indices(n);
-    scalars(square(n)); // StateParam T.
-    scalars(n);         // StateParam t.
-  }
-  for (std::size_t stage = 0; stage < stage_count; ++stage) {
-    const Stage &source = problem.stages[stage];
-    const std::size_t n = source.A.cols();
-    const std::size_t next = source.A.rows();
-    const std::size_t m = source.B.cols();
-    const std::size_t dual =
-        CheckedSum({next, source.C.rows()}, "dual dimension");
-    indices(m); // ControlParam free columns.
-    scalars(rectangle(m, n));
-    scalars(square(m));
-    scalars(m);
-    scalars(rectangle(next, n));
-    scalars(rectangle(next, m));
-    scalars(next);
-    scalars(square(n));
-    scalars(square(m));
-    scalars(rectangle(n, m));
-    scalars(n);
-    scalars(m); // ReducedStage.
-    scalars(rectangle(m, n));
-    scalars(m);
-    scalars(square(m));
-    scalars(rectangle(next, n));
-    scalars(next); // Feedback.
-    indices(dual); // DualParam free columns.
-    scalars(square(dual));
-    scalars(dual);
-
-    const std::size_t node = stage + 1;
-    const std::size_t constraints = node == stage_count
-                                        ? problem.terminal_E.rows()
-                                        : problem.stages[node].E.rows();
-    const std::size_t left_dual = dual;
-    const std::size_t right_dual =
-        node == stage_count ? 0
-                            : CheckedSum({problem.stages[node].A.rows(),
-                                          problem.stages[node].C.rows()},
-                                         "right dual dimension");
-    scalars(constraints);
-    scalars(rectangle(constraints, left_dual));
-    scalars(rectangle(constraints, right_dual)); // StateDualParam.
-  }
-  const std::size_t terminal_n = problem.Q.back().rows();
-  scalars(square(terminal_n));
-  scalars(terminal_n);
-
-  ArenaCursor stage_plan(nullptr);
-  stage_plan.Add(&workspace->stage_data, scalar_entries);
-  stage_plan.Add(&workspace->stage_indices, index_entries);
-  workspace->stage_layout_arena.Reserve(stage_plan.bytes());
-  ArenaCursor stage_bind(workspace->stage_layout_arena.get());
-  stage_bind.Add(&workspace->stage_data, scalar_entries);
-  stage_bind.Add(&workspace->stage_indices, index_entries);
-  Require(stage_bind.bytes() == stage_plan.bytes(),
-          "internal CUDA stage-arena layout mismatch");
-  Scalar *scalar_cursor = workspace->stage_data.get();
-  int *index_cursor = workspace->stage_indices.get();
-
-  for (std::size_t node = 0; node < node_count; ++node) {
-    const std::size_t n = node == stage_count ? problem.Q.back().rows()
-                                              : problem.stages[node].A.cols();
-    StateParam &out = workspace->host_state_params[node];
-    out = {};
-    out.free_columns = TakeStorage(&index_cursor, n);
-    out.T = TakeStorage(&scalar_cursor, square(n));
-    out.t = TakeStorage(&scalar_cursor, n);
-  }
-  for (std::size_t stage = 0; stage < stage_count; ++stage) {
-    const Stage &source = problem.stages[stage];
-    const std::size_t n = source.A.cols();
-    const std::size_t next = source.A.rows();
-    const std::size_t m = source.B.cols();
-    const std::size_t dual =
-        CheckedSum({next, source.C.rows()}, "dual dimension");
-
-    ControlParam &control = workspace->host_control_params[stage];
-    control = {};
-    control.free_columns = TakeStorage(&index_cursor, m);
-    control.Y = TakeStorage(&scalar_cursor, rectangle(m, n));
-    control.Z = TakeStorage(&scalar_cursor, square(m));
-    control.y = TakeStorage(&scalar_cursor, m);
-
-    ReducedStage &reduced = workspace->host_reduced_stages[stage];
-    reduced = {};
-    reduced.A = TakeStorage(&scalar_cursor, rectangle(next, n));
-    reduced.B = TakeStorage(&scalar_cursor, rectangle(next, m));
-    reduced.c = TakeStorage(&scalar_cursor, next);
-    reduced.Q = TakeStorage(&scalar_cursor, square(n));
-    reduced.R = TakeStorage(&scalar_cursor, square(m));
-    reduced.M = TakeStorage(&scalar_cursor, rectangle(n, m));
-    reduced.q = TakeStorage(&scalar_cursor, n);
-    reduced.r = TakeStorage(&scalar_cursor, m);
-
-    Feedback &feedback = workspace->host_feedback[stage];
-    feedback = {};
-    feedback.K = TakeStorage(&scalar_cursor, rectangle(m, n));
-    feedback.k = TakeStorage(&scalar_cursor, m);
-    feedback.control_factor = TakeStorage(&scalar_cursor, square(m));
-    feedback.transition = TakeStorage(&scalar_cursor, rectangle(next, n));
-    feedback.offset = TakeStorage(&scalar_cursor, next);
-
-    DualParam &dual_param = workspace->host_dual_params[stage];
-    dual_param = {};
-    dual_param.free_columns = TakeStorage(&index_cursor, dual);
-    dual_param.basis = TakeStorage(&scalar_cursor, square(dual));
-    dual_param.offset = TakeStorage(&scalar_cursor, dual);
-
-    const std::size_t node = stage + 1;
-    const std::size_t constraints = node == stage_count
-                                        ? problem.terminal_E.rows()
-                                        : problem.stages[node].E.rows();
-    const std::size_t right_dual =
-        node == stage_count ? 0
-                            : CheckedSum({problem.stages[node].A.rows(),
-                                          problem.stages[node].C.rows()},
-                                         "right dual dimension");
-    StateDualParam &state_dual = workspace->host_state_dual_params[stage];
-    state_dual = {};
-    state_dual.offset = TakeStorage(&scalar_cursor, constraints);
-    state_dual.left = TakeStorage(&scalar_cursor, rectangle(constraints, dual));
-    state_dual.right =
-        TakeStorage(&scalar_cursor, rectangle(constraints, right_dual));
-  }
-  ReducedTerminal &terminal = workspace->host_reduced_terminal[0];
-  terminal = {};
-  terminal.Q = TakeStorage(&scalar_cursor, square(terminal_n));
-  terminal.q = TakeStorage(&scalar_cursor, terminal_n);
-
-  Require(scalar_cursor == workspace->stage_data.get() + scalar_entries,
-          "internal CUDA stage-workspace layout size mismatch");
-  Require(index_cursor == workspace->stage_indices.get() + index_entries,
-          "internal CUDA stage-index layout size mismatch");
-  workspace->stage_layout_key = std::move(layout_key);
+  BindDenseArena(&workspace->state_layout_arena, nullptr, 0, layout);
   workspace->stage_layout_uploaded = false;
+}
+
+bool PrepareReductionStorage(const Problem &problem,
+                             WorkspaceStorage *workspace) {
+  const std::size_t nodes = problem.stages.size() + 1;
+  bool matches = workspace->reduction_state_layout_key.size() == nodes;
+  for (std::size_t node = 0; node < nodes && matches; ++node)
+    matches &= workspace->reduction_state_layout_key[node] ==
+               workspace->host_state_dimensions[2 * node + 1];
+  if (matches)
+    return false;
+  const auto layout = [&](DenseLayoutCursor &cursor) {
+    for (std::size_t stage = 0; stage < problem.stages.size(); ++stage) {
+      const std::size_t n = workspace->host_state_dimensions[2 * stage + 1];
+      const std::size_t next = workspace->host_state_dimensions[2 * stage + 3];
+      const std::size_t m = problem.stages[stage].B.cols();
+      workspace->host_control_params[stage] =
+          LayoutControlParameter(cursor, m, n);
+      workspace->host_reduced_stages[stage] =
+          LayoutReducedStage(cursor, n, next, m);
+    }
+    workspace->host_reduced_terminal[0] = LayoutReducedTerminal(
+        cursor,
+        workspace->host_state_dimensions[2 * problem.stages.size() + 1]);
+  };
+  // Internal feasibility nodes are dead after StateParamKernel. The suffix
+  // leaves remain in a separate buffer until ReduceStagesKernel completes.
+  workspace->reduction_layout_bytes = BindDenseArena(
+      &workspace->reduction_layout_arena,
+      reinterpret_cast<std::byte *>(workspace->relation_internal_data.get()),
+      DenseLayoutCursor::Product(workspace->relation_internal_data.count(),
+                                 sizeof(Scalar)),
+      layout);
+  workspace->dual_parameter_layout_ready = false;
+  workspace->feedback_control_layout_key.clear();
+  workspace->reduction_state_layout_key.resize(nodes);
+  for (std::size_t node = 0; node < nodes; ++node)
+    workspace->reduction_state_layout_key[node] =
+        workspace->host_state_dimensions[2 * node + 1];
+  return true;
+}
+
+bool PrepareFeedbackStorage(WorkspaceStorage *workspace, int stage_count,
+                            bool state_layout_matches) {
+  bool matches =
+      state_layout_matches && workspace->feedback_control_layout_key.size() ==
+                                  static_cast<std::size_t>(stage_count);
+  for (int stage = 0; stage < stage_count && matches; ++stage)
+    matches &= workspace->feedback_control_layout_key[stage] ==
+               workspace->host_control_dimensions[2 * stage + 1];
+  if (matches)
+    return false;
+  const auto layout = [&](DenseLayoutCursor &cursor) {
+    for (int stage = 0; stage < stage_count; ++stage) {
+      workspace->host_feedback[stage] = LayoutFeedback(
+          cursor, workspace->host_state_dimensions[2 * stage + 1],
+          workspace->host_state_dimensions[2 * stage + 3],
+          workspace->host_control_dimensions[2 * stage + 1]);
+    }
+  };
+  std::byte *spare = nullptr;
+  std::size_t spare_bytes = 0;
+  const auto *internal = workspace->relation_internal_data.get();
+  if (workspace->reduction_layout_arena.get() ==
+      reinterpret_cast<const std::byte *>(internal)) {
+    const std::size_t used = workspace->reduction_layout_bytes;
+    const std::size_t available = DenseLayoutCursor::Product(
+        workspace->relation_internal_data.count(), sizeof(Scalar));
+    Require(used <= available, "internal CUDA reduction scratch exceeds arena");
+    spare =
+        reinterpret_cast<std::byte *>(workspace->relation_internal_data.get()) +
+        used;
+    spare_bytes = available - used;
+  }
+  BindDenseArena(&workspace->feedback_layout_arena, spare, spare_bytes, layout);
+  workspace->feedback_control_layout_key.resize(stage_count);
+  for (int stage = 0; stage < stage_count; ++stage)
+    workspace->feedback_control_layout_key[stage] =
+        workspace->host_control_dimensions[2 * stage + 1];
+  workspace->state_dual_layout_key.clear();
+  return true;
+}
+
+bool PrepareDualParameterStorage(const Problem &problem,
+                                 WorkspaceStorage *workspace) {
+  const auto layout = [&](DenseLayoutCursor &cursor) {
+    for (std::size_t stage = 0; stage < problem.stages.size(); ++stage) {
+      const Stage &source = problem.stages[stage];
+      const std::size_t dual = CheckedSum({source.A.rows(), source.C.rows()},
+                                          "dual parameter dimension");
+      workspace->host_dual_params[stage] = LayoutDualParameter(cursor, dual);
+    }
+  };
+  if (!workspace->dual_parameter_layout_ready) {
+    DenseLayoutCursor plan;
+    layout(plan);
+    workspace->dual_parameter_layout_bytes = plan.bytes();
+  }
+  const auto *previous = workspace->dual_parameter_arena.get();
+  // Control parameterizations and reduced stage matrices are dead after primal
+  // reconstruction; the later dual QR can use their storage on the same stream.
+  workspace->dual_parameter_arena.ReserveReusing(
+      workspace->reduction_layout_arena.get(),
+      workspace->reduction_layout_arena.count(),
+      workspace->dual_parameter_layout_bytes);
+  if (workspace->dual_parameter_layout_ready &&
+      previous == workspace->dual_parameter_arena.get())
+    return false;
+  DenseLayoutCursor bind(workspace->dual_parameter_arena.get());
+  layout(bind);
+  Require(bind.bytes() == workspace->dual_parameter_layout_bytes,
+          "internal CUDA dual parameter layout mismatch");
+  workspace->dual_parameter_layout_ready = true;
+  return true;
+}
+
+bool PrepareStateDualStorage(const Problem &problem,
+                             WorkspaceStorage *workspace) {
+  const std::size_t stages = problem.stages.size();
+  bool matches = workspace->state_dual_layout_key.size() == stages;
+  for (std::size_t stage = 0; stage < stages && matches; ++stage)
+    matches &= workspace->state_dual_layout_key[stage] ==
+               workspace->host_dual_dimensions[stage];
+  if (matches)
+    return false;
+  const auto layout = [&](DenseLayoutCursor &cursor) {
+    for (std::size_t stage = 0; stage < stages; ++stage) {
+      const std::size_t next = stage + 1;
+      const std::size_t constraints = next == stages
+                                          ? problem.terminal_E.rows()
+                                          : problem.stages[next].E.rows();
+      const std::size_t left = workspace->host_dual_dimensions[stage];
+      const std::size_t right =
+          next == stages ? 0 : workspace->host_dual_dimensions[next];
+      workspace->host_state_dual_params[stage] =
+          LayoutStateDualParameter(cursor, constraints, left, right);
+    }
+  };
+  // Feedback is no longer used after reconstruction. Active free-dual counts
+  // are known now, so fully determined multipliers need only their offsets.
+  BindDenseArena(&workspace->state_dual_parameter_arena,
+                 workspace->feedback_layout_arena.get(),
+                 workspace->feedback_layout_arena.count(), layout);
+  workspace->state_dual_layout_key.assign(
+      workspace->host_dual_dimensions.begin(),
+      workspace->host_dual_dimensions.end());
+  return true;
 }
 
 std::size_t ConfigureScratchMemory(const ScratchRequirements &scratch,
@@ -4306,20 +4306,27 @@ bool PrepareRelationStorage(const Problem &problem,
   std::vector<RelationCapacity> internal_capacity;
   PlanSuffixScanStorage(leaves, workspace->node_level_offsets, &leaf_capacity,
                         &internal_capacity);
-  std::size_t entries = 0;
+  std::size_t leaf_entries = 0;
+  std::size_t internal_entries = 0;
   for (const RelationCapacity &capacity : leaf_capacity)
-    CheckedAccumulate(capacity.Entries(), &entries, "relation layout");
+    CheckedAccumulate(capacity.Entries(), &leaf_entries,
+                      "relation leaf layout");
   for (const RelationCapacity &capacity : internal_capacity)
-    CheckedAccumulate(capacity.Entries(), &entries, "relation layout");
-  workspace->relation_data.Reserve(entries);
-  Scalar *cursor = workspace->relation_data.get();
+    CheckedAccumulate(capacity.Entries(), &internal_entries,
+                      "relation tree layout");
+  workspace->relation_leaf_data.Reserve(leaf_entries);
+  workspace->relation_internal_data.Reserve(internal_entries);
+  Scalar *cursor = workspace->relation_leaf_data.get();
   for (int node = 0; node < node_count; ++node)
     BindRelationStorage(&workspace->host_relation_leaves[node], &cursor,
                         leaf_capacity[node]);
+  Require(cursor == workspace->relation_leaf_data.get() + leaf_entries,
+          "internal CUDA relation leaf layout size mismatch");
+  cursor = workspace->relation_internal_data.get();
   for (std::size_t node = 0; node < internal_capacity.size(); ++node)
     BindRelationStorage(&workspace->host_relation_scan[node], &cursor,
                         internal_capacity[node]);
-  Require(cursor == workspace->relation_data.get() + entries,
+  Require(cursor == workspace->relation_internal_data.get() + internal_entries,
           "internal CUDA relation layout size mismatch");
   workspace->relation_layout_key = std::move(key);
   return true;
@@ -4356,7 +4363,12 @@ bool PrepareValueStorage(WorkspaceStorage *workspace, int stage_count,
   workspace->value_internal_offset = entries;
   for (const ValueCapacity &capacity : internal_capacity)
     CheckedAccumulate(capacity.Entries(), &entries, "value layout");
-  workspace->value_data.Reserve(entries);
+  // Feasibility leaves are dead after independent stage reduction. Value
+  // storage can reuse them; unusual dimension profiles use an exact fallback.
+  workspace->value_data.ReserveReusing(workspace->relation_leaf_data.get(),
+                                       workspace->relation_leaf_data.count(),
+                                       entries);
+  workspace->dual_layout_key.clear();
   Scalar *cursor = workspace->value_data.get();
   for (int node = 0; node < node_count; ++node)
     BindValueStorage(&workspace->host_value_leaves[node], &cursor,
@@ -4516,7 +4528,11 @@ bool PrepareDualStorage(WorkspaceStorage *workspace, int stage_count) {
   device_plan.Add(&workspace->dual_values, tree_size);
   device_plan.Add(&workspace->dual_relation_data, relation_entries);
   device_plan.Add(&workspace->dual_value_data, value_entries);
-  workspace->dual_layout_arena.Reserve(device_plan.bytes());
+  // Value suffixes and affine maps are dead after BuildDualParametersKernel.
+  workspace->dual_layout_arena.ReserveReusing(
+      reinterpret_cast<std::byte *>(workspace->value_data.get()),
+      DenseLayoutCursor::Product(workspace->value_data.count(), sizeof(Scalar)),
+      device_plan.bytes());
   ArenaCursor device_bind(workspace->dual_layout_arena.get());
   device_bind.Add(&workspace->dual_tree, tree_size);
   device_bind.Add(&workspace->dual_values, tree_size);
@@ -4583,7 +4599,10 @@ void PrepareProblemStructure(const Problem &problem, int device,
   // Arena slices may move whenever the structure changes. Rebuild every
   // pointer-bearing compact layout before any slice is uploaded or launched.
   workspace->relation_layout_key.clear();
-  workspace->stage_layout_key.clear();
+  workspace->feedback_control_layout_key.clear();
+  workspace->state_dual_layout_key.clear();
+  workspace->reduction_state_layout_key.clear();
+  workspace->dual_parameter_layout_ready = false;
   workspace->value_layout_key.clear();
   workspace->map_layout_key.clear();
   workspace->dual_layout_key.clear();
@@ -4723,46 +4742,12 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                   host_stages.size() * sizeof(PackedStage),
                                   cudaMemcpyHostToDevice, stream),
                   "upload stage metadata");
-        CudaCheck(cudaMemcpyAsync(control_params.get(),
-                                  workspace.host_control_params.data(),
-                                  workspace.host_control_params.size() *
-                                      sizeof(ControlParam),
-                                  cudaMemcpyHostToDevice, stream),
-                  "upload control-parameter layouts");
-        CudaCheck(cudaMemcpyAsync(reduced_stages.get(),
-                                  workspace.host_reduced_stages.data(),
-                                  workspace.host_reduced_stages.size() *
-                                      sizeof(ReducedStage),
-                                  cudaMemcpyHostToDevice, stream),
-                  "upload reduced-stage layouts");
-        CudaCheck(cudaMemcpyAsync(
-                      workspace.feedback.get(), workspace.host_feedback.data(),
-                      workspace.host_feedback.size() * sizeof(Feedback),
-                      cudaMemcpyHostToDevice, stream),
-                  "upload feedback layouts");
-        CudaCheck(cudaMemcpyAsync(workspace.dual_params.get(),
-                                  workspace.host_dual_params.data(),
-                                  workspace.host_dual_params.size() *
-                                      sizeof(DualParam),
-                                  cudaMemcpyHostToDevice, stream),
-                  "upload dual-parameter layouts");
-        CudaCheck(cudaMemcpyAsync(workspace.state_dual_params.get(),
-                                  workspace.host_state_dual_params.data(),
-                                  workspace.host_state_dual_params.size() *
-                                      sizeof(StateDualParam),
-                                  cudaMemcpyHostToDevice, stream),
-                  "upload state-dual layouts");
       }
       CudaCheck(cudaMemcpyAsync(
                     state_params.get(), workspace.host_state_params.data(),
                     workspace.host_state_params.size() * sizeof(StateParam),
                     cudaMemcpyHostToDevice, stream),
                 "upload state-parameter layouts");
-      CudaCheck(cudaMemcpyAsync(reduced_terminal.get(),
-                                workspace.host_reduced_terminal.data(),
-                                sizeof(ReducedTerminal), cudaMemcpyHostToDevice,
-                                stream),
-                "upload reduced-terminal layout");
       CudaCheck(cudaMemcpyAsync(device_terminal.get(), &terminal,
                                 sizeof(PackedTerminal), cudaMemcpyHostToDevice,
                                 stream),
@@ -4919,6 +4904,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       primal_layout_matches &= workspace.map_layout_key[node] == dimension;
   }
   const bool primal_layout_changed = !primal_layout_matches;
+  const bool reduction_layout_changed =
+      PrepareReductionStorage(problem, &workspace);
   if (primal_layout_changed) {
     workspace.host_reduced_state_offsets[0] = 0;
     for (int index = 0; index < node_count; ++index) {
@@ -4939,6 +4926,27 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   result.timings.reduction_ms = TimeGpuKernels(
       workspace, stream,
       [&] {
+        if (reduction_layout_changed) {
+          if (stage_count > 0) {
+            CudaCheck(cudaMemcpyAsync(control_params.get(),
+                                      workspace.host_control_params.data(),
+                                      workspace.host_control_params.size() *
+                                          sizeof(ControlParam),
+                                      cudaMemcpyHostToDevice, stream),
+                      "upload control-parameter layouts");
+            CudaCheck(cudaMemcpyAsync(reduced_stages.get(),
+                                      workspace.host_reduced_stages.data(),
+                                      workspace.host_reduced_stages.size() *
+                                          sizeof(ReducedStage),
+                                      cudaMemcpyHostToDevice, stream),
+                      "upload reduced-stage layouts");
+          }
+          CudaCheck(cudaMemcpyAsync(reduced_terminal.get(),
+                                    workspace.host_reduced_terminal.data(),
+                                    sizeof(ReducedTerminal),
+                                    cudaMemcpyHostToDevice, stream),
+                    "upload reduced-terminal layout");
+        }
         if (primal_layout_changed) {
           CudaCheck(
               cudaMemcpyAsync(reduced_state_offsets.get(),
@@ -4996,6 +5004,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   }
 
   const auto primal_layout_start = std::chrono::steady_clock::now();
+  const bool feedback_layout_changed = PrepareFeedbackStorage(
+      &workspace, stage_count, !reduction_layout_changed);
   const bool value_layout_changed =
       PrepareValueStorage(&workspace, stage_count, primal_layout_matches);
   const bool map_layout_changed =
@@ -5045,6 +5055,13 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   QueueTimedKernels(
       workspace, TimingSlot::kRiccati, stream,
       [&] {
+        if (stage_count > 0 && feedback_layout_changed) {
+          CudaCheck(
+              cudaMemcpyAsync(feedback.get(), workspace.host_feedback.data(),
+                              workspace.host_feedback.size() * sizeof(Feedback),
+                              cudaMemcpyHostToDevice, stream),
+              "upload feedback layouts");
+        }
         if (value_layout_changed) {
           CudaCheck(cudaMemcpyAsync(value_a.get(),
                                     workspace.host_value_leaves.data(),
@@ -5207,9 +5224,23 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     }
   };
   if (stage_count > 0) {
+    const auto parameter_layout_start = std::chrono::steady_clock::now();
+    const bool parameter_layout_changed =
+        PrepareDualParameterStorage(problem, &workspace);
+    result.timings.layout_ms +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - parameter_layout_start)
+            .count();
     QueueTimedKernels(
         workspace, TimingSlot::kDualParameters, stream,
         [&] {
+          if (parameter_layout_changed) {
+            CudaCheck(cudaMemcpyAsync(
+                          dual_params.get(), workspace.host_dual_params.data(),
+                          workspace.host_dual_params.size() * sizeof(DualParam),
+                          cudaMemcpyHostToDevice, stream),
+                      "upload dual-parameter layouts");
+          }
           CudaCheck(
               cudaMemsetAsync(dual_scan_needed.get(), 0, sizeof(int), stream),
               "initialize dual scan flag");
@@ -5262,6 +5293,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       return result;
     }
     const auto dual_layout_start = std::chrono::steady_clock::now();
+    const bool state_dual_layout_changed =
+        PrepareStateDualStorage(problem, &workspace);
     const bool dual_layout_changed =
         host_dual_scan_needed != 0 ? PrepareDualStorage(&workspace, stage_count)
                                    : false;
@@ -5277,6 +5310,14 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         workspace, TimingSlot::kMultiplierRecovery, stream,
         [&] {
           initialize_multiplier_outputs();
+          if (state_dual_layout_changed) {
+            CudaCheck(cudaMemcpyAsync(state_dual_params.get(),
+                                      workspace.host_state_dual_params.data(),
+                                      workspace.host_state_dual_params.size() *
+                                          sizeof(StateDualParam),
+                                      cudaMemcpyHostToDevice, stream),
+                      "upload state-dual layouts");
+          }
           if (dual_layout_changed) {
             CudaCheck(cudaMemcpyAsync(dual_tree.get(),
                                       workspace.host_dual_tree.data(),

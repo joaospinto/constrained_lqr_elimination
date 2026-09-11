@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <iterator>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "../benchmarks/paper_cases.h"
 #include "../benchmarks/scaling_problem.h"
 #include "../src/cuda_solver.cu"
+#include "../src/cuda_stage_layout.h"
 #include "adversarial_test_support.h"
 #include "cuda_jax_problem.h"
 
@@ -24,6 +26,33 @@ using clqr::Stage;
 using clqr::Vector;
 using namespace clqr::cuda;
 using namespace clqr::cuda::detail;
+
+// Exercise the production dense layout with exact fallback allocations and
+// the same phase lifetime aliases as the native host launcher.
+struct PhaseStorage {
+  std::vector<std::byte> owned;
+  std::byte *data = nullptr;
+  std::size_t bytes = 0;
+
+  template <typename Layout>
+  void Bind(std::byte *scratch, std::size_t capacity, Layout layout) {
+    DenseLayoutCursor plan;
+    layout(plan);
+    bytes = plan.bytes();
+    if (bytes <= capacity) {
+      data = scratch;
+    } else {
+      owned.resize(bytes);
+      data = owned.data();
+    }
+    if (bytes > 0)
+      std::fill_n(data, bytes, std::byte{0xa5});
+    DenseLayoutCursor bind(data);
+    layout(bind);
+    if (bind.bytes() != bytes)
+      std::abort();
+  }
+};
 
 std::size_t MaximumScratchBytes(const ScratchRequirements &scratch) {
   return std::max({scratch.primal_leaf, scratch.primal_relation,
@@ -1844,22 +1873,12 @@ void RunEmulation(const Problem &problem, const std::string &name,
   }
   Relation *suffix = relation_a.data();
   std::vector<StateParam> state_params(nodes);
-  std::vector<int> state_free_columns(static_cast<std::size_t>(nodes) *
-                                      kTestStateCapacity);
-  std::vector<Scalar> state_t(static_cast<std::size_t>(nodes) *
-                              kTestStateCapacity);
-  std::vector<Scalar> state_T(static_cast<std::size_t>(nodes) *
-                              kTestStateCapacity * kTestStateCapacity);
-  for (int node = 0; node < nodes; ++node) {
-    state_params[node].free_columns =
-        state_free_columns.data() +
-        static_cast<std::size_t>(node) * kTestStateCapacity;
-    state_params[node].T = state_T.data() + static_cast<std::size_t>(node) *
-                                                kTestStateCapacity *
-                                                kTestStateCapacity;
-    state_params[node].t =
-        state_t.data() + static_cast<std::size_t>(node) * kTestStateCapacity;
-  }
+  PhaseStorage state_storage;
+  state_storage.Bind(nullptr, 0, [&](DenseLayoutCursor &cursor) {
+    for (int node = 0; node < nodes; ++node)
+      state_params[node] = LayoutStateParameter(
+          cursor, node == horizon ? terminal.n : stages[node].n);
+  });
   LaunchScratch(nodes, [&] {
     EMULATED_SCRATCH_KERNEL(StateParamKernel, suffix, nodes,
                             state_params.data(), nullptr, &status,
@@ -1871,59 +1890,22 @@ void RunEmulation(const Problem &problem, const std::string &name,
 
   std::vector<ControlParam> control_params(horizon);
   std::vector<ReducedStage> reduced(horizon);
-  std::vector<int> control_free_columns(static_cast<std::size_t>(horizon) *
-                                        kTestControlCapacity);
-  std::vector<Scalar> control_Y(static_cast<std::size_t>(horizon) *
-                                kTestControlCapacity * kTestStateCapacity);
-  std::vector<Scalar> control_Z(static_cast<std::size_t>(horizon) *
-                                kTestControlCapacity * kTestControlCapacity);
-  std::vector<Scalar> control_y(static_cast<std::size_t>(horizon) *
-                                kTestControlCapacity);
-  std::vector<Scalar> reduced_A(static_cast<std::size_t>(horizon) *
-                                kTestStateCapacity * kTestStateCapacity);
-  std::vector<Scalar> reduced_B(static_cast<std::size_t>(horizon) *
-                                kTestStateCapacity * kTestControlCapacity);
-  std::vector<Scalar> reduced_c(static_cast<std::size_t>(horizon) *
-                                kTestStateCapacity);
-  std::vector<Scalar> reduced_Q(static_cast<std::size_t>(horizon) *
-                                kTestStateCapacity * kTestStateCapacity);
-  std::vector<Scalar> reduced_R(static_cast<std::size_t>(horizon) *
-                                kTestControlCapacity * kTestControlCapacity);
-  std::vector<Scalar> reduced_M(static_cast<std::size_t>(horizon) *
-                                kTestStateCapacity * kTestControlCapacity);
-  std::vector<Scalar> reduced_q(static_cast<std::size_t>(horizon) *
-                                kTestStateCapacity);
-  std::vector<Scalar> reduced_r(static_cast<std::size_t>(horizon) *
-                                kTestControlCapacity);
-  for (int stage = 0; stage < horizon; ++stage) {
-    const std::size_t index = static_cast<std::size_t>(stage);
-    control_params[stage].free_columns =
-        control_free_columns.data() + index * kTestControlCapacity;
-    control_params[stage].Y =
-        control_Y.data() + index * kTestControlCapacity * kTestStateCapacity;
-    control_params[stage].Z =
-        control_Z.data() + index * kTestControlCapacity * kTestControlCapacity;
-    control_params[stage].y = control_y.data() + index * kTestControlCapacity;
-    reduced[stage].A =
-        reduced_A.data() + index * kTestStateCapacity * kTestStateCapacity;
-    reduced[stage].B =
-        reduced_B.data() + index * kTestStateCapacity * kTestControlCapacity;
-    reduced[stage].c = reduced_c.data() + index * kTestStateCapacity;
-    reduced[stage].Q =
-        reduced_Q.data() + index * kTestStateCapacity * kTestStateCapacity;
-    reduced[stage].R =
-        reduced_R.data() + index * kTestControlCapacity * kTestControlCapacity;
-    reduced[stage].M =
-        reduced_M.data() + index * kTestStateCapacity * kTestControlCapacity;
-    reduced[stage].q = reduced_q.data() + index * kTestStateCapacity;
-    reduced[stage].r = reduced_r.data() + index * kTestControlCapacity;
-  }
   ReducedTerminal reduced_terminal{};
-  std::vector<Scalar> reduced_terminal_Q(
-      static_cast<std::size_t>(kTestStateCapacity) * kTestStateCapacity);
-  std::vector<Scalar> reduced_terminal_q(kTestStateCapacity);
-  reduced_terminal.Q = reduced_terminal_Q.data();
-  reduced_terminal.q = reduced_terminal_q.data();
+  PhaseStorage reduction_storage;
+  reduction_storage.Bind(
+      reinterpret_cast<std::byte *>(relation_b_storage.data()),
+      relation_b_storage.size() * sizeof(Scalar),
+      [&](DenseLayoutCursor &cursor) {
+        for (int stage = 0; stage < horizon; ++stage) {
+          const int n = state_params[stage].reduced_dim;
+          const int next = state_params[stage + 1].reduced_dim;
+          const int m = stages[stage].m;
+          control_params[stage] = LayoutControlParameter(cursor, m, n);
+          reduced[stage] = LayoutReducedStage(cursor, n, next, m);
+        }
+        reduced_terminal =
+            LayoutReducedTerminal(cursor, state_params[horizon].reduced_dim);
+      });
   std::vector<Scalar> reduced_initial(kTestStateCapacity);
   LaunchScratch(horizon, [&] {
     EMULATED_SCRATCH_KERNEL(
@@ -1957,8 +1939,9 @@ void RunEmulation(const Problem &problem, const std::string &name,
 
   std::vector<ValueElement> value_a(nodes),
       value_b(std::max(node_tree_size - nodes, 1));
-  std::vector<Scalar> value_a_storage(static_cast<std::size_t>(nodes) *
-                                      kTestValueEntries);
+  std::span<Scalar> value_a_storage(relation_a_storage.data(),
+                                    static_cast<std::size_t>(nodes) *
+                                        kTestValueEntries);
   std::vector<Scalar> value_b_storage(value_b.size() * kTestValueEntries);
   std::fill(value_a_storage.begin(), value_a_storage.end(), Scalar{17});
   std::fill(value_b_storage.begin(), value_b_storage.end(), Scalar{19});
@@ -1975,32 +1958,22 @@ void RunEmulation(const Problem &problem, const std::string &name,
                             kTestStateCapacity, kTestStateCapacity);
   }
   std::vector<Feedback> feedback(horizon);
-  std::vector<Scalar> feedback_K(static_cast<std::size_t>(horizon) *
-                                 kTestControlCapacity * kTestStateCapacity);
-  std::vector<Scalar> feedback_k(static_cast<std::size_t>(horizon) *
-                                 kTestControlCapacity);
-  std::vector<Scalar> feedback_control_factor(
-      static_cast<std::size_t>(horizon) * kTestControlCapacity *
-      kTestControlCapacity);
-  std::vector<Scalar> feedback_transition(static_cast<std::size_t>(horizon) *
-                                          kTestStateCapacity *
-                                          kTestStateCapacity);
-  std::vector<Scalar> feedback_offset(static_cast<std::size_t>(horizon) *
-                                      kTestStateCapacity);
-  for (int stage = 0; stage < horizon; ++stage) {
-    const std::size_t index = static_cast<std::size_t>(stage);
-    feedback[stage].K =
-        feedback_K.data() + index * kTestControlCapacity * kTestStateCapacity;
-    feedback[stage].k = feedback_k.data() + index * kTestControlCapacity;
-    feedback[stage].control_factor =
-        feedback_control_factor.data() +
-        index * kTestControlCapacity * kTestControlCapacity;
-    feedback[stage].transition =
-        feedback_transition.data() +
-        index * kTestStateCapacity * kTestStateCapacity;
-    feedback[stage].offset =
-        feedback_offset.data() + index * kTestStateCapacity;
+  PhaseStorage feedback_storage;
+  std::byte *feedback_scratch = nullptr;
+  std::size_t feedback_capacity = 0;
+  if (reduction_storage.data ==
+      reinterpret_cast<std::byte *>(relation_b_storage.data())) {
+    feedback_scratch = reduction_storage.data + reduction_storage.bytes;
+    feedback_capacity =
+        relation_b_storage.size() * sizeof(Scalar) - reduction_storage.bytes;
   }
+  feedback_storage.Bind(
+      feedback_scratch, feedback_capacity, [&](DenseLayoutCursor &cursor) {
+        for (int stage = 0; stage < horizon; ++stage)
+          feedback[stage] =
+              LayoutFeedback(cursor, reduced[stage].n, reduced[stage].next_n,
+                             reduced[stage].m);
+      });
   LaunchScratch(nodes, [&] {
     EMULATED_SCRATCH_KERNEL(BuildValueElementsKernel, reduced.data(),
                             &reduced_terminal, horizon, rank_tolerance,
@@ -2237,36 +2210,15 @@ void RunEmulation(const Problem &problem, const std::string &name,
       multiplier_rank_tolerance, kMultiplierConsistencyTolerancePerTreeLevel);
   std::vector<DualParam> dual_params(horizon);
   std::vector<StateDualParam> state_dual_params(horizon);
-  std::vector<int> dual_free_columns(static_cast<std::size_t>(horizon) *
-                                     kTestDualCapacity);
-  std::vector<Scalar> dual_basis(static_cast<std::size_t>(horizon) *
-                                 kTestDualCapacity * kTestDualCapacity);
-  std::vector<Scalar> dual_offset(static_cast<std::size_t>(horizon) *
-                                  kTestDualCapacity);
-  std::vector<Scalar> state_dual_offset(static_cast<std::size_t>(horizon) *
-                                        kTestStateConstraintCapacity);
-  std::vector<Scalar> state_dual_left(static_cast<std::size_t>(horizon) *
-                                      kTestStateConstraintCapacity *
-                                      kTestDualCapacity);
-  std::vector<Scalar> state_dual_right(static_cast<std::size_t>(horizon) *
-                                       kTestStateConstraintCapacity *
-                                       kTestDualCapacity);
-  for (int stage = 0; stage < horizon; ++stage) {
-    const std::size_t index = static_cast<std::size_t>(stage);
-    dual_params[stage].free_columns =
-        dual_free_columns.data() + index * kTestDualCapacity;
-    dual_params[stage].basis =
-        dual_basis.data() + index * kTestDualCapacity * kTestDualCapacity;
-    dual_params[stage].offset = dual_offset.data() + index * kTestDualCapacity;
-    state_dual_params[stage].offset =
-        state_dual_offset.data() + index * kTestStateConstraintCapacity;
-    state_dual_params[stage].left =
-        state_dual_left.data() +
-        index * kTestStateConstraintCapacity * kTestDualCapacity;
-    state_dual_params[stage].right =
-        state_dual_right.data() +
-        index * kTestStateConstraintCapacity * kTestDualCapacity;
-  }
+  PhaseStorage dual_parameter_storage;
+  dual_parameter_storage.Bind(reduction_storage.data, reduction_storage.bytes,
+                              [&](DenseLayoutCursor &cursor) {
+                                for (int stage = 0; stage < horizon; ++stage)
+                                  dual_params[stage] = LayoutDualParameter(
+                                      cursor, stages[stage].next_n +
+                                                  stages[stage].mixed);
+                              });
+  PhaseStorage state_dual_storage;
   std::vector<DualRelation> dual_tree(stage_tree_size);
   std::vector<DualNodeValue> dual_values(stage_tree_size);
   std::vector<Scalar> dual_tree_storage(
@@ -2296,6 +2248,17 @@ void RunEmulation(const Problem &problem, const std::string &name,
           multiplier_rank_tolerance, multiplier_consistency_tolerance,
           dual_params.data(), &dual_scan_needed, nullptr, &status);
     });
+    state_dual_storage.Bind(
+        feedback_storage.data, feedback_storage.bytes,
+        [&](DenseLayoutCursor &cursor) {
+          for (int stage = 0; stage < horizon; ++stage) {
+            const int next = stage + 1;
+            state_dual_params[stage] = LayoutStateDualParameter(
+                cursor, next == horizon ? terminal.state : stages[next].state,
+                dual_params[stage].free_dim,
+                next == horizon ? 0 : dual_params[next].free_dim);
+          }
+        });
     LaunchScratch(horizon, [&] {
       EMULATED_SCRATCH_KERNEL(
           BuildDualParameterRelationsKernel, stages.data(), &terminal,
