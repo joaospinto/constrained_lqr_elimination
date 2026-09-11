@@ -1573,6 +1573,35 @@ void FiniteInputValidationCase() {
          "device input validation accepts finite values");
 }
 
+void ReducedScratchDimensionsCase() {
+  ScratchRequirements physical, reduced;
+  IncludeReducedStageScratch(64, 64, 32, &physical);
+  IncludeReducedStageScratch(48, 48, 8, &reduced);
+  Expect(physical.value_leaf == 5120 * sizeof(Scalar) &&
+             reduced.value_leaf == 832 * sizeof(Scalar),
+         "value leaves use reduced control and state dimensions");
+  Expect(physical.feedback == 9216 * sizeof(Scalar) &&
+             reduced.feedback == 3136 * sizeof(Scalar),
+         "feedback uses reduced control and state dimensions");
+  IncludeReducedStageScratch(0, 0, 0, &reduced);
+  Expect(reduced.value_leaf == 832 * sizeof(Scalar) &&
+             reduced.feedback == 3136 * sizeof(Scalar),
+         "empty stages preserve the largest reduced scratch requirement");
+  for (std::size_t n : {0, 1, 3, 16, 64}) {
+    for (std::size_t m : {0, 1, 4, 32}) {
+      ScratchRequirements bound;
+      IncludeReducedStageScratch(n, n, m, &bound);
+      for (std::size_t active = 0; active <= n; ++active) {
+        ScratchRequirements actual;
+        IncludeReducedStageScratch(active, active / 2, m / 2, &actual);
+        Expect(actual.value_leaf <= bound.value_leaf &&
+                   actual.feedback <= bound.feedback,
+               "active reduced scratch fits the physical reservation");
+      }
+    }
+  }
+}
+
 void DirectDeviceInputCase() {
   constexpr std::size_t n = 3, mixed = 2, state = 3;
   for (int horizon : {0, 3}) {
@@ -2106,10 +2135,16 @@ void RunEmulation(const Problem &problem, const std::string &name,
               LayoutFeedback(cursor, reduced[stage].n, reduced[stage].next_n,
                              reduced[stage].m);
       });
+  ScratchRequirements reduced_scratch;
+  for (const ReducedStage &stage : reduced)
+    IncludeReducedStageScratch(stage.n, stage.next_n, stage.m, &reduced_scratch);
   LaunchScratch(nodes, [&] {
+    g_emulated_block_scratch_bytes = 0;
     EMULATED_SCRATCH_KERNEL(BuildValueElementsKernel, reduced.data(),
                             &reduced_terminal, horizon, rank_tolerance,
                             value_a.data(), &status);
+    Expect(g_emulated_block_scratch_bytes <= reduced_scratch.value_leaf,
+           name + " value-leaf kernel fits the active-dimension scratch plan");
   });
   if (FinishAllowedDeviceFailure(status, name, "value base", allowed_failure))
     return;
@@ -2157,8 +2192,11 @@ void RunEmulation(const Problem &problem, const std::string &name,
   Expect(g_value_matrix_factorizations == g_value_matrix_combinations,
          name + " uses exactly one LU factorization per matrix composition");
   LaunchScratch(horizon, [&] {
+    g_emulated_block_scratch_bytes = 0;
     EMULATED_SCRATCH_KERNEL(MatrixFeedbackKernel, reduced.data(), value_suffix,
                             horizon, rank_tolerance, feedback.data(), &status);
+    Expect(g_emulated_block_scratch_bytes <= reduced_scratch.feedback,
+           name + " feedback kernel fits the active-dimension scratch plan");
   });
   if (FinishAllowedDeviceFailure(status, name, "feedback solve",
                                  allowed_failure))
@@ -2623,6 +2661,7 @@ int main(int argc, char **argv) {
   PivotSelectionOrderCase();
   CoordinatePivotingCase();
   FiniteInputValidationCase();
+  ReducedScratchDimensionsCase();
   DirectDeviceInputCase();
   DeviceObjectiveCase();
   PivotedLuMultiRhsCase();

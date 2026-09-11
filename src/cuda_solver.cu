@@ -663,6 +663,23 @@ std::size_t StateParameterScratchBytes(std::size_t variables,
   return size.bytes;
 }
 
+void IncludeReducedStageScratch(std::size_t n, std::size_t next, std::size_t m,
+                                ScratchRequirements *result) {
+  ScratchSize value_leaf;
+  value_leaf.Add<Scalar>(ScratchCheckedProduct(m, m, "value-leaf workspace"));
+  value_leaf.Add<Scalar>(ScratchCheckedProduct(
+      m, ScratchCheckedSum({n, next}, "value-leaf workspace"),
+      "value-leaf workspace"));
+  result->value_leaf = std::max(result->value_leaf, value_leaf.bytes);
+  ScratchSize feedback;
+  const auto columns = ScratchCheckedSum({m, n}, "feedback workspace");
+  feedback.Add<Scalar>(ScratchCheckedProduct(m, columns, "feedback workspace"));
+  if (m > 0)
+    feedback.Add<Scalar>(
+        ScratchCheckedProduct(next, columns, "feedback workspace"));
+  result->feedback = std::max(result->feedback, feedback.bytes);
+}
+
 ScratchRequirements PlanScratch(const Problem &problem) {
   ScratchRequirements result;
   const std::size_t stage_count = problem.stages.size();
@@ -707,22 +724,7 @@ ScratchRequirements PlanScratch(const Problem &problem) {
                                                "reduction kernel workspace"),
             StageHessianTransformScratchBytes(stage_variables, stage_variables,
                                               "stage Hessian workspace")));
-    ScratchSize value_leaf;
-    value_leaf.Add<Scalar>(ScratchCheckedProduct(m, m, "value-leaf workspace"));
-    value_leaf.Add<Scalar>(ScratchCheckedProduct(
-        m, ScratchCheckedSum({n, next}, "value-leaf workspace"),
-        "value-leaf workspace"));
-    result.value_leaf = std::max(result.value_leaf, value_leaf.bytes);
-    ScratchSize feedback;
-    feedback.Add<Scalar>(ScratchCheckedProduct(
-        m, ScratchCheckedSum({m, n}, "feedback workspace"),
-        "feedback workspace"));
-    if (m > 0) {
-      feedback.Add<Scalar>(ScratchCheckedProduct(
-          next, ScratchCheckedSum({m, n}, "feedback workspace"),
-          "feedback workspace"));
-    }
-    result.feedback = std::max(result.feedback, feedback.bytes);
+    IncludeReducedStageScratch(n, next, m, &result);
     result.affine_terms =
         std::max(result.affine_terms, AffineTermsScratchBytes(next));
 
@@ -4091,6 +4093,25 @@ std::size_t ConfigureScratchMemory(const ScratchRequirements &scratch,
   return global_bytes;
 }
 
+void RefineReducedScratchMemory(WorkspaceStorage *workspace, int stage_count) {
+  // State and control ranks are now known. Keep the physical-dimension plan
+  // for earlier phases, but do not charge the reduced kernels for eliminated
+  // coordinates: that can unnecessarily force shared scratch into global RAM.
+  ScratchRequirements scratch = workspace->scratch;
+  scratch.value_leaf = 0;
+  scratch.feedback = 0;
+  for (int stage = 0; stage < stage_count; ++stage) {
+    IncludeReducedStageScratch(
+        workspace->host_state_dimensions[2 * stage + 1],
+        workspace->host_state_dimensions[2 * stage + 3],
+        workspace->host_control_dimensions[2 * stage + 1], &scratch);
+  }
+  const std::size_t global_bytes = ConfigureScratchMemory(
+      scratch, workspace->device, stage_count, &workspace->scratch_launches);
+  Require(global_bytes <= workspace->global_scratch.count(),
+          "active CUDA scratch exceeds its physical-dimension reservation");
+}
+
 void BuildCompactOffsets(const Problem &problem, WorkspaceStorage *workspace) {
   auto &state = workspace->host_state_offsets;
   auto &control = workspace->host_control_offsets;
@@ -5112,6 +5133,8 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   const auto primal_layout_start = std::chrono::steady_clock::now();
   const bool feedback_layout_changed = PrepareFeedbackStorage(
       &workspace, stage_count, !reduction_layout_changed);
+  if (feedback_layout_changed)
+    RefineReducedScratchMemory(&workspace, stage_count);
   const bool value_layout_changed =
       PrepareValueStorage(&workspace, stage_count, primal_layout_matches);
   const bool map_layout_changed =
