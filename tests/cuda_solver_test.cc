@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "../benchmarks/cuda_benchmark_problem.h"
+#include "../benchmarks/scaling_problem.h"
 #include "clqr/cuda.h"
 
 namespace {
@@ -422,6 +423,25 @@ void CompareWithCpu(const Problem &problem, const std::string &name,
   }
 }
 
+void OptinSharedMemoryCase() {
+  const Problem problem =
+      clqr::benchmark::MakeScalingProblem(8, 24, 12, 3, 6).problem;
+  clqr::cuda::Workspace workspace;
+  clqr::cuda::Solution solution;
+  CompareWithCpu(problem, "opt-in or global scratch", nullptr, &workspace,
+                 &solution);
+  CompareWithCpu(clqr::benchmark::MakeScalingProblem(8, 8, 4, 1, 2).problem,
+                 "shared-memory workspace shrinks", nullptr, &workspace,
+                 &solution);
+  CompareWithCpu(problem, "shared-memory workspace grows again", nullptr,
+                 &workspace, &solution);
+  for (const std::size_t n : {32, 64})
+    CompareWithCpu(
+        clqr::benchmark::MakeScalingProblem(8, n, n / 2, n / 8, n / 4).problem,
+        "large-state scratch n=" + std::to_string(n), nullptr, &workspace,
+        &solution);
+}
+
 void NonPositiveDefiniteReducedControlCostCase() {
   Problem problem;
   problem.initial_state = Vector{0.4};
@@ -635,6 +655,7 @@ int main() {
                  "exact dual-relation scratch layout");
   CompareWithCpu(PathologicalScratchProblem(),
                  "topology-tight 45-to-0 scratch planning");
+  OptinSharedMemoryCase();
   const std::size_t many_mixed_rows = 3;
   CompareWithCpu(
       GeneratedProblem(102, 5, 4, 1, many_mixed_rows, ConstraintMode::kMixed),

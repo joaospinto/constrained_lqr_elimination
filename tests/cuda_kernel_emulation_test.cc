@@ -793,6 +793,22 @@ void TerminalReductionScratchPaddingCase() {
              std::abs(reduced_q[0] - Scalar{0.6}) < kTolerance,
          "scalar terminal reduction preserves the staged Hessian and "
          "gradient");
+
+  // Exercise the production global pointer path with explicit guards and
+  // neighboring block slices, not just the emulation-owned backing store.
+  constexpr std::size_t stride = 16;
+  alignas(16) unsigned char guarded[5 * stride];
+  std::fill(std::begin(guarded), std::end(guarded), 0xa5);
+  blockIdx.x = 2;
+  ReduceTerminalKernel<true>(&terminal, &param, 0, &reduced,
+                             guarded + stride, stride);
+  for (std::size_t i = 0; i < sizeof(guarded); ++i)
+    if (i < 3 * stride || i >= 4 * stride)
+      Expect(guarded[i] == 0xa5, "global scratch changed another block or guard");
+  Expect(std::abs(reduced_Q[0] - Scalar{2}) < kTolerance &&
+             std::abs(reduced_q[0] - Scalar{0.6}) < kTolerance,
+         "explicit global scratch preserves terminal reduction");
+  blockIdx.x = 0;
 }
 
 void DualRelationLeafScratchSizeCase() {
@@ -847,6 +863,12 @@ Problem PathologicalScratchProblem() {
 }
 
 void ScratchPlannerTopologyCase() {
+  const auto optin_problem =
+      clqr::benchmark::MakeScalingProblem(8, 24, 12, 3, 6).problem;
+  const std::size_t optin_bytes =
+      sizeof(Scalar) * (16 * 24 * 24 + 10 * 24) + 8 * 4 * 24 + 40;
+  Expect(PlanScratch(optin_problem).Maximum() == optin_bytes,
+         "native opt-in fixture uses the predicted shared-memory footprint");
   constexpr std::size_t kUsableP100SharedBytes = 48 * 1024 - 256;
   const ScratchRequirements pathological =
       PlanScratch(PathologicalScratchProblem());
@@ -2412,6 +2434,8 @@ int main(int argc, char **argv) {
   RunEmulation(
       UniformProblem(1800, 3, kTestStateCapacity, kTestControlCapacity),
       "maximum-active-dimension", false, false);
+  RunEmulation(clqr::benchmark::MakeScalingProblem(8, 24, 12, 3, 6).problem,
+               "opt-in-shared-memory-fixture", true, true);
   RunEmulation(ZeroControlStateConstraintProblem(), "zero-control", true,
                false);
   RunEmulation(ExactDualRelationScratchProblem(), "exact-dual-relation-scratch",

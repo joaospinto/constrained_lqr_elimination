@@ -28,6 +28,8 @@ py_test(
     main = "tests/notebook_paper_test.py",
     data = [
         "notebooks/kaggle_paper_comparison.ipynb",
+        "scripts/benchmark_options.sh",
+        "scripts/notebook_bazel.sh",
         "scripts/paper_benchmarks.sh",
     ],
 )
@@ -148,6 +150,17 @@ cc_binary(
         ":fp32": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
+)
+
+cc_binary(
+    name = "clqr_paper_cpu_benchmark",
+    srcs = ["benchmarks/paper_benchmark.cc", "benchmarks/paper_cases.h", "benchmarks/scaling_problem.h"],
+    tags = ["manual"],
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [":clqr"],
 )
 
 cc_binary(
@@ -299,6 +312,7 @@ cuda_library(
         "include/clqr/cuda.h",
         "src/cuda_device_io.h",
         "src/cuda_internal.h",
+        "src/cuda_shared_memory.h",
     ],
     alwayslink = True,
     copts = [
@@ -317,6 +331,7 @@ cc_test(
     name = "cuda_solver_test",
     srcs = [
         "benchmarks/cuda_benchmark_problem.h",
+        "benchmarks/scaling_problem.h",
         "tests/cuda_solver_test.cc",
     ],
     tags = [
@@ -324,7 +339,10 @@ cc_test(
         "requires-gpu",
     ],
     target_compatible_with = requires_cuda(),
-    deps = [":clqr_cuda"],
+    deps = [
+        ":clqr_cuda",
+        "@rules_cuda//cuda:runtime",
+    ],
 )
 
 cc_test(
@@ -411,6 +429,22 @@ cc_library(
     ],
     textual_hdrs = ["src/cuda_solver.cu"],
     deps = [":clqr"],
+)
+
+cc_test(
+    name = "cuda_shared_memory_test",
+    srcs = [
+        "src/cuda_shared_memory.h",
+        "tests/cuda_shared_memory_test.cc",
+        "tests/emulated_cuda/cuda_runtime.h",
+    ],
+    includes = ["tests/emulated_cuda"],
+)
+
+py_test(
+    name = "cuda_shared_memory_source_audit_test",
+    srcs = ["tests/cuda_shared_memory_source_audit_test.py"],
+    data = ["src/cuda_solver.cu"],
 )
 
 cc_test(

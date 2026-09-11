@@ -215,18 +215,34 @@ def main(argv=None):
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--require-laine", action="store_true",
                         help="require both the author and corrected Laine measurements")
+    parser.add_argument("--backends", nargs="+", choices=(*SOURCES, *OPTIONAL_SOURCES),
+                        help="require only these explicitly selected backends")
+    parser.add_argument("--skip-original-table", action="store_true")
     parser.add_argument("--suite", default="all",
                         choices=("all", "smoke", "horizon", "dimension", "constraints"))
     args = parser.parse_args(argv)
     data = {}
+    if args.backends is not None and "clqr_cpu" not in args.backends:
+        parser.error("--backends must include clqr_cpu")
     for backend, name in SOURCES.items():
+        if args.backends is not None and backend not in args.backends:
+            continue
         if "cuda" in backend and not args.cuda:
             continue
         data[backend] = indexed(read_csv(args.results / name), backend)
     for backend, name in OPTIONAL_SOURCES.items():
-        if args.require_laine or (args.results / name).is_file():
+        requested = (backend in args.backends if args.backends is not None else
+                     args.require_laine or (args.results / name).is_file())
+        if requested:
             data[backend] = indexed(read_csv(args.results / name), backend)
     identities = validate_cases(data, json.loads((args.results / "cases.json").read_text()))
+    if args.suite == "all":
+        expected_cases = {
+            ("horizon", 2**exponent, n, n // 2, n // 8, n // 4)
+            for n in (8, 16, 24, 32, 48, 64) for exponent in range(5, 16)
+        }
+        if {identity[:-1] for identity in identities} != expected_cases:
+            raise ValueError(f"{args.suite} suite requires the complete 66-case (N,n) grid")
     report = summarize(data)
     (args.results / "summary.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     # One convenient long-form table retains all timings and errors. Do not
@@ -245,13 +261,11 @@ def main(argv=None):
         report["platform"] = (args.results / "platform.txt").read_text()
         report["gpus"] = read_csv(args.results / "gpu.csv")
         if args.suite == "all":
-            expected_cases = {
-                ("horizon", 2**exponent, n, n // 2, n // 8, n // 4)
-                for n in (8, 16) for exponent in range(5, 16)
-            }
-            if {identity[:-1] for identity in identities} != expected_cases:
-                raise ValueError("paper table requires the complete all-suite run")
-            (args.results / "comparison_table.tex").write_text(comparison_table(data))
+            table_backends = {"clqr_cpu", "gen_riccati", "factor_graph",
+                              "laine_author", "clqr_cuda", "clqr_jax_cuda"}
+            if table_backends <= data.keys():
+                (args.results / "comparison_table.tex").write_text(comparison_table(data))
+    if args.cuda and not args.skip_original_table:
         original = read_csv(args.results / "original_table.csv")
         expected = [2 ** exponent for exponent in range(5, 15)]
         if [int(row["N"]) for row in original] != expected:
@@ -271,7 +285,7 @@ def main(argv=None):
             pack_transfer_share_of_gap=packing / (wall - kernel) if wall > kernel else None,
             max_kkt_inf=max(numeric(row, field) for row in original
                             for field in ("cpp_kkt_residual", "cuda_kkt_residual")))
-        (args.results / "summary.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    (args.results / "summary.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     print(json.dumps(report, indent=2, allow_nan=False))
     # Numerical outcomes are measurements, including third-party failures.
     # Missing/malformed data still raises above; accuracy is not an exit gate.

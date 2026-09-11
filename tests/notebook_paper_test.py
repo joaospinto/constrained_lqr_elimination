@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -14,6 +16,100 @@ from scripts import notebook_paper
 
 
 class NotebookTest(unittest.TestCase):
+    def test_backend_switches_skip_fetch_build_and_execution(self):
+        root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
+        configurations = (
+            ({"CLQR_RUN_EXTERNAL": "0"}, set()),
+            ({"CLQR_RUN_EXTERNAL": "0", "CLQR_RUN_VANROYE": "1"},
+             {"blasfeo", "generalization_riccati"}),
+            ({"CLQR_RUN_YANG": "0"},
+             {"blasfeo", "generalization_riccati", "eigen", "laine_author"}),
+            ({}, {"blasfeo", "generalization_riccati", "gtsam", "factor_graph", "laine_author"}),
+        )
+        for overrides, expected in configurations:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                source = work / "source"
+                (source / "scripts").mkdir(parents=True)
+                for name in ("paper_benchmarks.sh", "benchmark_options.sh", "notebook_bazel.sh"):
+                    shutil.copy(root / "scripts" / name, source / "scripts" / name)
+                (source / ".bazelversion").write_text("9.1.1\n")
+                (source / "bazel-bin").mkdir()
+                tools = work / "tools"
+                tools.mkdir()
+                stub = work / "stub.py"
+                # Stand-ins exercise the real shell driver without network,
+                # nested Bazel, or reference compilation.
+                stub.write_text('''import os, sys, json
+from pathlib import Path
+name, *args = sys.argv[1:]
+with open(os.environ["CALL_LOG"], "a") as f:
+    f.write(json.dumps([name, *args]) + "\\n")
+if name == "git" and args[0] == "init":
+    Path(args[-1]).mkdir(parents=True)
+if name == "git" and "fetch" in args:
+    (Path(args[1]) / "revision").write_text(args[-1])
+if name == "git" and "rev-parse" in args:
+    revision = Path(args[1]) / "revision"
+    print(revision.read_text() if revision.exists() else "test-revision")
+if name == "df":
+    print("Filesystem 1024-blocks Used Available Capacity Mounted")
+    print("mock 20000000 100 19999900 1% /mock")
+if name == "cmake" and "-B" in args:
+    build = Path(args[args.index("-B") + 1])
+    build.mkdir(parents=True, exist_ok=True)
+    for exe in ("clqr_cpu_benchmark", "clqr_reference_benchmark",
+                "clqr_laine_benchmark", "clqr_laine_corrected_benchmark"):
+        target = build / exe
+        target.write_text(Path(os.environ["STUB_LAUNCHER"]).read_text())
+        target.chmod(0o755)
+''')
+                launcher = tools / "launcher"
+                launcher.write_text(
+                    '#!/bin/sh\nexec "' + sys.executable + '" "' + str(stub) +
+                    '" "${0##*/}" "$@"\n')
+                launcher.chmod(0o755)
+                for name in ("git", "cmake", "ctest", "bazel", "python3", "df", "sysctl"):
+                    (tools / name).symlink_to(launcher)
+                for name in ("clqr_paper_fixture", "clqr_paper_cpu_benchmark", "clqr_paper_jax_cpu_benchmark"):
+                    (source / "bazel-bin" / name).symlink_to(launcher)
+                log = work / "calls.jsonl"
+                env = {key: value for key, value in os.environ.items()
+                       if not key.startswith("CLQR_")}
+                env.update(PATH=str(tools) + os.pathsep + env["PATH"],
+                           CLQR_BAZEL=str(tools / "bazel"), CALL_LOG=str(log),
+                           STUB_LAUNCHER=str(launcher), CLQR_RUN_JAX="0",
+                           CLQR_RUN_TESTS="0", CLQR_RUN_SANITIZERS="0",
+                           CLQR_RUN_ORIGINAL_TABLE="0", **overrides)
+                result = subprocess.run(["bash", str(source / "scripts/paper_benchmarks.sh"),
+                                         str(work / "results")], env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls = [json.loads(line) for line in log.read_text().splitlines()]
+                fetched = {Path(call[-1]).name for call in calls
+                           if call[:2] == ["git", "init"]}
+                self.assertEqual(fetched, expected)
+                cmake_calls = [call for call in calls if call[0] == "cmake"]
+                self.assertEqual(bool(cmake_calls), bool(expected))
+                self.assertEqual(any("gtsam-build" in " ".join(call)
+                                     for call in cmake_calls), "gtsam" in expected)
+                self.assertFalse(any(call[0] == "ctest" for call in calls))
+                self.assertFalse(any("jax" in " ".join(call) for call in calls))
+                for method, checkout in (("laine", "laine_author"),
+                                          ("laine_corrected", "laine_author")):
+                    self.assertEqual(any(call[0] == f"clqr_{method}_benchmark" for call in calls),
+                                     checkout in expected)
+                options = (work / "results/benchmark_options.txt").read_text()
+                self.assertIn("CLQR_RUN_JAX=0", options)
+
+    def test_invalid_benchmark_switch_is_rejected(self):
+        root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"', "test", str(root / "scripts/benchmark_options.sh")],
+            env=dict(os.environ, CLQR_RUN_EXTERNAL="sometimes"), capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CLQR_RUN_EXTERNAL must be 0 or 1", result.stderr)
+
     def test_bazel_version_with_and_without_startup_options(self):
         root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
         driver = (root / "scripts/paper_benchmarks.sh").read_text()
@@ -110,6 +206,10 @@ class NotebookTest(unittest.TestCase):
         compile(code, "kaggle_paper_comparison.ipynb", "exec")
         self.assertIn('get("CLQR_REVISION", "main")', code)
         self.assertIn("notebook_paper.py", code)
+        for option in ("EXTERNAL", "JAX", "TESTS", "SANITIZERS", "ORIGINAL_TABLE"):
+            self.assertIn(f'setdefault("CLQR_RUN_{option}", "1")', code)
+        for method in ("VANROYE", "YANG", "LAINE", "CORRECTED_LAINE"):
+            self.assertIn(f'"{method}"', code)
 
 
 if __name__ == "__main__":

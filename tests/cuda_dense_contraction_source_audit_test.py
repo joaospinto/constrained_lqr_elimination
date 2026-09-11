@@ -85,7 +85,7 @@ def test_terminal_reduction_product_is_staged_cubic():
         "param.T[x * param.reduced_dim + a] *\n"
         "                 terminal.Q[x * terminal.n + y]"
     ) not in body
-    assert "scratch.terminal_reduction" in source
+    assert "X(ReduceTerminalKernel, terminal_reduction, 1)" in source
     assert "SharedScalarEntries(transform_entries)" in body
     assert "scratch_size.Add<Scalar>(shared_transform_entries)" in body
     assert "scratch.Take<Scalar>(shared_transform_entries)" in body

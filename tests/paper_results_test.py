@@ -20,6 +20,49 @@ def row(backend="clqr_cpu"):
 
 
 class ResultsTest(unittest.TestCase):
+    def test_selected_cuda_summary_preserves_platform_without_original_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            for backend, filename in (("clqr_cpu", "cpu_round1.csv"),
+                                      ("clqr_cuda", "cuda_host.csv")):
+                value = row(backend)
+                with (work / filename).open("w") as output:
+                    writer = csv.DictWriter(output, fieldnames=value.keys())
+                    writer.writeheader()
+                    writer.writerow(value)
+            (work / "cases.json").write_text(json.dumps([
+                {field: value[field] for field in results.KEY_FIELDS[:-1]}]))
+            (work / "platform.txt").write_text("test hardware")
+            (work / "gpu.csv").write_text("name,compute_cap\nTest GPU,6.0\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = results.main([str(work), "--cuda", "--suite", "smoke",
+                                     "--skip-original-table", "--backends", "clqr_cpu", "clqr_cuda"])
+            self.assertEqual(code, 0)
+            report = json.loads((work / "summary.json").read_text())
+            self.assertEqual(report["platform"], "test hardware")
+            self.assertEqual(report["gpus"][0]["name"], "Test GPU")
+
+    def test_explicit_cpu_only_selection_needs_no_external_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            value = row()
+            with (work / "cpu_round1.csv").open("w") as output:
+                writer = csv.DictWriter(output, fieldnames=value.keys())
+                writer.writeheader()
+                writer.writerow(value)
+            (work / "cases.json").write_text(json.dumps([
+                {field: value[field] for field in results.KEY_FIELDS[:-1]}]))
+            # Even stale optional results must not enter an explicitly selected run.
+            (work / "laine_round1.csv").write_text("not a valid CSV")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = results.main([str(work), "--suite", "smoke",
+                                     "--backends", "clqr_cpu"])
+            self.assertEqual(code, 0)
+            self.assertEqual(set(json.loads((work / "summary.json").read_text())), {"clqr_cpu"})
+            with self.assertRaises(FileNotFoundError):
+                results.main([str(work), "--suite", "smoke", "--backends",
+                              "clqr_cpu", "gen_riccati"])
+
     def test_duplicate_rejected(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             results.indexed([row(), row()], "clqr_cpu")
@@ -213,12 +256,12 @@ class ResultsTest(unittest.TestCase):
         self.assertFalse(results.selected(("dimension", 128, 16, 8, 2, 4, 7)))
         self.assertFalse(results.selected(("dimension", 128, 32, 16, 4, 4, 7)))
 
-    def test_complete_two_dimension_horizon_run(self):
+    def test_complete_cartesian_grid_run(self):
         # Exercise the actual all-suite summary, not only the table selector:
         # an obsolete fixed row-count guard must not reject a complete run.
         manifest = [dict(family="horizon", N=str(2**exponent), n=str(n),
                          m=str(n // 2), mixed_rows=str(n // 8), state_rows=str(n // 4))
-                    for n in (8, 16) for exponent in range(5, 16)]
+                    for n in (8, 16, 24, 32, 48, 64) for exponent in range(5, 16)]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             files = {}
@@ -247,10 +290,11 @@ class ResultsTest(unittest.TestCase):
                                                "--cuda", "--require-laine"]), 0)
             table = (path / "comparison_table.tex").read_text()
             for case in manifest:
-                self.assertIn(f"{case['N']} & {case['n']} &", table)
+                if int(case["n"]) in (8, 16):
+                    self.assertIn(f"{case['N']} & {case['n']} &", table)
             measured = results.read_csv(path / "measurements.csv")
             corrected = [r for r in measured if r["backend"] == "laine_corrected"]
-            self.assertEqual(len(corrected), 22)
+            self.assertEqual(len(corrected), 66)
             self.assertNotIn("corrected", table)
 
     def test_dual_coordinate_errors_are_data(self):
@@ -263,6 +307,40 @@ class ResultsTest(unittest.TestCase):
         value["dual_error_inf"] = "nan"
         with self.assertRaises(ValueError):
             results.indexed([value], "clqr_cpu")
+
+    def test_grid_completeness_in_native_only_runs(self):
+        # An omitted pair must be detected even if it disappears from every
+        # backend and the fixture manifest. Numerical failures still count.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            cases = [dict(family="horizon", N=str(2**exponent), n=str(n),
+                          m=str(n // 2), mixed_rows=str(n // 8), state_rows=str(n // 4))
+                     for n in (8, 16, 24, 32, 48, 64) for exponent in range(5, 16)]
+            for complete in (True, False):
+                manifest = cases if complete else cases[:-1]
+                for backend, filename in (("clqr_cpu", "cpu_round1.csv"),
+                                          ("clqr_cuda", "cuda_host.csv")):
+                    values = [dict(row(backend), **case) for case in manifest]
+                    values[-1].update(status="failed", median_ms="nan",
+                                      kernel_ms="nan", kkt_inf="nan")
+                    with (path / filename).open("w") as stream:
+                        writer = csv.DictWriter(stream, fieldnames=values[0])
+                        writer.writeheader()
+                        writer.writerows(values)
+                (path / "cases.json").write_text(json.dumps(manifest))
+                (path / "platform.txt").write_text("test platform\n")
+                (path / "gpu.csv").write_text("name\nTest GPU\n")
+                for cuda in (False, True):
+                    options = [str(path), "--suite", "all", "--skip-original-table",
+                               "--backends", "clqr_cpu"]
+                    if cuda:
+                        options += ["clqr_cuda", "--cuda"]
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        if complete:
+                            self.assertEqual(results.main(options), 0)
+                        else:
+                            with self.assertRaisesRegex(ValueError, "complete 66-case"):
+                                results.main(options)
 
     def test_original_rows_reject_missing_cpu_values(self):
         value = dict(N="32", cpp_cpu_ms=".12345", cpp_kkt_residual="2.04e-14",

@@ -128,13 +128,15 @@ bazel test //:cuda_solver_test \
 ```
 
 `--config=fp32` builds both the CPU reference and CUDA backend entirely in
-FP32. Local dense workspaces are sized at runtime. A solve is accepted whenever
-its packed allocations and the largest active per-block factorization fit the
-selected device's portable, non-opt-in per-block shared-memory limit. Staying
-within that default limit avoids architecture-specific launch attributes and
-excessive per-block storage that would sharply reduce occupancy. If a
-factorization does not fit, `Solve` returns a deterministic diagnostic
-describing the required resource; there is no capacity flag to rebuild.
+FP32. Local dense workspaces are sized at runtime. Workspace preparation queries
+the selected GPU's shared-memory capacity and each kernel's static usage, and
+opts into larger dynamic shared-memory allocations when needed and supported.
+Each launch still requests only its planned scratch size. Kernels whose dense
+scratch exceeds the per-block limit use separate per-block slices of reusable
+global device workspace instead. Small static shared scalars remain shared.
+The fallback preserves the algorithm and numerical choices, but its memory
+traffic can cost performance. There is no capacity flag to rebuild; total
+device-memory availability still limits the problem size.
 
 The CUDA benchmark uses `SolvePreparedView`, reuses reserved storage, and
 reports both end-to-end wall time and pure kernel time. Wall time includes host
@@ -213,6 +215,35 @@ Sanitizer tools on the standard CUDA suite and dense smoke fixtures before
 collecting GPU timings.
 Requires CMake, a C++ compiler, Git, and at least 3 GiB free disk
 space; `CLQR_JOBS` defaults to 4. Set `CLQR_PAPER_SUITE=smoke` for a short run.
+
+Downloads, builds, and measurements can be selected independently with these
+environment variables (only `0` and `1` are accepted):
+
+| Variable | Default | Controls |
+| --- | --- | --- |
+| `CLQR_RUN_EXTERNAL` | `1` | Default for the four external-method switches below |
+| `CLQR_RUN_VANROYE` | inherits `CLQR_RUN_EXTERNAL` | Vanroye and its BLASFEO dependency |
+| `CLQR_RUN_YANG` | inherits `CLQR_RUN_EXTERNAL` | Yang and its GTSAM dependency |
+| `CLQR_RUN_LAINE` | inherits `CLQR_RUN_EXTERNAL` | Author-written Laine–Tomlin |
+| `CLQR_RUN_CORRECTED_LAINE` | inherits `CLQR_RUN_EXTERNAL` | Corrected Laine–Tomlin |
+| `CLQR_RUN_JAX` | `1` | JAX builds, tests, and timings |
+| `CLQR_RUN_TESTS` | `1` | Regression tests |
+| `CLQR_RUN_SANITIZERS` | `1` | CUDA Compute Sanitizer runs |
+| `CLQR_RUN_ORIGINAL_TABLE` | `1` | Additional original-table timing sweep |
+
+For a native CPU/CUDA-only measurement, preserving correctness checks:
+
+```sh
+CLQR_RUN_EXTERNAL=0 CLQR_RUN_JAX=0 CLQR_RUN_ORIGINAL_TABLE=0 \
+  bash scripts/paper_benchmarks.sh /path/to/new-results --cuda
+```
+
+Individual overrides win: `CLQR_RUN_EXTERNAL=0 CLQR_RUN_VANROYE=1`
+includes only Vanroye among the external methods. Laine comparisons without
+Yang fetch Eigen headers directly, not GTSAM. Selected settings are saved in
+`benchmark_options.txt`; disabled backends are not required by the summary.
+The notebook and desktop runner inherit the same environment variables.
+
 The [paper comparison notebook](notebooks/kaggle_paper_comparison.ipynb)
 runs this workflow from a fresh Kaggle GPU session using an uploaded
 `clqr-source.bundle` snapshot or, by default, current `origin/main`,
@@ -253,12 +284,19 @@ build outputs, or external dependencies, and is not checked into the repository.
 Internet is still required for pinned dependencies. Without an attached bundle,
 the notebook fetches current `origin/main` instead.
 
-The paper sweeps vary the horizon (every power of two from 32 through 32768
-at both $n=8$ and $n=16$), always with
+The default `all` suite crosses every power-of-two horizon from 32 through
+32768 with every state dimension $n=8,16,24,32,48,64$ (66 cases), always with
 $m=n/2$, $p_s=n/4$, and $p_m=n/8$. State-only rows at the fixed initial
-state are omitted to avoid introducing artificial redundancy. A separate
+state are omitted to avoid introducing artificial redundancy. Large cases can
+take substantially longer or exceed available memory; reported failures remain
+in the results. A separate
 `CLQR_PAPER_SUITE=constraints` diagnostic varies constraint counts;
-`CLQR_PAPER_SUITE=dimension` measures $n=8,16,32,64$ at $N=128$.
+`CLQR_PAPER_SUITE=dimension` measures all six state dimensions at $N=128$;
+`CLQR_PAPER_SUITE=horizon` restricts the horizon sweep to $n=8,16$.
+The archiving runner accepts the corresponding `--suite` options. Smaller
+diagnostics are opt-in: complete-grid runs never silently omit a pair.
+All measured cases remain in the CSVs even when the generated paper table
+selects only $n=8,16$.
 The corrected Laine–Tomlin implementation is included separately from the
 author's original, using the optimized native dense kernels.
 Each solve refactors; setup and setup-plus-solve
