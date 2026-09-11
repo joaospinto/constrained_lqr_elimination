@@ -103,7 +103,9 @@ def indexed(rows, backend):
 
 
 def validate_cases(data, manifest):
-    identities = set(data["clqr_cpu"])
+    if not data:
+        raise ValueError("no benchmark backends selected")
+    identities = set(next(iter(data.values())))
     if any(set(rows) != identities for rows in data.values()):
         raise ValueError("backends have different cases/seeds; refusing to combine them")
     if len({identity[-1] for identity in identities}) != 1:
@@ -239,8 +241,6 @@ def main(argv=None):
                         choices=("all", "smoke", "horizon", "dimension", "constraints"))
     args = parser.parse_args(argv)
     data = {}
-    if args.backends is not None and "clqr_cpu" not in args.backends:
-        parser.error("--backends must include clqr_cpu")
     for backend, name in SOURCES.items():
         if args.backends is not None and backend not in args.backends:
             continue

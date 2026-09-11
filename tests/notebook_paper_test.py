@@ -1,5 +1,6 @@
 import contextlib
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -75,20 +76,31 @@ class NotebookTest(unittest.TestCase):
     def test_backend_switches_skip_fetch_build_and_execution(self):
         root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
         configurations = (
-            ({"CLQR_RUN_EXTERNAL": "0"}, set()),
+            ({"CLQR_RUN_EXTERNAL": "0"}, set(), False),
             ({"CLQR_RUN_EXTERNAL": "0", "CLQR_RUN_VANROYE": "1"},
-             {"blasfeo"}),
+             {"blasfeo"}, False),
             ({"CLQR_RUN_YANG": "0"},
-             {"blasfeo", "eigen", "laine_author"}),
-            ({}, {"blasfeo", "gtsam", "factor_graph", "laine_author"}),
+             {"blasfeo", "eigen", "laine_author"}, False),
+            ({}, {"blasfeo", "gtsam", "factor_graph", "laine_author"}, False),
+            ({"CLQR_RUN_CPU": "0", "CLQR_RUN_EXTERNAL": "0", "CLQR_RUN_VANROYE": "1"},
+             {"blasfeo"}, False),
+            ({"CLQR_RUN_CPU": "0", "CLQR_RUN_EXTERNAL": "0", "CLQR_RUN_JAX_CPU": "1"},
+             set(), False),
+            # Explicit backend overrides also win over a disabled JAX group.
+            *((dict(CLQR_RUN_EXTERNAL="0", CLQR_RUN_CPU=str(cpu),
+                    CLQR_RUN_JAX_CPU=str(jax_cpu), CLQR_RUN_JAX_GPU=str(jax_gpu),
+                    CLQR_RUN_TESTS=str(int(not cpu and not jax_cpu and jax_gpu)),
+                    CLQR_RUN_SANITIZERS=str(int(not cpu and not jax_cpu and jax_gpu))), set(), True)
+              for cpu, jax_cpu, jax_gpu in itertools.product((0, 1), repeat=3)),
         )
-        for overrides, expected in configurations:
+        for overrides, expected, cuda in configurations:
             with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as directory:
                 work = Path(directory)
                 source = work / "source"
                 (source / "scripts").mkdir(parents=True)
                 for name in ("paper_benchmarks.sh", "benchmark_options.sh",
-                             "notebook_bazel.sh", "benchmark_progress.py", "paper_sweep.py"):
+                             "notebook_bazel.sh", "benchmark_progress.py", "paper_sweep.py",
+                             "paper_results.py"):
                     shutil.copy(root / "scripts" / name, source / "scripts" / name)
                 (source / ".bazelversion").write_text("9.1.1\n")
                 (source / "bazel-bin").mkdir()
@@ -102,14 +114,19 @@ from pathlib import Path
 name, *args = sys.argv[1:]
 with open(os.environ["CALL_LOG"], "a") as f:
     f.write(json.dumps([name, *args]) + "\\n")
-if name == "python3" and args[0].endswith(("benchmark_progress.py", "paper_sweep.py")):
+if name == "python3" and args[0].endswith(("benchmark_progress.py", "paper_sweep.py", "paper_results.py")):
     os.execv(sys.executable, [sys.executable, *args])
 case = dict(index=0, family="horizon", N=32, n=8, m=4, mixed_rows=1, state_rows=2)
 if name == "clqr_paper_fixture":
     print(json.dumps([case]))
-if "--backend" in args:
+backend = {"clqr_paper_jax_cpu_benchmark": "clqr_jax_cpu",
+           "clqr_paper_jax_cuda_benchmark": "clqr_jax_cuda"}.get(name)
+if backend or "--backend" in args:
     import csv
-    row = dict(backend=args[args.index("--backend")+1], seed="20260907",
+    row = dict(backend=backend or args[args.index("--backend")+1], seed="20260907",
+               median_ms=1.0, p10_ms=0.9, p90_ms=1.1, kernel_ms=0.8,
+               primal_error=1e-12, relative_objective_error=1e-15,
+               feasibility_inf=1e-12, kkt_inf=1e-12,
                status="ok", repeats=1, **{k:v for k,v in case.items() if k != "index"})
     writer = csv.DictWriter(sys.stdout, fieldnames=row.keys())
     writer.writeheader()
@@ -124,6 +141,11 @@ if name == "git" and "rev-parse" in args:
 if name == "df":
     print("Filesystem 1024-blocks Used Available Capacity Mounted")
     print("mock 20000000 100 19999900 1% /mock")
+if name == "nvidia-smi":
+    if "--query-gpu=compute_cap" in args:
+        print("6.0")
+    else:
+        print("name,compute_cap\\nTest GPU,6.0")
 if name == "cmake" and "-B" in args:
     build = Path(args[args.index("-B") + 1])
     build.mkdir(parents=True, exist_ok=True)
@@ -138,9 +160,12 @@ if name == "cmake" and "-B" in args:
                     '#!/bin/sh\nexec "' + sys.executable + '" "' + str(stub) +
                     '" "${0##*/}" "$@"\n')
                 launcher.chmod(0o755)
-                for name in ("git", "cmake", "ctest", "bazel", "python3", "df", "sysctl", "tar"):
+                for name in ("git", "cmake", "ctest", "bazel", "python3", "df", "sysctl", "tar",
+                             "nvcc", "nvidia-smi", "compute-sanitizer"):
                     (tools / name).symlink_to(launcher)
-                for name in ("clqr_paper_fixture", "clqr_paper_cpu_benchmark", "clqr_paper_jax_cpu_benchmark"):
+                for name in ("clqr_paper_fixture", "clqr_paper_cpu_benchmark", "clqr_paper_jax_cpu_benchmark",
+                             "clqr_paper_cuda_benchmark", "clqr_paper_jax_cuda_benchmark",
+                             "cuda_solver_test", "adversarial_cuda_extended_test"):
                     (source / "bazel-bin" / name).symlink_to(launcher)
                 log = work / "calls.jsonl"
                 env = {key: value for key, value in os.environ.items()
@@ -149,18 +174,30 @@ if name == "cmake" and "-B" in args:
                            CLQR_BAZEL=str(tools / "bazel"), CALL_LOG=str(log),
                            STUB_LAUNCHER=str(launcher), CLQR_RUN_JAX="0",
                            CLQR_RUN_TESTS="0", CLQR_RUN_SANITIZERS="0",
-                           CLQR_RUN_ORIGINAL_TABLE="0", **overrides)
-                result = subprocess.run(["bash", str(source / "scripts/paper_benchmarks.sh"),
-                                         str(work / "results")], env=env,
+                           CLQR_RUN_ORIGINAL_TABLE="0", CLQR_PAPER_SUITE="smoke")
+                env.update(overrides)
+                run_cpu = env.get("CLQR_RUN_CPU", "1") == "1"
+                run_jax_cpu = env.get("CLQR_RUN_JAX_CPU", env["CLQR_RUN_JAX"]) == "1"
+                run_jax_gpu = cuda and env.get("CLQR_RUN_JAX_GPU", env["CLQR_RUN_JAX"]) == "1"
+                run_checks = env["CLQR_RUN_TESTS"] == "1"
+                command = ["bash", str(source / "scripts/paper_benchmarks.sh"), str(work / "results")]
+                if cuda:
+                    command.append("--cuda")
+                result = subprocess.run(command, env=env,
                                         capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("[cpu_round1/clqr_cpu/0] START", result.stdout,
-                              result.stderr + log.read_text())
+                self.assertEqual("[cpu_round1/clqr_cpu/0] START" in result.stdout, run_cpu)
                 self.assertNotIn("cpu_round2", result.stdout)
                 calls = [json.loads(line) for line in log.read_text().splitlines()]
-                measured = [call for call in calls if "--backend" in call and call[0] != "python3"]
-                backends = [call[call.index("--backend") + 1] for call in measured]
-                self.assertEqual(backends.count("clqr_cpu"), 1)
+                measured = [call for call in calls if "--case-index" in call and call[0] != "python3"]
+                jax_backends = {"clqr_paper_jax_cpu_benchmark": "clqr_jax_cpu",
+                                "clqr_paper_jax_cuda_benchmark": "clqr_jax_cuda"}
+                backends = [jax_backends.get(call[0]) or call[call.index("--backend") + 1]
+                            for call in measured]
+                self.assertEqual(backends.count("clqr_cpu"), int(run_cpu))
+                self.assertEqual(backends.count("clqr_jax_cpu"), int(run_jax_cpu))
+                self.assertEqual(backends.count("clqr_jax_cuda"), int(run_jax_gpu))
+                self.assertEqual(backends.count("clqr_cuda"), int(cuda))
                 self.assertEqual(len(set(backends)), len(backends))
                 self.assertTrue(all("--case-index" in call for call in measured))
                 self.assertTrue(all("--min-seconds" in call for call in measured))
@@ -168,7 +205,7 @@ if name == "cmake" and "-B" in args:
                 for backend, executable, label in (
                         ("gen_riccati", "clqr_vanroye_benchmark", "vanroye"),
                         ("factor_graph", "clqr_yang_benchmark", "yang")):
-                    selected = [call for call in measured if call[call.index("--backend") + 1] == backend]
+                    selected = [call for call, actual in zip(measured, backends) if actual == backend]
                     self.assertTrue(all(call[0] == executable for call in selected))
                     if selected:
                         self.assertIn(f"[{label}] SWEEP START: 1 cases; backend={backend}", result.stdout)
@@ -187,13 +224,31 @@ if name == "cmake" and "-B" in args:
                 self.assertEqual(any("gtsam-build" in " ".join(call)
                                      for call in cmake_calls), "gtsam" in expected)
                 self.assertFalse(any(call[0] == "ctest" for call in calls))
-                self.assertFalse(any("jax" in " ".join(call) for call in calls))
+                build_calls = [call for call in calls if call[:2] == ["bazel", "build"]]
+                for label, selected in (("clqr_paper_cpu_benchmark", run_cpu),
+                                        ("clqr_paper_jax_cpu_benchmark", run_jax_cpu),
+                                        ("clqr_paper_jax_cuda_benchmark", run_jax_gpu)):
+                    self.assertEqual(any("//:" + label in call for call in build_calls), selected)
+                if expected:
+                    self.assertTrue(any(f"-DCLQR_COMPARE_CPU={'ON' if run_cpu else 'OFF'}" in call
+                                        for call in cmake_calls))
+                if cuda and run_checks:
+                    self.assertIn("Passed cuda_validation", result.stdout)
+                    self.assertIn("Passed cuda_rank_tolerance", result.stdout)
+                    for tool in ("memcheck", "initcheck", "racecheck", "synccheck"):
+                        self.assertIn(f"Passed cuda_regression_{tool}", result.stdout)
+                        self.assertIn(f"Passed cuda_{tool}", result.stdout)
+                summary = json.loads((work / "results/summary.json").read_text())
+                self.assertEqual(set(summary) - {"platform", "gpus"}, set(backends))
+                self.assertFalse((work / "results/original_table.csv").exists())
                 for method, checkout in (("laine", "laine_author"),
                                           ("laine_corrected", "laine_author")):
                     self.assertEqual(any(call[0] == f"clqr_{method}_benchmark" for call in calls),
                                      checkout in expected)
                 options = (work / "results/benchmark_options.txt").read_text()
                 self.assertIn("CLQR_RUN_JAX=0", options)
+                self.assertIn(f"CLQR_RUN_CPU={int(run_cpu)}", options)
+                self.assertIn(f"CLQR_RUN_JAX_CPU={int(run_jax_cpu)}", options)
 
     @unittest.skipUnless(os.name == "posix", "POSIX process signal semantics")
     def test_sweep_preserves_later_cases_after_fatal_exit(self):
@@ -237,11 +292,56 @@ writer.writerow(row)
 
     def test_invalid_benchmark_switch_is_rejected(self):
         root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
-        result = subprocess.run(
-            ["bash", "-c", 'source "$1"', "test", str(root / "scripts/benchmark_options.sh")],
-            env=dict(os.environ, CLQR_RUN_EXTERNAL="sometimes"), capture_output=True, text=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("CLQR_RUN_EXTERNAL must be 0 or 1", result.stderr)
+        for name in ("CLQR_RUN_EXTERNAL", "CLQR_RUN_CPU", "CLQR_RUN_JAX_CPU", "CLQR_RUN_JAX_GPU"):
+            with self.subTest(option=name):
+                env = {key: value for key, value in os.environ.items() if not key.startswith("CLQR_")}
+                env[name] = "sometimes"
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"', "test", str(root / "scripts/benchmark_options.sh")],
+                    env=env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{name} must be 0 or 1", result.stderr)
+
+    def test_notebook_and_shell_share_jax_defaults_and_override_precedence(self):
+        root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
+        notebook = json.loads((root / "notebooks/kaggle_paper_comparison.ipynb").read_text())
+        code = "".join(next(cell["source"] for cell in notebook["cells"]
+                            if cell["cell_type"] == "code"))
+        defaults = code[:code.index("# Use an uploaded snapshot")]
+        for overrides, expected in (
+                ({}, ("1", "1", "1")),
+                ({"CLQR_RUN_JAX": "0"}, ("1", "0", "0")),
+                ({"CLQR_RUN_JAX": "0", "CLQR_RUN_CPU": "0", "CLQR_RUN_JAX_GPU": "1"},
+                 ("0", "0", "1")),
+                ({"CLQR_RUN_JAX": "1", "CLQR_RUN_JAX_CPU": "0", "CLQR_RUN_JAX_GPU": "0"},
+                 ("1", "0", "0"))):
+            with self.subTest(overrides=overrides):
+                env = {key: value for key, value in os.environ.items() if not key.startswith("CLQR_")}
+                env.update(overrides)
+                flags = ("CLQR_RUN_CPU", "CLQR_RUN_JAX_CPU", "CLQR_RUN_JAX_GPU")
+                with mock.patch.dict(os.environ, env, clear=True):
+                    exec(compile(defaults, "notebook-defaults", "exec"), {})
+                    self.assertEqual(tuple(os.environ[name] for name in flags), expected)
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c",
+                     'source "$1"; printf "%s\\n" "$CLQR_RUN_CPU" "$CLQR_RUN_JAX_CPU" "$CLQR_RUN_JAX_GPU"',
+                     "test", str(root / "scripts/benchmark_options.sh")], env=env,
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(tuple(result.stdout.splitlines()), expected)
+
+    def test_no_active_backend_is_rejected_before_build(self):
+        root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "results"
+            env = {key: value for key, value in os.environ.items() if not key.startswith("CLQR_")}
+            env.update(CLQR_RUN_CPU="0", CLQR_RUN_EXTERNAL="0", CLQR_RUN_JAX_CPU="0",
+                       CLQR_RUN_JAX_GPU="1")
+            result = subprocess.run(["bash", str(root / "scripts/paper_benchmarks.sh"), str(output)],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("GPU backends require --cuda", result.stderr)
+            self.assertFalse(output.exists())
 
     def test_bazel_version_with_and_without_startup_options(self):
         root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
@@ -277,26 +377,26 @@ writer.writerow(row)
         shell = 'capture_bazel() { printf "%s\\n" "$@"; }\n'
         shell += 'bazel_cmd=(capture_bazel); bazel_args=(--config=fp64)\n'
         shell += driver[start:end]
-        for run_tests in (0, 1):
-            for run_jax in (0, 1):
-                for cuda in (0, 1):
-                    with self.subTest(tests=run_tests, jax=run_jax, cuda=cuda):
-                        env = dict(os.environ, CLQR_RUN_TESTS=str(run_tests),
-                                   CLQR_RUN_JAX=str(run_jax), cuda_run=str(cuda),
-                                   CLQR_RUN_CORRECTED_LAINE="0",
-                                   CLQR_RUN_YANG="0", CLQR_RUN_LAINE="0")
-                        result = subprocess.run(
-                            ["bash", "-euo", "pipefail", "-c", shell], env=env,
-                            capture_output=True, text=True)
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        targets = result.stdout.splitlines()
-                        for name in ("cpu_rank_tolerance_test", "cuda_feasibility_rank_test",
-                                     "cuda_stage_layout_test", "cuda_buffer_test"):
-                            self.assertEqual("//:" + name in targets, bool(run_tests))
-                        self.assertEqual("//:jax_binding_test" in targets,
-                                         bool(run_tests and run_jax))
-                        self.assertEqual("//:jax_cuda_binding_test" in targets,
-                                         bool(run_tests and run_jax and cuda))
+        for run_tests, jax_cpu, jax_gpu, cuda in itertools.product((0, 1), repeat=4):
+            with self.subTest(tests=run_tests, jax_cpu=jax_cpu, jax_gpu=jax_gpu, cuda=cuda):
+                env = dict(os.environ, CLQR_RUN_TESTS=str(run_tests), CLQR_RUN_CPU="0",
+                           CLQR_RUN_JAX_CPU=str(jax_cpu), CLQR_RUN_JAX_GPU=str(jax_gpu),
+                           cuda_run=str(cuda), CLQR_RUN_CORRECTED_LAINE="0",
+                           CLQR_RUN_YANG="0", CLQR_RUN_LAINE="0")
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", shell], env=env,
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                targets = result.stdout.splitlines()
+                for name in ("cpu_rank_tolerance_test", "cuda_feasibility_rank_test",
+                             "cuda_stage_layout_test", "cuda_buffer_test", "cuda_packing_pool_test"):
+                    self.assertEqual("//:" + name in targets, bool(run_tests))
+                for name in ("paper_jax_fixture_test", "jax_ffi_problem_test"):
+                    self.assertEqual("//:" + name in targets,
+                                     bool(run_tests and (jax_cpu or (cuda and jax_gpu))))
+                self.assertEqual("//:jax_binding_test" in targets, bool(run_tests and jax_cpu))
+                for name in ("jax_cuda_binding_test", "jax_cuda_transfer_audit_test"):
+                    self.assertEqual("//:" + name in targets, bool(run_tests and jax_gpu and cuda))
         self.assertIn(
             "check_log cuda_rank_tolerance bazel-bin/cuda_solver_test --rank-regression",
             driver)
@@ -371,8 +471,10 @@ writer.writerow(row)
         compile(code, "kaggle_paper_comparison.ipynb", "exec")
         self.assertIn('get("CLQR_REVISION", "main")', code)
         self.assertIn("notebook_paper.py", code)
-        for option in ("EXTERNAL", "JAX", "TESTS", "SANITIZERS", "ORIGINAL_TABLE"):
+        for option in ("CPU", "EXTERNAL", "JAX", "TESTS", "SANITIZERS", "ORIGINAL_TABLE"):
             self.assertIn(f'setdefault("CLQR_RUN_{option}", "1")', code)
+        for option in ("JAX_CPU", "JAX_GPU"):
+            self.assertIn(f'setdefault("CLQR_RUN_{option}", os.environ["CLQR_RUN_JAX"])', code)
         for method in ("VANROYE", "YANG", "LAINE", "CORRECTED_LAINE"):
             self.assertIn(f'"{method}"', code)
 

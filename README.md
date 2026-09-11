@@ -255,12 +255,15 @@ environment variables (only `0` and `1` are accepted):
 
 | Variable | Default | Controls |
 | --- | --- | --- |
+| `CLQR_RUN_CPU` | `1` | Native CPU benchmark build and timing sweep; does not disable CPU reference checks |
 | `CLQR_RUN_EXTERNAL` | `1` | Default for the four external-method switches below |
 | `CLQR_RUN_VANROYE` | inherits `CLQR_RUN_EXTERNAL` | Vanroye and its BLASFEO dependency |
 | `CLQR_RUN_YANG` | inherits `CLQR_RUN_EXTERNAL` | Yang and its GTSAM dependency |
 | `CLQR_RUN_LAINE` | inherits `CLQR_RUN_EXTERNAL` | Author-written Laine–Tomlin |
 | `CLQR_RUN_CORRECTED_LAINE` | inherits `CLQR_RUN_EXTERNAL` | Corrected Laine–Tomlin |
-| `CLQR_RUN_JAX` | `1` | JAX builds, tests, and timings |
+| `CLQR_RUN_JAX` | `1` | Default for the two JAX switches below |
+| `CLQR_RUN_JAX_CPU` | inherits `CLQR_RUN_JAX` | CPU JAX benchmark and binding tests |
+| `CLQR_RUN_JAX_GPU` | inherits `CLQR_RUN_JAX` | GPU JAX benchmark and binding tests (CUDA, requires `--cuda`) |
 | `CLQR_RUN_TESTS` | `1` | Regression tests |
 | `CLQR_RUN_SANITIZERS` | `1` | CUDA Compute Sanitizer runs |
 | `CLQR_RUN_ORIGINAL_TABLE` | `1` | Additional original-table timing sweep |
@@ -272,8 +275,22 @@ CLQR_RUN_EXTERNAL=0 CLQR_RUN_JAX=0 CLQR_RUN_ORIGINAL_TABLE=0 \
   bash scripts/paper_benchmarks.sh /path/to/new-results --cuda
 ```
 
+For native CUDA and GPU JAX only, with no CPU timing sweeps or external builds:
+
+```sh
+CLQR_RUN_CPU=0 CLQR_RUN_EXTERNAL=0 CLQR_RUN_JAX_CPU=0 CLQR_RUN_JAX_GPU=1 \
+  CLQR_RUN_ORIGINAL_TABLE=0 \
+  bash scripts/paper_benchmarks.sh /path/to/new-results --cuda
+```
+
+Regression tests and sanitizers remain enabled by default. GPU validation still
+builds and uses CPU references and shared JAX fixture/FFI checks as needed.
+The original-table switch is independent: that additional sweep includes both
+CPU and CUDA timings, so disable it for a GPU-only run.
+
 Individual overrides win: `CLQR_RUN_EXTERNAL=0 CLQR_RUN_VANROYE=1`
-includes only Vanroye among the external methods. Laine comparisons without
+includes only Vanroye among the external methods; `CLQR_RUN_JAX=0
+CLQR_RUN_JAX_GPU=1` enables GPU JAX without CPU JAX. Laine comparisons without
 Yang fetch Eigen headers directly, not GTSAM. Selected settings are saved in
 `benchmark_options.txt`; disabled backends are not required by the summary.
 The notebook and desktop runner inherit the same environment variables.

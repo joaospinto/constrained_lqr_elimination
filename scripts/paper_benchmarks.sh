@@ -14,6 +14,10 @@ run_references=$((CLQR_RUN_VANROYE || CLQR_RUN_YANG || CLQR_RUN_LAINE || CLQR_RU
 output_dir="$1"
 cuda_run=0
 if [[ $# -eq 2 ]]; then cuda_run=1; fi
+if (( ! (CLQR_RUN_CPU || CLQR_RUN_JAX_CPU || run_references || cuda_run) )); then
+  echo "No benchmark backend enabled; GPU backends require --cuda." >&2
+  exit 2
+fi
 if [[ -e "$output_dir" ]]; then
   echo "output directory already exists; choose a new directory: $output_dir" >&2
   exit 2
@@ -199,12 +203,13 @@ trap '"${bazel_cmd[@]}" shutdown || true' EXIT
 "${bazel_cmd[@]}" version >> "$output_dir/platform.txt"
 cd "$repo_dir"
 bazel_args=(--config=fp64 --jobs="$jobs" --cxxopt=-march=native)
-targets=(//:clqr_paper_cpu_benchmark //:clqr_paper_fixture)
-if (( CLQR_RUN_JAX )); then targets+=(//:clqr_paper_jax_cpu_benchmark); fi
+targets=(//:clqr_paper_fixture)
+if (( CLQR_RUN_CPU )); then targets+=(//:clqr_paper_cpu_benchmark); fi
+if (( CLQR_RUN_JAX_CPU )); then targets+=(//:clqr_paper_jax_cpu_benchmark); fi
 if (( cuda_run )); then
   bazel_args+=(--config=cuda --cuda_archs="sm_${cuda_arch}")
   targets+=(//:clqr_paper_cuda_benchmark)
-  if (( CLQR_RUN_JAX )); then targets+=(//:clqr_paper_jax_cuda_benchmark); fi
+  if (( CLQR_RUN_JAX_GPU )); then targets+=(//:clqr_paper_jax_cuda_benchmark); fi
   if (( CLQR_RUN_TESTS || CLQR_RUN_SANITIZERS )); then
     targets+=(//:cuda_solver_test //:adversarial_cuda_extended_test)
   fi
@@ -220,12 +225,16 @@ if (( CLQR_RUN_TESTS )); then
   tests=(//:clqr_test //:workspace_allocation_test //:scaling_problem_test
          //:reduced_objective_test //:cuda_kernel_emulation_extended_test
          //:cpu_rank_tolerance_test //:cuda_feasibility_rank_test
-         //:cuda_stage_layout_test //:cuda_buffer_test
+         //:cuda_stage_layout_test //:cuda_buffer_test //:cuda_packing_pool_test
          //:paper_results_test //:notebook_paper_test)
-  if (( CLQR_RUN_JAX )); then
-    tests+=(//:paper_jax_fixture_test //:jax_binding_test //:jax_ffi_problem_test
-            //:jax_cuda_transfer_audit_test)
-    if (( cuda_run )); then tests+=(//:jax_cuda_binding_test); fi
+  # Shared fixture/FFI checks and CPU reference solves remain necessary when
+  # only the GPU binding is selected; they are not CPU timing sweeps.
+  if (( CLQR_RUN_JAX_CPU || (cuda_run && CLQR_RUN_JAX_GPU) )); then
+    tests+=(//:paper_jax_fixture_test //:jax_ffi_problem_test)
+  fi
+  if (( CLQR_RUN_JAX_CPU )); then tests+=(//:jax_binding_test); fi
+  if (( cuda_run && CLQR_RUN_JAX_GPU )); then
+    tests+=(//:jax_cuda_binding_test //:jax_cuda_transfer_audit_test)
   fi
   if (( CLQR_RUN_CORRECTED_LAINE )); then
     tests+=(//:corrected_laine_benchmark_test //external_algorithms/corrected_laine_tomlin:all)
@@ -253,6 +262,8 @@ if (( run_references )); then
   # Explicit empty values also clear a previously enabled CMake cache entry.
   blasfeo_dir=""; vanroye_dir=""; yang_dir=""; laine_dir=""; gtsam_dir=""
   corrected=OFF
+  compare_cpu=OFF
+  if (( CLQR_RUN_CPU )); then compare_cpu=ON; fi
   if (( CLQR_RUN_VANROYE )); then
     blasfeo_dir="$deps_dir/blasfeo"; vanroye_dir="$deps_dir/vanroye-bazel-source"
   fi
@@ -266,7 +277,7 @@ if (( run_references )); then
     -DTARGET="$blasfeo_target" -DGEN_RICCATI_SOURCE_DIR="$vanroye_dir" \
     -DFACTOR_GRAPH_SOURCE_DIR="$yang_dir" -DLAINE_SOURCE_DIR="$laine_dir" \
     -DEIGEN_SOURCE_DIR="$eigen_dir" -DCLQR_COMPARE_LAINE_CORRECTED="$corrected" \
-    -DGTSAM_DIR="$gtsam_dir"
+    -DGTSAM_DIR="$gtsam_dir" -DCLQR_COMPARE_CPU="$compare_cpu"
   cmake --build "$cache_dir/reference-build" -j "$jobs"
   if (( CLQR_RUN_TESTS )); then ctest --test-dir "$cache_dir/reference-build" --output-on-failure; fi
   cpu_benchmark="$cache_dir/reference-build/clqr_cpu_benchmark"
@@ -311,7 +322,8 @@ sweep() {
 }
 bench_args=(--suite "$suite" --min-seconds "$min_seconds")
 if [[ -n "$repeats" ]]; then bench_args+=(--repeats "$repeats"); fi
-enabled_backends=(clqr_cpu)
+enabled_backends=()
+if (( CLQR_RUN_CPU )); then enabled_backends+=(clqr_cpu); fi
 if (( CLQR_RUN_VANROYE )); then
   sweep vanroye gen_riccati native \
     "$cache_dir/reference-build/clqr_vanroye_benchmark" "${bench_args[@]}"
@@ -329,7 +341,10 @@ for ((round=1; round<=rounds; ++round)); do
   if (( round % 2 == 0 )); then order=(laine_corrected laine cpu); fi
   for method in "${order[@]}"; do
     case "$method" in
-      cpu) sweep "cpu_round$round" clqr_cpu native "$cpu_benchmark" "${bench_args[@]}" ;;
+      cpu)
+        if (( CLQR_RUN_CPU )); then
+          sweep "cpu_round$round" clqr_cpu native "$cpu_benchmark" "${bench_args[@]}"
+        fi ;;
       laine)
         if (( CLQR_RUN_LAINE )); then
           sweep "laine_round$round" laine_author native \
@@ -346,7 +361,7 @@ done
 if (( CLQR_RUN_LAINE )); then enabled_backends+=(laine_author); fi
 if (( CLQR_RUN_CORRECTED_LAINE )); then enabled_backends+=(laine_corrected); fi
 
-if (( CLQR_RUN_JAX )); then
+if (( CLQR_RUN_JAX_CPU )); then
   sweep jax_cpu clqr_jax_cpu jax bazel-bin/clqr_paper_jax_cpu_benchmark "${bench_args[@]}"
   enabled_backends+=(clqr_jax_cpu)
 fi
@@ -366,7 +381,7 @@ if (( cuda_run )); then
   fi
   sweep cuda_host clqr_cuda native bazel-bin/clqr_paper_cuda_benchmark "${bench_args[@]}"
   enabled_backends+=(clqr_cuda)
-  if (( CLQR_RUN_JAX )); then
+  if (( CLQR_RUN_JAX_GPU )); then
   sweep cuda_resident clqr_jax_cuda jax bazel-bin/clqr_paper_jax_cuda_benchmark "${bench_args[@]}" \
     --capacity-report "$output_dir/cuda_host.csv"
     enabled_backends+=(clqr_jax_cuda)

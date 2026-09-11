@@ -116,6 +116,54 @@ class ResultsTest(unittest.TestCase):
                 results.main([str(work), "--suite", "smoke", "--backends",
                               "clqr_cpu", "gen_riccati"])
 
+    def test_selected_backends_do_not_require_native_cpu_measurements(self):
+        for backends in (("clqr_cuda",), ("clqr_cuda", "clqr_jax_cuda"),
+                         ("clqr_jax_cpu",), ("gen_riccati",)):
+            with self.subTest(backends=backends), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                for backend in backends:
+                    value = row(backend)
+                    with (work / results.SOURCES[backend]).open("w") as output:
+                        writer = csv.DictWriter(output, fieldnames=value)
+                        writer.writeheader()
+                        writer.writerow(value)
+                # A disabled CPU result must not be read, even if it exists.
+                (work / "cpu_round1.csv").write_text("not a valid CSV")
+                (work / "cases.json").write_text(json.dumps([
+                    {field: value[field] for field in results.KEY_FIELDS[:-1]}]))
+                (work / "platform.txt").write_text("test hardware")
+                (work / "gpu.csv").write_text("name,compute_cap\nTest GPU,6.0\n")
+                args = [str(work), "--suite", "smoke", "--skip-original-table", "--backends", *backends]
+                cuda = any("cuda" in backend for backend in backends)
+                if cuda:
+                    args.append("--cuda")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(results.main(args), 0)
+                summary = json.loads((work / "summary.json").read_text())
+                self.assertEqual(set(summary) - {"platform", "gpus"}, set(backends))
+                self.assertEqual({r["backend"] for r in results.read_csv(work / "measurements.csv")},
+                                 set(backends))
+                if cuda:
+                    self.assertEqual(summary["platform"], "test hardware")
+                # Missing selected files and mismatched cases still fail.
+                (work / results.SOURCES[backends[0]]).unlink()
+                with self.assertRaises(FileNotFoundError):
+                    results.main(args)
+
+    def test_gpu_only_manifest_validation_still_rejects_missing_cases_and_seeds(self):
+        value = row("clqr_cuda")
+        data = {"clqr_cuda": results.indexed([value], "clqr_cuda")}
+        manifest = [{field: value[field] for field in results.KEY_FIELDS[:-1]}]
+        self.assertEqual(results.validate_cases(data, manifest), {results.key(value)})
+        with self.assertRaisesRegex(ValueError, "manifest"):
+            results.validate_cases(data, manifest + [dict(manifest[0], N="256")])
+        jax = dict(row("clqr_jax_cuda"), seed="20260908")
+        data["clqr_jax_cuda"] = results.indexed([jax], "clqr_jax_cuda")
+        with self.assertRaisesRegex(ValueError, "different cases/seeds"):
+            results.validate_cases(data, manifest)
+        with self.assertRaisesRegex(ValueError, "no benchmark backends"):
+            results.validate_cases({}, manifest)
+
     def test_duplicate_rejected(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             results.indexed([row(), row()], "clqr_cpu")

@@ -36,6 +36,7 @@ py_test(
         "scripts/benchmark_options.sh",
         "scripts/notebook_bazel.sh",
         "scripts/paper_benchmarks.sh",
+        "scripts/paper_results.py",
     ],
 )
 
