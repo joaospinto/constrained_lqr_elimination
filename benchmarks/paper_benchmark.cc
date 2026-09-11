@@ -502,7 +502,17 @@ private:
 template <class Solver>
 void Run(const clqr::benchmark::PaperCase &c,
          const clqr::benchmark::ScalingProblem &data, const char *backend,
-         int repeats, std::uint64_t seed) {
+         int repeats, std::uint64_t seed, std::size_t index, std::size_t count) {
+  const auto started = Clock::now();
+  const auto progress = [&](const std::string &phase) {
+    std::cerr << "[case " << index + 1 << '/' << count << "] " << backend
+              << " N=" << c.horizon << " n=" << c.n << " m=" << c.m
+              << " " << phase << " (elapsed "
+              << std::chrono::duration_cast<std::chrono::seconds>(
+                     Clock::now() - started).count()
+              << "s)\n";
+  };
+  progress("setup");
   std::cout << backend << ',' << c.family << ',' << c.horizon << ',' << c.n
             << ',' << c.m << ',' << c.mixed << ',' << c.state << ',' << seed
             << ',';
@@ -510,10 +520,12 @@ void Run(const clqr::benchmark::PaperCase &c,
     const auto begin = Clock::now();
     Solver solver(data.problem);
     const double setup_ms = Milliseconds(begin);
+    progress("warmup");
     const auto warmup_start = Clock::now();
     for (int i = 0; i < 3 || Milliseconds(warmup_start) < 100.0; ++i)
       solver.Solve();
     std::vector<double> times, kernel_times, setup_solve_times;
+    progress("timing " + std::to_string(repeats) + " prepared solves");
     for (int i = 0; i < repeats; ++i) {
       const auto start = Clock::now();
       solver.Solve();
@@ -521,6 +533,7 @@ void Run(const clqr::benchmark::PaperCase &c,
       if constexpr (requires { solver.KernelMs(); })
         kernel_times.push_back(solver.KernelMs());
     }
+    progress("validation");
     const auto result = solver.Result();
     std::optional<Multipliers> dual;
     if constexpr (requires { solver.DualResult(); })
@@ -552,6 +565,7 @@ void Run(const clqr::benchmark::PaperCase &c,
     // square roots for the factor graph). Also report a repeated setup+solve
     // measurement so that the prepared-representation timing does not hide it.
     // Destruction and extraction into a common output container are excluded.
+    progress("timing " + std::to_string(repeats) + " setup+solve calls");
     for (int i = 0; i < repeats; ++i) {
       const auto start = Clock::now();
       Solver fresh(data.problem);
@@ -575,6 +589,7 @@ void Run(const clqr::benchmark::PaperCase &c,
                        : std::numeric_limits<double>::quiet_NaN())
               << ',' << setup_solve_times[setup_solve_times.size() / 2]
               << ',' << planted_dual_stationarity << ',' << dual_error << '\n';
+    progress(valid ? "DONE status=ok" : "DONE status=inaccurate");
   } catch (const std::exception &e) {
     std::string message = e.what();
     for (char &ch : message)
@@ -587,6 +602,8 @@ void Run(const clqr::benchmark::PaperCase &c,
     std::cout << (unsupported ? "unsupported" : "failed")
               << ",0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan\n# "
               << message << '\n';
+    progress(std::string("DONE status=") + (unsupported ? "unsupported: " : "failed: ") +
+             message);
   }
   std::cout.flush();
 }
@@ -850,24 +867,29 @@ int main(int argc, char **argv) {
                "feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,"
                "planted_dual_stationarity_inf,dual_error_inf\n";
   std::cout << std::setprecision(12);
-  for (const auto &c : clqr::benchmark::PaperCases(suite)) {
+  const auto cases = clqr::benchmark::PaperCases(suite);
+  for (std::size_t index = 0; index < cases.size(); ++index) {
+    const auto &c = cases[index];
+    std::cerr << "[case " << index + 1 << '/' << cases.size()
+              << "] generating fixture N=" << c.horizon << " n=" << c.n
+              << " m=" << c.m << '\n';
     const auto data = clqr::benchmark::MakeScalingProblem(
         c.horizon, c.n, c.m, c.mixed, c.state, seed);
-    Run<CpuSolver>(c, data, "clqr_cpu", repeats, seed);
+    Run<CpuSolver>(c, data, "clqr_cpu", repeats, seed, index, cases.size());
 #ifdef CLQR_BENCHMARK_GEN_RICCATI
-    Run<RiccatiSolver>(c, data, "gen_riccati", repeats, seed);
+    Run<RiccatiSolver>(c, data, "gen_riccati", repeats, seed, index, cases.size());
 #endif
 #ifdef CLQR_BENCHMARK_GTSAM
-    Run<FactorGraphSolver>(c, data, "factor_graph", repeats, seed);
+    Run<FactorGraphSolver>(c, data, "factor_graph", repeats, seed, index, cases.size());
 #endif
 #ifdef CLQR_BENCHMARK_CUDA
-    Run<CudaSolver>(c, data, "clqr_cuda", repeats, seed);
+    Run<CudaSolver>(c, data, "clqr_cuda", repeats, seed, index, cases.size());
 #endif
 #ifdef CLQR_BENCHMARK_LAINE
-    Run<LaineAuthorSolver>(c, data, "laine_author", repeats, seed);
+    Run<LaineAuthorSolver>(c, data, "laine_author", repeats, seed, index, cases.size());
 #endif
 #ifdef CLQR_BENCHMARK_LAINE_CORRECTED
-    Run<LaineCorrectedSolver>(c, data, "laine_corrected", repeats, seed);
+    Run<LaineCorrectedSolver>(c, data, "laine_corrected", repeats, seed, index, cases.size());
 #endif
   }
   // Keep all numerical outcomes in the CSV, without turning them into test

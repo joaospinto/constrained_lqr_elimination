@@ -257,7 +257,8 @@ failed=0
 measure() {
   local name="$1"
   shift
-  if "$@" > "$output_dir/$name.csv" 2> "$output_dir/$name.stderr"; then
+  if python3 "$repo_dir/scripts/benchmark_progress.py" --name "$name" \
+      --stdout "$output_dir/$name.csv" --stderr "$output_dir/$name.stderr" -- "$@"; then
     printf 'Completed %s\n' "$name"
   else
     printf 'CHECK FAILED: %s (see CSV and stderr)\n' "$name" >&2
@@ -267,7 +268,8 @@ measure() {
 check_log() {
   local name="$1"
   shift
-  if "$@" > "$output_dir/$name.log" 2>&1; then
+  if python3 "$repo_dir/scripts/benchmark_progress.py" --name "$name" \
+      --stdout "$output_dir/$name.log" -- "$@"; then
     printf 'Passed %s\n' "$name"
   else
     printf 'CHECK FAILED: %s (see its log)\n' "$name" >&2

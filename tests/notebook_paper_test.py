@@ -13,9 +13,64 @@ from unittest import mock
 import zipfile
 
 from scripts import notebook_paper
+from scripts import benchmark_progress
 
 
 class NotebookTest(unittest.TestCase):
+    def test_progress_streams_diagnostics_without_polluting_csv(self):
+        for code in (0, 7):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                output, errors = work / "results.csv", work / "results.stderr"
+                command = [sys.executable, "-c",
+                           "import sys,time; "
+                           "print('backend,median_ms\\nclqr_cpu,1.25', flush=True); "
+                           "print('[case 1/4] clqr_cpu N=1 n=4 timing', "
+                           "file=sys.stderr, flush=True); "
+                           f"time.sleep(0.15); sys.exit({code})"]
+                console = io.StringIO()
+                with contextlib.redirect_stdout(console):
+                    actual = benchmark_progress.run(
+                        command, name="cpu_round1", output=output, errors=errors,
+                        interval=0.025)
+                self.assertEqual(actual, code)
+                self.assertEqual(output.read_text(),
+                                 "backend,median_ms\nclqr_cpu,1.25\n")
+                self.assertEqual(errors.read_text(),
+                                 "[case 1/4] clqr_cpu N=1 n=4 timing\n")
+                self.assertIn(errors.read_text(), console.getvalue())
+                self.assertIn("[cpu_round1] RUNNING", console.getvalue())
+                self.assertIn("COMPLETE" if code == 0 else "FAILED: exit code 7",
+                              console.getvalue())
+                self.assertNotIn("backend,median_ms", console.getvalue())
+
+    def test_progress_streams_validation_stdout_and_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "validation.log"
+            console = io.StringIO()
+            with contextlib.redirect_stdout(console):
+                code = benchmark_progress.run(
+                    [sys.executable, "-c",
+                     "import sys; print('case passed', flush=True); "
+                     "print('diagnostic', file=sys.stderr, flush=True)"],
+                    name="validation", output=output)
+            self.assertEqual(code, 0)
+            self.assertEqual(output.read_text(), "case passed\ndiagnostic\n")
+            self.assertIn(output.read_text(), console.getvalue())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process signal semantics")
+    def test_progress_reports_killed_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            console = io.StringIO()
+            with contextlib.redirect_stdout(console):
+                code = benchmark_progress.run(
+                    [sys.executable, "-c",
+                     "import os,signal; os.kill(os.getpid(), signal.SIGKILL)"],
+                    name="references", output=Path(directory) / "results.csv",
+                    errors=Path(directory) / "results.stderr")
+            self.assertEqual(code, 137)
+            self.assertIn("FAILED: terminated by SIGKILL (9)", console.getvalue())
+
     def test_backend_switches_skip_fetch_build_and_execution(self):
         root = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"]
         configurations = (
@@ -31,7 +86,8 @@ class NotebookTest(unittest.TestCase):
                 work = Path(directory)
                 source = work / "source"
                 (source / "scripts").mkdir(parents=True)
-                for name in ("paper_benchmarks.sh", "benchmark_options.sh", "notebook_bazel.sh"):
+                for name in ("paper_benchmarks.sh", "benchmark_options.sh",
+                             "notebook_bazel.sh", "benchmark_progress.py"):
                     shutil.copy(root / "scripts" / name, source / "scripts" / name)
                 (source / ".bazelversion").write_text("9.1.1\n")
                 (source / "bazel-bin").mkdir()
@@ -45,6 +101,8 @@ from pathlib import Path
 name, *args = sys.argv[1:]
 with open(os.environ["CALL_LOG"], "a") as f:
     f.write(json.dumps([name, *args]) + "\\n")
+if name == "python3" and args[0].endswith("benchmark_progress.py"):
+    os.execv(sys.executable, [sys.executable, *args])
 if name == "git" and args[0] == "init":
     Path(args[-1]).mkdir(parents=True)
 if name == "git" and "fetch" in args:
@@ -85,6 +143,8 @@ if name == "cmake" and "-B" in args:
                                          str(work / "results")], env=env,
                                         capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("[cpu_round1] START", result.stdout)
+                self.assertIn("[cpu_round2] COMPLETE", result.stdout)
                 calls = [json.loads(line) for line in log.read_text().splitlines()]
                 fetched = {Path(call[-1]).name for call in calls
                            if call[:2] == ["git", "init"]}

@@ -24,7 +24,11 @@ py_test(
 
 py_test(
     name = "notebook_paper_test",
-    srcs = ["tests/notebook_paper_test.py", "scripts/notebook_paper.py"],
+    srcs = [
+        "tests/notebook_paper_test.py",
+        "scripts/notebook_paper.py",
+        "scripts/benchmark_progress.py",
+    ],
     main = "tests/notebook_paper_test.py",
     data = [
         "notebooks/kaggle_paper_comparison.ipynb",
@@ -161,6 +165,17 @@ cc_binary(
         "//conditions:default": [],
     }),
     deps = [":clqr"],
+)
+
+py_test(
+    name = "paper_benchmark_progress_test",
+    srcs = ["tests/paper_benchmark_progress_test.py"],
+    main = "tests/paper_benchmark_progress_test.py",
+    data = [":clqr_paper_cpu_benchmark"],
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_binary(

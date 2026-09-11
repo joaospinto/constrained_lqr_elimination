@@ -216,6 +216,12 @@ collecting GPU timings.
 Requires CMake, a C++ compiler, Git, and at least 3 GiB free disk
 space; `CLQR_JOBS` defaults to 4. Set `CLQR_PAPER_SUITE=smoke` for a short run.
 
+The driver streams the current method, case index/count, dimensions, and phase
+(setup, warm-up, timing, or validation), plus elapsed time. During long commands,
+it prints a heartbeat every 30 seconds; override this with
+`CLQR_PROGRESS_INTERVAL_SECONDS`. Progress stays out of the CSV files and is
+retained in the notebook's `driver.log`.
+
 Downloads, builds, and measurements can be selected independently with these
 environment variables (only `0` and `1` are accepted):
 

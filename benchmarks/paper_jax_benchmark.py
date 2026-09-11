@@ -91,7 +91,16 @@ def main(default_platform="cpu", argv=None):
     writer = csv.DictWriter(sys.stdout, fieldnames=fields)
     writer.writeheader()
     protocol_failed = False
-    for case in paper_fixture.cases(fixture, args.suite):
+    cases = paper_fixture.cases(fixture, args.suite)
+    for index, case in enumerate(cases, 1):
+        started = time.perf_counter()
+
+        def progress(phase):
+            print(f"[case {index}/{len(cases)}] clqr_jax_{args.platform} "
+                  f"N={case['N']} n={case['n']} m={case['m']} {phase} "
+                  f"(elapsed {time.perf_counter() - started:.1f}s)",
+                  file=sys.stderr, flush=True)
+
         row = dict(backend="clqr_jax_" + args.platform, seed=args.seed, repeats=args.repeats,
                    **{key: value for key, value in case.items() if key != "index"})
         identity = (case["family"], *(case[field] for field in
@@ -103,24 +112,31 @@ def main(default_platform="cpu", argv=None):
             print(f"# skipped {identity}: same-run native CUDA workspace capacity rejection")
             writer.writerow(row)
             sys.stdout.flush()
+            progress("DONE status=unsupported (native CUDA capacity report)")
             continue
         solve = inputs = result = host = p = expected_x = expected_u = expected_dual = None
         try:
+            progress("generating fixture")
             p, expected_x, expected_u, expected_dual = paper_fixture.problem(fixture, args.suite, case["index"], args.seed)
+            progress("packing and uploading inputs")
             host = module.pack_problem(p)
             inputs = jax.device_put(host, device)
             jax.block_until_ready(inputs)
+            progress("compiling JAX solve")
             solve = jax.jit(module.solve).lower(inputs).compile()
+            progress("warmup")
             start = time.perf_counter()
             warmed = 0
             while warmed < 3 or time.perf_counter() - start < 0.1:
                 result = jax.block_until_ready(solve(inputs))
                 warmed += 1
             times = []
+            progress(f"timing {args.repeats} resident solves")
             for _ in range(args.repeats):
                 start = time.perf_counter_ns()
                 result = jax.block_until_ready(solve(inputs))
                 times.append((time.perf_counter_ns() - start) / 1e6)
+            progress("validation")
             # Read the handler's audit before transferring the results for validation.
             if cuda:
                 transfers = cuda.last_transfer_audit()
@@ -152,6 +168,7 @@ def main(default_platform="cpu", argv=None):
             jax.clear_caches()
         writer.writerow(row)
         sys.stdout.flush()
+        progress(f"DONE status={row['status']}")
     # Accuracy and solver rejections are recorded above. A violated timing/
     # transfer protocol is a harness failure, not a numerical measurement.
     return int(protocol_failed)

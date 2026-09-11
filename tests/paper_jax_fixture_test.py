@@ -29,7 +29,8 @@ def check_capacity_report():
 if __name__ == "__main__":
     check_capacity_report()
     output = io.StringIO()
-    with contextlib.redirect_stdout(output):
+    progress = io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(progress):
         code = main("cpu", ["--suite", "smoke", "--repeats", "1"])
     print(output.getvalue(), end="")
     rows = list(csv.DictReader(line for line in output.getvalue().splitlines()
@@ -40,6 +41,11 @@ if __name__ == "__main__":
     assert len(rows) == 4
     assert all(row["status"] == "ok" for row in rows), rows
     assert all(float(row["dual_error_inf"]) < 1e-8 for row in rows), rows
+    assert "[case 1/4] clqr_jax_cpu N=1 n=4 m=2 generating fixture" in progress.getvalue()
+    assert "[case 4/4]" in progress.getvalue()
+    assert "compiling JAX solve" in progress.getvalue()
+    assert "DONE status=ok" in progress.getvalue()
+    assert "[case" not in output.getvalue()
     fixture = next(_runfiles().rglob("clqr_paper_fixture"))
     for index in (0, 2, 3):
         p, x, u, dual = paper_fixture.problem(fixture, "smoke", index, 20260907)
