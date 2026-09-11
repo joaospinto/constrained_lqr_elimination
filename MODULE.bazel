@@ -10,6 +10,10 @@ bazel_dep(name = "rules_cuda", version = "0.3.0")
 # Only optional reference-adapter tests use Eigen; downstream users omit it.
 bazel_dep(name = "eigen", version = "3.4.0.bcr.3", dev_dependency = True)
 
+# Lazily fetched only by the explicit reference-benchmark source target.
+references = use_extension("//benchmarks/reference:repositories.bzl", "reference_sources", dev_dependency = True)
+use_repo(references, "vanroye_source")
+
 cuda = use_extension("@rules_cuda//cuda:extensions.bzl", "toolchain")
 cuda.toolkit(
     name = "cuda",

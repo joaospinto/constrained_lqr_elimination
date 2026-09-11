@@ -9,6 +9,17 @@ Eigen is marked `dev_dependency = True` for the optional
 adapter tests; downstream Bazel consumers do not inherit it.
 No third-party solver source is vendored here.
 
+The optional Bazel source rule applies `vanroye_memory.patch` to Vanroye's
+wrapper: allocation byte counts use `std::size_t`, and failed allocations throw
+instead of dereferencing null. Its numerical routines are unchanged, and the
+original source checkout remains pristine. `vanroye_memory_test` checks requests
+larger than 2 GiB without allocating those buffers.
+
+The driver builds `//benchmarks/reference:vanroye_sources` and extracts its
+`vanroye_sources.tar` for CMake. For a manual CMake build, pass that extracted
+directory as `GEN_RICCATI_SOURCE_DIR`. This source dependency is development-only
+and is fetched only when explicitly requested.
+
 | Implementation | Mathematical scope relevant here | Timed output |
 | --- | --- | --- |
 | CLQR CPU | Stagewise equality constraints, including redundant rows; varying dimensions | Primal trajectory and original multipliers |

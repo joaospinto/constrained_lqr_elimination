@@ -77,10 +77,10 @@ class NotebookTest(unittest.TestCase):
         configurations = (
             ({"CLQR_RUN_EXTERNAL": "0"}, set()),
             ({"CLQR_RUN_EXTERNAL": "0", "CLQR_RUN_VANROYE": "1"},
-             {"blasfeo", "generalization_riccati"}),
+             {"blasfeo"}),
             ({"CLQR_RUN_YANG": "0"},
-             {"blasfeo", "generalization_riccati", "eigen", "laine_author"}),
-            ({}, {"blasfeo", "generalization_riccati", "gtsam", "factor_graph", "laine_author"}),
+             {"blasfeo", "eigen", "laine_author"}),
+            ({}, {"blasfeo", "gtsam", "factor_graph", "laine_author"}),
         )
         for overrides, expected in configurations:
             with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as directory:
@@ -138,7 +138,7 @@ if name == "cmake" and "-B" in args:
                     '#!/bin/sh\nexec "' + sys.executable + '" "' + str(stub) +
                     '" "${0##*/}" "$@"\n')
                 launcher.chmod(0o755)
-                for name in ("git", "cmake", "ctest", "bazel", "python3", "df", "sysctl"):
+                for name in ("git", "cmake", "ctest", "bazel", "python3", "df", "sysctl", "tar"):
                     (tools / name).symlink_to(launcher)
                 for name in ("clqr_paper_fixture", "clqr_paper_cpu_benchmark", "clqr_paper_jax_cpu_benchmark"):
                     (source / "bazel-bin" / name).symlink_to(launcher)
@@ -177,6 +177,11 @@ if name == "cmake" and "-B" in args:
                 fetched = {Path(call[-1]).name for call in calls
                            if call[:2] == ["git", "init"]}
                 self.assertEqual(fetched, expected)
+                vanroye_target = "//benchmarks/reference:vanroye_sources"
+                self.assertEqual(any(vanroye_target in call for call in calls),
+                                 "blasfeo" in expected)
+                self.assertEqual(any(call[0] == "tar" for call in calls),
+                                 "blasfeo" in expected)
                 cmake_calls = [call for call in calls if call[0] == "cmake"]
                 self.assertEqual(bool(cmake_calls), bool(expected))
                 self.assertEqual(any("gtsam-build" in " ".join(call)

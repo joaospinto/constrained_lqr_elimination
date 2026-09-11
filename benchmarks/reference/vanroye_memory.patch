@@ -1,0 +1,106 @@
+diff --git a/blasfeo_wrapper.hpp b/blasfeo_wrapper.hpp
+--- a/blasfeo_wrapper.hpp
++++ b/blasfeo_wrapper.hpp
+@@ -93,6 +93,8 @@
+             __typeof__(b) _b = (b); \
+             _a < _b ? _a : _b;      \
+         })
++#include <cstddef>
++#include <new>
+ #include <iostream>
+ extern "C"
+ {
+@@ -212,7 +214,7 @@
+         // TODO: if rvalue-reference is used -> unecessary copy, use move sementics instead.;
+         FatropMemoryMatBF(const int nrows, const int ncols, int N);
+         /** \brief calculate memory size*/
+-        int memory_size() const;
++        std::size_t memory_size() const;
+         /** \brief set up memory element and advance pointer */
+         void set_up();
+         /** \brief get fatrop matrix bf */
+@@ -292,7 +294,7 @@
+         // TODO: if rvalue-reference is used -> unecessary copy, use move sementics instead.;
+         FatropMemoryVecBF(const int nels, int N);
+         /** \brief calculate memory size*/
+-        int memory_size() const;
++        std::size_t memory_size() const;
+         /** \brief set up memory element and advance pointer */
+         void set_up();
+         /** \brief get fatrop matrix bf */
+@@ -364,7 +366,7 @@
+         /** \brief constructor */
+         MemoryPermMat(const int dim, const int N);
+         /** \brief calculate needed memory size*/
+-        int memory_size() const;
++        std::size_t memory_size() const;
+         /** \brief set up memory*/
+         void set_up();
+         explicit operator PermMat *()
+diff --git a/blasfeo_wrapper.cpp b/blasfeo_wrapper.cpp
+--- a/blasfeo_wrapper.cpp
++++ b/blasfeo_wrapper.cpp
+@@ -409,9 +409,9 @@
+ {
+     set_up();
+ }
+-int FatropMemoryMatBF::memory_size() const
+-{
+-    int result = 0;
++std::size_t FatropMemoryMatBF::memory_size() const
++{
++    std::size_t result = 0;
+     // size to store structs
+     result += N_ * sizeof(MAT);
+     // sufficient space for cache alignment
+@@ -428,6 +428,7 @@
+ {
+     free(mem);
+     mem = malloc(this->memory_size());
++    if (mem == nullptr) throw std::bad_alloc();
+     char *data_p = (char *)mem;
+     MAT *bf_ptr = (MAT *)data_p;
+     this->mat = bf_ptr;
+@@ -474,9 +475,9 @@
+ {
+     set_up();
+ }
+-int FatropMemoryVecBF::memory_size() const
+-{
+-    int result = 0;
++std::size_t FatropMemoryVecBF::memory_size() const
++{
++    std::size_t result = 0;
+     // size to store structs
+     result += N_ * sizeof(VEC);
+     // sufficient space for cache alignment
+@@ -492,6 +493,7 @@
+ {
+     free(mem);
+     mem = malloc(this->memory_size());
++    if (mem == nullptr) throw std::bad_alloc();
+     char *data_p = (char *)mem;
+     VEC *bf_ptr = (VEC *)data_p;
+     this->vec = bf_ptr;
+@@ -717,16 +719,17 @@
+ {
+     set_up();
+ };
+-int MemoryPermMat::memory_size() const
+-{
+-    int size = 0;
+-    size += N_ * sizeof(PermMat) + N_ * dim_ * sizeof(int);
++std::size_t MemoryPermMat::memory_size() const
++{
++    std::size_t size = 0;
++    size += N_ * sizeof(PermMat) + static_cast<std::size_t>(N_) * dim_ * sizeof(int);
+     return size;
+ }
+ void MemoryPermMat::set_up()
+ {
+     free(mem);
+     mem = malloc(this->memory_size());
++    if (mem == nullptr) throw std::bad_alloc();
+     char *char_p = (char *)mem;
+     perm_p = (PermMat *)char_p;
+     PermMat *perm_pp = perm_p;

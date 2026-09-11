@@ -109,7 +109,6 @@ checkout() {
 # BLASFEO is an upstream dependency of Vanroye's reference, not of CLQR.
 if (( CLQR_RUN_VANROYE )); then
   checkout blasfeo https://github.com/giaf/blasfeo.git 60493284741b3e4e5b0bf25155221d4b5f0b2232
-  checkout generalization_riccati https://github.com/lvanroye/generalization_riccati.git 8bf4b5684219a6035e93b61d8ef6ae4afd1f4e19
 fi
 eigen_dir=""
 if (( CLQR_RUN_YANG )); then
@@ -210,7 +209,12 @@ if (( cuda_run )); then
     targets+=(//:cuda_solver_test //:adversarial_cuda_extended_test)
   fi
 fi
+if (( CLQR_RUN_VANROYE )); then targets+=(//benchmarks/reference:vanroye_sources); fi
 "${bazel_cmd[@]}" build "${bazel_args[@]}" "${targets[@]}"
+if (( CLQR_RUN_VANROYE )); then
+  mkdir -p "$deps_dir/vanroye-bazel-source"
+  tar -xf bazel-bin/benchmarks/reference/vanroye_sources.tar -C "$deps_dir/vanroye-bazel-source"
+fi
 bazel-bin/clqr_paper_fixture --suite "$suite" > "$output_dir/cases.json"
 if (( CLQR_RUN_TESTS )); then
   tests=(//:clqr_test //:workspace_allocation_test //:scaling_problem_test
@@ -244,7 +248,7 @@ if (( run_references )); then
   blasfeo_dir=""; vanroye_dir=""; yang_dir=""; laine_dir=""; gtsam_dir=""
   corrected=OFF
   if (( CLQR_RUN_VANROYE )); then
-    blasfeo_dir="$deps_dir/blasfeo"; vanroye_dir="$deps_dir/generalization_riccati"
+    blasfeo_dir="$deps_dir/blasfeo"; vanroye_dir="$deps_dir/vanroye-bazel-source"
   fi
   if (( CLQR_RUN_YANG )); then
     yang_dir="$deps_dir/factor_graph"; gtsam_dir="$cache_dir/gtsam-build"

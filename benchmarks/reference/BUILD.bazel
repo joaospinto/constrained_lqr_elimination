@@ -1,5 +1,19 @@
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
+exports_files(["vanroye_memory.patch"])
+
+# The optional CMake harness consumes sources already patched by Bazel. Neither
+# normal library builds nor wildcard test runs fetch this manual target.
+genrule(
+    name = "vanroye_sources",
+    srcs = ["@vanroye_source//:sources", "@vanroye_source//:gen_riccati.cpp"],
+    outs = ["vanroye_sources.tar"],
+    cmd = "COPYFILE_DISABLE=1 tar -chf $@ -C $$(dirname $(location @vanroye_source//:gen_riccati.cpp)) " +
+          "auxilary.cpp auxilary.hpp blasfeo_wrapper.cpp blasfeo_wrapper.hpp " +
+          "cocp.hpp cocp_dims.hpp gen_riccati.cpp gen_riccati.hpp numeric_vector.hpp",
+    tags = ["manual"],
+)
+
 # Tests input conversion without downloading GTSAM. The optional CMake harness
 # runs this same test with the original factor-graph solver linked as well.
 cc_test(
