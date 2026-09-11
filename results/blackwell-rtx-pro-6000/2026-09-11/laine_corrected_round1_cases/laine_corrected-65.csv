@@ -1,0 +1,11 @@
+# FP64; exactly one untimed warmup solve; setup includes representation/storage preparation; solve includes a fresh factorization and primal solve on every repetition.
+# All backends receive identical data. Validation and result conversion are untimed.
+# CLQR, generalized Riccati, and both Laine implementations also recover duals inside timing. Primal-only backends report no solver-dual KKT measurement.
+# Setup+solve includes representation construction and fresh workspace allocation; destruction is excluded.
+# Missing dual/kernel measurements are nan, not inferred from other solvers.
+# planted_dual_stationarity_inf audits each returned primal with the fixture's known optimal dual, not solver output.
+# primal_error and dual_error_inf are absolute infinity-norm errors against the known planted optimum, in original coordinates.
+# Samples are individually timed; sample-list columns retain chronological times in ms separated by semicolons. Timing quantiles are unavailable for a single sample.
+# min_seconds=1; fixed_repeats=0 (0 means duration-based); each timing phase uses its own budget.
+backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,setup_ms,median_ms,p10_ms,p90_ms,primal_error,objective,relative_objective_error,kernel_ms,feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,planted_dual_stationarity_inf,dual_error_inf,setup_solve_repeats,solve_samples_ms,setup_solve_samples_ms,kernel_samples_ms
+laine_corrected,horizon,32768,64,32,8,16,20260907,ok,1,1346.755838,12762.999206,nan,nan,2.03725925019e-14,-118593.462434,6.0513298827e-18,nan,2.48689957516e-14,2.37754260723e-13,2.37754260723e-13,13034.59144,2.10387263166e-14,3.55826479392e-13,1,12762.999206,13034.59144,

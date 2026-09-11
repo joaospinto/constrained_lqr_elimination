@@ -1,0 +1,7 @@
+[case 26/66] generating fixture N=256 n=24 m=12
+[case 26/66] clqr_cpu N=256 n=24 m=12 setup (elapsed 0s)
+[case 26/66] clqr_cpu N=256 n=24 m=12 warmup (1 solve) (elapsed 0s)
+[case 26/66] clqr_cpu N=256 n=24 m=12 timing prepared solves: at least 1.000000 measured seconds (elapsed 0s)
+[case 26/66] clqr_cpu N=256 n=24 m=12 validation (elapsed 1s)
+[case 26/66] clqr_cpu N=256 n=24 m=12 timing setup+solve: at least 1.000000 measured seconds (elapsed 1s)
+[case 26/66] clqr_cpu N=256 n=24 m=12 DONE status=ok (elapsed 2s)

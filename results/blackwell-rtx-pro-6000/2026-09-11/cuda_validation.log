@@ -1,0 +1,33 @@
+testing NVIDIA RTX PRO 6000 Blackwell Workstation Edition (compute 12.0, 97288.3 MiB)
+case: unconstrained
+case: state-only
+case: mixed
+case: alternating
+case: rank-deficient redundant
+case: terminal constraints
+case: nonuniform dimensions
+case: non-positive-definite reduced control cost
+case: zero horizon
+case: runtime dimensions beyond former capacities
+case: zero control dimension
+case: exact dual-relation scratch layout
+case: topology-tight 45-to-0 scratch planning
+case: opt-in or global scratch
+case: shared-memory workspace shrinks
+case: shared-memory workspace grows again
+case: large-state scratch n=32
+case: large-state scratch n=64
+case: more mixed rows than controls
+case: independently rescaled rows
+case: maximum constraint dimensions
+case: small state-only standalone
+case: reusable workspace large case
+case: reusable workspace smaller case
+case: reusable workspace cached layout
+case: workspace-backed result view
+case: cached layout constrained rank
+case: cached layout after changed-rank failure
+case: cached layout free rank
+case: cached layout restored rank
+case: long-horizon state constraints
+all CUDA cross-validation tests passed

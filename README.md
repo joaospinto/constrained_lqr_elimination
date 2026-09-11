@@ -320,6 +320,14 @@ It prints the `paper-results.zip` path and removes only that run's private
 dependency/build cache. GPU architecture and system details are detected and
 recorded; no P100-specific architecture flag is needed.
 
+A complete `all`-suite run of `scripts/paper_benchmarks.sh --cuda` from an
+RTX PRO 6000 Blackwell workstation (Core Ultra 9 285K host, CUDA 12.9, FP64)
+is archived under
+[`results/blackwell-rtx-pro-6000/2026-09-11`](results/blackwell-rtx-pro-6000/2026-09-11),
+including `measurements.csv`, `summary.json`, the generated LaTeX tables,
+`platform.txt`, `gpu.csv`, the validation and sanitizer logs, and every
+per-case raw output.
+
 To create a source bundle, run these commands from a full-history clone with
 local `main` at the revision you want to test, choosing an output path outside
 the repository:

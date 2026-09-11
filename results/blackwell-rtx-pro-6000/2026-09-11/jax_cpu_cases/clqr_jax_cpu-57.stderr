@@ -1,0 +1,8 @@
+An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+[case 58/66] clqr_jax_cpu N=128 n=64 m=32 generating fixture (elapsed 0.0s)
+[case 58/66] clqr_jax_cpu N=128 n=64 m=32 packing and uploading inputs (elapsed 0.0s)
+[case 58/66] clqr_jax_cpu N=128 n=64 m=32 compiling JAX solve (elapsed 0.1s)
+[case 58/66] clqr_jax_cpu N=128 n=64 m=32 warmup (1 solve) (elapsed 0.1s)
+[case 58/66] clqr_jax_cpu N=128 n=64 m=32 timing resident solves: at least 1.0 measured seconds (elapsed 0.2s)
+[case 58/66] clqr_jax_cpu N=128 n=64 m=32 validation (elapsed 1.2s)
+[case 58/66] clqr_jax_cpu N=128 n=64 m=32 DONE status=ok (elapsed 1.2s)

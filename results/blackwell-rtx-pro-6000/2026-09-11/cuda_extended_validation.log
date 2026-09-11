@@ -1,0 +1,75 @@
+case: empty-zero-horizon passed
+case: zero-horizon passed
+case: zero-horizon-terminal passed
+case: single-stage passed
+case: power-of-two passed
+case: horizon-2 passed
+case: horizon-3 passed
+case: horizon-5 passed
+case: horizon-6 passed
+case: horizon-7 passed
+case: horizon-9 passed
+case: horizon-15 passed
+case: horizon-17 passed
+case: ill-conditioned-horizon-17 passed
+case: nonuniform-zero-control passed
+case: all-zero-controls passed
+case: more-mixed-than-controls passed
+case: redundant-rank-deficient passed
+case: independently-scaled-rows passed
+case: terminal-only passed
+case: fully-constrained-nonunique-multipliers passed
+case: free-fixed-free-state passed
+case: infeasible-initial passed (infeasible)
+case: infeasible-terminal passed (infeasible)
+case: singular-reduced-hessian passed (numerical_failure)
+case: indefinite-reduced-hessian passed (numerical_failure)
+case: invalid-shape passed (invalid_input)
+case: extended-horizon-31 passed
+case: extended-horizon-32 passed
+case: extended-horizon-33 passed
+case: extended-horizon-63 passed
+case: extended-horizon-65 passed
+case: extended-horizon-127 passed
+case: extended-horizon-257 passed
+case: extended-horizon-1025 passed
+case: stable-extended-horizon-32 passed
+case: stable-extended-horizon-63 passed
+case: stable-extended-horizon-65 passed
+case: stable-extended-horizon-127 passed
+case: stable-extended-horizon-257 passed
+case: property-seed-0 passed
+case: property-seed-1 passed
+case: property-seed-2 passed
+case: property-seed-3 passed
+case: property-seed-4 passed
+case: property-seed-5 passed
+case: property-seed-6 passed
+case: property-seed-7 passed
+case: property-seed-8 passed
+case: property-seed-9 passed
+case: property-seed-10 passed
+case: property-seed-11 passed
+case: property-seed-12 passed
+case: property-seed-13 passed
+case: property-seed-14 passed
+case: property-seed-15 passed
+case: property-seed-16 passed
+case: property-seed-17 passed
+case: property-seed-18 passed
+case: property-seed-19 passed
+case: property-seed-20 passed
+case: property-seed-21 passed
+case: property-seed-22 passed
+case: property-seed-23 passed
+case: property-seed-24 passed
+case: property-seed-25 passed
+case: property-seed-26 passed
+case: property-seed-27 passed
+case: property-seed-28 passed
+case: property-seed-29 passed
+case: property-seed-30 passed
+case: property-seed-31 passed
+case: stable-property-seed-1 passed
+case: stable-property-seed-5 passed
+all 74 executed adversarial CUDA cases passed

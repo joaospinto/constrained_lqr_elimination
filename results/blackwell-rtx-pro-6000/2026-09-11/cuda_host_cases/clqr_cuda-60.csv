@@ -1,0 +1,11 @@
+# FP64; exactly one untimed warmup solve; setup includes representation/storage preparation; solve includes a fresh factorization and primal solve on every repetition.
+# All backends receive identical data. Validation and result conversion are untimed.
+# CLQR, generalized Riccati, and both Laine implementations also recover duals inside timing. Primal-only backends report no solver-dual KKT measurement.
+# Setup+solve includes representation construction and fresh workspace allocation; destruction is excluded.
+# Missing dual/kernel measurements are nan, not inferred from other solvers.
+# planted_dual_stationarity_inf audits each returned primal with the fixture's known optimal dual, not solver output.
+# primal_error and dual_error_inf are absolute infinity-norm errors against the known planted optimum, in original coordinates.
+# Samples are individually timed; sample-list columns retain chronological times in ms separated by semicolons. Timing quantiles are unavailable for a single sample.
+# min_seconds=1; fixed_repeats=0 (0 means duration-based); each timing phase uses its own budget.
+backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,setup_ms,median_ms,p10_ms,p90_ms,primal_error,objective,relative_objective_error,kernel_ms,feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,planted_dual_stationarity_inf,dual_error_inf,setup_solve_repeats,solve_samples_ms,setup_solve_samples_ms,kernel_samples_ms
+clqr_cuda,horizon,1024,64,32,8,16,20260907,ok,18,207.577511,56.958254,56.694861,57.137931,1.33002359126e-11,-3698.99071234,1.13963974293e-15,49.092000436,1.53710377759e-11,1.87228010873e-12,1.53710377759e-11,116.786588,1.37439226666e-11,1.17696463686e-10,9,56.765603;56.896988;57.319197;57.099562;56.91313;56.694861;57.137931;56.960325;56.958254;57.014612;57.060913;56.860992;56.747221;57.100887;56.927278;56.909872;57.087633;56.469895,117.749269;120.346305;110.177447;116.786588;118.782451;114.498013;116.30595;117.010264;115.460539,49.0810560472;49.0842247345;49.1047366522;49.0847357698;49.0684471317;49.1181115098;49.0918073095;49.0970892869;49.092000436;49.1012808271;49.0938241668;49.0844805427;49.1411530115;49.1113920398;49.0569592007;49.0815999471;49.1112318225;49.0511679836

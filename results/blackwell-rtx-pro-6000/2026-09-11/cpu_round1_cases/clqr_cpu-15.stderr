@@ -1,0 +1,7 @@
+[case 16/66] generating fixture N=512 n=16 m=8
+[case 16/66] clqr_cpu N=512 n=16 m=8 setup (elapsed 0s)
+[case 16/66] clqr_cpu N=512 n=16 m=8 warmup (1 solve) (elapsed 0s)
+[case 16/66] clqr_cpu N=512 n=16 m=8 timing prepared solves: at least 1.000000 measured seconds (elapsed 0s)
+[case 16/66] clqr_cpu N=512 n=16 m=8 validation (elapsed 1s)
+[case 16/66] clqr_cpu N=512 n=16 m=8 timing setup+solve: at least 1.000000 measured seconds (elapsed 1s)
+[case 16/66] clqr_cpu N=512 n=16 m=8 DONE status=ok (elapsed 2s)

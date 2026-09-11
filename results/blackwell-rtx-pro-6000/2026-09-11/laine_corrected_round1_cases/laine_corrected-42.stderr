@@ -1,0 +1,7 @@
+[case 43/66] generating fixture N=16384 n=32 m=16
+[case 43/66] laine_corrected N=16384 n=32 m=16 setup (elapsed 0s)
+[case 43/66] laine_corrected N=16384 n=32 m=16 warmup (1 solve) (elapsed 0s)
+[case 43/66] laine_corrected N=16384 n=32 m=16 timing prepared solves: at least 1.000000 measured seconds (elapsed 1s)
+[case 43/66] laine_corrected N=16384 n=32 m=16 validation (elapsed 2s)
+[case 43/66] laine_corrected N=16384 n=32 m=16 timing setup+solve: at least 1.000000 measured seconds (elapsed 2s)
+[case 43/66] laine_corrected N=16384 n=32 m=16 DONE status=ok (elapsed 4s)

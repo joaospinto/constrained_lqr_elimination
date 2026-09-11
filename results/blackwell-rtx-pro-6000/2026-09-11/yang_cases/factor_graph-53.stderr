@@ -1,0 +1,7 @@
+[case 54/66] generating fixture N=16384 n=48 m=24
+[case 54/66] factor_graph N=16384 n=48 m=24 setup (elapsed 0s)
+[case 54/66] factor_graph N=16384 n=48 m=24 warmup (1 solve) (elapsed 0s)
+[case 54/66] factor_graph N=16384 n=48 m=24 timing prepared solves: at least 1.000000 measured seconds (elapsed 4s)
+[case 54/66] factor_graph N=16384 n=48 m=24 validation (elapsed 7s)
+[case 54/66] factor_graph N=16384 n=48 m=24 timing setup+solve: at least 1.000000 measured seconds (elapsed 8s)
+[case 54/66] factor_graph N=16384 n=48 m=24 DONE status=inaccurate (elapsed 11s)

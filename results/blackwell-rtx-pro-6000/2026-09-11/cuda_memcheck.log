@@ -1,0 +1,44 @@
+========= COMPUTE-SANITIZER
+# FP64; exactly one untimed warmup solve; setup includes representation/storage preparation; solve includes a fresh factorization and primal solve on every repetition.
+# All backends receive identical data. Validation and result conversion are untimed.
+# CLQR, generalized Riccati, and both Laine implementations also recover duals inside timing. Primal-only backends report no solver-dual KKT measurement.
+# Setup+solve includes representation construction and fresh workspace allocation; destruction is excluded.
+# Missing dual/kernel measurements are nan, not inferred from other solvers.
+# planted_dual_stationarity_inf audits each returned primal with the fixture's known optimal dual, not solver output.
+# primal_error and dual_error_inf are absolute infinity-norm errors against the known planted optimum, in original coordinates.
+# Samples are individually timed; sample-list columns retain chronological times in ms separated by semicolons. Timing quantiles are unavailable for a single sample.
+# min_seconds=1; fixed_repeats=1 (0 means duration-based); each timing phase uses its own budget.
+backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,setup_ms,median_ms,p10_ms,p90_ms,primal_error,objective,relative_objective_error,kernel_ms,feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,planted_dual_stationarity_inf,dual_error_inf,setup_solve_repeats,solve_samples_ms,setup_solve_samples_ms,kernel_samples_ms
+[case 1/4] generating fixture N=1 n=4 m=2
+[case 1/4] clqr_cuda N=1 n=4 m=2 setup (elapsed 0s)
+clqr_cuda,state,1,4,2,0,1,20260907,[case 1/4] clqr_cuda N=1 n=4 m=2 warmup (1 solve) (elapsed 0s)
+[case 1/4] clqr_cuda N=1 n=4 m=2 timing prepared solves: 1 calls (elapsed 0s)
+[case 1/4] clqr_cuda N=1 n=4 m=2 validation (elapsed 0s)
+[case 1/4] clqr_cuda N=1 n=4 m=2 timing setup+solve: 1 calls (elapsed 0s)
+ok,1,287.652086,2.937003,nan,nan,1.38777878078e-16,-0.539061515521,9.92044987824e-18,2.66092803329,1.11022302463e-16,1.11022302463e-16,1.11022302463e-16,3.808599,1.52655665886e-16,2.15105711021e-16,1,2.937003,3.808599,2.66092803329
+[case 1/4] clqr_cuda N=1 n=4 m=2 DONE status=ok (elapsed 0s)
+[case 2/4] generating fixture N=17 n=8 m=4
+[case 2/4] clqr_cuda N=17 n=8 m=4 setup (elapsed 0s)
+clqr_cuda,mixed,17,8,4,2,0,20260907,[case 2/4] clqr_cuda N=17 n=8 m=4 warmup (1 solve) (elapsed 0s)
+[case 2/4] clqr_cuda N=17 n=8 m=4 timing prepared solves: 1 calls (elapsed 0s)
+[case 2/4] clqr_cuda N=17 n=8 m=4 validation (elapsed 0s)
+[case 2/4] clqr_cuda N=17 n=8 m=4 timing setup+solve: 1 calls (elapsed 0s)
+ok,1,0.605156,12.310631,nan,nan,4.99600361081e-16,-8.44580981335,1.29398579179e-17,11.6815678328,2.77555756156e-16,1.98452365652e-15,1.98452365652e-15,13.367266,4.99600361081e-16,2.17187379192e-15,1,12.310631,13.367266,11.6815678328
+[case 2/4] clqr_cuda N=17 n=8 m=4 DONE status=ok (elapsed 0s)
+[case 3/4] generating fixture N=17 n=8 m=4
+[case 3/4] clqr_cuda N=17 n=8 m=4 setup (elapsed 0s)
+clqr_cuda,combined,17,8,4,1,1,20260907,[case 3/4] clqr_cuda N=17 n=8 m=4 warmup (1 solve) (elapsed 0s)
+[case 3/4] clqr_cuda N=17 n=8 m=4 timing prepared solves: 1 calls (elapsed 0s)
+[case 3/4] clqr_cuda N=17 n=8 m=4 validation (elapsed 0s)
+[case 3/4] clqr_cuda N=17 n=8 m=4 timing setup+solve: 1 calls (elapsed 0s)
+ok,1,0.601904,12.229038,nan,nan,4.55191440096e-15,-8.42501864412,1.12628088013e-16,11.6355842501,6.43929354283e-15,1.85036708178e-12,1.85036708178e-12,12.981213,4.60742555219e-15,1.91409388339e-12,1,12.229038,12.981213,11.6355842501
+[case 3/4] clqr_cuda N=17 n=8 m=4 DONE status=ok (elapsed 0s)
+[case 4/4] generating fixture N=0 n=4 m=2
+[case 4/4] clqr_cuda N=0 n=4 m=2 setup (elapsed 0s)
+clqr_cuda,zero,0,4,2,0,0,20260907,[case 4/4] clqr_cuda N=0 n=4 m=2 warmup (1 solve) (elapsed 0s)
+[case 4/4] clqr_cuda N=0 n=4 m=2 timing prepared solves: 1 calls (elapsed 0s)
+[case 4/4] clqr_cuda N=0 n=4 m=2 validation (elapsed 0s)
+[case 4/4] clqr_cuda N=0 n=4 m=2 timing setup+solve: 1 calls (elapsed 0s)
+ok,1,0.467942,0.590274,nan,nan,0,-0.239640729005,0,0.472384013236,0,2.77555756156e-17,2.77555756156e-17,1.166837,2.08166817117e-17,4.33680868994e-17,1,0.590274,1.166837,0.472384013236
+[case 4/4] clqr_cuda N=0 n=4 m=2 DONE status=ok (elapsed 0s)
+========= ERROR SUMMARY: 0 errors

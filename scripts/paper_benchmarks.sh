@@ -246,6 +246,9 @@ if (( CLQR_RUN_TESTS )); then
 fi
 
 # Build the authors' factor-graph dependency without unused modules or Boost.
+# GTSAM defaults to warnings-as-errors; GCC 13 with -march=native reports a
+# false-positive -Warray-bounds inside Eigen's AVX kernels, so keep warnings
+# non-fatal (a build setting only, not a numerical change).
 if (( CLQR_RUN_YANG )); then
 cmake -S "$deps_dir/gtsam" -B "$cache_dir/gtsam-build" \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
@@ -254,7 +257,7 @@ cmake -S "$deps_dir/gtsam" -B "$cache_dir/gtsam-build" \
   -DGTSAM_BUILD_UNSTABLE=OFF -DGTSAM_BUILD_PYTHON=OFF \
   -DGTSAM_WITH_TBB=OFF -DGTSAM_WITH_EIGEN_MKL=OFF \
   -DGTSAM_WITH_EIGEN_MKL_OPENMP=OFF -DGTSAM_BUILD_WITH_MARCH_NATIVE=ON \
-  -DGTSAM_INSTALL_CPPUNITLITE=OFF
+  -DGTSAM_INSTALL_CPPUNITLITE=OFF -DGTSAM_BUILD_WITH_WERROR=OFF
 cmake --build "$cache_dir/gtsam-build" --target gtsam -j "$jobs"
 fi
 cpu_benchmark=bazel-bin/clqr_paper_cpu_benchmark

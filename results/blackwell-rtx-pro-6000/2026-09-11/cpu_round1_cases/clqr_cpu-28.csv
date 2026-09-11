@@ -1,0 +1,11 @@
+# FP64; exactly one untimed warmup solve; setup includes representation/storage preparation; solve includes a fresh factorization and primal solve on every repetition.
+# All backends receive identical data. Validation and result conversion are untimed.
+# CLQR, generalized Riccati, and both Laine implementations also recover duals inside timing. Primal-only backends report no solver-dual KKT measurement.
+# Setup+solve includes representation construction and fresh workspace allocation; destruction is excluded.
+# Missing dual/kernel measurements are nan, not inferred from other solvers.
+# planted_dual_stationarity_inf audits each returned primal with the fixture's known optimal dual, not solver output.
+# primal_error and dual_error_inf are absolute infinity-norm errors against the known planted optimum, in original coordinates.
+# Samples are individually timed; sample-list columns retain chronological times in ms separated by semicolons. Timing quantiles are unavailable for a single sample.
+# min_seconds=1; fixed_repeats=0 (0 means duration-based); each timing phase uses its own budget.
+backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,setup_ms,median_ms,p10_ms,p90_ms,primal_error,objective,relative_objective_error,kernel_ms,feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,planted_dual_stationarity_inf,dual_error_inf,setup_solve_repeats,solve_samples_ms,setup_solve_samples_ms,kernel_samples_ms
+clqr_cpu,horizon,2048,24,12,3,6,20260907,ok,22,38.64911,47.321434,47.079811,48.215551,3.63792329594e-13,-2801.99496361,6.18112430933e-18,nan,4.16333634234e-15,6.91025014987e-12,6.91025014987e-12,82.093669,3.80293019298e-13,9.50619444273e-12,13,48.215551;49.036541;47.269942;47.084141;47.828902;47.325703;48.055161;47.723764;47.116439;47.312975;47.079811;47.685646;47.160287;48.320999;47.321434;47.074774;47.457209;47.33121;47.272127;47.072648;47.13407;47.291782,82.032126;81.798011;86.551204;83.506669;82.093669;81.620733;82.056954;82.961561;82.247332;82.057797;86.613971;85.060999;81.844508,

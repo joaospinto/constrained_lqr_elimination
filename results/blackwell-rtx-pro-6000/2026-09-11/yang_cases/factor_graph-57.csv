@@ -1,0 +1,11 @@
+# FP64; exactly one untimed warmup solve; setup includes representation/storage preparation; solve includes a fresh factorization and primal solve on every repetition.
+# All backends receive identical data. Validation and result conversion are untimed.
+# CLQR, generalized Riccati, and both Laine implementations also recover duals inside timing. Primal-only backends report no solver-dual KKT measurement.
+# Setup+solve includes representation construction and fresh workspace allocation; destruction is excluded.
+# Missing dual/kernel measurements are nan, not inferred from other solvers.
+# planted_dual_stationarity_inf audits each returned primal with the fixture's known optimal dual, not solver output.
+# primal_error and dual_error_inf are absolute infinity-norm errors against the known planted optimum, in original coordinates.
+# Samples are individually timed; sample-list columns retain chronological times in ms separated by semicolons. Timing quantiles are unavailable for a single sample.
+# min_seconds=1; fixed_repeats=0 (0 means duration-based); each timing phase uses its own budget.
+backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,setup_ms,median_ms,p10_ms,p90_ms,primal_error,objective,relative_objective_error,kernel_ms,feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,planted_dual_stationarity_inf,dual_error_inf,setup_solve_repeats,solve_samples_ms,setup_solve_samples_ms,kernel_samples_ms
+factor_graph,horizon,128,64,32,8,16,20260907,ok,23,15.397048,44.795584,43.637271,45.503838,2.00783834003e-13,-469.730272038,4.60888945612e-17,nan,1.13659082146e-14,nan,nan,50.380796,2.06723527185e-13,nan,20,44.447531;45.115107;43.599135;43.325103;43.926294;43.637271;44.07212;44.941235;44.795584;45.257932;44.986475;44.837345;44.767093;45.688104;46.38359;44.974349;45.503838;44.761385;44.778395;44.789136;44.670515;45.041469;44.86851,50.605223;50.206438;49.583516;49.813332;49.331611;50.689928;50.069862;49.908064;49.813446;50.380796;49.846045;51.09601;53.333527;51.69038;50.760249;51.620897;50.728882;50.165819;50.994065;50.148609,

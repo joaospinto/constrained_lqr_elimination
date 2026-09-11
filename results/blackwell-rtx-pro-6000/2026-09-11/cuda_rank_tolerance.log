@@ -1,0 +1,11 @@
+testing NVIDIA RTX PRO 6000 Blackwell Workstation Edition (compute 12.0, 97288.3 MiB)
+case: N=2048 n=32 rank tolerance=1e-12
+  KKT=6.37419e-12 in state feasibility at stage 1622; primal error=3.60527e-12
+case: N=2048 n=32 rank tolerance=1e-11
+  KKT=1.75908e-11 in state stationarity at stage 1771; primal error=4.70568e-12
+case: N=2048 n=32 rank tolerance=1e-10
+  KKT=1.75908e-11 in state stationarity at stage 1771; primal error=3.60657e-12
+case: N=2048 n=32 rank tolerance=1e-09
+  KKT=1.75908e-11 in state stationarity at stage 1771; primal error=3.60657e-12
+case: N=2048 n=32 rank tolerance=1e-08
+  KKT=1.75908e-11 in state stationarity at stage 1771; primal error=3.60657e-12

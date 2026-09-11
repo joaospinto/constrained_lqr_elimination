@@ -1,0 +1,7 @@
+[case 43/66] clqr_jax_cuda N=16384 n=32 m=16 generating fixture (elapsed 0.0s)
+[case 43/66] clqr_jax_cuda N=16384 n=32 m=16 packing and uploading inputs (elapsed 1.4s)
+[case 43/66] clqr_jax_cuda N=16384 n=32 m=16 compiling JAX solve (elapsed 1.7s)
+[case 43/66] clqr_jax_cuda N=16384 n=32 m=16 warmup (1 solve) (elapsed 1.7s)
+[case 43/66] clqr_jax_cuda N=16384 n=32 m=16 timing resident solves: at least 1.0 measured seconds (elapsed 2.1s)
+[case 43/66] clqr_jax_cuda N=16384 n=32 m=16 validation (elapsed 3.1s)
+[case 43/66] clqr_jax_cuda N=16384 n=32 m=16 DONE status=ok (elapsed 4.3s)

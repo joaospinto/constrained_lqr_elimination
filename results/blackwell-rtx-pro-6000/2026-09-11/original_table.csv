@@ -1,0 +1,24 @@
+# device=NVIDIA RTX PRO 6000 Blackwell Workstation Edition (compute 12.0, 97288.3 MiB)
+# precision=FP64
+# dimensions are runtime-sized; benchmark problem: n=8, m=4, mixed/state constraints=2
+# per-stage records are compact runtime slices; dense kernel workspaces use active-dimension dynamic shared memory.
+# cpp_cpu_ms and CUDA timings use the same scalar precision.
+# CUDA wall time reuses reserved storage and includes packing, transfers, kernels, synchronization, and construction of a workspace-backed result view.
+# cuda_kernel_ms sums pure kernel event times and excludes all host-device transfers; upload_ms and download_ms cover the bulk packed inputs and outputs.
+# objective_ms is the device-side objective reduction and is included in cuda_kernel_ms.
+# other_wall_ms is wall time minus bulk upload, kernels, and bulk download; it includes host packing/view construction, phase-control transfers, synchronization, and API setup/validation.
+# api_overhead_ms is time outside the backend's internal timer (validation and device/workspace setup); internal_other_ms is internal wall time not covered by bulk-transfer or kernel events.
+# The timed CUDA path uses a prepared workspace: numerical values may change, while dimensions and shapes remain fixed.
+# The sequential C++ solver is timed at every horizon.
+# Multiplier consistency rejection is disabled while timing; the KKT residuals report the final repeated solutions' accuracy.
+N,n,m,p,repeats,cpp_cpu_ms,cuda_wall_ms,cuda_internal_ms,cuda_kernel_ms,wall_speedup,kernel_speedup,other_wall_ms,api_overhead_ms,internal_other_ms,input_pack_ms,layout_ms,result_ms,objective_ms,synchronizations,unattributed_internal_ms,upload_ms,feasibility_ms,reduction_ms,riccati_ms,reconstruction_ms,multiplier_ms,download_ms,min_reduced_n,min_reduced_m,cpp_kkt_residual,cuda_kkt_residual
+32,8,4,2,11,0.077300,1.035051,1.034768,0.967904,0.074682,0.079863,0.051103,0.000314,0.050727,0.006478,0.000435,0.000000,0.009600,4,0.042286,0.008640,0.548992,0.039264,0.267424,0.031872,0.071040,0.007680,6,2,1.443290e-14,1.329492e-14
+64,8,4,2,11,0.151050,1.176238,1.175971,1.098528,0.128418,0.137502,0.059405,0.000327,0.059005,0.014477,0.000551,0.000000,0.011424,4,0.044022,0.011552,0.633888,0.037792,0.310528,0.036160,0.068736,0.006944,6,2,1.398881e-14,1.332268e-14
+128,8,4,2,11,0.299152,1.318713,1.318003,1.225632,0.226851,0.244080,0.072217,0.000334,0.071507,0.025522,0.000948,0.000000,0.011392,4,0.045763,0.014176,0.716672,0.037440,0.348000,0.042112,0.069728,0.007872,6,2,1.487699e-14,1.876277e-14
+256,8,4,2,11,0.607294,1.493600,1.493141,1.363776,0.406597,0.445303,0.100928,0.000459,0.100533,0.051440,0.001376,0.000000,0.012288,4,0.047955,0.022368,0.808928,0.037280,0.387296,0.047328,0.069696,0.007328,6,2,1.598721e-14,1.720846e-14
+512,8,4,2,11,1.288215,1.734123,1.733318,1.509024,0.742863,0.853674,0.178147,0.000746,0.177451,0.125516,0.002290,0.000000,0.014336,4,0.053759,0.036320,0.906624,0.037728,0.429248,0.051360,0.070624,0.008288,6,2,1.865175e-14,2.253753e-14
+1024,8,4,2,11,2.452727,1.987111,1.986436,1.684576,1.234318,1.455991,0.228148,0.000781,0.227424,0.170823,0.003114,0.000000,0.015872,4,0.053139,0.064864,1.011200,0.043008,0.473152,0.056640,0.083712,0.008064,6,2,3.108624e-14,2.253753e-14
+2048,8,4,2,11,4.982076,2.519948,2.519210,1.974560,1.977055,2.523132,0.405913,0.000918,0.404898,0.341885,0.005781,0.000000,0.017888,4,0.056408,0.121408,1.170944,0.057344,0.535744,0.065696,0.125920,0.016896,6,2,3.197442e-14,2.361999e-14
+4096,8,4,2,11,13.653888,3.951785,3.948908,2.628032,3.455119,5.195480,1.029289,0.003230,1.026412,0.950315,0.014762,0.000000,0.022048,4,0.063094,0.247840,1.543680,0.102400,0.646240,0.075936,0.237600,0.038048,6,2,3.108624e-14,2.786660e-14
+8192,8,4,2,11,30.399407,5.601667,5.597433,3.743232,5.426850,8.121166,1.303459,0.007209,1.299225,1.189213,0.035108,0.000000,0.028160,4,0.076762,0.487808,2.120064,0.187392,0.862848,0.093344,0.452608,0.064352,6,2,2.930989e-14,2.930989e-14
+16384,8,4,2,11,65.501702,9.495580,9.488912,5.996544,6.898125,10.923242,2.550063,0.007710,2.540526,2.381744,0.060619,0.000000,0.040160,4,0.085866,0.836800,3.332640,0.347136,1.284736,0.127136,0.864256,0.130112,6,2,3.019807e-14,3.039236e-14

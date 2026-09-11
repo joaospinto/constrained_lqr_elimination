@@ -1,0 +1,11 @@
+# FP64; exactly one untimed warmup solve; setup includes representation/storage preparation; solve includes a fresh factorization and primal solve on every repetition.
+# All backends receive identical data. Validation and result conversion are untimed.
+# CLQR, generalized Riccati, and both Laine implementations also recover duals inside timing. Primal-only backends report no solver-dual KKT measurement.
+# Setup+solve includes representation construction and fresh workspace allocation; destruction is excluded.
+# Missing dual/kernel measurements are nan, not inferred from other solvers.
+# planted_dual_stationarity_inf audits each returned primal with the fixture's known optimal dual, not solver output.
+# primal_error and dual_error_inf are absolute infinity-norm errors against the known planted optimum, in original coordinates.
+# Samples are individually timed; sample-list columns retain chronological times in ms separated by semicolons. Timing quantiles are unavailable for a single sample.
+# min_seconds=1; fixed_repeats=0 (0 means duration-based); each timing phase uses its own budget.
+backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,setup_ms,median_ms,p10_ms,p90_ms,primal_error,objective,relative_objective_error,kernel_ms,feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,planted_dual_stationarity_inf,dual_error_inf,setup_solve_repeats,solve_samples_ms,setup_solve_samples_ms,kernel_samples_ms
+laine_author,horizon,2048,16,8,2,4,20260907,ok,26,32.123706,39.080566,38.900386,40.618915,1.63973001843e-13,-1867.91770092,1.1887279874e-19,nan,3.71924713249e-15,1.68746960849e-13,1.68746960849e-13,49.927733,1.70315150871e-13,6.08176703443e-14,20,39.019485;39.049348;40.618915;42.881043;39.401894;39.176676;39.135497;39.213201;39.063739;38.767571;38.977972;39.008687;38.903712;39.26355;42.706337;38.997014;39.092522;38.841045;38.958567;38.900386;39.475333;40.505936;38.939377;39.467842;39.071557;39.080566,49.663019;49.193605;49.093925;49.420298;49.679802;49.234573;49.883786;52.081471;49.927733;49.348344;53.747608;49.365936;50.009898;50.290655;50.516202;51.589693;49.274677;50.367283;50.21117;52.878741,

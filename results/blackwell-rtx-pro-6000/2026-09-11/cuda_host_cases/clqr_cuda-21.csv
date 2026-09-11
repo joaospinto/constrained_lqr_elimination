@@ -1,0 +1,11 @@
+# FP64; exactly one untimed warmup solve; setup includes representation/storage preparation; solve includes a fresh factorization and primal solve on every repetition.
+# All backends receive identical data. Validation and result conversion are untimed.
+# CLQR, generalized Riccati, and both Laine implementations also recover duals inside timing. Primal-only backends report no solver-dual KKT measurement.
+# Setup+solve includes representation construction and fresh workspace allocation; destruction is excluded.
+# Missing dual/kernel measurements are nan, not inferred from other solvers.
+# planted_dual_stationarity_inf audits each returned primal with the fixture's known optimal dual, not solver output.
+# primal_error and dual_error_inf are absolute infinity-norm errors against the known planted optimum, in original coordinates.
+# Samples are individually timed; sample-list columns retain chronological times in ms separated by semicolons. Timing quantiles are unavailable for a single sample.
+# min_seconds=1; fixed_repeats=0 (0 means duration-based); each timing phase uses its own budget.
+backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,setup_ms,median_ms,p10_ms,p90_ms,primal_error,objective,relative_objective_error,kernel_ms,feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,planted_dual_stationarity_inf,dual_error_inf,setup_solve_repeats,solve_samples_ms,setup_solve_samples_ms,kernel_samples_ms
+clqr_cuda,horizon,32768,16,8,2,4,20260907,ok,18,294.681725,56.917254,56.604657,57.644188,2.05946301679e-10,-29635.2045502,5.78608207063e-16,38.5763842314,2.44826173224e-10,3.29063484794e-09,3.29063484794e-09,218.636916,2.12796114063e-10,7.20957359091e-09,5,57.712416;57.164404;57.514186;57.151306;57.303387;57.644188;57.394683;56.845498;56.709879;56.801693;56.767466;55.847192;56.655763;56.604657;56.923527;56.804572;56.917254;56.913032,230.735874;206.237568;218.636916;214.850736;229.211013,38.5691204816;38.5720632374;38.5749122202;38.5763842314;38.5844152421;38.5754230022;38.5746880025;38.5881918371;38.5803187788;38.5640963912;38.5634559691;38.5634873956;38.5532799512;38.6027848423;38.5890234411;38.5984648317;38.6552642286;38.7023362219

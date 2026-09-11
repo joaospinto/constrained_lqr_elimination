@@ -1,0 +1,11 @@
+# FP64; exactly one untimed warmup solve; setup includes representation/storage preparation; solve includes a fresh factorization and primal solve on every repetition.
+# All backends receive identical data. Validation and result conversion are untimed.
+# CLQR, generalized Riccati, and both Laine implementations also recover duals inside timing. Primal-only backends report no solver-dual KKT measurement.
+# Setup+solve includes representation construction and fresh workspace allocation; destruction is excluded.
+# Missing dual/kernel measurements are nan, not inferred from other solvers.
+# planted_dual_stationarity_inf audits each returned primal with the fixture's known optimal dual, not solver output.
+# primal_error and dual_error_inf are absolute infinity-norm errors against the known planted optimum, in original coordinates.
+# Samples are individually timed; sample-list columns retain chronological times in ms separated by semicolons. Timing quantiles are unavailable for a single sample.
+# min_seconds=1; fixed_repeats=0 (0 means duration-based); each timing phase uses its own budget.
+backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,setup_ms,median_ms,p10_ms,p90_ms,primal_error,objective,relative_objective_error,kernel_ms,feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,planted_dual_stationarity_inf,dual_error_inf,setup_solve_repeats,solve_samples_ms,setup_solve_samples_ms,kernel_samples_ms
+clqr_cuda,horizon,16384,24,12,3,6,20260907,ok,12,291.386618,86.677088,86.128773,88.159261,5.33632582567e-11,-22256.5588153,2.96903375648e-16,69.2975991964,8.19190826284e-11,1.57378554633e-11,8.19190826284e-11,245.973123,5.56355239656e-11,4.73848120464e-10,5,87.790008;87.891935;87.929197;88.185634;88.159261;86.532683;86.677088;86.128773;86.079309;86.238631;86.338663;86.451167,245.973123;242.485906;254.643165;236.950965;247.117194,69.1220803261;69.1655367464;69.2792948782;69.3586544842;69.3338866085;69.2975991964;69.3576947749;69.3423988521;69.2605416328;69.2744953185;69.338657096;69.287521556

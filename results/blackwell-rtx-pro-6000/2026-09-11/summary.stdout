@@ -1,0 +1,212 @@
+{
+  "clqr_cpu": {
+    "counts": {
+      "ok": 66,
+      "inaccurate": 0,
+      "unsupported": 0,
+      "failed": 0
+    },
+    "maxima": {
+      "primal_error": 3.35919347894e-11,
+      "relative_objective_error": 5.59600775182e-17,
+      "feasibility_inf": 1.62092561595e-14,
+      "kkt_inf": 1.11127523156e-09,
+      "planted_dual_stationarity_inf": 3.50796024173e-11,
+      "dual_error_inf": 1.20129386993e-09
+    },
+    "nonfinite_measurements": {
+      "primal_error": 0,
+      "relative_objective_error": 0,
+      "feasibility_inf": 0,
+      "kkt_inf": 0,
+      "planted_dual_stationarity_inf": 0,
+      "dual_error_inf": 0
+    }
+  },
+  "gen_riccati": {
+    "counts": {
+      "ok": 66,
+      "inaccurate": 0,
+      "unsupported": 0,
+      "failed": 0
+    },
+    "maxima": {
+      "primal_error": 1.94717575397e-11,
+      "relative_objective_error": 6.17655614961e-17,
+      "feasibility_inf": 1.50990331349e-14,
+      "kkt_inf": 3.31319940233e-10,
+      "planted_dual_stationarity_inf": 2.0256428479e-11,
+      "dual_error_inf": 5.03127886575e-10
+    },
+    "nonfinite_measurements": {
+      "primal_error": 0,
+      "relative_objective_error": 0,
+      "feasibility_inf": 0,
+      "kkt_inf": 0,
+      "planted_dual_stationarity_inf": 0,
+      "dual_error_inf": 0
+    }
+  },
+  "factor_graph": {
+    "counts": {
+      "ok": 43,
+      "inaccurate": 23,
+      "unsupported": 0,
+      "failed": 0
+    },
+    "maxima": {
+      "primal_error": 1.32030871678e-05,
+      "relative_objective_error": 2.3257313386e-14,
+      "feasibility_inf": 1.52100554374e-14,
+      "kkt_inf": null,
+      "planted_dual_stationarity_inf": 1.34560703179e-05,
+      "dual_error_inf": null
+    },
+    "nonfinite_measurements": {
+      "primal_error": 0,
+      "relative_objective_error": 0,
+      "feasibility_inf": 0,
+      "planted_dual_stationarity_inf": 0
+    }
+  },
+  "clqr_jax_cpu": {
+    "counts": {
+      "ok": 66,
+      "inaccurate": 0,
+      "unsupported": 0,
+      "failed": 0
+    },
+    "maxima": {
+      "primal_error": 3.3591934789356515e-11,
+      "relative_objective_error": 4.6918255962583736e-17,
+      "feasibility_inf": 1.609823385706477e-14,
+      "kkt_inf": 1.1112752176800633e-09,
+      "planted_dual_stationarity_inf": 3.5079616295119465e-11,
+      "dual_error_inf": 1.2012938699346165e-09
+    },
+    "nonfinite_measurements": {
+      "primal_error": 0,
+      "relative_objective_error": 0,
+      "feasibility_inf": 0,
+      "kkt_inf": 0,
+      "planted_dual_stationarity_inf": 0,
+      "dual_error_inf": 0
+    }
+  },
+  "clqr_cuda": {
+    "counts": {
+      "ok": 64,
+      "inaccurate": 2,
+      "unsupported": 0,
+      "failed": 0
+    },
+    "maxima": {
+      "primal_error": 2.70009949122e-09,
+      "relative_objective_error": 2.08900380196e-14,
+      "feasibility_inf": 5.01136578068e-09,
+      "kkt_inf": 1.44919835923e-07,
+      "planted_dual_stationarity_inf": 2.7822621429e-09,
+      "dual_error_inf": 1.38048754039e-07
+    },
+    "nonfinite_measurements": {
+      "primal_error": 0,
+      "relative_objective_error": 0,
+      "feasibility_inf": 0,
+      "kkt_inf": 0,
+      "planted_dual_stationarity_inf": 0,
+      "dual_error_inf": 0
+    }
+  },
+  "clqr_jax_cuda": {
+    "counts": {
+      "ok": 64,
+      "inaccurate": 2,
+      "unsupported": 0,
+      "failed": 0
+    },
+    "maxima": {
+      "primal_error": 2.700099491215191e-09,
+      "relative_objective_error": 2.0885915481090266e-14,
+      "feasibility_inf": 5.011365891705033e-09,
+      "kkt_inf": 1.44919835964874e-07,
+      "planted_dual_stationarity_inf": 2.7822621428974514e-09,
+      "dual_error_inf": 1.3804875403922168e-07
+    },
+    "nonfinite_measurements": {
+      "primal_error": 0,
+      "relative_objective_error": 0,
+      "feasibility_inf": 0,
+      "kkt_inf": 0,
+      "planted_dual_stationarity_inf": 0,
+      "dual_error_inf": 0
+    }
+  },
+  "laine_author": {
+    "counts": {
+      "ok": 66,
+      "inaccurate": 0,
+      "unsupported": 0,
+      "failed": 0
+    },
+    "maxima": {
+      "primal_error": 6.19224227016e-11,
+      "relative_objective_error": 6.56383405289e-17,
+      "feasibility_inf": 1.82076576039e-14,
+      "kkt_inf": 6.41099673349e-11,
+      "planted_dual_stationarity_inf": 6.47000231169e-11,
+      "dual_error_inf": 3.63975516393e-12
+    },
+    "nonfinite_measurements": {
+      "primal_error": 0,
+      "relative_objective_error": 0,
+      "feasibility_inf": 0,
+      "kkt_inf": 0,
+      "planted_dual_stationarity_inf": 0,
+      "dual_error_inf": 0
+    }
+  },
+  "laine_corrected": {
+    "counts": {
+      "ok": 66,
+      "inaccurate": 0,
+      "unsupported": 0,
+      "failed": 0
+    },
+    "maxima": {
+      "primal_error": 7.28412718597e-11,
+      "relative_objective_error": 9.68307766016e-17,
+      "feasibility_inf": 2.48689957516e-14,
+      "kkt_inf": 1.35118444211e-09,
+      "planted_dual_stationarity_inf": 7.66017804743e-11,
+      "dual_error_inf": 1.40990841224e-09
+    },
+    "nonfinite_measurements": {
+      "primal_error": 0,
+      "relative_objective_error": 0,
+      "feasibility_inf": 0,
+      "kkt_inf": 0,
+      "planted_dual_stationarity_inf": 0,
+      "dual_error_inf": 0
+    }
+  },
+  "platform": "=== Source revision and working tree ===\nc408fb6d5464af106a6d6d8617ab175c6bfa01bc\n=== Host platform ===\nFri Sep 11 09:13:57 PM UTC 2026\nLinux 9bf4702-lcedt 7.0.0-30-generic #30~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug  7 13:27:52 UTC 2 x86_64 x86_64 x86_64 GNU/Linux\nPRETTY_NAME=\"Ubuntu 24.04.4 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nVERSION=\"24.04.4 LTS (Noble Numbat)\"\nVERSION_CODENAME=noble\nID=ubuntu\nID_LIKE=debian\nHOME_URL=\"https://www.ubuntu.com/\"\nSUPPORT_URL=\"https://help.ubuntu.com/\"\nBUG_REPORT_URL=\"https://bugs.launchpad.net/ubuntu/\"\nPRIVACY_POLICY_URL=\"https://www.ubuntu.com/legal/terms-and-policies/privacy-policy\"\nUBUNTU_CODENAME=noble\nLOGO=ubuntu-logo\nVARIANT=\"NVIDIA IT Managed (NBDE)\"\n=== CPU topology, affinity and memory ===\nArchitecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  24\nOn-line CPU(s) list:                     0-23\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Core(TM) Ultra 9 285K\nCPU family:                              6\nModel:                                   198\nThread(s) per core:                      1\nCore(s) per socket:                      24\nSocket(s):                               1\nStepping:                                2\nCPU(s) scaling MHz:                      55%\nCPU max MHz:                             5700.0000\nCPU min MHz:                             800.0000\nBogoMIPS:                                7372.80\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdt_a rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nVirtualization:                          VT-x\nL1d cache:                               768 KiB (20 instances)\nL1i cache:                               1.3 MiB (20 instances)\nL2 cache:                                40 MiB (12 instances)\nL3 cache:                                36 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-23\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS Not affected; BHI BHI_DIS_S\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB before exit to userspace\nEffective logical CPUs: 1\nAll logical CPUs: 24\nCpus_allowed_list:\t0-23\nMems_allowed_list:\t0\nMemTotal:       131143056 kB\nSwapTotal:      65011708 kB\n               total        used        free      shared  buff/cache   available\nMem:           125Gi        23Gi        36Gi       241Mi        66Gi       101Gi\nSwap:           61Gi       2.0Gi        60Gi\n=== Toolchain ===\nc++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\ncmake version 3.28.3\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).\nPython 3.12.3\nnvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Tue_May_27_02:21:03_PDT_2025\nCuda compilation tools, release 12.9, V12.9.86\nBuild cuda_12.9.r12.9/compiler.36037853_0\nNVIDIA (R) Compute Sanitizer\nCopyright (c) 2020-2025 NVIDIA Corporation\nVersion 2025.2.1.0 (build 35969825) (public-release)\nBLASFEO target: X64_INTEL_HASWELL\nC++ comparison flags: Release -O3 -DNDEBUG -march=native\nOMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1\nBuild jobs: 16; suite: all; fixed repetitions: not set; minimum measured seconds: 1; rounds: 1\n=== GPU and driver ===\nFri Sep 11 14:13:57 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 610.43.02              KMD Version: 610.43.02     CUDA UMD Version: 13.3     |\n+-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA RTX PRO 6000 Blac...    Off |   00000000:02:00.0 Off |                  Off |\n| 30%   29C    P8             12W /  600W |      15MiB /  97887MiB |      0%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n\n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|    0   N/A  N/A            4389      G   /usr/lib/xorg/Xorg                        4MiB |\n+-----------------------------------------------------------------------------------------+\n\n==============NVSMI LOG==============\n\nTimestamp                                              : Fri Sep 11 14:13:57 2026\nDriver Version                                         : 610.43.02 [Deprecated; will be removed in CUDA 14.0. Use KMD Version instead]\nCUDA Version                                           : 13.3 [Deprecated; will be removed in CUDA 14.0. Use CUDA UMD Version instead]\nKMD Version                                            : 610.43.02\nCUDA UMD Version                                       : 13.3\n\nAttached GPUs                                          : 1\nGPU 00000000:02:00.0\n    Product Name                                       : NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n    Product Brand                                      : NVIDIA RTX\n    Product Architecture                               : Blackwell\n    Display Mode                                       : Requested functionality has been deprecated\n    Display Attached                                   : No\n    Display Active                                     : Disabled\n    Persistence Mode                                   : Disabled\n    Addressing Mode                                    : HMM\n    MIG Mode\n        Current                                        : N/A\n        Pending                                        : N/A\n    Accounting Mode                                    : Disabled\n    Accounting Mode Buffer Size                        : 4000\n    Driver Model\n        Current                                        : N/A\n        Pending                                        : N/A\n    Serial Number                                      : 1792326070298\n    GPU UUID                                           : GPU-a24b3bb6-d561-10ea-f70b-8d517fb9c472\n    GPU PDI                                            : 0xa515a3ef7cb47223\n    Minor Number                                       : 0\n    VBIOS Version                                      : 98.02.81.00.07\n    MultiGPU Board                                     : No\n    Board ID                                           : 0x200\n    Board Part Number                                  : 900-5G144-0000-000\n    GPU Part Number                                    : 2BB1-870-A1\n    FRU Part Number                                    : N/A\n    Platform Info\n        Chassis Serial Number                          : \n        Slot Number                                    : 0\n        Tray Index                                     : 0\n        Host ID                                        : 1\n        Peer Type                                      : Direct Connected\n        Module Id                                      : 1\n        GPU Fabric GUID                                : 0x0000000000000000\n    Inforom Version\n        Image Version                                  : G144.0520.00.02\n        OEM Object                                     : 2.1\n        ECC Object                                     : 7.16\n        Power Management Object                        : N/A\n    Inforom BBX Object Flush\n        Latest Timestamp                               : 2026/09/11 11:18:21.563\n        Latest Duration                                : 32411 us\n    Inforom Time Data\n        Time Run                                       : 716255 seconds\n    GPU Operation Mode\n        Current                                        : N/A\n        Pending                                        : N/A\n    GPU C2C Mode                                       : Disabled\n    GPU Virtualization Mode\n        Virtualization Mode                            : None\n        Host VGPU Mode                                 : N/A\n        vGPU Heterogeneous Mode                        : N/A\n    GPU Recovery Action                                : None\n    GSP Firmware Version                               : 610.43.02\n    IBMNPU\n        Relaxed Ordering Mode                          : N/A\n    PCI\n        Bus                                            : 0x02\n        Device                                         : 0x00\n        Domain                                         : 0x0000\n        Base Classcode                                 : 0x3\n        Sub Classcode                                  : 0x0\n        Device Id                                      : 0x2BB110DE\n        Bus Id                                         : 00000000:02:00.0\n        Sub System Id                                  : 0x204B10DE\n        GPU Link Info\n            PCIe Generation\n                Max                                    : 5\n                Current                                : 1\n                Device Current                         : 1\n                Device Max                             : 5\n                Host Max                               : 5\n            Link Width\n                Max                                    : 16x\n                Current                                : 16x\n        Bridge Chip\n            Type                                       : N/A\n            Firmware                                   : N/A\n        Replays Since Reset                            : 0\n        Replay Number Rollovers                        : 0\n        Tx Throughput                                  : 1690 KB/s\n        Rx Throughput                                  : 1584 KB/s\n        Atomic Caps Outbound                           : N/A\n        Atomic Caps Inbound                            : FETCHADD_32 FETCHADD_64 SWAP_32 SWAP_64 CAS_32 CAS_64 \n    Fan Speed                                          : 30 %\n    Performance State                                  : P8\n    Clocks Event Reasons\n        Idle                                           : Not Active\n        Applications Clocks Setting                    : Not Active\n        SW Power Cap                                   : Not Active\n        HW Slowdown                                    : Not Active\n            HW Thermal Slowdown                        : Not Active\n            HW Power Brake Slowdown                    : Not Active\n        Sync Boost                                     : Not Active\n        SW Thermal Slowdown                            : Not Active\n        Display Clock Setting                          : Not Active\n    Clocks Event Reasons Counters\n        SW Power Capping                               : 5335557327 us\n        Sync Boost                                     : 0 us\n        SW Thermal Slowdown                            : 0 us\n        HW Thermal Slowdown                            : 0 us\n        HW Power Braking                               : 0 us\n    Sparse Operation Mode                              : N/A\n    FB Memory Usage\n        Total                                          : 97887 MiB\n        Reserved                                       : 599 MiB\n        Used                                           : 15 MiB\n        Free                                           : 97274 MiB\n    BAR1 Memory Usage\n        Total                                          : 131072 MiB\n        Used                                           : 15 MiB\n        Free                                           : 131057 MiB\n    Conf Compute Protected Memory Usage\n        Total                                          : 0 MiB\n        Used                                           : 0 MiB\n        Free                                           : 0 MiB\n    Compute Mode                                       : Default\n    Utilization\n        GPU                                            : 0 %\n        Memory                                         : 0 %\n        Encoder                                        : 0 %\n        Decoder                                        : 0 %\n        JPEG                                           : 0 %\n        OFA                                            : 0 %\n    Encoder Stats\n        Active Sessions                                : 0\n        Average FPS                                    : 0\n        Average Latency                                : 0\n    FBC Stats\n        Active Sessions                                : 0\n        Average FPS                                    : 0\n        Average Latency                                : 0\n    DRAM Encryption Mode\n        Current                                        : Disabled\n        Pending                                        : Disabled\n    ECC Mode\n        Current                                        : Disabled\n        Pending                                        : Disabled\n    ECC Errors\n        Volatile\n            SRAM Correctable                           : N/A\n            SRAM Uncorrectable Parity                  : N/A\n            SRAM Uncorrectable SEC-DED                 : N/A\n            DRAM Correctable                           : N/A\n            DRAM Uncorrectable                         : N/A\n        Aggregate\n            SRAM Correctable                           : N/A\n            SRAM Uncorrectable Parity                  : N/A\n            SRAM Uncorrectable SEC-DED                 : N/A\n            DRAM Correctable                           : N/A\n            DRAM Uncorrectable                         : N/A\n            SRAM Threshold Exceeded                    : N/A\n        Aggregate Uncorrectable SRAM Sources\n            SRAM L2                                    : N/A\n            SRAM SM                                    : N/A\n            SRAM Microcontroller                       : N/A\n            SRAM PCIE                                  : N/A\n            SRAM Other                                 : N/A\n        Channel Repair Pending                         : No\n        TPC Repair Pending                             : No\n        Unrepairable Memory                            : N/A\n    Retired Pages\n        Single Bit ECC                                 : N/A\n        Double Bit ECC                                 : N/A\n        Pending Page Blacklist                         : N/A\n    Remapped Rows\n        Correctable Error                              : 0\n        Inactive Correctable Error                     : 0\n        Uncorrectable Error                            : 0\n        Inactive Uncorrectable Error                   : 0\n        Pending                                        : No\n        Remapping Failure Occurred                     : No\n        Bank Remap Availability Histogram\n            Max                                        : 512 bank(s)\n            High                                       : 0 bank(s)\n            Partial                                    : 0 bank(s)\n            Low                                        : 0 bank(s)\n            None                                       : 0 bank(s)\n    Temperature\n        GPU Current Temp                               : 29 C\n        GPU Current T.Limit Temp                       : 65 C\n        GPU Shutdown T.Limit Temp Specification        : -5 C\n        GPU Slowdown T.Limit Temp Specification        : -2 C\n        GPU Max Operating T.Limit Temp Specification   : 0 C\n        GPU Target Temperature Specification           : N/A\n        Memory Current Temp                            : N/A\n        Memory Max Operating T.Limit Temp Specification: N/A\n    GPU Power Readings\n        Average Power Draw                             : 12.62 W\n        Instantaneous Power Draw                       : 11.91 W\n        GPU Ceiling Power Limit\n            Current Power Limit                        : 600.00 W\n            Requested Power Limit                      : 600.00 W\n            Default Power Limit                        : 600.00 W\n        GPU Base Power\n            Current Base Power                         : N/A\n            Requested Base Power                       : N/A\n            Default Base Power                         : N/A\n        Min Power Limit                                : 150.00 W\n        Max Power Limit                                : 600.00 W\n    GPU Memory Power Readings \n        Average Power Draw                             : N/A\n        Instantaneous Power Draw                       : N/A\n    Module Power Readings\n        Average Power Draw                             : N/A\n        Instantaneous Power Draw                       : N/A\n        Current Power Limit                            : N/A\n        Requested Power Limit                          : N/A\n        Default Power Limit                            : N/A\n        Min Power Limit                                : N/A\n        Max Power Limit                                : N/A\n    Power Smoothing                                    : N/A\n    Workload Power Profiles\n        Requested Profiles                             : N/A\n        Enforced Profiles                              : N/A\n    EDPp Multiplier                                    : N/A\n    Clocks\n        Graphics                                       : 180 MHz\n        SM                                             : 180 MHz\n        Memory                                         : 405 MHz\n        Video                                          : 600 MHz\n    Applications Clocks\n        Graphics                                       : Requested functionality has been deprecated\n        Memory                                         : Requested functionality has been deprecated\n    Default Applications Clocks\n        Graphics                                       : Requested functionality has been deprecated\n        Memory                                         : Requested functionality has been deprecated\n    Deferred Clocks\n        Memory                                         : N/A\n    Max Clocks\n        Graphics                                       : 3090 MHz\n        SM                                             : 3090 MHz\n        Memory                                         : 14001 MHz\n        Video                                          : 3090 MHz\n    Max Customer Boost Clocks\n        Graphics                                       : N/A\n    Clock Policy\n        Auto Boost                                     : N/A\n        Auto Boost Default                             : N/A\n    Fabric\n        State                                          : N/A\n        Status                                         : N/A\n        CliqueId                                       : N/A\n        ClusterUUID                                    : N/A\n        Health\n            Summary                                    : N/A\n            Bandwidth                                  : N/A\n            Route Recovery in progress                 : N/A\n            Route Unhealthy                            : N/A\n            Access Timeout Recovery                    : N/A\n            Incorrect Configuration                    : N/A\n            Partition Assigned                         : N/A\n    Processes\n        GPU instance ID                   : N/A\n        Compute instance ID               : N/A\n        Process ID                        : 4389\n            Type                          : G\n            Name                          : /usr/lib/xorg/Xorg\n            Used GPU Memory               : 4 MiB\n    Capabilities\n        EGM                                            : disabled\n\nCUDA build architecture: sm_120\nCUDA_VISIBLE_DEVICES=not set\n=== Disk ===\nFilesystem                         Size  Used Avail Use% Mounted on\n/dev/mapper/ubuntu--vg-ubuntu--lv  1.8T  1.1T  631G  63% /\nBazelisk version: v1.29.0\nBuild label: 9.1.1\nBuild target: @@//src/main/java/com/google/devtools/build/lib/bazel:BazelServer\nBuild time: Wed Jun 03 15:41:13 2026 (1780501273)\nBuild timestamp: 1780501273\nBuild timestamp as int: 1780501273\n",
+  "gpus": [
+    {
+      "index": "0",
+      "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "uuid": "GPU-a24b3bb6-d561-10ea-f70b-8d517fb9c472",
+      "compute_cap": "12.0",
+      "driver_version": "610.43.02",
+      "pci.bus_id": "00000000:02:00.0",
+      "memory.total [MiB]": "97887 MiB"
+    }
+  ],
+  "original_table": {
+    "horizon": 16384,
+    "kernel_speedup": 10.92324212079491,
+    "wall_speedup": 6.898125443627455,
+    "wall_kernel_gap_ms": 3.4990360000000003,
+    "pack_transfer_share_of_gap": 0.9570224484686639,
+    "max_kkt_inf": 3.197442e-14
+  }
+}

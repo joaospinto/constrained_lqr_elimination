@@ -1,0 +1,7 @@
+# native JAX FFI, FP64, device=cpu:0; inputs and outputs remain resident during timing
+# compile, upload, host validation, and download are excluded; each solve includes fresh numerical factorization
+# exactly one untimed warmup solve; each repetition blocks on all outputs
+# min_seconds=1.0; fixed_repeats=None; individual samples are retained chronologically in ms separated by semicolons
+# primal_error and dual_error_inf: absolute infinity-norm errors against the known planted optimum
+backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,median_ms,p10_ms,p90_ms,primal_error,relative_objective_error,feasibility_inf,stationarity_inf,kkt_inf,scalar_device_to_host_bytes,scalar_host_to_device_bytes,metadata_device_to_host_bytes,planted_dual_stationarity_inf,dual_error_inf,solve_samples_ms
+clqr_jax_cpu,horizon,2048,32,16,4,8,20260907,ok,12,85.778024,85.093504,87.114697,2.774447338538266e-13,2.029627112799628e-18,4.884981308350689e-15,5.151039317308204e-12,5.151039317308204e-12,,,,2.8493873927004643e-13,8.357328717956136e-12,85.772527;85.093504;85.524232;87.114697;84.659754;86.217878;85.778024;88.977;85.554693;85.91145;86.034029;85.400684

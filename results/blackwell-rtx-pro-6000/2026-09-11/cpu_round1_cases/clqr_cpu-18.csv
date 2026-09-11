@@ -1,0 +1,11 @@
+# FP64; exactly one untimed warmup solve; setup includes representation/storage preparation; solve includes a fresh factorization and primal solve on every repetition.
+# All backends receive identical data. Validation and result conversion are untimed.
+# CLQR, generalized Riccati, and both Laine implementations also recover duals inside timing. Primal-only backends report no solver-dual KKT measurement.
+# Setup+solve includes representation construction and fresh workspace allocation; destruction is excluded.
+# Missing dual/kernel measurements are nan, not inferred from other solvers.
+# planted_dual_stationarity_inf audits each returned primal with the fixture's known optimal dual, not solver output.
+# primal_error and dual_error_inf are absolute infinity-norm errors against the known planted optimum, in original coordinates.
+# Samples are individually timed; sample-list columns retain chronological times in ms separated by semicolons. Timing quantiles are unavailable for a single sample.
+# min_seconds=1; fixed_repeats=0 (0 means duration-based); each timing phase uses its own budget.
+backend,family,N,n,m,mixed_rows,state_rows,seed,status,repeats,setup_ms,median_ms,p10_ms,p90_ms,primal_error,objective,relative_objective_error,kernel_ms,feasibility_inf,stationarity_inf,kkt_inf,setup_solve_ms,planted_dual_stationarity_inf,dual_error_inf,setup_solve_repeats,solve_samples_ms,setup_solve_samples_ms,kernel_samples_ms
+clqr_cpu,horizon,4096,16,8,2,4,20260907,ok,23,39.337785,43.280143,43.011799,45.425907,2.51709764143e-12,-3731.14782854,2.69585153559e-17,nan,1.11022302463e-14,6.6351479866e-11,6.6351479866e-11,78.482201,2.64168895092e-12,8.81110184814e-11,13,43.139386;43.02751;43.751275;43.212531;43.85305;43.192621;42.96575;43.127368;43.000287;43.011799;43.242075;45.425907;43.870001;43.093095;43.280143;46.072765;43.106244;43.511396;46.618975;43.69955;43.331622;44.125233;43.474195,78.218112;78.482201;78.725632;78.863771;78.479598;79.072523;78.289796;80.270677;78.396372;78.313477;78.743954;79.582205;78.322348,

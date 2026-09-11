@@ -1,0 +1,7 @@
+[case 61/66] generating fixture N=1024 n=64 m=32
+[case 61/66] clqr_cuda N=1024 n=64 m=32 setup (elapsed 0s)
+[case 61/66] clqr_cuda N=1024 n=64 m=32 warmup (1 solve) (elapsed 0s)
+[case 61/66] clqr_cuda N=1024 n=64 m=32 timing prepared solves: at least 1.000000 measured seconds (elapsed 0s)
+[case 61/66] clqr_cuda N=1024 n=64 m=32 validation (elapsed 1s)
+[case 61/66] clqr_cuda N=1024 n=64 m=32 timing setup+solve: at least 1.000000 measured seconds (elapsed 1s)
+[case 61/66] clqr_cuda N=1024 n=64 m=32 DONE status=ok (elapsed 2s)

@@ -1,0 +1,7 @@
+[case 49/66] generating fixture N=512 n=48 m=24
+[case 49/66] laine_author N=512 n=48 m=24 setup (elapsed 0s)
+[case 49/66] laine_author N=512 n=48 m=24 warmup (1 solve) (elapsed 0s)
+[case 49/66] laine_author N=512 n=48 m=24 timing prepared solves: at least 1.000000 measured seconds (elapsed 0s)
+[case 49/66] laine_author N=512 n=48 m=24 validation (elapsed 1s)
+[case 49/66] laine_author N=512 n=48 m=24 timing setup+solve: at least 1.000000 measured seconds (elapsed 1s)
+[case 49/66] laine_author N=512 n=48 m=24 DONE status=ok (elapsed 2s)
