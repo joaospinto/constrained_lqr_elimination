@@ -7,6 +7,8 @@ import sys
 import jax
 import numpy as np
 
+from jax_rank_reuse_support import assert_uniform_solution_kkt, rank_reuse_problem
+
 
 def _load_extension(root, name):
     candidates = list(root.rglob(f"{name}.so"))
@@ -205,25 +207,7 @@ def test_cuda_reuses_uniform_layout_after_rank_changes():
     dtype = np.dtype(clqr_jax.scalar_dtype)
     if dtype == np.dtype(np.float64):
         jax.config.update("jax_enable_x64", True)
-    problem = {
-        "initial_state": np.array([0.0, 0.5], dtype=dtype),
-        "stages": [
-            {
-                "A": np.eye(2, dtype=dtype),
-                "B": np.eye(2, dtype=dtype),
-                "c": np.zeros(2, dtype=dtype),
-                "R": np.eye(2, dtype=dtype),
-                "M": np.zeros((2, 2), dtype=dtype),
-                "r": np.zeros(2, dtype=dtype),
-                "C": np.array([[0.0, 1.0]], dtype=dtype),
-                "D": np.array([[0.0, 1.0]], dtype=dtype),
-                "E": np.array([[1.0, 0.0]], dtype=dtype),
-            }
-            for _ in range(3)
-        ],
-        "Q": [np.eye(2, dtype=dtype) for _ in range(4)],
-        "q": [np.zeros(2, dtype=dtype) for _ in range(4)],
-    }
+    problem = rank_reuse_problem(dtype)
     packed = clqr_jax.pack_problem(problem, dtype=dtype)
     free = packed._replace(factors=packed.factors._replace(
         C=np.zeros_like(packed.factors.C),
@@ -236,9 +220,17 @@ def test_cuda_reuses_uniform_layout_after_rank_changes():
     for value in (packed, free, packed, free):
         cpu = solve(jax.device_put(value, cpu_device))
         gpu = solve(jax.device_put(value, device))
+        assert int(cpu.status) == clqr_jax.SolveStatus.OPTIMAL
         assert int(gpu.status) == clqr_jax.SolveStatus.OPTIMAL
-        for actual, expected in zip(gpu, cpu):
-            np.testing.assert_allclose(actual, expected, atol=atol)
+        # CUDA does not populate the CPU-only Newton-KKT flags. This fixture
+        # also has redundant rows, so its optimal multipliers are not unique.
+        for name in ("states", "controls", "objective"):
+            np.testing.assert_allclose(
+                getattr(gpu, name), getattr(cpu, name), rtol=0, atol=atol,
+                err_msg=name,
+            )
+        assert_uniform_solution_kkt(value, cpu, atol)
+        assert_uniform_solution_kkt(value, gpu, atol)
     invalid = free._replace(factors=free.factors._replace(
         Q=np.full_like(free.factors.Q, np.nan),
     ))
@@ -246,6 +238,7 @@ def test_cuda_reuses_uniform_layout_after_rank_changes():
     assert int(rejected.status) == clqr_jax.SolveStatus.INVALID_INPUT
     restored = solve(jax.device_put(packed, device))
     assert int(restored.status) == clqr_jax.SolveStatus.OPTIMAL
+    assert_uniform_solution_kkt(packed, restored, atol)
 
 
 if __name__ == "__main__":

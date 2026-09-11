@@ -779,6 +779,14 @@ py_library(
     ],
 )
 
+py_library(
+    name = "jax_rank_reuse_support",
+    testonly = True,
+    srcs = ["tests/jax_rank_reuse_support.py"],
+    imports = ["tests"],
+    deps = [requirement("numpy")],
+)
+
 py_test(
     name = "jax_binding_test",
     srcs = ["tests/jax_binding_test.py"],
@@ -789,6 +797,7 @@ py_test(
     main = "tests/jax_binding_test.py",
     deps = [
         ":clqr_jax_python",
+        ":jax_rank_reuse_support",
         requirement("jax"),
         requirement("numpy"),
     ],
@@ -816,6 +825,7 @@ py_test(
     target_compatible_with = requires_cuda(),
     deps = [
         ":clqr_jax_python",
+        ":jax_rank_reuse_support",
         requirement("jax"),
         requirement("jax-cuda12-plugin"),
         requirement("jax-cuda12-pjrt"),

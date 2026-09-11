@@ -84,10 +84,12 @@ class Solution(NamedTuple):
 
     @property
     def newton_kkt_singular(self) -> Any:
+        """CPU Newton-KKT diagnostic; CUDA/Metal currently leave this unset."""
         return self.diagnostics[1] != 0
 
     @property
     def newton_kkt_wrong_inertia(self) -> Any:
+        """CPU Newton-KKT diagnostic; CUDA/Metal currently leave this unset."""
         return self.diagnostics[2] != 0
 
 

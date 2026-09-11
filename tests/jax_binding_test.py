@@ -7,6 +7,8 @@ import sys
 import jax
 import numpy as np
 
+from jax_rank_reuse_support import assert_uniform_solution_kkt, rank_reuse_problem
+
 
 def _load_modules():
     root = pathlib.Path(os.environ["TEST_SRCDIR"])
@@ -245,6 +247,48 @@ def test_zero_horizon_and_zero_capacities():
     np.testing.assert_allclose(result.states[0], problem["initial_state"])
 
 
+def test_rank_reuse_fixture_and_kkt_checks():
+    _, clqr_jax = _load_modules()
+    dtype = np.dtype(clqr_jax.scalar_dtype)
+    if dtype == np.dtype(np.float64):
+        jax.config.update("jax_enable_x64", True)
+    packed = clqr_jax.pack_problem(rank_reuse_problem(dtype), dtype=dtype)
+    free = packed._replace(factors=packed.factors._replace(
+        C=np.zeros_like(packed.factors.C),
+        D=np.zeros_like(packed.factors.D),
+        E=np.zeros_like(packed.factors.E),
+    ))
+    solve = jax.jit(clqr_jax.solve)
+    atol = 2e-4 if dtype == np.dtype(np.float32) else 1e-9
+    for value, constrained in ((packed, True), (free, False), (packed, True), (free, False)):
+        result = solve(value)
+        assert int(result.status) == clqr_jax.SolveStatus.OPTIMAL
+        assert bool(result.newton_kkt_singular)  # Redundant or identically zero rows.
+        assert_uniform_solution_kkt(value, result, atol)
+        expected = [0.5, 0.0, 0.0, 0.0] if constrained else [0.5, 5/26, 1/13, 1/26]
+        np.testing.assert_allclose(result.states[:, 0], 0.0, rtol=0, atol=atol)
+        np.testing.assert_allclose(result.states[:, 1], expected, rtol=0, atol=atol)
+
+    result = solve(packed)
+    # A different dual for the redundant initial-state row remains valid.
+    alternative = result._replace(
+        state_multipliers=result.state_multipliers.at[0, 0].add(1.0),
+        initial_multiplier=result.initial_multiplier.at[0].add(-1.0),
+    )
+    assert_uniform_solution_kkt(packed, alternative, atol)
+    corruptions = (
+        result._replace(states=result.states.at[1, 0].add(0.1)),
+        result._replace(controls=result.controls.at[0, 1].add(0.1)),
+        result._replace(dynamics_multipliers=result.dynamics_multipliers.at[0, 1].add(0.1)),
+        result._replace(objective=result.objective + 0.1),
+        result._replace(states=result.states.at[1, 0].set(np.nan)),
+        result._replace(mixed_multipliers=result.mixed_multipliers.at[0, 0].set(np.inf)),
+    )
+    for invalid in corruptions:
+        with np.testing.assert_raises(AssertionError):
+            assert_uniform_solution_kkt(packed, invalid, atol)
+
+
 if __name__ == "__main__":
     test_eager_and_jit()
     test_new_rhs_reuses_compiled_shape()
@@ -252,3 +296,4 @@ if __name__ == "__main__":
     test_active_dimensions_are_bounds_checked()
     test_heterogeneous_dimensions_match_python_solver()
     test_zero_horizon_and_zero_capacities()
+    test_rank_reuse_fixture_and_kkt_checks()

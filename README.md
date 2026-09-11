@@ -668,6 +668,12 @@ JAX stream ordering, and the native CUDA workspace is reused for unchanged
 dimensions. Only the compact active-dimension vector is copied to the host for
 workspace planning; there is no bulk scalar round trip through host memory.
 
+`Solution.status` is supported by every backend. The additional
+`newton_kkt_singular` and `newton_kkt_wrong_inertia` diagnostics are populated
+only by the CPU backend; CUDA and Metal leave them unset. With redundant
+constraints, valid multipliers need not agree across backends: compare their
+original KKT residuals rather than individual multiplier values.
+
 On Apple silicon, the optional `_clqr_metal` extension provides the same
 elimination/scan numerical design as CUDA in a native FP32 Metal
 implementation. Select it explicitly because JAX exposes Apple Metal hosts

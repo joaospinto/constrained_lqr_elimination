@@ -1291,6 +1291,32 @@ Problem ZeroHorizonProblem() {
   return problem;
 }
 
+Problem JaxRankReuseProblem(bool constrained) {
+  // Matches tests/jax_rank_reuse_support.py, including redundant rows.
+  Problem problem;
+  problem.initial_state = Vector{0, Scalar{0.5}};
+  problem.Q.assign(4, clqr::Identity(2));
+  problem.q.assign(4, Vector(2));
+  problem.terminal_E = Matrix(0, 2);
+  problem.terminal_e = Vector(0);
+  problem.stages.resize(3);
+  for (auto &stage : problem.stages) {
+    stage.A = clqr::Identity(2);
+    stage.B = clqr::Identity(2);
+    stage.c = Vector(2);
+    stage.R = clqr::Identity(2);
+    stage.M = Matrix(2, 2);
+    stage.r = Vector(2);
+    const Scalar coefficient = constrained ? Scalar{1} : Scalar{0};
+    stage.C = Matrix(1, 2, {0, coefficient});
+    stage.D = stage.C;
+    stage.d = Vector(1);
+    stage.E = Matrix(1, 2, {coefficient, 0});
+    stage.e = Vector(1);
+  }
+  return problem;
+}
+
 Problem ZeroControlStateConstraintProblem() {
   constexpr int seed = 1900;
   constexpr std::size_t horizon = 4;
@@ -2677,6 +2703,13 @@ int main(int argc, char **argv) {
   ScratchPlannerTopologyCase();
   NonPositiveDefiniteReducedControlCostCase();
   RunEmulation(MakeProblem(), "rank-deficient constrained", true, true);
+  const Scalar jax_kkt_tolerance = sizeof(Scalar) == sizeof(float)
+                                       ? Scalar{2e-4}
+                                       : Scalar{1e-9};
+  RunEmulation(JaxRankReuseProblem(true), "JAX rank-reuse constrained",
+               true, true, true, jax_kkt_tolerance / kKktComparisonTolerance);
+  RunEmulation(JaxRankReuseProblem(false), "JAX rank-reuse zero rows",
+               false, false, true, jax_kkt_tolerance / kKktComparisonTolerance);
   g_test_global_scratch = true;
   RunEmulation(MakeProblem(), "bounded-global-rank-deficient", true, true);
   RunEmulation(HeterogeneousDimensionProblem(), "bounded-global-heterogeneous",
