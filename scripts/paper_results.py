@@ -13,8 +13,8 @@ import sys
 KEY_FIELDS = ("family", "N", "n", "m", "mixed_rows", "state_rows", "seed")
 SOURCES = {
     "clqr_cpu": "cpu_round1.csv",
-    "gen_riccati": "references.csv",
-    "factor_graph": "references.csv",
+    "gen_riccati": "vanroye.csv",
+    "factor_graph": "yang.csv",
     "clqr_jax_cpu": "jax_cpu.csv",
     "clqr_cuda": "cuda_host.csv",
     "clqr_jax_cuda": "cuda_resident.csv",
@@ -237,7 +237,11 @@ def main(argv=None):
             continue
         if "cuda" in backend and not args.cuda:
             continue
-        data[backend] = indexed(read_csv(args.results / name), backend)
+        source = args.results / name
+        # Read existing result archives as well as the per-method output files.
+        if not source.exists() and backend in ("gen_riccati", "factor_graph"):
+            source = args.results / "references.csv"
+        data[backend] = indexed(read_csv(source), backend)
     for backend, name in OPTIONAL_SOURCES.items():
         requested = (backend in args.backends if args.backends is not None else
                      args.require_laine or (args.results / name).is_file())

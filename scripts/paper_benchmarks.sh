@@ -288,15 +288,13 @@ check_log() {
   fi
 }
 sweep() {
-  local name="$1" backends="$2" kind="$3"
+  local name="$1" backend="$2" kind="$3"
   shift 3
-  local backend_args=()
-  read -r -a backend_args <<< "$backends"
   local sweep_command=(python3 "$repo_dir/scripts/paper_sweep.py" --name "$name"
       --manifest "$output_dir/cases.json" --stdout "$output_dir/$name.csv"
       --stderr "$output_dir/$name.stderr")
   if [[ "$kind" == jax ]]; then sweep_command+=(--jax); fi
-  if ! "${sweep_command[@]}" --backends "${backend_args[@]}" -- "$@"; then
+  if ! "${sweep_command[@]}" --backend "$backend" -- "$@"; then
     printf 'CHECK FAILED: %s (individual failures recorded; all cases attempted)\n' "$name" >&2
     failed=1
   fi
@@ -304,12 +302,13 @@ sweep() {
 bench_args=(--suite "$suite" --min-seconds "$min_seconds")
 if [[ -n "$repeats" ]]; then bench_args+=(--repeats "$repeats"); fi
 enabled_backends=(clqr_cpu)
-reference_backends=()
-if (( CLQR_RUN_VANROYE )); then reference_backends+=(gen_riccati); fi
-if (( CLQR_RUN_YANG )); then reference_backends+=(factor_graph); fi
-if (( CLQR_RUN_VANROYE || CLQR_RUN_YANG )); then
-  sweep references "${reference_backends[*]}" native \
-    "$cache_dir/reference-build/clqr_reference_benchmark" "${bench_args[@]}"
+if (( CLQR_RUN_VANROYE )); then
+  sweep vanroye gen_riccati native \
+    "$cache_dir/reference-build/clqr_vanroye_benchmark" "${bench_args[@]}"
+fi
+if (( CLQR_RUN_YANG )); then
+  sweep yang factor_graph native \
+    "$cache_dir/reference-build/clqr_yang_benchmark" "${bench_args[@]}"
 fi
 if (( CLQR_RUN_VANROYE )); then enabled_backends+=(gen_riccati); fi
 if (( CLQR_RUN_YANG )); then enabled_backends+=(factor_graph); fi

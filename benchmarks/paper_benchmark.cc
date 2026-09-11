@@ -10,6 +10,13 @@
 #include <string>
 #include <vector>
 
+// Share the harness source, not backend dependencies or executable dispatch.
+#if (defined(CLQR_BENCHMARK_GEN_RICCATI) + defined(CLQR_BENCHMARK_GTSAM) + \
+     defined(CLQR_BENCHMARK_CUDA) + defined(CLQR_BENCHMARK_LAINE) + \
+     defined(CLQR_BENCHMARK_LAINE_CORRECTED)) > 1
+#error "Build a separate benchmark executable for each backend"
+#endif
+
 #include "benchmarks/paper_cases.h"
 #include "benchmarks/scaling_problem.h"
 #ifdef CLQR_BENCHMARK_ADVERSARIAL

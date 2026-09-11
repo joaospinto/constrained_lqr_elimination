@@ -339,8 +339,10 @@ table files. The summary checks matching cases/seeds, preserves failed or
 inaccurate rows, and uses the first comparison round rather than selecting the
 fastest round. Each backend is measured once by default; set
 `CLQR_BENCHMARK_ROUNDS=2` for an additional, reverse-order CPU comparison round.
-Each paper benchmark invocation selects one backend, never an implicit CPU
-baseline alongside another method. The driver isolates each backend/case in a
+Each paper benchmark executable contains one backend and only its dependencies;
+the shared harness source is compiled separately for each method. The script
+runs separate Vanroye, Yang, and Laine sweeps, with no implicit CPU baseline.
+The driver isolates each backend/case in a
 subprocess, retaining its raw CSV/log and updating the combined CSV after every
 case; a killed process cannot discard the remaining cases in its sweep.
 The separate original-table reproduction retains its fixed-count protocol.

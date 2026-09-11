@@ -20,6 +20,29 @@ def row(backend="clqr_cpu"):
 
 
 class ResultsTest(unittest.TestCase):
+    def test_separate_and_combined_reference_files(self):
+        for separate in (False, True):
+            with self.subTest(separate=separate), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                files = {"cpu_round1.csv": [row()]}
+                for backend in ("gen_riccati", "factor_graph"):
+                    filename = results.SOURCES[backend] if separate else "references.csv"
+                    files.setdefault(filename, []).append(row(backend))
+                for filename, values in files.items():
+                    with (work / filename).open("w") as output:
+                        writer = csv.DictWriter(output, fieldnames=values[0])
+                        writer.writeheader()
+                        writer.writerows(values)
+                (work / "cases.json").write_text(json.dumps([
+                    {field: row()[field] for field in results.KEY_FIELDS[:-1]}]))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(results.main([
+                        str(work), "--suite", "smoke", "--backends",
+                        "clqr_cpu", "gen_riccati", "factor_graph"]), 0)
+                measured = results.read_csv(work / "measurements.csv")
+                self.assertEqual({r["backend"] for r in measured},
+                                 {"clqr_cpu", "gen_riccati", "factor_graph"})
+
     def test_long_individual_sample_list_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             filename = Path(directory) / "measurements.csv"
@@ -206,7 +229,7 @@ class ResultsTest(unittest.TestCase):
                 self.assertEqual(report["laine_corrected"]["counts"][status], 1)
                 measured = results.read_csv(path / "measurements.csv")
                 self.assertTrue(all(r["reference_solution"] == "planted_optimum" for r in measured))
-                self.assertEqual(len(measured), len(files) + 1)
+                self.assertEqual(len(measured), sum(len(values) for values in files.values()))
 
     def test_nonfinite_errors_are_reported_not_discarded(self):
         value = row()

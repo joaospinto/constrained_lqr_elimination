@@ -127,7 +127,7 @@ if name == "df":
 if name == "cmake" and "-B" in args:
     build = Path(args[args.index("-B") + 1])
     build.mkdir(parents=True, exist_ok=True)
-    for exe in ("clqr_cpu_benchmark", "clqr_reference_benchmark",
+    for exe in ("clqr_cpu_benchmark", "clqr_vanroye_benchmark", "clqr_yang_benchmark",
                 "clqr_laine_benchmark", "clqr_laine_corrected_benchmark"):
         target = build / exe
         target.write_text(Path(os.environ["STUB_LAUNCHER"]).read_text())
@@ -165,6 +165,15 @@ if name == "cmake" and "-B" in args:
                 self.assertTrue(all("--case-index" in call for call in measured))
                 self.assertTrue(all("--min-seconds" in call for call in measured))
                 self.assertTrue(all("--repeats" not in call for call in measured))
+                for backend, executable, label in (
+                        ("gen_riccati", "clqr_vanroye_benchmark", "vanroye"),
+                        ("factor_graph", "clqr_yang_benchmark", "yang")):
+                    selected = [call for call in measured if call[call.index("--backend") + 1] == backend]
+                    self.assertTrue(all(call[0] == executable for call in selected))
+                    if selected:
+                        self.assertIn(f"[{label}] SWEEP START: 1 cases; backend={backend}", result.stdout)
+                        self.assertTrue((work / "results" / (label + ".csv")).is_file())
+                self.assertNotIn("clqr_reference_benchmark", log.read_text())
                 fetched = {Path(call[-1]).name for call in calls
                            if call[:2] == ["git", "init"]}
                 self.assertEqual(fetched, expected)
@@ -206,7 +215,7 @@ writer.writerow(row)
             with contextlib.redirect_stdout(console):
                 code = paper_sweep.run(
                     [sys.executable, "-c", child, str(manifest)], manifest=manifest,
-                    backends=["clqr_cpu"], name="cpu_round1", output=work / "result.csv",
+                    backend="clqr_cpu", name="cpu_round1", output=work / "result.csv",
                     errors=work / "result.stderr")
             import csv
             with (work / "result.csv").open() as output:

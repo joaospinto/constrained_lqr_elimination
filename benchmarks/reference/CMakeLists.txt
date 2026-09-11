@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(clqr_reference_benchmark LANGUAGES C CXX ASM)
+project(clqr_reference_benchmarks LANGUAGES C CXX ASM)
 
 # Optional experiment harness, separate from the library's Bazel dependencies.
 # Reference implementations are fetched by the runner, never vendored here.
@@ -23,6 +23,11 @@ set(LAINE_SOURCE_DIR "" CACHE PATH "Unmodified Forrest Laine parallel_lqr checko
 set(EIGEN_SOURCE_DIR "" CACHE PATH "Eigen headers for the optional Laine comparison")
 option(CLQR_COMPARE_LAINE_CORRECTED "Include our corrected Laine-Tomlin implementation" OFF)
 
+if(GEN_RICCATI_SOURCE_DIR OR FACTOR_GRAPH_SOURCE_DIR)
+  enable_testing()
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+endif()
+
 if(BLASFEO_SOURCE_DIR)
   set(BLASFEO_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(BLASFEO_TESTING OFF CACHE BOOL "" FORCE)
@@ -38,9 +43,6 @@ target_link_libraries(clqr_paper_fixture PRIVATE clqr_paper_cpu)
 add_executable(clqr_cpu_benchmark ../paper_benchmark.cc)
 target_include_directories(clqr_cpu_benchmark PRIVATE "${CLQR_ROOT}")
 target_link_libraries(clqr_cpu_benchmark PRIVATE clqr_paper_cpu)
-add_executable(clqr_reference_benchmark ../paper_benchmark.cc)
-target_include_directories(clqr_reference_benchmark PRIVATE "${CLQR_ROOT}")
-target_link_libraries(clqr_reference_benchmark PRIVATE clqr_paper_cpu)
 if(GEN_RICCATI_SOURCE_DIR)
   if(NOT BLASFEO_SOURCE_DIR)
     message(FATAL_ERROR "GEN_RICCATI_SOURCE_DIR needs BLASFEO_SOURCE_DIR")
@@ -51,8 +53,13 @@ if(GEN_RICCATI_SOURCE_DIR)
   target_include_directories(gen_riccati_reference PUBLIC
     "${GEN_RICCATI_SOURCE_DIR}/src/gen_riccati")
   target_link_libraries(gen_riccati_reference PUBLIC blasfeo)
-  target_link_libraries(clqr_reference_benchmark PRIVATE gen_riccati_reference)
-  target_compile_definitions(clqr_reference_benchmark PRIVATE CLQR_BENCHMARK_GEN_RICCATI)
+  add_executable(clqr_vanroye_benchmark ../paper_benchmark.cc)
+  target_include_directories(clqr_vanroye_benchmark PRIVATE "${CLQR_ROOT}")
+  target_link_libraries(clqr_vanroye_benchmark PRIVATE clqr_paper_cpu gen_riccati_reference)
+  target_compile_definitions(clqr_vanroye_benchmark PRIVATE CLQR_BENCHMARK_GEN_RICCATI)
+  add_test(NAME vanroye_benchmark_isolation
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/single_backend_test.py"
+            "$<TARGET_FILE:clqr_vanroye_benchmark>" gen_riccati)
   add_executable(clqr_adversarial_benchmark ../paper_benchmark.cc)
   target_include_directories(clqr_adversarial_benchmark PRIVATE "${CLQR_ROOT}")
   target_compile_definitions(clqr_adversarial_benchmark PRIVATE
@@ -85,9 +92,13 @@ if(FACTOR_GRAPH_SOURCE_DIR)
   target_include_directories(quadratic_factor_test PRIVATE "${FACTOR_GRAPH_SOURCE_DIR}/src")
   target_compile_definitions(quadratic_factor_test PRIVATE CLQR_BENCHMARK_GTSAM)
   target_link_libraries(quadratic_factor_test PRIVATE gtsam)
-  target_link_libraries(clqr_reference_benchmark PRIVATE gtsam)
-  target_include_directories(clqr_reference_benchmark PRIVATE "${FACTOR_GRAPH_SOURCE_DIR}/src")
-  target_compile_definitions(clqr_reference_benchmark PRIVATE CLQR_BENCHMARK_GTSAM)
+  add_executable(clqr_yang_benchmark ../paper_benchmark.cc)
+  target_include_directories(clqr_yang_benchmark PRIVATE "${CLQR_ROOT}" "${FACTOR_GRAPH_SOURCE_DIR}/src")
+  target_link_libraries(clqr_yang_benchmark PRIVATE clqr_paper_cpu gtsam)
+  target_compile_definitions(clqr_yang_benchmark PRIVATE CLQR_BENCHMARK_GTSAM)
+  add_test(NAME yang_benchmark_isolation
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/single_backend_test.py"
+            "$<TARGET_FILE:clqr_yang_benchmark>" factor_graph)
   add_executable(clqr_adversarial_factor_graph_benchmark ../paper_benchmark.cc)
   target_include_directories(clqr_adversarial_factor_graph_benchmark PRIVATE
     "${CLQR_ROOT}" "${FACTOR_GRAPH_SOURCE_DIR}/src")
