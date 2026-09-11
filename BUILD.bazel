@@ -340,6 +340,23 @@ cc_test(
     deps = [":clqr_cuda_stub"],
 )
 
+cc_library(
+    name = "cuda_packing_pool",
+    hdrs = ["src/cuda_packing_pool.h"],
+    linkopts = select({
+        ":linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:private"],
+)
+
+cc_test(
+    name = "cuda_packing_pool_test",
+    size = "small",
+    srcs = ["tests/cuda_packing_pool_test.cc"],
+    deps = [":cuda_packing_pool"],
+)
+
 cuda_library(
     name = "clqr_cuda",
     srcs = ["src/cuda_solver.cu"],
@@ -361,7 +378,7 @@ cuda_library(
     includes = ["include"],
     target_compatible_with = requires_cuda(),
     visibility = ["//visibility:public"],
-    deps = [":clqr"],
+    deps = [":clqr", ":cuda_packing_pool"],
 )
 
 cc_library(
