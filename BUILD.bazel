@@ -364,13 +364,24 @@ cuda_library(
     deps = [":clqr"],
 )
 
-cc_test(
-    name = "cuda_solver_test",
+cc_library(
+    name = "cuda_solver_test_source",
+    testonly = True,
     srcs = [
-        "benchmarks/cuda_benchmark_problem.h",
-        "benchmarks/scaling_problem.h",
         "tests/cuda_solver_test.cc",
     ],
+    hdrs = [
+        "benchmarks/cuda_benchmark_problem.h",
+        "benchmarks/scaling_problem.h",
+        "include/clqr/cuda.h",
+    ],
+    # Compile host-side GPU assertions in ordinary CI too. Linking/running the
+    # actual test still requires the CUDA backend below.
+    deps = [":clqr"],
+)
+
+cc_test(
+    name = "cuda_solver_test",
     tags = [
         "manual",
         "requires-gpu",
@@ -378,6 +389,7 @@ cc_test(
     target_compatible_with = requires_cuda(),
     deps = [
         ":clqr_cuda",
+        ":cuda_solver_test_source",
         "@rules_cuda//cuda:runtime",
     ],
 )

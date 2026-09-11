@@ -616,12 +616,12 @@ void ReusedRankLayoutCase() {
   for (auto &stage : free.stages) {
     for (Matrix *matrix : {&stage.C, &stage.D, &stage.E})
       std::fill(matrix->data().begin(), matrix->data().end(), Scalar{0});
-    std::fill(stage.d.begin(), stage.d.end(), Scalar{0});
-    std::fill(stage.e.begin(), stage.e.end(), Scalar{0});
+    std::fill(stage.d.data().begin(), stage.d.data().end(), Scalar{0});
+    std::fill(stage.e.data().begin(), stage.e.data().end(), Scalar{0});
   }
   std::fill(free.terminal_E.data().begin(), free.terminal_E.data().end(),
             Scalar{0});
-  std::fill(free.terminal_e.begin(), free.terminal_e.end(), Scalar{0});
+  std::fill(free.terminal_e.data().begin(), free.terminal_e.data().end(), Scalar{0});
   clqr::cuda::Workspace workspace;
   clqr::cuda::Solution solution;
   CompareWithCpu(constrained, "cached layout constrained rank", nullptr,
