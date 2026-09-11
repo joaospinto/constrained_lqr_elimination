@@ -2,16 +2,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -30,10 +35,9 @@ namespace cuda {
 namespace detail {
 namespace {
 
-// Each stage/node carries a small dense problem. A single warp avoids the
-// four-warp synchronization and occupancy cost of the former 128-thread
-// blocks; lanes stride over every runtime-sized dense workspace.
-constexpr int kThreads = 32;
+// Each stage/node carries a small dense problem handled by one block whose
+// threads stride over every runtime-sized dense workspace. The block size is
+// chosen per workspace from the stage dimensions (see ResolveBlockThreads).
 #ifdef CLQR_USE_FLOAT
 constexpr Scalar kMinimumFeasibilityConsistencyTolerance = 1e-4f;
 constexpr Scalar kMinimumMultiplierRankTolerance = 1e-4f;
@@ -113,7 +117,7 @@ __global__ void PackPaddedProblemKernel(PaddedDeviceProblem input,
     return;
   }
   if (index < stage_count) {
-    const PackedStage &stage = stages[index];
+    const PackedStage stage = stages[index];
     const std::size_t stage_index = static_cast<std::size_t>(index);
     CopyPaddedMatrix(DeviceOffset(input.A, stage_index * nx * nx), nx,
                      const_cast<Scalar *>(stage.A), stage.next_n, stage.n);
@@ -148,7 +152,7 @@ __global__ void PackPaddedProblemKernel(PaddedDeviceProblem input,
   }
   if (index != stage_count)
     return;
-  const PackedTerminal &terminal_value = terminal[0];
+  const PackedTerminal terminal_value = terminal[0];
   const std::size_t terminal_index = static_cast<std::size_t>(stage_count);
   CopyPaddedMatrix(DeviceOffset(input.Q, terminal_index * nx * nx), nx,
                    const_cast<Scalar *>(terminal_value.Q), terminal_value.n,
@@ -189,7 +193,7 @@ __global__ void ScatterPaddedSolutionKernel(
                      state_dimension);
   }
   if (node < stage_count) {
-    const PackedStage &stage = stages[node];
+    const PackedStage stage = stages[node];
     const std::size_t stage_index = static_cast<std::size_t>(node);
     CopyPaddedVector(DeviceOffset(controls, control_offsets[node]),
                      DeviceOffset(output.controls, stage_index * nu), stage.m);
@@ -1019,46 +1023,112 @@ __device__ inline int DeviceMax(int first, int second) {
   return first > second ? first : second;
 }
 
-#ifdef CLQR_CUDA_EMULATION
-constexpr int kActiveWarpWidth = 1;
-#else
-constexpr int kActiveWarpWidth = 32;
-#endif
+// Dense kernels run one block per stage or tree node. A block may contain
+// several warps; every collective below must be reached by all threads of the
+// block (uniform control flow) and returns the same value in every thread.
+// Single-warp blocks use shuffles only; kernel emulation runs one host thread
+// per block, so every collective degenerates to the identity there.
+constexpr int kWarpThreads = 32;
+constexpr int kMaxBlockThreads = 1024;
+constexpr int kMaxBlockWarps = kMaxBlockThreads / kWarpThreads;
+// Pivot searches over at most this many entries stay serial on one thread; a
+// block-wide argmax would add more instructions than the comparisons save.
+constexpr int kSerialPivotSearchEntries = 32;
 
-__device__ Scalar WarpSum(Scalar value) {
 #ifdef CLQR_CUDA_EMULATION
-  return value;
+__device__ inline void BlockSynchronize() {}
+__device__ inline int BlockWarpCount() { return 1; }
 #else
+__device__ inline void BlockSynchronize() { __syncthreads(); }
+__device__ inline int BlockWarpCount() {
+  return (static_cast<int>(blockDim.x) + kWarpThreads - 1) / kWarpThreads;
+}
+
+__device__ Scalar WarpReduceSum(Scalar value) {
   constexpr unsigned kFullWarp = 0xffffffffu;
   for (int offset = 16; offset > 0; offset /= 2)
     value += __shfl_down_sync(kFullWarp, value, offset);
   return __shfl_sync(kFullWarp, value, 0);
-#endif
 }
 
-__device__ Scalar WarpMaximum(Scalar value) {
-#ifdef CLQR_CUDA_EMULATION
-  return value;
-#else
+__device__ Scalar WarpReduceMaximum(Scalar value) {
   constexpr unsigned kFullWarp = 0xffffffffu;
   for (int offset = 16; offset > 0; offset /= 2)
     value = fmax(value, __shfl_down_sync(kFullWarp, value, offset));
   return __shfl_sync(kFullWarp, value, 0);
-#endif
 }
+#endif
 
-__device__ int WarpBroadcastLaneZero(int value) {
+__device__ Scalar BlockSum(Scalar value) {
 #ifdef CLQR_CUDA_EMULATION
   return value;
 #else
-  return __shfl_sync(0xffffffffu, value, 0);
+  value = WarpReduceSum(value);
+  const int warps = BlockWarpCount();
+  if (warps == 1)
+    return value;
+  __shared__ Scalar partials[kMaxBlockWarps];
+  const int warp = threadIdx.x / kWarpThreads;
+  const int lane = threadIdx.x % kWarpThreads;
+  // A previous collective may still be reading the partial results.
+  __syncthreads();
+  if (lane == 0)
+    partials[warp] = value;
+  __syncthreads();
+  Scalar total = partials[0];
+  for (int other = 1; other < warps; ++other)
+    total += partials[other];
+  return total;
+#endif
+}
+
+__device__ Scalar BlockMaximum(Scalar value) {
+#ifdef CLQR_CUDA_EMULATION
+  return value;
+#else
+  value = WarpReduceMaximum(value);
+  const int warps = BlockWarpCount();
+  if (warps == 1)
+    return value;
+  __shared__ Scalar partials[kMaxBlockWarps];
+  const int warp = threadIdx.x / kWarpThreads;
+  const int lane = threadIdx.x % kWarpThreads;
+  __syncthreads();
+  if (lane == 0)
+    partials[warp] = value;
+  __syncthreads();
+  Scalar total = partials[0];
+  for (int other = 1; other < warps; ++other)
+    total = fmax(total, partials[other]);
+  return total;
+#endif
+}
+
+__device__ int BlockBroadcastThreadZero(int value) {
+#ifdef CLQR_CUDA_EMULATION
+  return value;
+#else
+  if (BlockWarpCount() == 1)
+    return __shfl_sync(0xffffffffu, value, 0);
+  __shared__ int slot;
+  __syncthreads();
+  if (threadIdx.x == 0)
+    slot = value;
+  __syncthreads();
+  return slot;
 #endif
 }
 
 // Deterministic argmax: ties retain the earliest column-major candidate,
 // matching the serial pivot search exactly (including equal-magnitude pivots).
-__device__ int WarpMaximumIndex(Scalar value, int index) {
-#ifndef CLQR_CUDA_EMULATION
+// The winning value is optionally returned alongside its index.
+__device__ int BlockMaximumIndex(Scalar value, int index,
+                                 Scalar *winning_value = nullptr) {
+#ifdef CLQR_CUDA_EMULATION
+  if (winning_value != nullptr)
+    *winning_value = value;
+  return index;
+#else
   constexpr unsigned kFullWarp = 0xffffffffu;
   for (int offset = 16; offset > 0; offset /= 2) {
     const Scalar other_value = __shfl_down_sync(kFullWarp, value, offset);
@@ -1068,10 +1138,73 @@ __device__ int WarpMaximumIndex(Scalar value, int index) {
       index = other_index;
     }
   }
-#else
-  (void)value;
+  value = __shfl_sync(kFullWarp, value, 0);
+  index = __shfl_sync(kFullWarp, index, 0);
+  const int warps = BlockWarpCount();
+  if (warps == 1) {
+    if (winning_value != nullptr)
+      *winning_value = value;
+    return index;
+  }
+  __shared__ Scalar partial_values[kMaxBlockWarps];
+  __shared__ int partial_indices[kMaxBlockWarps];
+  const int warp = threadIdx.x / kWarpThreads;
+  const int lane = threadIdx.x % kWarpThreads;
+  __syncthreads();
+  if (lane == 0) {
+    partial_values[warp] = value;
+    partial_indices[warp] = index;
+  }
+  __syncthreads();
+  Scalar best = partial_values[0];
+  int best_index = partial_indices[0];
+  for (int other = 1; other < warps; ++other) {
+    const Scalar other_value = partial_values[other];
+    const int other_index = partial_indices[other];
+    if (other_value > best ||
+        (other_value == best && other_index < best_index)) {
+      best = other_value;
+      best_index = other_index;
+    }
+  }
+  if (winning_value != nullptr)
+    *winning_value = best;
+  return best_index;
 #endif
-  return WarpBroadcastLaneZero(index);
+}
+
+// Threads per block for the dense per-stage and per-node kernels. Every dense
+// loop strides over the block, so wide stages gain from additional warps,
+// while tiny stages are dominated by barrier latency and keep a single warp.
+// The leaf feasibility matrix (mixed + state + next_n rows by
+// m + n + next_n + 1 columns) is the largest dense object a block handles
+// before the reduced ranks are known, so it sizes the block. Block size never
+// changes the device memory footprint: the bounded global scratch pool only
+// shrinks when fewer, larger blocks are resident. Measured on an RTX PRO 6000
+// (N = 128): two warps beat one even for n = 8, 128 threads win for n = 16,
+// and 256 threads win from n = 24 on, with 512 slower everywhere.
+constexpr std::size_t kDenseEntriesPerThread = 8;
+constexpr int kMinAutomaticBlockThreads = 64;
+constexpr int kMaxAutomaticBlockThreads = 256;
+
+[[maybe_unused]] int ResolveBlockThreads(const Problem &problem,
+                                         const Options &options) {
+  if (options.block_threads > 0)
+    return options.block_threads;
+  std::size_t entries = 0;
+  for (const Stage &stage : problem.stages) {
+    const std::size_t rows = stage.C.rows() + stage.E.rows() + stage.A.rows();
+    const std::size_t columns =
+        stage.B.cols() + stage.A.cols() + stage.A.rows() + 1;
+    entries = std::max(entries, rows * columns);
+  }
+  entries = std::max(entries, problem.terminal_E.rows() *
+                                  (problem.Q.back().rows() + 1));
+  int threads = kMinAutomaticBlockThreads;
+  while (threads < kMaxAutomaticBlockThreads &&
+         entries > static_cast<std::size_t>(threads) * kDenseEntriesPerThread)
+    threads *= 2;
+  return threads;
 }
 
 __device__ int SelectRrefPivotBlock(const Scalar *matrix, int rows, int columns,
@@ -1081,9 +1214,9 @@ __device__ int SelectRrefPivotBlock(const Scalar *matrix, int rows, int columns,
   int best_index = std::numeric_limits<int>::max();
   const int width = last - first;
   const int entries = (rows - rank) * width;
-  // Retain the short serial search for tiny blocks; a warp-wide argmax would
+  // Retain the short serial search for tiny blocks; a block-wide argmax would
   // add more instructions than these few comparisons save.
-  if (entries <= kThreads) {
+  if (entries <= kSerialPivotSearchEntries) {
     if (threadIdx.x == 0) {
       for (int col = first; col < last; ++col) {
         for (int row = rank; row < rows; ++row) {
@@ -1095,7 +1228,7 @@ __device__ int SelectRrefPivotBlock(const Scalar *matrix, int rows, int columns,
         }
       }
     }
-    return WarpBroadcastLaneZero(best_index);
+    return BlockBroadcastThreadZero(best_index);
   }
   // Contiguous columns give coalesced accesses for complete pivot selection.
   // The ordinal, rather than the traversal order, breaks magnitude ties.
@@ -1110,13 +1243,7 @@ __device__ int SelectRrefPivotBlock(const Scalar *matrix, int rows, int columns,
       best_index = index;
     }
   }
-  return WarpMaximumIndex(best, best_index);
-}
-
-__device__ void WarpSynchronize() {
-#ifndef CLQR_CUDA_EMULATION
-  __syncwarp();
-#endif
+  return BlockMaximumIndex(best, best_index);
 }
 
 // Factor a small symmetric positive-definite matrix into a dense lower
@@ -1134,35 +1261,55 @@ __device__ bool FactorPositiveDefiniteBlock(const Scalar *coefficient,
     lower[linear] = Scalar{0.5} * (coefficient[row * coefficient_stride + col] +
                                    coefficient[col * coefficient_stride + row]);
   }
-  WarpSynchronize();
+  BlockSynchronize();
+  __shared__ Scalar cholesky_scale;
+  // Thread zero is the only writer of the flag and remembers its own decision
+  // in a register, so no thread reads the flag while it may be written; every
+  // block-wide read happens between the barrier after a write and the barrier
+  // before the next one.
+  bool failed = false;
   if (threadIdx.x == 0) {
     *positive_definite = 1;
     Scalar scale = Scalar{0};
     for (int diagonal = 0; diagonal < dimension; ++diagonal) {
       scale = fmax(scale, DeviceAbs(lower[diagonal * dimension + diagonal]));
     }
-    if (!(scale > Scalar{0}) || !DeviceFinite(scale))
+    if (!(scale > Scalar{0}) || !DeviceFinite(scale)) {
       *positive_definite = 0;
-    for (int col = 0; col < dimension && *positive_definite; ++col) {
+      failed = true;
+    }
+    cholesky_scale = scale;
+  }
+  BlockSynchronize();
+  // Right-looking column sweep: one thread finishes the diagonal, then the
+  // rows below it are independent. The per-entry arithmetic order matches the
+  // serial factorization exactly.
+  for (int col = 0; col < dimension; ++col) {
+    if (threadIdx.x == 0 && !failed) {
       Scalar diagonal = lower[col * dimension + col];
       for (int k = 0; k < col; ++k) {
         diagonal -= lower[col * dimension + k] * lower[col * dimension + k];
       }
-      if (!(diagonal > tolerance * scale) || !DeviceFinite(diagonal)) {
+      if (!(diagonal > tolerance * cholesky_scale) || !DeviceFinite(diagonal)) {
         *positive_definite = 0;
-        break;
-      }
-      lower[col * dimension + col] = sqrt(diagonal);
-      for (int row = col + 1; row < dimension; ++row) {
-        Scalar value = lower[row * dimension + col];
-        for (int k = 0; k < col; ++k) {
-          value -= lower[row * dimension + k] * lower[col * dimension + k];
-        }
-        lower[row * dimension + col] = value / lower[col * dimension + col];
+        failed = true;
+      } else {
+        lower[col * dimension + col] = sqrt(diagonal);
       }
     }
+    BlockSynchronize();
+    if (!*positive_definite)
+      break;
+    const Scalar pivot = lower[col * dimension + col];
+    for (int row = col + 1 + threadIdx.x; row < dimension; row += blockDim.x) {
+      Scalar value = lower[row * dimension + col];
+      for (int k = 0; k < col; ++k) {
+        value -= lower[row * dimension + k] * lower[col * dimension + k];
+      }
+      lower[row * dimension + col] = value / pivot;
+    }
+    BlockSynchronize();
   }
-  WarpSynchronize();
   return *positive_definite != 0;
 }
 
@@ -1192,7 +1339,7 @@ __device__ void SolvePositiveDefiniteMultipleRhsBlock(
           value / lower[row * dimension + row];
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
 }
 
 __device__ void BindValueElementScratch(ValueElement *element, Scalar *storage,
@@ -1273,7 +1420,7 @@ __global__ void CheckFiniteDirectInputsKernel(const PackedStage *stages,
   const int index = blockIdx.x;
   bool finite = true;
   if (index < stage_count) {
-    const PackedStage &s = stages[index];
+    const PackedStage s = stages[index];
     const std::size_t n = s.n, next = s.next_n, m = s.m;
     finite &= FiniteInputSpan(s.A, next * n);
     finite &= FiniteInputSpan(s.B, next * m);
@@ -1303,15 +1450,69 @@ __global__ void CheckFiniteDirectInputsKernel(const PackedStage *stages,
 }
 
 // A global failure can be reported by another block at any time.  Sampling it
-// independently in every lane before a later warp synchronization can
-// therefore make only part of a warp return.  Have one lane sample the flag
-// and broadcast a warp-uniform decision instead.
+// independently in every thread before a later block barrier can therefore
+// make only part of a block return.  Have one thread sample the flag and
+// broadcast a block-uniform decision instead.
 __device__ bool BlockEnabled(const DeviceStatus *status) {
   int enabled = 0;
   if (threadIdx.x == 0)
     enabled = atomicCAS(const_cast<int *>(&status->code), kDeviceOk,
                         kDeviceOk) == kDeviceOk;
-  return WarpBroadcastLaneZero(enabled) != 0;
+  return BlockBroadcastThreadZero(enabled) != 0;
+}
+
+// Kernels that assign one logical item per thread exit divergently before this
+// check and use no block collectives, so each thread samples the flag itself.
+__device__ bool ThreadEnabled(const DeviceStatus *status) {
+  return atomicCAS(const_cast<int *>(&status->code), kDeviceOk, kDeviceOk) ==
+         kDeviceOk;
+}
+
+// Rank-one elimination update over a row-major block: every entry (row, col)
+// with first_row <= row < first_row + rows and first_column <= col <
+// first_column + width becomes entry - factors[row] * pivot_values[col], except
+// in skip_row. Each entry belongs to exactly one thread. Loads for several
+// entries are issued before their stores so that latency-bound scratch (global
+// fallback in particular) keeps multiple accesses in flight per thread; the
+// restrict qualifiers state that the factor and pivot vectors are never
+// written through `matrix` inside this call.
+__device__ void RankOneUpdateBlock(Scalar *__restrict__ matrix, int columns,
+                                   int first_row, int rows, int first_column,
+                                   int width,
+                                   const Scalar *__restrict__ factors,
+                                   const Scalar *__restrict__ pivot_values,
+                                   int skip_row) {
+  constexpr int kUnroll = 4;
+  const int total = rows * width;
+  const int stride = static_cast<int>(blockDim.x);
+  int index = static_cast<int>(threadIdx.x);
+  for (; index + (kUnroll - 1) * stride < total; index += kUnroll * stride) {
+    int entry_row[kUnroll];
+    int entry_col[kUnroll];
+    Scalar value[kUnroll];
+    Scalar factor[kUnroll];
+    Scalar pivot[kUnroll];
+    for (int k = 0; k < kUnroll; ++k) {
+      const int entry = index + k * stride;
+      entry_row[k] = first_row + entry / width;
+      entry_col[k] = first_column + entry % width;
+      value[k] = matrix[entry_row[k] * columns + entry_col[k]];
+      factor[k] = factors[entry_row[k]];
+      pivot[k] = pivot_values[entry_col[k]];
+    }
+    for (int k = 0; k < kUnroll; ++k) {
+      if (entry_row[k] != skip_row) {
+        matrix[entry_row[k] * columns + entry_col[k]] =
+            value[k] - factor[k] * pivot[k];
+      }
+    }
+  }
+  for (; index < total; index += stride) {
+    const int row = first_row + index / width;
+    const int col = first_column + index % width;
+    if (row != skip_row)
+      matrix[row * columns + col] -= factors[row] * pivot_values[col];
+  }
 }
 
 // Scale each nonzero equation before pivoting, then use partial row pivoting.
@@ -1326,7 +1527,7 @@ __device__ bool BlockEnabled(const DeviceStatus *status) {
 // without allowing state columns to replace available control pivots.
 __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
                           int pivot_limit, Scalar tolerance, int *pivot_columns,
-                          int *pivot_rows, int *rank, int *best_row,
+                          int *pivot_rows, int *rank,
                           Scalar *factors, Scalar minimum_row_scale = Scalar{0},
                           int priority_pivot_limit = 0) {
   for (int row = threadIdx.x; row < rows; row += blockDim.x) {
@@ -1339,80 +1540,71 @@ __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
         matrix[row * columns + col] /= scale;
     }
   }
-  if (threadIdx.x == 0)
-    *rank = 0;
-  WarpSynchronize();
+  BlockSynchronize();
 
-  for (int position = 0; position < pivot_limit; ++position) {
+  // The selected pivot is block-uniform, so every thread tracks the rank in a
+  // register and derives the pivot coordinates itself. Each pivot step then
+  // needs three barriers: the fused row exchange and normalization, the
+  // elimination, and the pivot search of the next step.
+  int current_rank = 0;
+  for (int position = 0; position < pivot_limit && current_rank < rows;
+       ++position) {
     const int first = position < priority_pivot_limit ? 0 : position;
     const int last =
         position < priority_pivot_limit ? priority_pivot_limit : position + 1;
-    const int selected = SelectRrefPivotBlock(matrix, rows, columns, *rank,
-                                              first, last, tolerance);
-    if (threadIdx.x == 0) {
-      *best_row = -1;
-      if (selected != std::numeric_limits<int>::max()) {
-        *best_row = selected % rows;
-        pivot_rows[*rank] = selected / rows;
-      }
-    }
-    WarpSynchronize();
-    const int selected_row = *best_row;
-    // A no-pivot iteration skips the barriers below.  Ensure every thread has
-    // consumed best_row before thread 0 reuses it in the next iteration.
-    WarpSynchronize();
-    if (selected_row < 0)
+    const int selected = SelectRrefPivotBlock(matrix, rows, columns,
+                                              current_rank, first, last,
+                                              tolerance);
+    if (selected == std::numeric_limits<int>::max())
       continue;
 
-    const int pivot_row = *rank;
-    const int col = pivot_rows[pivot_row];
+    const int pivot_row = current_rank;
+    const int selected_row = selected % rows;
+    const int col = selected / rows;
     const int first_entry = priority_pivot_limit > 0 ? 0 : col;
-    if (selected_row != pivot_row) {
-      for (int j = threadIdx.x; j < columns; j += blockDim.x) {
-        const Scalar tmp = matrix[pivot_row * columns + j];
-        matrix[pivot_row * columns + j] = matrix[selected_row * columns + j];
-        matrix[selected_row * columns + j] = tmp;
-      }
+    // Every thread loads the pivot and the coefficient it displaces before any
+    // entry of the two rows is written.
+    const Scalar pivot = matrix[selected_row * columns + col];
+    const Scalar displaced = matrix[pivot_row * columns + col];
+    BlockSynchronize();
+    for (int j = threadIdx.x; j < columns; j += blockDim.x) {
+      const Scalar pivot_entry = matrix[selected_row * columns + j];
+      if (selected_row != pivot_row)
+        matrix[selected_row * columns + j] = matrix[pivot_row * columns + j];
+      matrix[pivot_row * columns + j] =
+          j >= first_entry ? pivot_entry / pivot : pivot_entry;
     }
-    WarpSynchronize();
-
-    const Scalar pivot = matrix[pivot_row * columns + col];
-    // All threads must load the pivot before any thread normalizes its entry.
-    WarpSynchronize();
-    for (int j = first_entry + threadIdx.x; j < columns; j += blockDim.x) {
-      matrix[pivot_row * columns + j] /= pivot;
-    }
-    WarpSynchronize();
-
+    // Rows other than the two exchanged ones are untouched above; the row
+    // that now holds the former pivot row keeps the coefficient loaded before
+    // the exchange, exactly as if it had been read after it.
     for (int row = threadIdx.x; row < rows; row += blockDim.x) {
-      factors[row] = row == pivot_row ? Scalar{0} : matrix[row * columns + col];
-    }
-    WarpSynchronize();
-    for (int index = threadIdx.x; index < rows * (columns - first_entry);
-         index += blockDim.x) {
-      const int row = index / (columns - first_entry);
-      const int j = first_entry + index % (columns - first_entry);
-      if (row != pivot_row) {
-        matrix[row * columns + j] -=
-            factors[row] * matrix[pivot_row * columns + j];
+      Scalar factor = Scalar{0};
+      if (row == selected_row) {
+        factor = selected_row == pivot_row ? Scalar{0} : displaced;
+      } else if (row != pivot_row) {
+        factor = matrix[row * columns + col];
       }
+      factors[row] = factor;
     }
-    WarpSynchronize();
+    BlockSynchronize();
+    RankOneUpdateBlock(matrix, columns, 0, rows, first_entry,
+                       columns - first_entry, factors,
+                       matrix + pivot_row * columns, pivot_row);
     if (threadIdx.x == 0) {
       pivot_columns[pivot_row] = col;
       pivot_rows[pivot_row] = pivot_row;
-      ++(*rank);
     }
-    WarpSynchronize();
-    if (*rank == rows)
-      break;
+    ++current_rank;
+    BlockSynchronize();
   }
+  if (threadIdx.x == 0)
+    *rank = current_rank;
 
   for (int index = threadIdx.x; index < rows * columns; index += blockDim.x) {
     if (DeviceAbs(matrix[index]) <= tolerance)
       matrix[index] = Scalar{0};
   }
-  WarpSynchronize();
+  BlockSynchronize();
 }
 
 // Solve A*X=B for a square nonsymmetric A using one row-equilibrated,
@@ -1422,7 +1614,7 @@ __device__ void RrefBlock(Scalar *matrix, int rows, int columns,
 // B.  Native CUDA and kernel emulation use this same source.
 __device__ bool SolveGeneralMultipleRhsBlock(Scalar *augmented, int dimension,
                                              int columns, Scalar tolerance,
-                                             Scalar *factors, int *best_row) {
+                                             Scalar *factors) {
   for (int row = threadIdx.x; row < dimension; row += blockDim.x) {
     Scalar scale = Scalar{0};
     for (int col = 0; col < dimension; ++col) {
@@ -1430,33 +1622,37 @@ __device__ bool SolveGeneralMultipleRhsBlock(Scalar *augmented, int dimension,
     }
     factors[row] = scale;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < dimension * columns;
        linear += blockDim.x) {
     const int row = linear / columns;
     if (factors[row] > Scalar{0})
       augmented[linear] /= factors[row];
   }
-  WarpSynchronize();
+  BlockSynchronize();
 
   for (int pivot_col = 0; pivot_col < dimension; ++pivot_col) {
-    if (threadIdx.x == 0) {
-      *best_row = -1;
-      Scalar best = tolerance;
-      for (int row = pivot_col; row < dimension; ++row) {
-        const Scalar candidate =
-            DeviceAbs(augmented[row * columns + pivot_col]);
-        if (candidate > best) {
-          best = candidate;
-          *best_row = row;
-        }
+    // Partial pivoting: the first row attaining the largest magnitude wins,
+    // exactly as in a serial scan.
+    Scalar best = tolerance;
+    int best_index = std::numeric_limits<int>::max();
+    for (int row = pivot_col + threadIdx.x; row < dimension;
+         row += blockDim.x) {
+      const Scalar candidate = DeviceAbs(augmented[row * columns + pivot_col]);
+      if (candidate > best ||
+          (candidate == best && candidate > tolerance && row < best_index)) {
+        best = candidate;
+        best_index = row;
       }
     }
-    WarpSynchronize();
-    const int selected_row = *best_row;
-    if (selected_row < 0)
+    const int selected_row = BlockMaximumIndex(best, best_index);
+    if (selected_row == std::numeric_limits<int>::max())
       return false;
 
+    // Load the pivot and the coefficient it displaces before the exchange.
+    const Scalar pivot = augmented[selected_row * columns + pivot_col];
+    const Scalar displaced = augmented[pivot_col * columns + pivot_col];
+    BlockSynchronize();
     if (selected_row != pivot_col) {
       for (int col = threadIdx.x; col < columns; col += blockDim.x) {
         const Scalar tmp = augmented[pivot_col * columns + col];
@@ -1465,25 +1661,22 @@ __device__ bool SolveGeneralMultipleRhsBlock(Scalar *augmented, int dimension,
         augmented[selected_row * columns + col] = tmp;
       }
     }
-    WarpSynchronize();
-
-    const Scalar pivot = augmented[pivot_col * columns + pivot_col];
     for (int row = threadIdx.x; row < dimension; row += blockDim.x) {
-      factors[row] = row > pivot_col
-                         ? augmented[row * columns + pivot_col] / pivot
-                         : Scalar{0};
+      Scalar factor = Scalar{0};
+      if (row > pivot_col) {
+        const Scalar coefficient = row == selected_row
+                                       ? displaced
+                                       : augmented[row * columns + pivot_col];
+        factor = coefficient / pivot;
+      }
+      factors[row] = factor;
     }
-    WarpSynchronize();
-    const int remaining_rows = dimension - pivot_col - 1;
-    const int remaining_columns = columns - pivot_col - 1;
-    for (int linear = threadIdx.x; linear < remaining_rows * remaining_columns;
-         linear += blockDim.x) {
-      const int row = pivot_col + 1 + linear / remaining_columns;
-      const int col = pivot_col + 1 + linear % remaining_columns;
-      augmented[row * columns + col] -=
-          factors[row] * augmented[pivot_col * columns + col];
-    }
-    WarpSynchronize();
+    BlockSynchronize();
+    RankOneUpdateBlock(augmented, columns, pivot_col + 1,
+                       dimension - pivot_col - 1, pivot_col + 1,
+                       columns - pivot_col - 1, factors,
+                       augmented + pivot_col * columns, -1);
+    BlockSynchronize();
   }
 
   const int right_hand_side_count = columns - dimension;
@@ -1499,7 +1692,7 @@ __device__ bool SolveGeneralMultipleRhsBlock(Scalar *augmented, int dimension,
           value / augmented[row * columns + row];
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
   return true;
 }
 
@@ -1531,45 +1724,45 @@ __device__ void OrthogonalEchelonBlock(Scalar *matrix, int rows, int columns,
     *rank = 0;
     *matrix_scale = Scalar{0};
   }
-  WarpSynchronize();
+  BlockSynchronize();
 
-  for (int col = 0; col < pivot_limit; ++col) {
+  // Column norms are independent, so one thread measures whole columns and the
+  // block reduces once, instead of reducing every column across the block.
+  Scalar largest_column_norm = Scalar{0};
+  for (int col = threadIdx.x; col < pivot_limit; col += blockDim.x) {
     Scalar squared_norm = Scalar{0};
-    for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+    for (int row = 0; row < rows; ++row) {
       const Scalar value = matrix[row * columns + col];
       squared_norm += value * value;
     }
-    squared_norm = WarpSum(squared_norm);
-    if (threadIdx.x == 0)
-      *matrix_scale = fmax(*matrix_scale, sqrt(squared_norm));
+    largest_column_norm = fmax(largest_column_norm, sqrt(squared_norm));
   }
-  WarpSynchronize();
-  const Scalar rank_threshold = tolerance * fmax(Scalar{1}, *matrix_scale);
+  largest_column_norm = BlockMaximum(largest_column_norm);
+  const Scalar rank_threshold = tolerance * fmax(Scalar{1}, largest_column_norm);
   const int maximum_rank = rows < pivot_limit ? rows : pivot_limit;
 
   for (int basis = 0; basis < maximum_rank; ++basis) {
-    int selected_column = basis;
+    // Column pivoting: the first column attaining the largest trailing norm.
     Scalar best_norm_squared = Scalar{-1};
-    for (int candidate = basis; candidate < pivot_limit; ++candidate) {
+    int selected_column = std::numeric_limits<int>::max();
+    for (int candidate = basis + threadIdx.x; candidate < pivot_limit;
+         candidate += blockDim.x) {
       Scalar squared_norm = Scalar{0};
-      for (int row = basis + threadIdx.x; row < rows; row += blockDim.x) {
+      for (int row = basis; row < rows; ++row) {
         const Scalar value = matrix[row * columns + candidate];
         squared_norm += value * value;
       }
-      squared_norm = WarpSum(squared_norm);
       if (squared_norm > best_norm_squared) {
         best_norm_squared = squared_norm;
         selected_column = candidate;
       }
     }
+    selected_column = BlockMaximumIndex(best_norm_squared, selected_column,
+                                        &best_norm_squared);
     const Scalar best_norm = sqrt(best_norm_squared);
-    if (threadIdx.x == 0)
-      *best_column = selected_column;
-    WarpSynchronize();
     if (!(best_norm > rank_threshold))
       break;
 
-    selected_column = *best_column;
     if (selected_column != basis) {
       for (int row = threadIdx.x; row < rows; row += blockDim.x) {
         const Scalar value = matrix[row * columns + basis];
@@ -1582,28 +1775,28 @@ __device__ void OrthogonalEchelonBlock(Scalar *matrix, int rows, int columns,
         permutation[selected_column] = variable;
       }
     }
-    WarpSynchronize();
+    BlockSynchronize();
 
     const Scalar diagonal = matrix[basis * columns + basis];
     const Scalar alpha = diagonal < Scalar{0} ? best_norm : -best_norm;
     for (int row = basis + threadIdx.x; row < rows; row += blockDim.x)
       reflector[row] = matrix[row * columns + basis];
-    WarpSynchronize();
+    BlockSynchronize();
     if (threadIdx.x == 0) {
       reflector[basis] -= alpha;
       matrix[basis * columns + basis] = alpha;
     }
-    WarpSynchronize();
+    BlockSynchronize();
     Scalar reflector_norm_squared = Scalar{0};
     for (int row = basis + threadIdx.x; row < rows; row += blockDim.x)
       reflector_norm_squared += reflector[row] * reflector[row];
-    reflector_norm_squared = WarpSum(reflector_norm_squared);
+    reflector_norm_squared = BlockSum(reflector_norm_squared);
     if (threadIdx.x == 0) {
       *matrix_scale = reflector_norm_squared > Scalar{0}
                           ? Scalar{2} / reflector_norm_squared
                           : Scalar{0};
     }
-    WarpSynchronize();
+    BlockSynchronize();
     const Scalar beta = *matrix_scale;
     if (!(beta > Scalar{0}))
       break;
@@ -1616,14 +1809,14 @@ __device__ void OrthogonalEchelonBlock(Scalar *matrix, int rows, int columns,
       for (int row = basis; row < rows; ++row)
         matrix[row * columns + col] -= reflector[row] * projection;
     }
-    WarpSynchronize();
+    BlockSynchronize();
     if (threadIdx.x == 0) {
       pivot_columns[basis] = permutation[basis];
       *rank = basis + 1;
     }
     for (int row = basis + 1 + threadIdx.x; row < rows; row += blockDim.x)
       matrix[row * columns + basis] = Scalar{0};
-    WarpSynchronize();
+    BlockSynchronize();
   }
 
   for (int reverse = 0; reverse < *rank; ++reverse) {
@@ -1631,13 +1824,13 @@ __device__ void OrthogonalEchelonBlock(Scalar *matrix, int rows, int columns,
     const Scalar diagonal = matrix[row * columns + row];
     for (int col = row + threadIdx.x; col < columns; col += blockDim.x)
       matrix[row * columns + col] /= diagonal;
-    WarpSynchronize();
+    BlockSynchronize();
     for (int upper = 0; upper < row; ++upper) {
       const Scalar factor = matrix[upper * columns + row];
       for (int col = row + threadIdx.x; col < columns; col += blockDim.x)
         matrix[upper * columns + col] -= factor * matrix[row * columns + col];
     }
-    WarpSynchronize();
+    BlockSynchronize();
   }
 
   // permutation[position] is the original variable at that position. Restore
@@ -1648,7 +1841,7 @@ __device__ void OrthogonalEchelonBlock(Scalar *matrix, int rows, int columns,
       while (permutation[*best_column] != original)
         ++(*best_column);
     }
-    WarpSynchronize();
+    BlockSynchronize();
     const int selected_column = *best_column;
     if (selected_column != original) {
       for (int row = threadIdx.x; row < rows; row += blockDim.x) {
@@ -1663,7 +1856,7 @@ __device__ void OrthogonalEchelonBlock(Scalar *matrix, int rows, int columns,
         permutation[selected_column] = variable;
       }
     }
-    WarpSynchronize();
+    BlockSynchronize();
   }
 
   for (int index = threadIdx.x; index < rows * columns; index += blockDim.x) {
@@ -1674,13 +1867,17 @@ __device__ void OrthogonalEchelonBlock(Scalar *matrix, int rows, int columns,
       matrix[index] = Scalar{0};
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
 }
 
-__device__ bool InconsistentRref(const Scalar *matrix, int rows, int columns,
-                                 int lhs_columns, Scalar lhs_tolerance,
-                                 Scalar rhs_tolerance) {
-  for (int row = 0; row < rows; ++row) {
+// Block collective: every thread scans a subset of rows and the block-wide
+// result is uniform.
+__device__ bool InconsistentRrefBlock(const Scalar *matrix, int rows,
+                                      int columns, int lhs_columns,
+                                      Scalar lhs_tolerance,
+                                      Scalar rhs_tolerance) {
+  Scalar inconsistent = Scalar{0};
+  for (int row = threadIdx.x; row < rows; row += blockDim.x) {
     bool zero = true;
     for (int col = 0; col < lhs_columns; ++col) {
       if (DeviceAbs(matrix[row * columns + col]) > lhs_tolerance) {
@@ -1689,19 +1886,19 @@ __device__ bool InconsistentRref(const Scalar *matrix, int rows, int columns,
       }
     }
     if (zero && DeviceAbs(matrix[row * columns + lhs_columns]) > rhs_tolerance)
-      return true;
+      inconsistent = Scalar{1};
   }
-  return false;
+  return BlockMaximum(inconsistent) > Scalar{0};
 }
 
 // Measure the right-hand side relative to each equation's largest coefficient
 // before the matrix is overwritten, so long multiplier chains are tested on a
-// scale-independent residual.
-__device__ Scalar ConditionedRhsScale(const Scalar *matrix, int rows,
-                                      int columns, int lhs_columns,
-                                      Scalar rank_tolerance) {
+// scale-independent residual. Block collective with a uniform result.
+__device__ Scalar ConditionedRhsScaleBlock(const Scalar *matrix, int rows,
+                                           int columns, int lhs_columns,
+                                           Scalar rank_tolerance) {
   Scalar scale = Scalar{1};
-  for (int row = 0; row < rows; ++row) {
+  for (int row = threadIdx.x; row < rows; row += blockDim.x) {
     Scalar lhs_scale = Scalar{0};
     for (int col = 0; col < lhs_columns; ++col) {
       const Scalar value = DeviceAbs(matrix[row * columns + col]);
@@ -1714,7 +1911,7 @@ __device__ Scalar ConditionedRhsScale(const Scalar *matrix, int rows,
     if (rhs_scale > scale)
       scale = rhs_scale;
   }
-  return scale;
+  return BlockMaximum(scale);
 }
 
 template <typename RelationType>
@@ -1732,7 +1929,7 @@ __device__ void ExtractResidualRelation(const Scalar *matrix, int columns,
     output->right_dim = right_dim;
     output->rows = rank - eliminated_rank;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   const int eliminated_rank = rank - output->rows;
   const int outer_dim = left_dim + right_dim;
   for (int index = threadIdx.x; index < output->rows * outer_dim;
@@ -1750,7 +1947,7 @@ __device__ void ExtractResidualRelation(const Scalar *matrix, int columns,
   for (int row = threadIdx.x; row < output->rows; row += blockDim.x) {
     output->rhs[row] = matrix[(eliminated_rank + row) * columns + columns - 1];
   }
-  WarpSynchronize();
+  BlockSynchronize();
 }
 
 // Eliminate the leading variables by orthogonally projecting the equations
@@ -1764,215 +1961,214 @@ __device__ void EliminateRelationOrthogonally(
     Scalar *matrix, int rows, int columns, int eliminated_columns, int left_dim,
     int right_dim, Scalar rank_tolerance, Scalar consistency_tolerance,
     RelationType *relation, int *local_ok) {
-  if (threadIdx.x < kActiveWarpWidth) {
-    const int lane = threadIdx.x;
-    const Scalar rank_threshold_squared = rank_tolerance * rank_tolerance;
-    Scalar rhs_scale = Scalar{1};
-    for (int row = lane; row < rows; row += kActiveWarpWidth)
-      rhs_scale =
-          fmax(rhs_scale, DeviceAbs(matrix[row * columns + columns - 1]));
-    rhs_scale = WarpMaximum(rhs_scale);
+  const int lane = threadIdx.x;
+  const Scalar rank_threshold_squared = rank_tolerance * rank_tolerance;
+  Scalar rhs_scale = Scalar{1};
+  for (int row = lane; row < rows; row += blockDim.x)
+    rhs_scale = fmax(rhs_scale, DeviceAbs(matrix[row * columns + columns - 1]));
+  rhs_scale = BlockMaximum(rhs_scale);
 
-    int eliminated_rank = 0;
-    for (int basis = 0; basis < eliminated_columns; ++basis) {
-      int best_column = basis;
-      Scalar best_norm_squared = Scalar{-1};
-      for (int candidate = basis; candidate < eliminated_columns; ++candidate) {
-        Scalar norm_squared = Scalar{0};
-        for (int row = lane; row < rows; row += kActiveWarpWidth) {
-          const Scalar value = matrix[row * columns + candidate];
-          norm_squared += value * value;
-        }
-        norm_squared = WarpSum(norm_squared);
-        if (norm_squared > best_norm_squared) {
-          best_norm_squared = norm_squared;
-          best_column = candidate;
-        }
-      }
-      if (!(best_norm_squared > rank_threshold_squared))
-        break;
-      if (best_column != basis) {
-        for (int row = lane; row < rows; row += kActiveWarpWidth) {
-          const Scalar value = matrix[row * columns + basis];
-          matrix[row * columns + basis] = matrix[row * columns + best_column];
-          matrix[row * columns + best_column] = value;
-        }
-        WarpSynchronize();
-      }
-      for (int pass = 0; pass < 2; ++pass) {
-        for (int previous = 0; previous < basis; ++previous) {
-          Scalar projection = Scalar{0};
-          for (int row = lane; row < rows; row += kActiveWarpWidth) {
-            projection += matrix[row * columns + basis] *
-                          matrix[row * columns + previous];
-          }
-          projection = WarpSum(projection);
-          for (int row = lane; row < rows; row += kActiveWarpWidth) {
-            matrix[row * columns + basis] -=
-                projection * matrix[row * columns + previous];
-          }
-          WarpSynchronize();
-        }
-      }
+  // Columns (and later rows) being orthogonalized against one new basis
+  // vector are independent, so one thread owns each of them and performs both
+  // passes serially; only the pivot choice and the norms of the vector being
+  // added need block-wide reductions.
+  int eliminated_rank = 0;
+  for (int basis = 0; basis < eliminated_columns; ++basis) {
+    Scalar best_norm_squared = Scalar{-1};
+    int best_column = std::numeric_limits<int>::max();
+    for (int candidate = basis + lane; candidate < eliminated_columns;
+         candidate += blockDim.x) {
       Scalar norm_squared = Scalar{0};
-      for (int row = lane; row < rows; row += kActiveWarpWidth) {
+      for (int row = 0; row < rows; ++row) {
+        const Scalar value = matrix[row * columns + candidate];
+        norm_squared += value * value;
+      }
+      if (norm_squared > best_norm_squared) {
+        best_norm_squared = norm_squared;
+        best_column = candidate;
+      }
+    }
+    best_column =
+        BlockMaximumIndex(best_norm_squared, best_column, &best_norm_squared);
+    if (!(best_norm_squared > rank_threshold_squared))
+      break;
+    if (best_column != basis) {
+      for (int row = lane; row < rows; row += blockDim.x) {
         const Scalar value = matrix[row * columns + basis];
-        norm_squared += value * value;
+        matrix[row * columns + basis] = matrix[row * columns + best_column];
+        matrix[row * columns + best_column] = value;
       }
-      norm_squared = WarpSum(norm_squared);
-      if (!(norm_squared > rank_threshold_squared))
-        break;
-      const Scalar inverse_norm = Scalar{1} / sqrt(norm_squared);
-      for (int row = lane; row < rows; row += kActiveWarpWidth)
-        matrix[row * columns + basis] *= inverse_norm;
-      WarpSynchronize();
-      for (int candidate = basis + 1; candidate < eliminated_columns;
-           ++candidate) {
-        for (int pass = 0; pass < 2; ++pass) {
-          Scalar projection = Scalar{0};
-          for (int row = lane; row < rows; row += kActiveWarpWidth)
-            projection += matrix[row * columns + candidate] *
-                          matrix[row * columns + basis];
-          projection = WarpSum(projection);
-          for (int row = lane; row < rows; row += kActiveWarpWidth)
-            matrix[row * columns + candidate] -=
-                projection * matrix[row * columns + basis];
-          WarpSynchronize();
-        }
-      }
-      ++eliminated_rank;
+      BlockSynchronize();
     }
-
-    // Apply the orthogonal projector to the outer coefficients and right-hand
-    // side. The remaining rows are precisely the equations that cannot be
-    // satisfied by choosing the eliminated variables.
-    for (int col = eliminated_columns; col < columns; ++col) {
-      for (int basis = 0; basis < eliminated_rank; ++basis) {
-        for (int pass = 0; pass < 2; ++pass) {
-          Scalar projection = Scalar{0};
-          for (int row = lane; row < rows; row += kActiveWarpWidth)
-            projection +=
-                matrix[row * columns + col] * matrix[row * columns + basis];
-          projection = WarpSum(projection);
-          for (int row = lane; row < rows; row += kActiveWarpWidth)
-            matrix[row * columns + col] -=
-                projection * matrix[row * columns + basis];
-          WarpSynchronize();
+    for (int pass = 0; pass < 2; ++pass) {
+      for (int previous = 0; previous < basis; ++previous) {
+        Scalar projection = Scalar{0};
+        for (int row = lane; row < rows; row += blockDim.x) {
+          projection +=
+              matrix[row * columns + basis] * matrix[row * columns + previous];
         }
+        projection = BlockSum(projection);
+        for (int row = lane; row < rows; row += blockDim.x) {
+          matrix[row * columns + basis] -=
+              projection * matrix[row * columns + previous];
+        }
+        BlockSynchronize();
       }
     }
-
-    const int outer_columns = left_dim + right_dim;
-    int relation_rank = 0;
-    while (relation_rank < rows) {
-      int best_row = relation_rank;
-      Scalar best_norm_squared = Scalar{-1};
-      for (int candidate = relation_rank; candidate < rows; ++candidate) {
-        Scalar norm_squared = Scalar{0};
-        for (int col = lane; col < outer_columns; col += kActiveWarpWidth) {
-          const Scalar value =
-              matrix[candidate * columns + eliminated_columns + col];
-          norm_squared += value * value;
-        }
-        norm_squared = WarpSum(norm_squared);
-        if (norm_squared > best_norm_squared) {
-          best_norm_squared = norm_squared;
-          best_row = candidate;
-        }
-      }
-      if (!(best_norm_squared > rank_threshold_squared))
-        break;
-      if (best_row != relation_rank) {
-        for (int outer = lane; outer <= outer_columns;
-             outer += kActiveWarpWidth) {
-          const int col = eliminated_columns + outer;
-          const Scalar value = matrix[relation_rank * columns + col];
-          matrix[relation_rank * columns + col] =
-              matrix[best_row * columns + col];
-          matrix[best_row * columns + col] = value;
-        }
-        WarpSynchronize();
-      }
+    Scalar norm_squared = Scalar{0};
+    for (int row = lane; row < rows; row += blockDim.x) {
+      const Scalar value = matrix[row * columns + basis];
+      norm_squared += value * value;
+    }
+    norm_squared = BlockSum(norm_squared);
+    if (!(norm_squared > rank_threshold_squared))
+      break;
+    const Scalar inverse_norm = Scalar{1} / sqrt(norm_squared);
+    for (int row = lane; row < rows; row += blockDim.x)
+      matrix[row * columns + basis] *= inverse_norm;
+    BlockSynchronize();
+    for (int candidate = basis + 1 + lane; candidate < eliminated_columns;
+         candidate += blockDim.x) {
       for (int pass = 0; pass < 2; ++pass) {
-        for (int previous = 0; previous < relation_rank; ++previous) {
-          Scalar projection = Scalar{0};
-          for (int col = lane; col < outer_columns; col += kActiveWarpWidth) {
-            projection +=
-                matrix[relation_rank * columns + eliminated_columns + col] *
-                matrix[previous * columns + eliminated_columns + col];
-          }
-          projection = WarpSum(projection);
-          for (int col = lane; col <= outer_columns; col += kActiveWarpWidth) {
-            matrix[relation_rank * columns + eliminated_columns + col] -=
-                projection *
-                matrix[previous * columns + eliminated_columns + col];
-          }
-          WarpSynchronize();
-        }
+        Scalar projection = Scalar{0};
+        for (int row = 0; row < rows; ++row)
+          projection +=
+              matrix[row * columns + candidate] * matrix[row * columns + basis];
+        for (int row = 0; row < rows; ++row)
+          matrix[row * columns + candidate] -=
+              projection * matrix[row * columns + basis];
       }
-      Scalar norm_squared = Scalar{0};
-      for (int col = lane; col < outer_columns; col += kActiveWarpWidth) {
-        const Scalar value =
-            matrix[relation_rank * columns + eliminated_columns + col];
-        norm_squared += value * value;
-      }
-      norm_squared = WarpSum(norm_squared);
-      if (!(norm_squared > rank_threshold_squared))
-        break;
-      const Scalar inverse_norm = Scalar{1} / sqrt(norm_squared);
-      for (int col = lane; col <= outer_columns; col += kActiveWarpWidth)
-        matrix[relation_rank * columns + eliminated_columns + col] *=
-            inverse_norm;
-      WarpSynchronize();
-      for (int row = relation_rank + 1; row < rows; ++row) {
-        for (int pass = 0; pass < 2; ++pass) {
-          Scalar projection = Scalar{0};
-          for (int col = lane; col < outer_columns; col += kActiveWarpWidth) {
-            projection +=
-                matrix[row * columns + eliminated_columns + col] *
-                matrix[relation_rank * columns + eliminated_columns + col];
-          }
-          projection = WarpSum(projection);
-          for (int col = lane; col <= outer_columns; col += kActiveWarpWidth) {
-            matrix[row * columns + eliminated_columns + col] -=
-                projection *
-                matrix[relation_rank * columns + eliminated_columns + col];
-          }
-          WarpSynchronize();
-        }
-      }
-      ++relation_rank;
     }
+    BlockSynchronize();
+    ++eliminated_rank;
+  }
 
-    Scalar maximum_residual = Scalar{0};
-    for (int row = relation_rank + lane; row < rows; row += kActiveWarpWidth)
-      maximum_residual = fmax(maximum_residual,
-                              DeviceAbs(matrix[row * columns + columns - 1]));
-    maximum_residual = WarpMaximum(maximum_residual);
-    const bool okay = maximum_residual <= consistency_tolerance * rhs_scale;
-    if (lane == 0) {
-      *local_ok = okay;
-      relation->left_dim = left_dim;
-      relation->right_dim = right_dim;
-      relation->rows = relation_rank;
-    }
-    if (okay) {
-      const int outer_entries = relation_rank * outer_columns;
-      for (int entry = lane; entry < outer_entries; entry += kActiveWarpWidth) {
-        const int row = entry / outer_columns;
-        const int col = entry % outer_columns;
-        const Scalar value = matrix[row * columns + eliminated_columns + col];
-        if (col < left_dim) {
-          relation->left[row * left_dim + col] = value;
-        } else {
-          relation->right[row * right_dim + col - left_dim] = value;
-        }
+  // Apply the orthogonal projector to the outer coefficients and right-hand
+  // side. The remaining rows are precisely the equations that cannot be
+  // satisfied by choosing the eliminated variables.
+  for (int col = eliminated_columns + lane; col < columns; col += blockDim.x) {
+    for (int basis = 0; basis < eliminated_rank; ++basis) {
+      for (int pass = 0; pass < 2; ++pass) {
+        Scalar projection = Scalar{0};
+        for (int row = 0; row < rows; ++row)
+          projection +=
+              matrix[row * columns + col] * matrix[row * columns + basis];
+        for (int row = 0; row < rows; ++row)
+          matrix[row * columns + col] -=
+              projection * matrix[row * columns + basis];
       }
-      for (int row = lane; row < relation_rank; row += kActiveWarpWidth)
-        relation->rhs[row] = matrix[row * columns + columns - 1];
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
+
+  const int outer_columns = left_dim + right_dim;
+  int relation_rank = 0;
+  while (relation_rank < rows) {
+    Scalar best_norm_squared = Scalar{-1};
+    int best_row = std::numeric_limits<int>::max();
+    for (int candidate = relation_rank + lane; candidate < rows;
+         candidate += blockDim.x) {
+      Scalar norm_squared = Scalar{0};
+      for (int col = 0; col < outer_columns; ++col) {
+        const Scalar value =
+            matrix[candidate * columns + eliminated_columns + col];
+        norm_squared += value * value;
+      }
+      if (norm_squared > best_norm_squared) {
+        best_norm_squared = norm_squared;
+        best_row = candidate;
+      }
+    }
+    best_row =
+        BlockMaximumIndex(best_norm_squared, best_row, &best_norm_squared);
+    if (!(best_norm_squared > rank_threshold_squared))
+      break;
+    if (best_row != relation_rank) {
+      for (int outer = lane; outer <= outer_columns; outer += blockDim.x) {
+        const int col = eliminated_columns + outer;
+        const Scalar value = matrix[relation_rank * columns + col];
+        matrix[relation_rank * columns + col] = matrix[best_row * columns + col];
+        matrix[best_row * columns + col] = value;
+      }
+      BlockSynchronize();
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+      for (int previous = 0; previous < relation_rank; ++previous) {
+        Scalar projection = Scalar{0};
+        for (int col = lane; col < outer_columns; col += blockDim.x) {
+          projection +=
+              matrix[relation_rank * columns + eliminated_columns + col] *
+              matrix[previous * columns + eliminated_columns + col];
+        }
+        projection = BlockSum(projection);
+        for (int col = lane; col <= outer_columns; col += blockDim.x) {
+          matrix[relation_rank * columns + eliminated_columns + col] -=
+              projection * matrix[previous * columns + eliminated_columns + col];
+        }
+        BlockSynchronize();
+      }
+    }
+    Scalar norm_squared = Scalar{0};
+    for (int col = lane; col < outer_columns; col += blockDim.x) {
+      const Scalar value =
+          matrix[relation_rank * columns + eliminated_columns + col];
+      norm_squared += value * value;
+    }
+    norm_squared = BlockSum(norm_squared);
+    if (!(norm_squared > rank_threshold_squared))
+      break;
+    const Scalar inverse_norm = Scalar{1} / sqrt(norm_squared);
+    for (int col = lane; col <= outer_columns; col += blockDim.x)
+      matrix[relation_rank * columns + eliminated_columns + col] *=
+          inverse_norm;
+    BlockSynchronize();
+    for (int row = relation_rank + 1 + lane; row < rows; row += blockDim.x) {
+      for (int pass = 0; pass < 2; ++pass) {
+        Scalar projection = Scalar{0};
+        for (int col = 0; col < outer_columns; ++col) {
+          projection +=
+              matrix[row * columns + eliminated_columns + col] *
+              matrix[relation_rank * columns + eliminated_columns + col];
+        }
+        for (int col = 0; col <= outer_columns; ++col) {
+          matrix[row * columns + eliminated_columns + col] -=
+              projection *
+              matrix[relation_rank * columns + eliminated_columns + col];
+        }
+      }
+    }
+    BlockSynchronize();
+    ++relation_rank;
+  }
+
+  Scalar maximum_residual = Scalar{0};
+  for (int row = relation_rank + lane; row < rows; row += blockDim.x)
+    maximum_residual = fmax(maximum_residual,
+                            DeviceAbs(matrix[row * columns + columns - 1]));
+  maximum_residual = BlockMaximum(maximum_residual);
+  const bool okay = maximum_residual <= consistency_tolerance * rhs_scale;
+  if (lane == 0) {
+    *local_ok = okay;
+    relation->left_dim = left_dim;
+    relation->right_dim = right_dim;
+    relation->rows = relation_rank;
+  }
+  if (okay) {
+    const int outer_entries = relation_rank * outer_columns;
+    for (int entry = lane; entry < outer_entries; entry += blockDim.x) {
+      const int row = entry / outer_columns;
+      const int col = entry % outer_columns;
+      const Scalar value = matrix[row * columns + eliminated_columns + col];
+      if (col < left_dim) {
+        relation->left[row * left_dim + col] = value;
+      } else {
+        relation->right[row * right_dim + col - left_dim] = value;
+      }
+    }
+    for (int row = lane; row < relation_rank; row += blockDim.x)
+      relation->rhs[row] = matrix[row * columns + columns - 1];
+  }
+  BlockSynchronize();
 }
 
 // Solve an overdetermined system with column-pivoted, reorthogonalized QR.
@@ -1985,118 +2181,111 @@ __device__ void SolveSystemOrthogonally(Scalar *matrix, int rows, int columns,
                                         Scalar *upper, Scalar *rhs_projection,
                                         Scalar *solution, int *permutation,
                                         int *rank, int *local_ok) {
-  if (threadIdx.x < kActiveWarpWidth) {
-    const int lane = threadIdx.x;
-    for (int index = lane; index < variables * variables;
-         index += kActiveWarpWidth)
-      upper[index] = Scalar{0};
-    for (int variable = lane; variable < variables;
-         variable += kActiveWarpWidth) {
-      permutation[variable] = variable;
-      rhs_projection[variable] = Scalar{0};
-      solution[variable] = Scalar{0};
-    }
-    for (int row = lane; row < rows; row += kActiveWarpWidth)
-      residual_rhs[row] = matrix[row * columns + variables];
-    WarpSynchronize();
+  const int lane = threadIdx.x;
+  for (int index = lane; index < variables * variables; index += blockDim.x)
+    upper[index] = Scalar{0};
+  for (int variable = lane; variable < variables; variable += blockDim.x) {
+    permutation[variable] = variable;
+    rhs_projection[variable] = Scalar{0};
+    solution[variable] = Scalar{0};
+  }
+  for (int row = lane; row < rows; row += blockDim.x)
+    residual_rhs[row] = matrix[row * columns + variables];
+  BlockSynchronize();
 
-    int computed_rank = 0;
-    const Scalar rank_threshold_squared = rank_tolerance * rank_tolerance;
-    for (int basis = 0; basis < variables; ++basis) {
-      int best_column = basis;
-      Scalar best_norm_squared = Scalar{-1};
-      for (int candidate = basis; candidate < variables; ++candidate) {
-        Scalar norm_squared = Scalar{0};
-        for (int row = lane; row < rows; row += kActiveWarpWidth) {
-          const Scalar value = matrix[row * columns + candidate];
-          norm_squared += value * value;
-        }
-        norm_squared = WarpSum(norm_squared);
-        if (norm_squared > best_norm_squared) {
-          best_norm_squared = norm_squared;
-          best_column = candidate;
-        }
-      }
-      if (!(best_norm_squared > rank_threshold_squared))
-        break;
-      if (best_column != basis) {
-        for (int row = lane; row < rows; row += kActiveWarpWidth) {
-          const Scalar value = matrix[row * columns + basis];
-          matrix[row * columns + basis] = matrix[row * columns + best_column];
-          matrix[row * columns + best_column] = value;
-        }
-        for (int previous = lane; previous < basis;
-             previous += kActiveWarpWidth) {
-          const Scalar value = upper[previous * variables + basis];
-          upper[previous * variables + basis] =
-              upper[previous * variables + best_column];
-          upper[previous * variables + best_column] = value;
-        }
-        if (lane == 0) {
-          const int variable = permutation[basis];
-          permutation[basis] = permutation[best_column];
-          permutation[best_column] = variable;
-        }
-        WarpSynchronize();
-      }
-
+  int computed_rank = 0;
+  const Scalar rank_threshold_squared = rank_tolerance * rank_tolerance;
+  for (int basis = 0; basis < variables; ++basis) {
+    // Column pivoting: one thread measures whole candidate columns and the
+    // block selects the first column attaining the largest norm.
+    Scalar best_norm_squared = Scalar{-1};
+    int best_column = std::numeric_limits<int>::max();
+    for (int candidate = basis + lane; candidate < variables;
+         candidate += blockDim.x) {
       Scalar norm_squared = Scalar{0};
-      for (int row = lane; row < rows; row += kActiveWarpWidth) {
-        const Scalar value = matrix[row * columns + basis];
+      for (int row = 0; row < rows; ++row) {
+        const Scalar value = matrix[row * columns + candidate];
         norm_squared += value * value;
       }
-      norm_squared = WarpSum(norm_squared);
-      if (!(norm_squared > rank_threshold_squared))
-        break;
-      const Scalar norm = sqrt(norm_squared);
-      if (lane == 0)
-        upper[basis * variables + basis] = norm;
-      for (int row = lane; row < rows; row += kActiveWarpWidth)
-        matrix[row * columns + basis] /= norm;
-      WarpSynchronize();
+      if (norm_squared > best_norm_squared) {
+        best_norm_squared = norm_squared;
+        best_column = candidate;
+      }
+    }
+    best_column =
+        BlockMaximumIndex(best_norm_squared, best_column, &best_norm_squared);
+    if (!(best_norm_squared > rank_threshold_squared))
+      break;
+    if (best_column != basis) {
+      for (int row = lane; row < rows; row += blockDim.x) {
+        const Scalar value = matrix[row * columns + basis];
+        matrix[row * columns + basis] = matrix[row * columns + best_column];
+        matrix[row * columns + best_column] = value;
+      }
+      for (int previous = lane; previous < basis; previous += blockDim.x) {
+        const Scalar value = upper[previous * variables + basis];
+        upper[previous * variables + basis] =
+            upper[previous * variables + best_column];
+        upper[previous * variables + best_column] = value;
+      }
+      if (lane == 0) {
+        const int variable = permutation[basis];
+        permutation[basis] = permutation[best_column];
+        permutation[best_column] = variable;
+      }
+      BlockSynchronize();
+    }
 
+    // The selected column's norm is the winning value above.
+    const Scalar norm = sqrt(best_norm_squared);
+    if (lane == 0)
+      upper[basis * variables + basis] = norm;
+    for (int row = lane; row < rows; row += blockDim.x)
+      matrix[row * columns + basis] /= norm;
+    BlockSynchronize();
+
+    // Re-orthogonalize the remaining columns and the right-hand side (treated
+    // as column `variables`) against the new basis vector, two passes each.
+    // Columns are independent, so one thread owns each and no block-wide
+    // reduction is needed.
+    for (int candidate = basis + 1 + lane; candidate <= variables;
+         candidate += blockDim.x) {
+      const bool is_rhs = candidate == variables;
+      Scalar accumulated = Scalar{0};
       for (int pass = 0; pass < 2; ++pass) {
         Scalar projection = Scalar{0};
-        for (int row = lane; row < rows; row += kActiveWarpWidth)
-          projection += matrix[row * columns + basis] * residual_rhs[row];
-        projection = WarpSum(projection);
-        if (lane == 0)
-          rhs_projection[basis] += projection;
-        for (int row = lane; row < rows; row += kActiveWarpWidth)
-          residual_rhs[row] -= projection * matrix[row * columns + basis];
-        WarpSynchronize();
-      }
-      for (int candidate = basis + 1; candidate < variables; ++candidate) {
-        for (int pass = 0; pass < 2; ++pass) {
-          Scalar projection = Scalar{0};
-          for (int row = lane; row < rows; row += kActiveWarpWidth) {
-            projection += matrix[row * columns + basis] *
-                          matrix[row * columns + candidate];
-          }
-          projection = WarpSum(projection);
-          if (lane == 0)
-            upper[basis * variables + candidate] += projection;
-          for (int row = lane; row < rows; row += kActiveWarpWidth) {
-            matrix[row * columns + candidate] -=
-                projection * matrix[row * columns + basis];
-          }
-          WarpSynchronize();
+        for (int row = 0; row < rows; ++row) {
+          const Scalar entry =
+              is_rhs ? residual_rhs[row] : matrix[row * columns + candidate];
+          projection += matrix[row * columns + basis] * entry;
         }
+        for (int row = 0; row < rows; ++row) {
+          const Scalar update = projection * matrix[row * columns + basis];
+          if (is_rhs)
+            residual_rhs[row] -= update;
+          else
+            matrix[row * columns + candidate] -= update;
+        }
+        accumulated += projection;
       }
-      ++computed_rank;
+      if (is_rhs)
+        rhs_projection[basis] += accumulated;
+      else
+        upper[basis * variables + candidate] += accumulated;
     }
+    BlockSynchronize();
+    ++computed_rank;
+  }
 
-    Scalar maximum_residual = Scalar{0};
-    for (int row = lane; row < rows; row += kActiveWarpWidth)
-      maximum_residual = fmax(maximum_residual, DeviceAbs(residual_rhs[row]));
-    maximum_residual = WarpMaximum(maximum_residual);
-    const bool okay = maximum_residual <= consistency_tolerance * rhs_scale;
-    WarpSynchronize();
-    if (lane == 0) {
-      *rank = computed_rank;
-      *local_ok = okay;
-    }
-    if (okay && lane == 0) {
+  Scalar maximum_residual = Scalar{0};
+  for (int row = lane; row < rows; row += blockDim.x)
+    maximum_residual = fmax(maximum_residual, DeviceAbs(residual_rhs[row]));
+  maximum_residual = BlockMaximum(maximum_residual);
+  const bool okay = maximum_residual <= consistency_tolerance * rhs_scale;
+  if (lane == 0) {
+    *rank = computed_rank;
+    *local_ok = okay;
+    if (okay) {
       for (int reverse = 0; reverse < computed_rank; ++reverse) {
         const int row = computed_rank - 1 - reverse;
         Scalar value = rhs_projection[row];
@@ -2108,7 +2297,7 @@ __device__ void SolveSystemOrthogonally(Scalar *matrix, int rows, int columns,
         solution[permutation[variable]] = rhs_projection[variable];
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
 }
 
 template <bool GlobalScratch = false>
@@ -2122,7 +2311,7 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage *stages, int stage_cou
     return;
   if (!BlockEnabled(status))
     return;
-  const PackedTerminal &terminal = *terminal_ptr;
+  const PackedTerminal terminal = *terminal_ptr;
   const bool is_terminal = index == stage_count;
   const PackedStage *stage = is_terminal ? nullptr : &stages[index];
   const int rows = is_terminal ? terminal.state
@@ -2144,12 +2333,11 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage *stages, int stage_cou
   int *pivot_columns = scratch.Take<int>(rows);
   int *pivot_rows = scratch.Take<int>(rows);
   __shared__ int rank;
-  __shared__ int best_row;
   __shared__ int local_ok;
 
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
     matrix[i] = Scalar{0};
-  WarpSynchronize();
+  BlockSynchronize();
   if (index == stage_count) {
     for (int linear = threadIdx.x; linear < terminal.state * terminal.n;
          linear += blockDim.x) {
@@ -2161,7 +2349,7 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage *stages, int stage_cou
       matrix[row * columns + terminal.n] = -terminal.e[row];
     }
   } else {
-    const PackedStage &s = *stage;
+    const PackedStage s = *stage;
     for (int linear = threadIdx.x; linear < s.mixed * s.m;
          linear += blockDim.x) {
       const int row = linear / s.m;
@@ -2205,19 +2393,20 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage *stages, int stage_cou
       matrix[(dynamics_row + row) * columns + columns - 1] = s.c[row];
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
   // Choose stable pivots within the controls, without exchanging them with
   // retained state variables. ExtractResidualRelation only needs the pivots
   // grouped by eliminated/retained variables, not sorted within each group.
   RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
-            pivot_rows, &rank, &best_row, factors, Scalar{0}, eliminated);
+            pivot_rows, &rank, factors, Scalar{0}, eliminated);
+  const bool inconsistent = InconsistentRrefBlock(
+      matrix, rows, columns, columns - 1, rank_tolerance, consistency_tolerance);
   if (threadIdx.x == 0) {
-    local_ok = !InconsistentRref(matrix, rows, columns, columns - 1,
-                                 rank_tolerance, consistency_tolerance);
-    if (!local_ok)
+    local_ok = !inconsistent;
+    if (inconsistent)
       SetFailure(status, kDeviceInfeasible, index, 1);
   }
-  WarpSynchronize();
+  BlockSynchronize();
   if (!local_ok)
     return;
   ExtractResidualRelation(matrix, columns, rank, pivot_columns, eliminated,
@@ -2226,12 +2415,12 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage *stages, int stage_cou
 
 template <typename RelationType>
 __device__ void
-ComposeRelationsBlock(const RelationType &first, const RelationType &second,
+ComposeRelationsBlock(const RelationType first, const RelationType second,
                       Scalar rank_tolerance, Scalar consistency_tolerance,
                       RelationType *output, DeviceStatus *status, int stage,
                       int inconsistency_code, int inconsistency_detail,
                       Scalar *matrix, Scalar *factors, int *pivot_columns,
-                      int *pivot_rows, int *rank, int *best_row, int *local_ok,
+                      int *pivot_rows, int *rank, int *local_ok,
                       bool orthonormalize_output = false) {
   if (first.right_dim != second.left_dim) {
     if (threadIdx.x == 0)
@@ -2243,7 +2432,7 @@ ComposeRelationsBlock(const RelationType &first, const RelationType &second,
   const int columns = shared + first.left_dim + second.right_dim + 1;
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
     matrix[i] = Scalar{0};
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < first.rows * shared;
        linear += blockDim.x) {
     const int row = linear / shared;
@@ -2277,28 +2466,29 @@ ComposeRelationsBlock(const RelationType &first, const RelationType &second,
   for (int row = threadIdx.x; row < second.rows; row += blockDim.x) {
     matrix[(first.rows + row) * columns + columns - 1] = second.rhs[row];
   }
-  WarpSynchronize();
+  BlockSynchronize();
   if (orthonormalize_output) {
     EliminateRelationOrthogonally(matrix, rows, columns, shared, first.left_dim,
                                   second.right_dim, rank_tolerance,
                                   consistency_tolerance, output, local_ok);
     if (threadIdx.x == 0 && !*local_ok)
       SetFailure(status, inconsistency_code, stage, inconsistency_detail);
-    WarpSynchronize();
+    BlockSynchronize();
     return;
   }
   // Fixed-column pivot order can amplify cancellation into a spurious rank
   // in the shared endpoint and discard a genuine boundary constraint.
   // Complete pivot selection within that endpoint preserves the projection.
   RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
-            pivot_rows, rank, best_row, factors, Scalar{0}, shared);
+            pivot_rows, rank, factors, Scalar{0}, shared);
+  const bool inconsistent = InconsistentRrefBlock(
+      matrix, rows, columns, columns - 1, rank_tolerance, consistency_tolerance);
   if (threadIdx.x == 0) {
-    *local_ok = !InconsistentRref(matrix, rows, columns, columns - 1,
-                                  rank_tolerance, consistency_tolerance);
-    if (!*local_ok)
+    *local_ok = !inconsistent;
+    if (inconsistent)
       SetFailure(status, inconsistency_code, stage, inconsistency_detail);
   }
-  WarpSynchronize();
+  BlockSynchronize();
   if (!*local_ok)
     return;
   ExtractResidualRelation(matrix, columns, *rank, pivot_columns, shared,
@@ -2306,7 +2496,7 @@ ComposeRelationsBlock(const RelationType &first, const RelationType &second,
 }
 
 template <typename RelationType>
-__device__ void CopyRelationBlock(const RelationType &input,
+__device__ void CopyRelationBlock(const RelationType input,
                                   RelationType *output) {
   if (threadIdx.x == 0) {
     output->left_dim = input.left_dim;
@@ -2331,7 +2521,7 @@ __device__ void CopyRelationBlock(const RelationType &input,
     output->rhs[row] = input.rhs[row];
 }
 
-__device__ bool InvalidScanRelation(const Relation &relation) {
+__device__ bool InvalidScanRelation(const Relation relation) {
   return relation.left_dim < 0;
 }
 
@@ -2344,12 +2534,12 @@ __device__ void SetInvalidScanRelation(Relation *relation) {
 }
 
 __device__ void
-ComposeScanRelationBlock(const Relation &first, const Relation &second,
+ComposeScanRelationBlock(const Relation first, const Relation second,
                          Scalar rank_tolerance, Scalar consistency_tolerance,
                          Relation *output, DeviceStatus *status, int stage,
                          int inconsistency_detail, Scalar *matrix,
                          Scalar *factors, int *pivot_columns, int *pivot_rows,
-                         int *rank, int *best_row, int *local_ok) {
+                         int *rank, int *local_ok) {
   if (InvalidScanRelation(first)) {
     if (InvalidScanRelation(second)) {
       SetInvalidScanRelation(output);
@@ -2365,7 +2555,7 @@ ComposeScanRelationBlock(const Relation &first, const Relation &second,
   ComposeRelationsBlock(first, second, rank_tolerance, consistency_tolerance,
                         output, status, stage, kDeviceInfeasible,
                         inconsistency_detail, matrix, factors, pivot_columns,
-                        pivot_rows, rank, best_row, local_ok);
+                        pivot_rows, rank, local_ok);
 }
 
 template <bool GlobalScratch = false>
@@ -2383,8 +2573,8 @@ __global__ void ReduceRelationLeavesKernel(const Relation *leaves, int count, in
     CopyRelationBlock(leaves[left], &parents[index]);
     return;
   }
-  const Relation &first = leaves[left];
-  const Relation &second = leaves[left + 1];
+  const Relation first = leaves[left];
+  const Relation second = leaves[left + 1];
   const int rows = first.rows + second.rows;
   const int columns = first.right_dim + first.left_dim + second.right_dim + 1;
   ScratchSize scratch_size;
@@ -2399,12 +2589,11 @@ __global__ void ReduceRelationLeavesKernel(const Relation *leaves, int count, in
   int *pivot_columns = scratch.Take<int>(rows);
   int *pivot_rows = scratch.Take<int>(rows);
   __shared__ int rank;
-  __shared__ int best_row;
   __shared__ int local_ok;
   ComposeRelationsBlock(first, second, rank_tolerance, consistency_tolerance,
                         &parents[index], status, index, kDeviceInfeasible, 19,
                         matrix, factors, pivot_columns, pivot_rows, &rank,
-                        &best_row, &local_ok);
+                        &local_ok);
 }
 
 template <bool GlobalScratch = false>
@@ -2426,8 +2615,8 @@ __global__ void ReduceRelationTreeLevelKernel(Relation *tree, int child_offset,
     return;
   }
   const int right = left + 1;
-  const Relation &first = tree[left];
-  const Relation &second = tree[right];
+  const Relation first = tree[left];
+  const Relation second = tree[right];
   const int rows = first.rows + second.rows;
   const int columns = first.right_dim + first.left_dim + second.right_dim + 1;
   ScratchSize scratch_size;
@@ -2442,12 +2631,11 @@ __global__ void ReduceRelationTreeLevelKernel(Relation *tree, int child_offset,
   int *pivot_columns = scratch.Take<int>(rows);
   int *pivot_rows = scratch.Take<int>(rows);
   __shared__ int rank;
-  __shared__ int best_row;
   __shared__ int local_ok;
   ComposeRelationsBlock(first, second, rank_tolerance, consistency_tolerance,
                         &tree[parent_offset + index], status, index,
                         kDeviceInfeasible, 19, matrix, factors, pivot_columns,
-                        pivot_rows, &rank, &best_row, &local_ok);
+                        pivot_rows, &rank, &local_ok);
 }
 
 __global__ void InitializeRelationContextRootKernel(Relation *tree,
@@ -2468,14 +2656,14 @@ __global__ void ExpandRelationContextLevelKernel(
   if (!BlockEnabled(status))
     return;
   const int left = child_offset + 2 * index;
-  const Relation &parent_context = tree[parent_offset + index];
+  const Relation parent_context = tree[parent_offset + index];
   if (2 * index + 1 >= child_count) {
     CopyRelationBlock(parent_context, &tree[left]);
     return;
   }
   const int right = left + 1;
-  const Relation &first = tree[right];
-  const Relation &second = parent_context;
+  const Relation first = tree[right];
+  const Relation second = parent_context;
   const int rows = first.rows + second.rows;
   const int columns = first.right_dim + first.left_dim + second.right_dim + 1;
   ScratchSize scratch_size;
@@ -2490,13 +2678,12 @@ __global__ void ExpandRelationContextLevelKernel(
   int *pivot_columns = scratch.Take<int>(rows);
   int *pivot_rows = scratch.Take<int>(rows);
   __shared__ int rank;
-  __shared__ int best_row;
   __shared__ int local_ok;
   ComposeScanRelationBlock(tree[right], parent_context, rank_tolerance,
                            consistency_tolerance, &tree[left], status, index,
                            20, matrix, factors, pivot_columns, pivot_rows,
-                           &rank, &best_row, &local_ok);
-  WarpSynchronize();
+                           &rank, &local_ok);
+  BlockSynchronize();
   CopyRelationBlock(parent_context, &tree[right]);
 }
 
@@ -2512,7 +2699,7 @@ __global__ void FinalizeRelationSuffixFromParentsKernel(
   if (!BlockEnabled(status))
     return;
   const int left = 2 * index;
-  const Relation &parent = parent_contexts[index];
+  const Relation parent = parent_contexts[index];
   const int right = left + 1;
   int scratch_left = leaves[left].left_dim;
   int scratch_right = leaves[left].right_dim;
@@ -2529,7 +2716,7 @@ __global__ void FinalizeRelationSuffixFromParentsKernel(
   }
   if (!InvalidScanRelation(parent)) {
     scratch_right = DeviceMax(scratch_right, parent.right_dim);
-    const Relation &child = left + 1 < count ? leaves[right] : leaves[left];
+    const Relation child = left + 1 < count ? leaves[right] : leaves[left];
     matrix_rows = DeviceMax(matrix_rows, child.rows + parent.rows);
     matrix_columns =
         DeviceMax(matrix_columns,
@@ -2557,19 +2744,18 @@ __global__ void FinalizeRelationSuffixFromParentsKernel(
   int *pivot_rows = scratch.Take<int>(matrix_rows);
   Relation &composed = *composed_ptr;
   __shared__ int rank;
-  __shared__ int best_row;
   __shared__ int local_ok;
   if (threadIdx.x == 0)
     BindRelationScratch(&composed, composed_storage, scratch_left,
                         scratch_right);
-  WarpSynchronize();
+  BlockSynchronize();
   if (left + 1 >= count) {
     if (!InvalidScanRelation(parent)) {
       ComposeScanRelationBlock(leaves[left], parent, rank_tolerance,
                                consistency_tolerance, &composed, status, left,
                                21, matrix, factors, pivot_columns, pivot_rows,
-                               &rank, &best_row, &local_ok);
-      WarpSynchronize();
+                               &rank, &local_ok);
+      BlockSynchronize();
       CopyRelationBlock(composed, &leaves[left]);
     }
     return;
@@ -2578,16 +2764,16 @@ __global__ void FinalizeRelationSuffixFromParentsKernel(
     ComposeScanRelationBlock(leaves[right], parent, rank_tolerance,
                              consistency_tolerance, &composed, status, right,
                              21, matrix, factors, pivot_columns, pivot_rows,
-                             &rank, &best_row, &local_ok);
-    WarpSynchronize();
+                             &rank, &local_ok);
+    BlockSynchronize();
     CopyRelationBlock(composed, &leaves[right]);
-    WarpSynchronize();
+    BlockSynchronize();
   }
   ComposeRelationsBlock(leaves[left], leaves[right], rank_tolerance,
                         consistency_tolerance, &composed, status, left,
                         kDeviceInfeasible, 21, matrix, factors, pivot_columns,
-                        pivot_rows, &rank, &best_row, &local_ok);
-  WarpSynchronize();
+                        pivot_rows, &rank, &local_ok);
+  BlockSynchronize();
   CopyRelationBlock(composed, &leaves[left]);
 }
 
@@ -2599,7 +2785,7 @@ __global__ void StateParamKernel(const Relation *suffix, int count,
   const int index = (first_block + blockIdx.x);
   if (index >= count || !BlockEnabled(status))
     return;
-  const Relation &relation = suffix[index];
+  const Relation relation = suffix[index];
   if (relation.right_dim != 0 || relation.rows > relation.left_dim) {
     SetFailure(status, kDeviceNumericalFailure, index, 4);
     return;
@@ -2644,7 +2830,6 @@ __global__ void StateParamKernel(const Relation *suffix, int count,
   int *pivot_scratch = scratch.Take<int>(rows);
   int *pivot_row = scratch.Take<int>(relation.left_dim);
   __shared__ int rank;
-  __shared__ int best_row;
   for (int entry = threadIdx.x; entry < rows * columns; entry += blockDim.x) {
     const int row = entry / columns;
     const int col = entry % columns;
@@ -2652,56 +2837,71 @@ __global__ void StateParamKernel(const Relation *suffix, int count,
                         ? relation.rhs[row]
                         : relation.left[row * relation.left_dim + col];
   }
-  WarpSynchronize();
+  BlockSynchronize();
   RrefBlock(matrix, rows, columns, relation.left_dim, tolerance, pivot_columns,
-            pivot_scratch, &rank, &best_row, factors, Scalar{0},
+            pivot_scratch, &rank, factors, Scalar{0},
             relation.left_dim);
-  if (threadIdx.x != 0)
-    return;
+  // The rank is block-uniform after the elimination's final barrier.
   if (rank != rows) {
-    SetFailure(status, kDeviceNumericalFailure, index, 5);
+    if (threadIdx.x == 0)
+      SetFailure(status, kDeviceNumericalFailure, index, 5);
     return;
   }
   StateParam &out = params[index];
-  out.physical_dim = relation.left_dim;
-  for (int row = 0; row < relation.left_dim; ++row)
-    out.t[row] = Scalar{0};
-  for (int i = 0; i < relation.left_dim; ++i)
-    pivot_row[i] = -1;
-  for (int row = 0; row < relation.rows; ++row) {
-    const int column = pivot_columns[row];
-    if (column < 0 || pivot_row[column] >= 0) {
-      SetFailure(status, kDeviceNumericalFailure, index, 5);
-      return;
+  __shared__ int parameterization_ok;
+  if (threadIdx.x == 0) {
+    parameterization_ok = 1;
+    out.physical_dim = relation.left_dim;
+    for (int i = 0; i < relation.left_dim; ++i)
+      pivot_row[i] = -1;
+    for (int row = 0; row < relation.rows; ++row) {
+      const int column = pivot_columns[row];
+      if (column < 0 || pivot_row[column] >= 0) {
+        SetFailure(status, kDeviceNumericalFailure, index, 5);
+        parameterization_ok = 0;
+        break;
+      }
+      pivot_row[column] = row;
     }
-    pivot_row[column] = row;
-  }
-  int reduced = 0;
-  for (int col = 0; col < relation.left_dim; ++col) {
-    if (pivot_row[col] < 0)
-      out.free_columns[reduced++] = col;
-  }
-  out.reduced_dim = reduced;
-  for (int row = 0; row < relation.left_dim; ++row)
-    for (int col = 0; col < reduced; ++col)
-      out.T[row * reduced + col] = Scalar{0};
-  for (int col = 0; col < relation.left_dim; ++col) {
-    if (pivot_row[col] >= 0) {
-      const int row = pivot_row[col];
-      const Scalar diagonal = matrix[row * columns + col];
-      out.t[col] = matrix[row * columns + columns - 1] / diagonal;
-      for (int free = 0; free < reduced; ++free) {
-        out.T[col * reduced + free] =
-            -matrix[row * columns + out.free_columns[free]] / diagonal;
+    if (parameterization_ok) {
+      int reduced = 0;
+      for (int col = 0; col < relation.left_dim; ++col) {
+        if (pivot_row[col] < 0)
+          out.free_columns[reduced++] = col;
+      }
+      out.reduced_dim = reduced;
+      if (state_dimensions != nullptr) {
+        state_dimensions[2 * index] = out.physical_dim;
+        state_dimensions[2 * index + 1] = out.reduced_dim;
       }
     }
   }
-  for (int free = 0; free < reduced; ++free) {
-    out.T[out.free_columns[free] * reduced + free] = Scalar{1};
+  BlockSynchronize();
+  if (!parameterization_ok)
+    return;
+  // Pivot coordinates are affine in the free coordinates and free coordinates
+  // keep identity rows, so every entry of T and t is independent once the
+  // pivot map is known.
+  const int n = relation.left_dim;
+  const int reduced = out.reduced_dim;
+  for (int col = threadIdx.x; col < n; col += blockDim.x) {
+    const int row = pivot_row[col];
+    out.t[col] = row >= 0 ? matrix[row * columns + columns - 1] /
+                                matrix[row * columns + col]
+                          : Scalar{0};
   }
-  if (state_dimensions != nullptr) {
-    state_dimensions[2 * index] = out.physical_dim;
-    state_dimensions[2 * index + 1] = out.reduced_dim;
+  for (int linear = threadIdx.x; linear < n * reduced; linear += blockDim.x) {
+    const int col = linear / reduced;
+    const int free = linear % reduced;
+    const int row = pivot_row[col];
+    Scalar value = Scalar{0};
+    if (row >= 0) {
+      value = -matrix[row * columns + out.free_columns[free]] /
+              matrix[row * columns + col];
+    } else if (out.free_columns[free] == col) {
+      value = Scalar{1};
+    }
+    out.T[col * reduced + free] = value;
   }
 }
 
@@ -3028,8 +3228,155 @@ struct KernelScratchPlans {
 #undef CLQR_DECLARE_SCRATCH
 };
 
+// Persistent helper threads that pack large host problems into pinned memory.
+// They are created during structure preparation, only when the packed problem
+// is large enough for the fork/join latency to pay off, and they sleep between
+// solves; a prepared solve therefore performs no allocation. Work is a plain
+// function pointer plus context, so dispatch never allocates either.
+class PackingPool {
+public:
+  using Task = void (*)(void *context, std::size_t worker, std::size_t workers);
+
+  PackingPool() = default;
+  PackingPool(const PackingPool &) = delete;
+  PackingPool &operator=(const PackingPool &) = delete;
+  ~PackingPool() { Stop(); }
+
+  // Participants in Run, including the calling thread.
+  std::size_t participants() const { return threads_.size() + 1; }
+
+  void Resize(std::size_t helper_threads) {
+    if (helper_threads == threads_.size())
+      return;
+    Stop();
+    threads_.reserve(helper_threads);
+    for (std::size_t index = 0; index < helper_threads; ++index)
+      threads_.emplace_back([this, index] { Worker(index + 1); });
+  }
+
+  // Runs task(context, worker, participants()) on every participant, the
+  // caller acting as worker 0, and returns once all have finished. The first
+  // exception thrown by a helper is rethrown on the calling thread.
+  void Run(Task task, void *context) {
+    if (threads_.empty()) {
+      task(context, 0, 1);
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      task_ = task;
+      context_ = context;
+      ++generation_;
+      pending_ = threads_.size();
+      error_ = nullptr;
+    }
+    start_.notify_all();
+    task(context, 0, participants());
+    std::unique_lock<std::mutex> lock(mutex_);
+    done_.wait(lock, [this] { return pending_ == 0; });
+    if (error_) {
+      std::exception_ptr error = error_;
+      error_ = nullptr;
+      lock.unlock();
+      std::rethrow_exception(error);
+    }
+  }
+
+private:
+  void Worker(std::size_t index) {
+    // A helper created by a later Resize must not run the task of an earlier
+    // generation, whose context no longer exists.
+    std::uint64_t seen = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      seen = generation_;
+    }
+    for (;;) {
+      Task task = nullptr;
+      void *context = nullptr;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        start_.wait(lock, [&] { return stop_ || generation_ != seen; });
+        if (stop_)
+          return;
+        seen = generation_;
+        task = task_;
+        context = context_;
+      }
+      try {
+        task(context, index, threads_.size() + 1);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!error_)
+          error_ = std::current_exception();
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (--pending_ == 0)
+        done_.notify_one();
+    }
+  }
+
+  void Stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    start_.notify_all();
+    for (std::thread &thread : threads_)
+      thread.join();
+    threads_.clear();
+    stop_ = false;
+    // No helper exists now; later helpers start from this generation.
+    generation_ = 0;
+    pending_ = 0;
+  }
+
+  std::vector<std::thread> threads_;
+  std::mutex mutex_;
+  std::condition_variable start_;
+  std::condition_variable done_;
+  Task task_ = nullptr;
+  void *context_ = nullptr;
+  std::uint64_t generation_ = 0;
+  std::size_t pending_ = 0;
+  bool stop_ = false;
+  std::exception_ptr error_;
+};
+
+// Host packing of the numerical problem is memory-bound and, for long
+// horizons, dominates end-to-end wall time. Helpers claim work dynamically,
+// so a late wake-up only reduces their share; the remaining fixed cost is
+// notifying sleeping threads, which small problems avoid by packing serially
+// (measured neutral at 8 MiB, a net loss at 4 MiB). The thread count grows
+// with the packed size.
+constexpr std::size_t kParallelPackBytes = std::size_t{8} << 20;
+constexpr std::size_t kPackBytesPerThread = std::size_t{2} << 20;
+constexpr std::size_t kMinStagesPerPackThread = 128;
+constexpr std::size_t kMaxPackThreads = 8;
+
+std::size_t PackingHelperThreads(std::size_t packed_entries,
+                                 std::size_t stage_count, int requested) {
+  if (requested > 0)
+    return static_cast<std::size_t>(requested) - 1;
+  const std::size_t bytes = packed_entries * sizeof(Scalar);
+  if (bytes < kParallelPackBytes)
+    return 0;
+  const unsigned hardware = std::thread::hardware_concurrency();
+  const std::size_t threads =
+      std::min({hardware == 0 ? std::size_t{1} : std::size_t{hardware},
+                kMaxPackThreads, stage_count / kMinStagesPerPackThread,
+                bytes / kPackBytesPerThread});
+  return threads > 1 ? threads - 1 : 0;
+}
+
 struct WorkspaceStorage {
   int device = -1;
+  // Threads per block for every dense kernel launch of this workspace.
+  int threads = kWarpThreads;
+  // Requested host packing threads (Options::host_pack_threads) and the pool
+  // sized from it during structure preparation.
+  int pack_threads_option = 0;
+  PackingPool packing_pool;
   std::array<cudaEvent_t, TimingSlotCount()> event_start{};
   std::array<cudaEvent_t, TimingSlotCount()> event_stop{};
   DeviceBuffer<std::byte> fixed_device_arena;
@@ -3099,6 +3446,9 @@ struct WorkspaceStorage {
   PinnedBuffer<PackedStage> host_stages;
   PinnedBuffer<PackedTerminal> host_terminal;
   PinnedBuffer<Scalar> host_problem_data;
+  // Entry offset of every stage's packed block, plus the terminal block's
+  // offset at index N. Fixed by the structure; lets stages pack in parallel.
+  std::vector<std::size_t> host_stage_entry_offsets;
   PinnedBuffer<Scalar> host_initial;
   PinnedBuffer<Scalar> host_states;
   PinnedBuffer<Scalar> host_controls;
@@ -3523,6 +3873,14 @@ bool ValidateCudaProblem(const Problem &problem, const Options &options,
   Require(std::isfinite(options.tolerance) && options.tolerance > Scalar{0},
           "CUDA tolerance must be finite and positive");
   Require(options.device >= 0, "CUDA device index must be nonnegative");
+  Require(options.block_threads >= 0 &&
+              options.block_threads <= kMaxBlockThreads &&
+              options.block_threads % kWarpThreads == 0,
+          "CUDA block_threads must be zero or a multiple of 32 up to 1024");
+  Require(options.host_pack_threads >= 0 &&
+              static_cast<std::size_t>(options.host_pack_threads) <=
+                  kMaxPackThreads,
+          "CUDA host_pack_threads must be between zero and eight");
   const std::size_t count = problem.stages.size();
   Require(problem.Q.size() == count + 1, "Q must contain N + 1 entries");
   Require(problem.q.size() == count + 1, "q must contain N + 1 entries");
@@ -3760,22 +4118,109 @@ bool PackTerminal(const Problem &problem, Scalar **host_cursor,
   return finite;
 }
 
+// Packing workers claim chunks of stages dynamically through an atomic
+// counter and pack each stage into its recorded offset. The calling thread
+// starts immediately, so a helper that wakes late or runs on a slow core
+// merely packs fewer chunks: the parallel path is never slower than serial
+// packing by more than one chunk. Flags are per worker, so no other
+// synchronization is needed.
+struct PackStagesTask {
+  const Problem *problem;
+  WorkspaceStorage *workspace;
+  bool validate_values;
+  std::size_t chunk_stages;
+  std::atomic<std::size_t> next_chunk;
+  std::array<char, kMaxPackThreads> finite;
+  std::array<char, kMaxPackThreads> consistent;
+};
+
+void PackStagesRange(void *context, std::size_t worker, std::size_t workers) {
+  (void)workers;
+  PackStagesTask &task = *static_cast<PackStagesTask *>(context);
+  const Problem &problem = *task.problem;
+  WorkspaceStorage &workspace = *task.workspace;
+  const std::size_t stage_count = problem.stages.size();
+  Scalar *const host_base = workspace.host_problem_data.data();
+  Scalar *const host_end = host_base + workspace.host_problem_data.size();
+  const std::vector<std::size_t> &offsets = workspace.host_stage_entry_offsets;
+  bool finite = true;
+  bool consistent = true;
+  Scalar *device_cursor = nullptr;
+  for (;;) {
+    const std::size_t first =
+        task.next_chunk.fetch_add(1, std::memory_order_relaxed) *
+        task.chunk_stages;
+    if (first >= stage_count)
+      break;
+    const std::size_t last = std::min(stage_count, first + task.chunk_stages);
+    for (std::size_t index = first; index < last; ++index) {
+      Scalar *host_cursor = host_base + offsets[index];
+      finite &= PackStage(problem.stages[index], problem.Q[index],
+                          problem.q[index], &host_cursor, host_end,
+                          &device_cursor, &workspace.host_stages[index],
+                          task.validate_values, false);
+      consistent &= host_cursor == host_base + offsets[index + 1];
+    }
+  }
+  task.finite[worker] = finite ? 1 : 0;
+  task.consistent[worker] = consistent ? 1 : 0;
+}
+
 bool PackProblemData(const Problem &problem, WorkspaceStorage *workspace,
                      bool validate_values, bool bind_metadata) {
   Require(problem.stages.size() == workspace->host_stages.size(),
           "problem structure differs from reserved CUDA workspace");
-  Scalar *host_cursor = workspace->host_problem_data.data();
-  Scalar *host_end = host_cursor;
-  if (workspace->host_problem_data.size() > 0)
-    host_end += workspace->host_problem_data.size();
+  const std::size_t stage_count = problem.stages.size();
+  Scalar *const host_base = workspace->host_problem_data.data();
+  Scalar *const host_end = host_base + workspace->host_problem_data.size();
+  Scalar *host_cursor = host_base;
   Scalar *device_cursor =
       bind_metadata ? workspace->device_problem_data.get() : nullptr;
-  for (std::size_t index = 0; index < problem.stages.size(); ++index) {
-    if (!PackStage(problem.stages[index], problem.Q[index], problem.q[index],
-                   &host_cursor, host_end, &device_cursor,
-                   &workspace->host_stages[index], validate_values,
-                   bind_metadata)) {
+  std::vector<std::size_t> &offsets = workspace->host_stage_entry_offsets;
+  const std::size_t participants = workspace->packing_pool.participants();
+  if (bind_metadata) {
+    // Structure preparation: bind device pointers and record where every
+    // stage's packed block starts so later solves can pack stages in parallel.
+    offsets.assign(stage_count + 1, 0);
+    for (std::size_t index = 0; index < stage_count; ++index) {
+      offsets[index] = static_cast<std::size_t>(host_cursor - host_base);
+      if (!PackStage(problem.stages[index], problem.Q[index], problem.q[index],
+                     &host_cursor, host_end, &device_cursor,
+                     &workspace->host_stages[index], validate_values, true)) {
+        return false;
+      }
+    }
+    offsets[stage_count] = static_cast<std::size_t>(host_cursor - host_base);
+  } else if (participants > 1 && stage_count >= participants) {
+    Require(offsets.size() == stage_count + 1,
+            "internal CUDA packing layout is missing");
+    PackStagesTask task{};
+    task.problem = &problem;
+    task.workspace = workspace;
+    task.validate_values = validate_values;
+    // About eight chunks per participant balances late helpers against the
+    // per-chunk claim overhead.
+    task.chunk_stages =
+        std::max<std::size_t>(1, stage_count / (8 * participants));
+    task.next_chunk.store(0, std::memory_order_relaxed);
+    workspace->packing_pool.Run(PackStagesRange, &task);
+    bool finite = true;
+    bool consistent = true;
+    for (std::size_t worker = 0; worker < participants; ++worker) {
+      finite &= task.finite[worker] != 0;
+      consistent &= task.consistent[worker] != 0;
+    }
+    Require(consistent, "internal CUDA problem-packing size mismatch");
+    if (!finite)
       return false;
+    host_cursor = host_base + offsets[stage_count];
+  } else {
+    for (std::size_t index = 0; index < stage_count; ++index) {
+      if (!PackStage(problem.stages[index], problem.Q[index], problem.q[index],
+                     &host_cursor, host_end, &device_cursor,
+                     &workspace->host_stages[index], validate_values, false)) {
+        return false;
+      }
     }
   }
   if (!PackTerminal(problem, &host_cursor, host_end, &device_cursor,
@@ -3783,8 +4228,7 @@ bool PackProblemData(const Problem &problem, WorkspaceStorage *workspace,
                     bind_metadata)) {
     return false;
   }
-  Require(host_cursor == workspace->host_problem_data.data() +
-                             workspace->host_problem_data.size(),
+  Require(host_cursor == host_end,
           "internal CUDA problem-packing size mismatch");
   if (bind_metadata) {
     Require(device_cursor == workspace->device_problem_data.get() +
@@ -4076,7 +4520,8 @@ bool PrepareStateDualStorage(const Problem &problem,
 }
 
 std::size_t ConfigureScratchMemory(const ScratchRequirements &scratch,
-                                   int device, std::size_t stage_count,
+                                   int device, int threads,
+                                   std::size_t stage_count,
                                    KernelScratchPlans *plans) {
   const int capacity = DeviceSharedMemoryCapacity(device);
   const std::size_t node_count = stage_count + 1;
@@ -4086,7 +4531,7 @@ std::size_t ConfigureScratchMemory(const ScratchRequirements &scratch,
 #define CLQR_CONFIGURE_SCRATCH(kernel, member, blocks)                         \
   plans->kernel =                                                              \
       PlanKernelScratch(kernel<false>, kernel<true>, #kernel, scratch.member,  \
-                        capacity, device, kThreads);                           \
+                        capacity, device, threads);                            \
   global_bytes = std::max(global_bytes, plans->kernel.GlobalBytes(blocks));
   CLQR_SCRATCH_KERNELS(CLQR_CONFIGURE_SCRATCH)
 #undef CLQR_CONFIGURE_SCRATCH
@@ -4106,8 +4551,9 @@ void RefineReducedScratchMemory(WorkspaceStorage *workspace, int stage_count) {
         workspace->host_state_dimensions[2 * stage + 3],
         workspace->host_control_dimensions[2 * stage + 1], &scratch);
   }
-  const std::size_t global_bytes = ConfigureScratchMemory(
-      scratch, workspace->device, stage_count, &workspace->scratch_launches);
+  const std::size_t global_bytes =
+      ConfigureScratchMemory(scratch, workspace->device, workspace->threads,
+                             stage_count, &workspace->scratch_launches);
   Require(global_bytes <= workspace->global_scratch.count(),
           "active CUDA scratch exceeds its physical-dimension reservation");
 }
@@ -4678,14 +5124,16 @@ void BuildTreeLevels(int leaf_count, std::vector<int> *offsets,
   }
 }
 
-void PrepareProblemStructure(const Problem &problem, int device,
-                             WorkspaceStorage *workspace,
+void PrepareProblemStructure(const Problem &problem, int device, int threads,
+                             int pack_threads, WorkspaceStorage *workspace,
                              bool direct_device_input = false) {
   workspace->structure_ready = false;
   workspace->direct_device_input = direct_device_input;
+  workspace->threads = threads;
+  workspace->pack_threads_option = pack_threads;
   RefreshScratchPlan(problem, &workspace->structure_key, &workspace->scratch);
   const std::size_t global_scratch_bytes = ConfigureScratchMemory(
-      workspace->scratch, device, problem.stages.size(),
+      workspace->scratch, device, threads, problem.stages.size(),
       &workspace->scratch_launches);
   const int stage_count = static_cast<int>(problem.stages.size());
   const int node_count = stage_count + 1;
@@ -4695,6 +5143,11 @@ void PrepareProblemStructure(const Problem &problem, int device,
                      direct_device_input ? 0 : entries.problem_data,
                      static_cast<int>(problem.initial_state.size()),
                      static_cast<int>(problem.terminal_E.rows()));
+  workspace->packing_pool.Resize(
+      direct_device_input
+          ? 0
+          : PackingHelperThreads(entries.problem_data, stage_count,
+                                 pack_threads));
   if (global_scratch_bytes > 0)
     workspace->global_scratch.Reserve(global_scratch_bytes);
   // Arena slices may move whenever the structure changes. Rebuild every
@@ -4746,12 +5199,13 @@ void PrepareProblemStructure(const Problem &problem, int device,
     if (clqr_launch.global_stride != 0) {                                      \
       ForEachGlobalScratchLaunch(                                              \
           clqr_launch, blocks, [&](int first, int count) {                     \
-            kernel<true><<<count, kThreads, 0, stream>>>(                      \
+            kernel<true><<<count, workspace.threads, 0, stream>>>(             \
                 __VA_ARGS__, workspace.global_scratch.get(),                   \
                 clqr_launch.global_stride, first);                             \
           });                                                                  \
     } else {                                                                   \
-      kernel<false><<<blocks, kThreads, clqr_launch.shared_bytes, stream>>>(   \
+      kernel<false><<<blocks, workspace.threads, clqr_launch.shared_bytes,     \
+                      stream>>>(                                               \
           __VA_ARGS__, nullptr, 0, 0);                                         \
     }                                                                          \
   } while (false)
@@ -4787,9 +5241,20 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     }
   }
   CudaCheck(cudaSetDevice(options.device), "cudaSetDevice");
-  if (!prepared && (!workspace.structure_ready || !structure_matches ||
-                    workspace.direct_device_input))
-    PrepareProblemStructure(problem, options.device, &workspace);
+  if (prepared) {
+    Require(options.block_threads == 0 ||
+                options.block_threads == workspace.threads,
+            "prepared CUDA workspace block size differs from solve options");
+  } else {
+    const int resolved_threads = ResolveBlockThreads(problem, options);
+    if (!workspace.structure_ready || !structure_matches ||
+        workspace.direct_device_input ||
+        workspace.threads != resolved_threads ||
+        workspace.pack_threads_option != options.host_pack_threads)
+      PrepareProblemStructure(problem, options.device, resolved_threads,
+                              options.host_pack_threads, &workspace);
+  }
+  const int threads = workspace.threads;
   const auto total_start = std::chrono::steady_clock::now();
   result.status = SolveStatus::kInvalidInput;
   result.message.clear();
@@ -4904,7 +5369,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                 "upload state-constraint offsets");
     }
     if (device_input != nullptr) {
-      PackPaddedProblemKernel<<<node_count, kThreads, 0, stream>>>(
+      PackPaddedProblemKernel<<<node_count, threads, 0, stream>>>(
           *device_input, device_stages.get(), stage_count,
           device_terminal.get(), device_initial.get(),
           workspace.direct_device_input);
@@ -4928,7 +5393,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
   const int finite_input_blocks =
       prepared && packed_input_entries > 0
           ? static_cast<int>(std::min<std::size_t>(
-                (packed_input_entries - 1) / kThreads + 1, 65535))
+                (packed_input_entries - 1) / threads + 1, 65535))
           : 0;
   result.timings.feasibility_ms = TimeGpuKernels(
       workspace, stream,
@@ -4944,11 +5409,11 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       },
       [&] {
         if (workspace.direct_device_input) {
-          CheckFiniteDirectInputsKernel<<<node_count, kThreads, 0, stream>>>(
+          CheckFiniteDirectInputsKernel<<<node_count, threads, 0, stream>>>(
               device_stages.get(), stage_count, device_terminal.get(),
               device_initial.get(), device_status.get());
         } else if (finite_input_blocks > 0) {
-          CheckFiniteInputsKernel<<<finite_input_blocks, kThreads, 0, stream>>>(
+          CheckFiniteInputsKernel<<<finite_input_blocks, threads, 0, stream>>>(
               workspace.device_problem_data.get(),
               workspace.host_problem_data.size(), device_initial.get(),
               host_initial.size(), device_status.get());
@@ -4974,7 +5439,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                 level_counts[level + 1], options.tolerance,
                 feasibility_consistency_tolerance, device_status.get());
           }
-          InitializeRelationContextRootKernel<<<1, kThreads, 0, stream>>>(
+          InitializeRelationContextRootKernel<<<1, threads, 0, stream>>>(
               relation_b.get(), level_offsets.back() - node_count);
           for (int level = static_cast<int>(level_counts.size()) - 2;
                level >= 1; --level) {
@@ -5103,7 +5568,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         CLQR_LAUNCH_SCRATCH(ReduceTerminalKernel, 1, device_terminal.get(),
                             state_params.get(), stage_count,
                             reduced_terminal.get());
-        InitialReducedStateKernel<<<1, kThreads, 0, stream>>>(
+        InitialReducedStateKernel<<<1, threads, 0, stream>>>(
             state_params.get(), device_initial.get(), reduced_initial.get(),
             options.tolerance, device_status.get());
       },
@@ -5154,23 +5619,23 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
     if (stage_count <= 1)
       return;
     const int first_parent_count = stage_level_counts[1];
-    ReduceAffineLeavesKernel<<<first_parent_count, kThreads, 0, stream>>>(
+    ReduceAffineLeavesKernel<<<first_parent_count, threads, 0, stream>>>(
         map_a.get(), stage_count, first_parent_count, map_b.get(),
         device_status.get());
     for (std::size_t level = 1; level + 1 < stage_level_counts.size();
          ++level) {
-      ReduceAffineTreeLevelKernel<<<stage_level_counts[level + 1], kThreads, 0,
+      ReduceAffineTreeLevelKernel<<<stage_level_counts[level + 1], threads, 0,
                                     stream>>>(
           map_b.get(), stage_level_offsets[level] - stage_count,
           stage_level_offsets[level + 1] - stage_count,
           stage_level_counts[level], stage_level_counts[level + 1],
           device_status.get());
     }
-    InitializeAffineContextRootKernel<<<1, kThreads, 0, stream>>>(
+    InitializeAffineContextRootKernel<<<1, threads, 0, stream>>>(
         map_b.get(), stage_level_offsets.back() - stage_count);
     for (int level = static_cast<int>(stage_level_counts.size()) - 2;
          level >= 1; --level) {
-      ExpandAffineContextLevelKernel<<<stage_level_counts[level + 1], kThreads,
+      ExpandAffineContextLevelKernel<<<stage_level_counts[level + 1], threads,
                                        0, stream>>>(
           map_b.get(), stage_level_offsets[level] - stage_count,
           stage_level_offsets[level + 1] - stage_count,
@@ -5242,7 +5707,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                                 level_counts[level], level_counts[level + 1],
                                 options.tolerance, device_status.get());
           }
-          InitializeValueContextRootKernel<<<1, kThreads, 0, stream>>>(
+          InitializeValueContextRootKernel<<<1, threads, 0, stream>>>(
               value_b.get(), level_offsets.back() - node_count);
           for (int level = static_cast<int>(level_counts.size()) - 2;
                level >= 1; --level) {
@@ -5268,8 +5733,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                               feedback.get(), stage_count, map_a.get(),
                               device_status.get());
           queue_affine_prefix_scan();
-          const int costate_blocks = (node_count + kThreads - 1) / kThreads;
-          RecoverCostatesKernel<<<costate_blocks, kThreads, 0, stream>>>(
+          RecoverCostatesKernel<<<node_count, threads, 0, stream>>>(
               map_a.get(), reduced_terminal.get(), reduced_state_offsets.get(),
               stage_count, workspace.reduced_value_linear.get(),
               device_status.get());
@@ -5290,13 +5754,12 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
       workspace, TimingSlot::kReconstruction, stream, [] {},
       [&] {
         if (stage_count > 0) {
-          InitializeAffineMapsKernel<<<stage_count, kThreads, 0, stream>>>(
+          InitializeAffineMapsKernel<<<stage_count, threads, 0, stream>>>(
               feedback.get(), stage_count, map_a.get(), device_status.get());
           queue_affine_prefix_scan();
           prefix = map_a.get();
         }
-        const int state_blocks = (node_count + kThreads - 1) / kThreads;
-        ReconstructPrimalKernel<<<state_blocks, kThreads, 0, stream>>>(
+        ReconstructPrimalKernel<<<node_count, threads, 0, stream>>>(
             prefix, state_params.get(), control_params.get(), feedback.get(),
             reduced_initial.get(), reduced_state_offsets.get(),
             state_offsets.get(), control_offsets.get(), stage_count,
@@ -5499,8 +5962,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                   device_status.get());
             }
           }
-          const int recovery_blocks = (stage_count + kThreads - 1) / kThreads;
-          RecoverParameterizedMultipliersKernel<<<recovery_blocks, kThreads, 0,
+          RecoverParameterizedMultipliersKernel<<<stage_count, threads, 0,
                                                   stream>>>(
               dual_params.get(), state_dual_params.get(), dual_leaf_values,
               dynamics_offsets.get(), mixed_offsets.get(),
@@ -5508,7 +5970,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
               dynamics_multipliers.get(), mixed_multipliers.get(),
               state_multipliers.get(), terminal_multiplier.get(),
               device_status.get());
-          RecoverInitialMultiplierKernel<<<1, kThreads, 0, stream>>>(
+          RecoverInitialMultiplierKernel<<<1, threads, 0, stream>>>(
               device_stages.get(), device_terminal.get(), stage_count,
               states.get(), controls.get(), dynamics_multipliers.get(),
               mixed_multipliers.get(), state_offsets.get(),
@@ -5524,7 +5986,7 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
         workspace, TimingSlot::kMultiplierRecovery, stream,
         initialize_multiplier_outputs,
         [&] {
-          RecoverInitialMultiplierKernel<<<1, kThreads, 0, stream>>>(
+          RecoverInitialMultiplierKernel<<<1, threads, 0, stream>>>(
               device_stages.get(), device_terminal.get(), stage_count,
               states.get(), controls.get(), dynamics_multipliers.get(),
               mixed_multipliers.get(), state_offsets.get(),
@@ -5546,14 +6008,14 @@ SolveMetadata &SolveImpl(const Problem &problem, WorkspaceStorage &workspace,
                   "initialize objective tree");
       },
       [&] {
-        BuildObjectiveTermsKernel<<<node_count, kThreads, 0, stream>>>(
+        BuildObjectiveTermsKernel<<<node_count, threads, 0, stream>>>(
             device_stages.get(), stage_count, device_terminal.get(),
             states.get(), controls.get(), state_offsets.get(),
             control_offsets.get(), objective_tree.get(), device_status.get());
         for (std::size_t level = 0; level + 1 < level_counts.size(); ++level) {
           const int parent_count = level_counts[level + 1];
-          const int blocks = (parent_count + kThreads - 1) / kThreads;
-          ReduceObjectiveTreeLevelKernel<<<blocks, kThreads, 0, stream>>>(
+          const int blocks = (parent_count + threads - 1) / threads;
+          ReduceObjectiveTreeLevelKernel<<<blocks, threads, 0, stream>>>(
               objective_tree.get(), level_offsets[level], level_counts[level],
               level_offsets[level + 1], device_status.get());
         }
@@ -5697,9 +6159,14 @@ void Workspace::Reserve(const Problem &problem, const Options &options) {
                     "a CUDA workspace cannot be reused across devices");
   }
   detail::CudaCheck(cudaSetDevice(options.device), "cudaSetDevice");
+  const int threads = detail::ResolveBlockThreads(problem, options);
   if (!impl_->storage.structure_ready || !structure_matches ||
-      impl_->storage.direct_device_input) {
-    detail::PrepareProblemStructure(problem, options.device, &impl_->storage);
+      impl_->storage.direct_device_input ||
+      impl_->storage.threads != threads ||
+      impl_->storage.pack_threads_option != options.host_pack_threads) {
+    detail::PrepareProblemStructure(problem, options.device, threads,
+                                    options.host_pack_threads,
+                                    &impl_->storage);
   }
 }
 
@@ -5903,7 +6370,7 @@ void ExportPaddedDeviceSolution(const Problem &problem,
     return;
   const int stage_count = static_cast<int>(problem.stages.size());
   const int node_count = stage_count + 1;
-  ScatterPaddedSolutionKernel<<<node_count, kThreads, 0, stream>>>(
+  ScatterPaddedSolutionKernel<<<node_count, storage.threads, 0, stream>>>(
       storage.device_stages.get(), stage_count, storage.device_terminal.get(),
       storage.state_offsets.get(), storage.control_offsets.get(),
       storage.dynamics_offsets.get(), storage.mixed_offsets.get(),
@@ -5945,14 +6412,17 @@ SolveStatus SolvePackedDevice(const Problem &structure, Workspace &workspace,
     output_validated = true;
     auto &storage = workspace.impl_->storage;
     const bool direct = CanReadDeviceInputDirectly(structure, input);
-    if (!storage.structure_ready || storage.direct_device_input != direct) {
+    const int threads = ResolveBlockThreads(structure, options);
+    if (!storage.structure_ready || storage.direct_device_input != direct ||
+        storage.threads != threads) {
       ValidateCudaProblem(structure, options, storage.structure_key, true);
       int device_count = 0;
       CudaCheck(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
       Require(options.device < device_count,
               "CUDA device index is out of range");
       CudaCheck(cudaSetDevice(options.device), "cudaSetDevice");
-      PrepareProblemStructure(structure, options.device, &storage, direct);
+      PrepareProblemStructure(structure, options.device, threads,
+                              options.host_pack_threads, &storage, direct);
     }
     SolveImpl(structure, workspace.impl_->storage, result, options, true,
               stream, &input);
@@ -6092,7 +6562,7 @@ __global__ void InitializeAffineMapsKernel(const Feedback *feedback, int count,
     return;
   if (!BlockEnabled(status))
     return;
-  const Feedback &fb = feedback[index];
+  const Feedback fb = feedback[index];
   if (threadIdx.x == 0) {
     maps[index].left_dim = fb.state_dim;
     maps[index].right_dim = fb.next_state_dim;
@@ -6108,7 +6578,7 @@ __global__ void InitializeAffineMapsKernel(const Feedback *feedback, int count,
     maps[index].offset[row] = fb.offset[row];
 }
 
-__device__ void CopyAffineMapBlock(const AffineMap &input, AffineMap *output) {
+__device__ void CopyAffineMapBlock(const AffineMap input, AffineMap *output) {
   if (threadIdx.x == 0) {
     output->left_dim = input.left_dim;
     output->right_dim = input.right_dim;
@@ -6124,7 +6594,7 @@ __device__ void CopyAffineMapBlock(const AffineMap &input, AffineMap *output) {
     output->offset[row] = input.offset[row];
 }
 
-__device__ bool InvalidScanAffineMap(const AffineMap &map) {
+__device__ bool InvalidScanAffineMap(const AffineMap map) {
   return map.left_dim < 0;
 }
 
@@ -6135,8 +6605,8 @@ __device__ void SetInvalidScanAffineMap(AffineMap *map) {
   }
 }
 
-__device__ void ComposeAffineMapsBlock(const AffineMap &first,
-                                       const AffineMap &second,
+__device__ void ComposeAffineMapsBlock(const AffineMap first,
+                                       const AffineMap second,
                                        AffineMap *output, DeviceStatus *status,
                                        int index) {
   if (InvalidScanAffineMap(first)) {
@@ -6231,7 +6701,7 @@ ExpandAffineContextLevelKernel(AffineMap *tree, int child_offset,
   if (!BlockEnabled(status))
     return;
   const int left = child_offset + 2 * index;
-  const AffineMap &parent_context = tree[parent_offset + index];
+  const AffineMap parent_context = tree[parent_offset + index];
   if (2 * index + 1 >= child_count) {
     CopyAffineMapBlock(parent_context, &tree[left]);
     return;
@@ -6239,7 +6709,7 @@ ExpandAffineContextLevelKernel(AffineMap *tree, int child_offset,
   const int right = left + 1;
   ComposeAffineMapsBlock(parent_context, tree[left], &tree[right], status,
                          index);
-  WarpSynchronize();
+  BlockSynchronize();
   CopyAffineMapBlock(parent_context, &tree[left]);
 }
 
@@ -6254,7 +6724,7 @@ __global__ void FinalizeAffinePrefixFromParentsKernel(AffineMap *leaves, int cou
   if (!BlockEnabled(status))
     return;
   const int left = 2 * index;
-  const AffineMap &parent = parent_contexts[index];
+  const AffineMap parent = parent_contexts[index];
   const int right = left + 1;
   int left_capacity = leaves[left].left_dim;
   int right_capacity = leaves[left].right_dim;
@@ -6276,23 +6746,23 @@ __global__ void FinalizeAffinePrefixFromParentsKernel(AffineMap *leaves, int cou
   if (threadIdx.x == 0)
     BindAffineMapScratch(&composed, composed_storage, left_capacity,
                          right_capacity);
-  WarpSynchronize();
+  BlockSynchronize();
   if (left + 1 >= count) {
     if (!InvalidScanAffineMap(parent)) {
       ComposeAffineMapsBlock(parent, leaves[left], &composed, status, left);
-      WarpSynchronize();
+      BlockSynchronize();
       CopyAffineMapBlock(composed, &leaves[left]);
     }
     return;
   }
   if (!InvalidScanAffineMap(parent)) {
     ComposeAffineMapsBlock(parent, leaves[left], &composed, status, left);
-    WarpSynchronize();
+    BlockSynchronize();
     CopyAffineMapBlock(composed, &leaves[left]);
-    WarpSynchronize();
+    BlockSynchronize();
   }
   ComposeAffineMapsBlock(leaves[left], leaves[right], &composed, status, right);
-  WarpSynchronize();
+  BlockSynchronize();
   CopyAffineMapBlock(composed, &leaves[right]);
 }
 
@@ -6303,26 +6773,28 @@ __global__ void ReconstructPrimalKernel(
     const int *state_offsets, const int *control_offsets, int stage_count,
     Scalar *reduced_states, Scalar *reduced_controls, Scalar *states,
     Scalar *controls, DeviceStatus *status) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  // One block per node; threads stride over the dense rows.
+  const int index = blockIdx.x;
   if (index > stage_count)
     return;
   if (!BlockEnabled(status))
     return;
-  const StateParam &state = state_params[index];
+  const StateParam state = state_params[index];
   Scalar *z = reduced_states + reduced_state_offsets[index];
   if (index == 0) {
-    for (int col = 0; col < state.reduced_dim; ++col)
+    for (int col = threadIdx.x; col < state.reduced_dim; col += blockDim.x)
       z[col] = initial[col];
   } else {
-    const AffineMap &map = prefix[index - 1];
-    for (int row = 0; row < map.right_dim; ++row) {
+    const AffineMap map = prefix[index - 1];
+    for (int row = threadIdx.x; row < map.right_dim; row += blockDim.x) {
       Scalar value = map.offset[row];
       for (int col = 0; col < map.left_dim; ++col)
         value += map.linear[row * map.left_dim + col] * initial[col];
       z[row] = value;
     }
   }
-  for (int x = 0; x < state.physical_dim; ++x) {
+  BlockSynchronize();
+  for (int x = threadIdx.x; x < state.physical_dim; x += blockDim.x) {
     Scalar value = state.t[x];
     for (int col = 0; col < state.reduced_dim; ++col) {
       value += state.T[x * state.reduced_dim + col] * z[col];
@@ -6331,17 +6803,18 @@ __global__ void ReconstructPrimalKernel(
   }
   if (index == stage_count)
     return;
-  const ControlParam &control = control_params[index];
-  const Feedback &fb = feedback[index];
+  const ControlParam control = control_params[index];
+  const Feedback fb = feedback[index];
   Scalar *v = reduced_controls + control_offsets[index];
-  for (int row = 0; row < control.reduced_dim; ++row) {
+  for (int row = threadIdx.x; row < control.reduced_dim; row += blockDim.x) {
     Scalar value = fb.k[row];
     for (int col = 0; col < fb.state_dim; ++col) {
       value += fb.K[row * fb.state_dim + col] * z[col];
     }
     v[row] = value;
   }
-  for (int u = 0; u < control.physical_dim; ++u) {
+  BlockSynchronize();
+  for (int u = threadIdx.x; u < control.physical_dim; u += blockDim.x) {
     Scalar value = control.y[u];
     for (int col = 0; col < control.state_dim; ++col) {
       value += control.Y[u * control.state_dim + col] * z[col];
@@ -6368,9 +6841,9 @@ __global__ void BuildDualParametersKernel(
     return;
   if (!BlockEnabled(status))
     return;
-  const PackedStage &stage = stages[index];
-  const StateParam &next = state_params[index + 1];
-  const ValueElement &next_value = value_suffix[index + 1];
+  const PackedStage stage = stages[index];
+  const StateParam next = state_params[index + 1];
+  const ValueElement next_value = value_suffix[index + 1];
   const int variables = stage.next_n + stage.mixed;
   const int rows = next.reduced_dim + stage.m;
   const int columns = variables + 1;
@@ -6394,7 +6867,6 @@ __global__ void BuildDualParametersKernel(
   int *permutation = scratch.Take<int>(variables);
   __shared__ int rank;
   __shared__ int local_ok;
-  __shared__ Scalar conditioned_rhs_scale;
 
   for (int entry = threadIdx.x; entry < rows * columns; entry += blockDim.x)
     matrix[entry] = Scalar{0};
@@ -6407,7 +6879,7 @@ __global__ void BuildDualParametersKernel(
       scale = fmax(scale, DeviceAbs(stage.D[constraint * stage.m + control]));
     constraint_scales[constraint] = scale > Scalar{0} ? scale : Scalar{1};
   }
-  WarpSynchronize();
+  BlockSynchronize();
 
   for (int linear = threadIdx.x; linear < next.reduced_dim * stage.next_n;
        linear += blockDim.x) {
@@ -6450,63 +6922,69 @@ __global__ void BuildDualParametersKernel(
       gradient += stage.R[row * stage.m + col] * control[col];
     matrix[(next.reduced_dim + row) * columns + variables] = gradient;
   }
-  WarpSynchronize();
-  if (threadIdx.x == 0) {
-    conditioned_rhs_scale =
-        ConditionedRhsScale(matrix, rows, columns, variables, rank_tolerance);
-  }
-  WarpSynchronize();
+  BlockSynchronize();
+  const Scalar conditioned_rhs_scale = ConditionedRhsScaleBlock(
+      matrix, rows, columns, variables, rank_tolerance);
   SolveSystemOrthogonally(matrix, rows, columns, variables, rank_tolerance,
                           consistency_tolerance, conditioned_rhs_scale,
                           residual_rhs, upper, rhs_projection, solution,
                           permutation, &rank, &local_ok);
-  if (threadIdx.x == 0) {
-    if (!local_ok) {
+  if (!local_ok) {
+    if (threadIdx.x == 0)
       SetFailure(status, kDeviceNumericalFailure, index, 24);
-    } else {
-      DualParam &out = params[index];
-      out.state_dim = stage.next_n;
-      out.mixed_dim = stage.mixed;
-      out.physical_dim = variables;
-      out.free_dim = variables - rank;
-      if (dual_dimensions != nullptr)
-        dual_dimensions[index] = out.free_dim;
-      for (int free = 0; free < out.free_dim; ++free)
-        out.free_columns[free] = permutation[rank + free];
-      if (out.free_dim > 0)
-        atomicExch(scan_needed, 1);
-      for (int variable = 0; variable < variables; ++variable) {
+    return;
+  }
+  DualParam &out = params[index];
+  const int free_dim = variables - rank;
+  if (threadIdx.x == 0) {
+    out.state_dim = stage.next_n;
+    out.mixed_dim = stage.mixed;
+    out.physical_dim = variables;
+    out.free_dim = free_dim;
+    if (dual_dimensions != nullptr)
+      dual_dimensions[index] = free_dim;
+    for (int free = 0; free < free_dim; ++free)
+      out.free_columns[free] = permutation[rank + free];
+    if (free_dim > 0)
+      atomicExch(scan_needed, 1);
+  }
+  for (int variable = threadIdx.x; variable < variables;
+       variable += blockDim.x) {
+    const Scalar scale = variable < stage.next_n
+                             ? Scalar{1}
+                             : constraint_scales[variable - stage.next_n];
+    out.offset[variable] = solution[variable] / scale;
+  }
+  for (int linear = threadIdx.x; linear < variables * free_dim;
+       linear += blockDim.x)
+    out.basis[linear] = Scalar{0};
+  // The solution vector is reused below, so every offset must be read first.
+  // Free dual directions are rare (rank-deficient multiplier systems), so the
+  // basis back-substitution stays serial.
+  BlockSynchronize();
+  if (threadIdx.x == 0) {
+    for (int free = 0; free < free_dim; ++free) {
+      for (int position = 0; position < variables; ++position)
+        solution[position] = Scalar{0};
+      solution[rank + free] = Scalar{1};
+      for (int reverse = 0; reverse < rank; ++reverse) {
+        const int row = rank - 1 - reverse;
+        Scalar value = -upper[row * variables + rank + free];
+        for (int col = row + 1; col < rank; ++col) {
+          value -= upper[row * variables + col] * solution[col];
+        }
+        solution[row] = value / upper[row * variables + row];
+      }
+      for (int position = 0; position < variables; ++position) {
+        const int variable = permutation[position];
         const Scalar scale = variable < stage.next_n
                                  ? Scalar{1}
                                  : constraint_scales[variable - stage.next_n];
-        out.offset[variable] = solution[variable] / scale;
-        for (int free = 0; free < out.free_dim; ++free)
-          out.basis[variable * out.free_dim + free] = Scalar{0};
-      }
-      for (int free = 0; free < out.free_dim; ++free) {
-        for (int position = 0; position < variables; ++position)
-          solution[position] = Scalar{0};
-        solution[rank + free] = Scalar{1};
-        for (int reverse = 0; reverse < rank; ++reverse) {
-          const int row = rank - 1 - reverse;
-          Scalar value = -upper[row * variables + rank + free];
-          for (int col = row + 1; col < rank; ++col) {
-            value -= upper[row * variables + col] * solution[col];
-          }
-          solution[row] = value / upper[row * variables + row];
-        }
-        for (int position = 0; position < variables; ++position) {
-          const int variable = permutation[position];
-          const Scalar scale = variable < stage.next_n
-                                   ? Scalar{1}
-                                   : constraint_scales[variable - stage.next_n];
-          out.basis[variable * out.free_dim + free] =
-              solution[position] / scale;
-        }
+        out.basis[variable * free_dim + free] = solution[position] / scale;
       }
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
 }
 
 template <bool GlobalScratch = false>
@@ -6526,8 +7004,8 @@ __global__ void BuildDualParameterRelationsKernel(
     return;
   const int node = relation_index + 1;
   const bool is_terminal = node == stage_count;
-  const PackedTerminal &terminal = *terminal_ptr;
-  const DualParam &left = params[node - 1];
+  const PackedTerminal terminal = *terminal_ptr;
+  const DualParam left = params[node - 1];
   const DualParam *right = is_terminal ? nullptr : &params[node];
   const int state_dim = is_terminal ? terminal.n : stages[node].n;
   const int state_constraints =
@@ -6564,7 +7042,7 @@ __global__ void BuildDualParameterRelationsKernel(
     }
     constraint_scales[constraint] = scale > Scalar{0} ? scale : Scalar{1};
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < rows * state_constraints;
        linear += blockDim.x) {
     const int state = linear / state_constraints;
@@ -6583,7 +7061,7 @@ __global__ void BuildDualParameterRelationsKernel(
         left.basis[state * left.free_dim + free];
   }
   if (!is_terminal) {
-    const PackedStage &stage = stages[node];
+    const PackedStage stage = stages[node];
     for (int linear = threadIdx.x; linear < state_dim * right_dim;
          linear += blockDim.x) {
       const int state = linear / right_dim;
@@ -6609,7 +7087,7 @@ __global__ void BuildDualParameterRelationsKernel(
       for (int col = 0; col < terminal.n; ++col)
         rhs -= terminal.Q[row * terminal.n + col] * state[col];
     } else {
-      const PackedStage &stage = stages[node];
+      const PackedStage stage = stages[node];
       const Scalar *control = controls + control_offsets[node];
       rhs -= stage.q[row];
       for (int col = 0; col < stage.n; ++col)
@@ -6625,7 +7103,7 @@ __global__ void BuildDualParameterRelationsKernel(
     }
     matrix[row * columns + columns - 1] = rhs;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   // Solve for an independent subset of state-equality multipliers using the
   // same rank-revealing orthogonal factorization as the CPU path. A redundant
   // multiplier is a true null direction; contributions produced only at the
@@ -6634,37 +7112,47 @@ __global__ void BuildDualParameterRelationsKernel(
                          rank_tolerance, pivot_columns, integer_scratch, &rank,
                          &best_row, factors, &matrix_scale,
                          kMinimumDualRelationRowScale);
+  StateDualParam &out = state_params[relation_index];
   if (threadIdx.x == 0) {
     constraint_rank = rank;
-    StateDualParam &out = state_params[relation_index];
     out.constraint_dim = state_constraints;
     out.left_dim = left.free_dim;
     out.right_dim = right_dim;
-    for (int constraint = 0; constraint < state_constraints; ++constraint) {
-      out.offset[constraint] = Scalar{0};
-      for (int free = 0; free < left.free_dim; ++free)
-        out.left[constraint * left.free_dim + free] = Scalar{0};
-      for (int free = 0; free < right_dim; ++free)
-        out.right[constraint * right_dim + free] = Scalar{0};
-    }
-    for (int pivot = 0; pivot < constraint_rank; ++pivot) {
-      const int constraint = pivot_columns[pivot];
-      const Scalar inverse_scale = Scalar{1} / constraint_scales[constraint];
+  }
+  // Zero every multiplier row, then overwrite the pivot rows; a pivot row is
+  // also a zeroed row, so the two passes are separated by a barrier.
+  for (int constraint = threadIdx.x; constraint < state_constraints;
+       constraint += blockDim.x)
+    out.offset[constraint] = Scalar{0};
+  for (int linear = threadIdx.x; linear < state_constraints * left.free_dim;
+       linear += blockDim.x)
+    out.left[linear] = Scalar{0};
+  for (int linear = threadIdx.x; linear < state_constraints * right_dim;
+       linear += blockDim.x)
+    out.right[linear] = Scalar{0};
+  BlockSynchronize();
+  const int pivot_width = 1 + left.free_dim + right_dim;
+  for (int linear = threadIdx.x; linear < constraint_rank * pivot_width;
+       linear += blockDim.x) {
+    const int pivot = linear / pivot_width;
+    const int entry = linear % pivot_width;
+    const int constraint = pivot_columns[pivot];
+    const Scalar inverse_scale = Scalar{1} / constraint_scales[constraint];
+    if (entry == 0) {
       out.offset[constraint] =
           matrix[pivot * columns + columns - 1] * inverse_scale;
-      for (int free = 0; free < left.free_dim; ++free) {
-        out.left[constraint * left.free_dim + free] =
-            -matrix[pivot * columns + state_constraints + free] * inverse_scale;
-      }
-      for (int free = 0; free < right_dim; ++free) {
-        out.right[constraint * right_dim + free] =
-            -matrix[pivot * columns + state_constraints + left.free_dim +
-                    free] *
-            inverse_scale;
-      }
+    } else if (entry <= left.free_dim) {
+      const int free = entry - 1;
+      out.left[constraint * left.free_dim + free] =
+          -matrix[pivot * columns + state_constraints + free] * inverse_scale;
+    } else {
+      const int free = entry - 1 - left.free_dim;
+      out.right[constraint * right_dim + free] =
+          -matrix[pivot * columns + state_constraints + left.free_dim + free] *
+          inverse_scale;
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
 
   // Only the rows left after eliminating the state multipliers constrain the
   // free dynamics/mixed-multiplier parameters. Use the same rank-revealing
@@ -6676,14 +7164,15 @@ __global__ void BuildDualParameterRelationsKernel(
                          columns - 1, rank_tolerance, pivot_columns,
                          integer_scratch, &rank, &best_row, factors,
                          &matrix_scale, kMinimumDualRelationRowScale);
+  const bool inconsistent =
+      InconsistentRrefBlock(residual_matrix, residual_rows, columns,
+                            columns - 1, rank_tolerance, consistency_tolerance);
   if (threadIdx.x == 0) {
-    local_ok =
-        !InconsistentRref(residual_matrix, residual_rows, columns, columns - 1,
-                          rank_tolerance, consistency_tolerance);
-    if (!local_ok)
+    local_ok = !inconsistent;
+    if (inconsistent)
       SetFailure(status, kDeviceNumericalFailure, relation_index, 17);
   }
-  WarpSynchronize();
+  BlockSynchronize();
   if (!local_ok)
     return;
   if (*scan_needed != 0) {
@@ -6700,13 +7189,14 @@ __global__ void RecoverParameterizedMultipliersKernel(
     int stage_count, Scalar *dynamics_multipliers, Scalar *mixed_multipliers,
     Scalar *state_multipliers, Scalar *terminal_multiplier,
     DeviceStatus *status) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  // One block per stage; threads stride over the multiplier rows.
+  const int index = blockIdx.x;
   if (index >= stage_count)
     return;
   if (!BlockEnabled(status))
     return;
-  const DualParam &param = params[index];
-  for (int row = 0; row < param.physical_dim; ++row) {
+  const DualParam param = params[index];
+  for (int row = threadIdx.x; row < param.physical_dim; row += blockDim.x) {
     Scalar result = param.offset[row];
     for (int free = 0; free < param.free_dim; ++free) {
       result += param.basis[row * param.free_dim + free] *
@@ -6719,9 +7209,9 @@ __global__ void RecoverParameterizedMultipliersKernel(
     }
   }
   const int node = index + 1;
-  const StateDualParam &state_param = state_params[index];
-  for (int constraint = 0; constraint < state_param.constraint_dim;
-       ++constraint) {
+  const StateDualParam state_param = state_params[index];
+  for (int constraint = threadIdx.x; constraint < state_param.constraint_dim;
+       constraint += blockDim.x) {
     Scalar multiplier = state_param.offset[constraint];
     for (int free = 0; free < state_param.left_dim; ++free) {
       multiplier += state_param.left[constraint * state_param.left_dim + free] *
@@ -6754,7 +7244,7 @@ __global__ void RecoverInitialMultiplierKernel(
     return;
   if (!BlockEnabled(status))
     return;
-  const PackedTerminal &terminal = *terminal_ptr;
+  const PackedTerminal terminal = *terminal_ptr;
   if (stage_count == 0) {
     for (int row = threadIdx.x; row < terminal.state; row += blockDim.x)
       terminal_multiplier[row] = Scalar{0};
@@ -6767,7 +7257,7 @@ __global__ void RecoverInitialMultiplierKernel(
     }
     return;
   }
-  const PackedStage &stage = stages[0];
+  const PackedStage stage = stages[0];
   for (int row = threadIdx.x; row < stage.state; row += blockDim.x)
     state_multipliers[state_constraint_offsets[0] + row] = Scalar{0};
   for (int row = threadIdx.x; row < stage.n; row += blockDim.x) {
@@ -6805,8 +7295,8 @@ __global__ void ReduceDualTreeLevelKernel(const DualRelation *tree, int child_of
                       &mutable_tree[parent_offset + index]);
     return;
   }
-  const DualRelation &first = tree[child_offset + 2 * index];
-  const DualRelation &second = tree[child_offset + 2 * index + 1];
+  const DualRelation first = tree[child_offset + 2 * index];
+  const DualRelation second = tree[child_offset + 2 * index + 1];
   const int rows = first.rows + second.rows;
   const int columns = first.right_dim + first.left_dim + second.right_dim + 1;
   ScratchSize scratch_size;
@@ -6821,12 +7311,11 @@ __global__ void ReduceDualTreeLevelKernel(const DualRelation *tree, int child_of
   int *pivot_columns = scratch.Take<int>(rows);
   int *pivot_rows = scratch.Take<int>(rows);
   __shared__ int rank;
-  __shared__ int best_row;
   __shared__ int local_ok;
   ComposeRelationsBlock(first, second, rank_tolerance, consistency_tolerance,
                         &mutable_tree[parent_offset + index], status, index,
                         kDeviceNumericalFailure, 18, matrix, factors,
-                        pivot_columns, pivot_rows, &rank, &best_row, &local_ok,
+                        pivot_columns, pivot_rows, &rank, &local_ok,
                         true);
 }
 
@@ -6865,7 +7354,6 @@ __global__ void SolveDualRootKernel(const DualRelation *relation,
   int *permutation = scratch.Take<int>(variables);
   __shared__ int rank;
   __shared__ int local_ok;
-  __shared__ Scalar rhs_scale;
   for (int linear = threadIdx.x; linear < relation->rows * variables;
        linear += blockDim.x) {
     const int row = linear / variables;
@@ -6875,11 +7363,9 @@ __global__ void SolveDualRootKernel(const DualRelation *relation,
   }
   for (int row = threadIdx.x; row < relation->rows; row += blockDim.x)
     matrix[row * columns + variables] = relation->rhs[row];
-  WarpSynchronize();
-  if (threadIdx.x == 0)
-    rhs_scale = ConditionedRhsScale(matrix, relation->rows, columns, variables,
-                                    tolerance);
-  WarpSynchronize();
+  BlockSynchronize();
+  const Scalar rhs_scale = ConditionedRhsScaleBlock(
+      matrix, relation->rows, columns, variables, tolerance);
   SolveSystemOrthogonally(matrix, relation->rows, columns, variables, tolerance,
                           tolerance, rhs_scale, residual_rhs, upper,
                           rhs_projection, solution, permutation, &rank,
@@ -6910,7 +7396,7 @@ __global__ void ExpandDualTreeLevelKernel(
   if (!BlockEnabled(status))
     return;
   if (2 * index + 1 >= child_count) {
-    const DualNodeValue &parent = parent_values[parent_offset + index];
+    const DualNodeValue parent = parent_values[parent_offset + index];
     DualNodeValue &child = values[child_offset + 2 * index];
     if (threadIdx.x == 0) {
       child.left_dim = parent.left_dim;
@@ -6922,9 +7408,9 @@ __global__ void ExpandDualTreeLevelKernel(
       child.right[entry] = parent.right[entry];
     return;
   }
-  const DualRelation &left = tree[child_offset + 2 * index];
-  const DualRelation &right = tree[child_offset + 2 * index + 1];
-  const DualNodeValue &parent = parent_values[parent_offset + index];
+  const DualRelation left = tree[child_offset + 2 * index];
+  const DualRelation right = tree[child_offset + 2 * index + 1];
+  const DualNodeValue parent = parent_values[parent_offset + index];
   if (left.left_dim != parent.left_dim || right.right_dim != parent.right_dim ||
       left.right_dim != right.left_dim) {
     if (threadIdx.x == 0)
@@ -6952,10 +7438,9 @@ __global__ void ExpandDualTreeLevelKernel(
   int *permutation = scratch.Take<int>(shared);
   __shared__ int rank;
   __shared__ int local_ok;
-  __shared__ Scalar conditioned_rhs_scale;
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
     matrix[i] = Scalar{0};
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < left.rows * shared;
        linear += blockDim.x) {
     const int row = linear / shared;
@@ -6983,36 +7468,33 @@ __global__ void ExpandDualTreeLevelKernel(
     }
     matrix[(left.rows + row) * columns + shared] = rhs;
   }
-  WarpSynchronize();
-  if (threadIdx.x == 0) {
-    conditioned_rhs_scale =
-        ConditionedRhsScale(matrix, rows, columns, shared, rank_tolerance);
-  }
-  WarpSynchronize();
+  BlockSynchronize();
+  const Scalar conditioned_rhs_scale =
+      ConditionedRhsScaleBlock(matrix, rows, columns, shared, rank_tolerance);
   SolveSystemOrthogonally(matrix, rows, columns, shared, rank_tolerance,
                           consistency_tolerance, conditioned_rhs_scale,
                           residual_rhs, upper, rhs_projection, shared_solution,
                           permutation, &rank, &local_ok);
   if (threadIdx.x == 0 && !local_ok)
     SetFailure(status, kDeviceNumericalFailure, index, 16);
-  WarpSynchronize();
+  BlockSynchronize();
   if (!local_ok)
     return;
+  DualNodeValue &left_value = values[child_offset + 2 * index];
+  DualNodeValue &right_value = values[child_offset + 2 * index + 1];
   if (threadIdx.x == 0) {
-    DualNodeValue &left_value = values[child_offset + 2 * index];
-    DualNodeValue &right_value = values[child_offset + 2 * index + 1];
     left_value.left_dim = left.left_dim;
     left_value.right_dim = shared;
     right_value.left_dim = shared;
     right_value.right_dim = right.right_dim;
-    for (int col = 0; col < left.left_dim; ++col)
-      left_value.left[col] = parent.left[col];
-    for (int col = 0; col < right.right_dim; ++col)
-      right_value.right[col] = parent.right[col];
-    for (int col = 0; col < shared; ++col) {
-      left_value.right[col] = shared_solution[col];
-      right_value.left[col] = shared_solution[col];
-    }
+  }
+  for (int col = threadIdx.x; col < left.left_dim; col += blockDim.x)
+    left_value.left[col] = parent.left[col];
+  for (int col = threadIdx.x; col < right.right_dim; col += blockDim.x)
+    right_value.right[col] = parent.right[col];
+  for (int col = threadIdx.x; col < shared; col += blockDim.x) {
+    left_value.right[col] = shared_solution[col];
+    right_value.left[col] = shared_solution[col];
   }
 }
 
@@ -7039,7 +7521,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
   if (!BlockEnabled(status))
     return;
   if (index == stage_count) {
-    const ReducedTerminal &terminal = *terminal_ptr;
+    const ReducedTerminal terminal = *terminal_ptr;
     if (threadIdx.x == 0) {
       elements[index].left_dim = terminal.n;
       elements[index].right_dim = 0;
@@ -7054,7 +7536,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
     return;
   }
 
-  const ReducedStage &s = stages[index];
+  const ReducedStage s = stages[index];
   ValueElement &out = elements[index];
   if (threadIdx.x == 0) {
     out.left_dim = s.n;
@@ -7097,7 +7579,7 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
       right_hand_sides[linear] = s.B[(col - s.n) * s.m + row];
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
   if (!FactorPositiveDefiniteBlock(s.R, s.m, s.m, tolerance, cholesky,
                                    &positive_definite)) {
     if (threadIdx.x == 0)
@@ -7140,10 +7622,10 @@ __global__ void BuildValueElementsKernel(const ReducedStage *stages,
 }
 
 __device__ void
-ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
+ComposeValueElementsBlock(const ValueElement first, const ValueElement second,
                           Scalar tolerance, ValueElement *output,
                           DeviceStatus *status, int node, Scalar *augmented,
-                          Scalar *factors, Scalar *product, int *best_row) {
+                          Scalar *factors, Scalar *product) {
   const int shared = first.right_dim;
   if (shared != second.left_dim) {
     if (threadIdx.x == 0)
@@ -7204,13 +7686,13 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     }
     augmented[linear] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
 #ifdef CLQR_CUDA_EMULATION
   if (threadIdx.x == 0)
     ++g_value_matrix_factorizations;
 #endif
   if (!SolveGeneralMultipleRhsBlock(augmented, shared, columns, tolerance,
-                                    factors, best_row)) {
+                                    factors)) {
     if (threadIdx.x == 0)
       SetFailure(status, kDeviceNumericalFailure, node, 20);
     return;
@@ -7241,7 +7723,7 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     }
     product[row * right + col] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < right * right; linear += blockDim.x) {
     const int row = linear / right;
     const int col = linear % right;
@@ -7251,7 +7733,7 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     }
     output->C[row * right + col] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
 
   // J = J1 + A1^T*J2*(S^{-1}*A1). Reuse the same exactly sized product
   // workspace after C has consumed it.
@@ -7265,7 +7747,7 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     }
     product[row * left + col] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < left * left; linear += blockDim.x) {
     const int row = linear / left;
     const int col = linear % left;
@@ -7275,7 +7757,7 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
     }
     output->J[row * left + col] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < left * left; linear += blockDim.x) {
     const int row = linear / left;
     const int col = linear % left;
@@ -7298,7 +7780,7 @@ ComposeValueElementsBlock(const ValueElement &first, const ValueElement &second,
   }
 }
 
-__device__ bool InvalidScanValueElement(const ValueElement &element) {
+__device__ bool InvalidScanValueElement(const ValueElement element) {
   return element.left_dim < 0;
 }
 
@@ -7309,7 +7791,7 @@ __device__ void SetInvalidScanValueElement(ValueElement *element) {
   }
 }
 
-__device__ void CopyValueElementBlock(const ValueElement &input,
+__device__ void CopyValueElementBlock(const ValueElement input,
                                       ValueElement *output) {
   if (InvalidScanValueElement(input)) {
     SetInvalidScanValueElement(output);
@@ -7340,12 +7822,12 @@ __device__ void CopyValueElementBlock(const ValueElement &input,
   }
 }
 
-__device__ void ComposeScanValueBlock(const ValueElement &first,
-                                      const ValueElement &second,
+__device__ void ComposeScanValueBlock(const ValueElement first,
+                                      const ValueElement second,
                                       Scalar tolerance, ValueElement *output,
                                       DeviceStatus *status, int node,
                                       Scalar *augmented, Scalar *factors,
-                                      Scalar *product, int *best_row) {
+                                      Scalar *product) {
   if (InvalidScanValueElement(first)) {
     if (InvalidScanValueElement(second)) {
       SetInvalidScanValueElement(output);
@@ -7359,7 +7841,7 @@ __device__ void ComposeScanValueBlock(const ValueElement &first,
     return;
   }
   ComposeValueElementsBlock(first, second, tolerance, output, status, node,
-                            augmented, factors, product, best_row);
+                            augmented, factors, product);
 }
 
 template <bool GlobalScratch = false>
@@ -7378,8 +7860,8 @@ __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
     CopyValueElementBlock(leaves[left], &parents[index]);
     return;
   }
-  const ValueElement &first = leaves[left];
-  const ValueElement &second = leaves[left + 1];
+  const ValueElement first = leaves[left];
+  const ValueElement second = leaves[left + 1];
   const int shared = first.right_dim;
   const int columns = 2 * shared + first.left_dim;
   ScratchSize scratch_size;
@@ -7394,9 +7876,8 @@ __global__ void ReduceValueLeavesKernel(const ValueElement *leaves, int count,
   Scalar *product =
       scratch.Take<Scalar>(static_cast<std::size_t>(shared) *
                            DeviceMax(first.left_dim, second.right_dim));
-  __shared__ int best_row;
   ComposeValueElementsBlock(first, second, tolerance, &parents[index], status,
-                            index, augmented, factors, product, &best_row);
+                            index, augmented, factors, product);
 }
 
 template <bool GlobalScratch = false>
@@ -7416,8 +7897,8 @@ __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
     return;
   }
   const int right = left + 1;
-  const ValueElement &first = tree[left];
-  const ValueElement &second = tree[right];
+  const ValueElement first = tree[left];
+  const ValueElement second = tree[right];
   const int shared = first.right_dim;
   const int columns = 2 * shared + first.left_dim;
   ScratchSize scratch_size;
@@ -7432,10 +7913,9 @@ __global__ void ReduceValueTreeLevelKernel(ValueElement *tree, int child_offset,
   Scalar *product =
       scratch.Take<Scalar>(static_cast<std::size_t>(shared) *
                            DeviceMax(first.left_dim, second.right_dim));
-  __shared__ int best_row;
   ComposeValueElementsBlock(
       first, second, tolerance, &tree[parent_offset + index], status,
-      parent_offset + index, augmented, factors, product, &best_row);
+      parent_offset + index, augmented, factors, product);
 }
 
 __global__ void InitializeValueContextRootKernel(ValueElement *tree,
@@ -7455,13 +7935,13 @@ __global__ void ExpandValueContextLevelKernel(
   if (!BlockEnabled(status))
     return;
   const int left = child_offset + 2 * index;
-  const ValueElement &parent_context = tree[parent_offset + index];
+  const ValueElement parent_context = tree[parent_offset + index];
   if (2 * index + 1 >= child_count) {
     CopyValueElementBlock(parent_context, &tree[left]);
     return;
   }
   const int right = left + 1;
-  const ValueElement &first = tree[right];
+  const ValueElement first = tree[right];
   const int shared = first.right_dim;
   const int columns = 2 * shared + first.left_dim;
   ScratchSize scratch_size;
@@ -7478,10 +7958,9 @@ __global__ void ExpandValueContextLevelKernel(
   Scalar *factors = scratch.Take<Scalar>(shared);
   Scalar *product =
       scratch.Take<Scalar>(static_cast<std::size_t>(shared) * product_columns);
-  __shared__ int best_row;
   ComposeScanValueBlock(tree[right], parent_context, tolerance, &tree[left],
-                        status, left, augmented, factors, product, &best_row);
-  WarpSynchronize();
+                        status, left, augmented, factors, product);
+  BlockSynchronize();
   CopyValueElementBlock(parent_context, &tree[right]);
 }
 
@@ -7496,7 +7975,7 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   if (!BlockEnabled(status))
     return;
   const int left = 2 * index;
-  const ValueElement &parent = parent_contexts[index];
+  const ValueElement parent = parent_contexts[index];
   const int right = left + 1;
   int left_capacity = leaves[left].left_dim;
   int right_capacity = leaves[left].right_dim;
@@ -7511,7 +7990,7 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   }
   if (!InvalidScanValueElement(parent)) {
     right_capacity = DeviceMax(right_capacity, parent.right_dim);
-    const ValueElement &child = left + 1 < count ? leaves[right] : leaves[left];
+    const ValueElement child = left + 1 < count ? leaves[right] : leaves[left];
     shared_capacity = DeviceMax(shared_capacity, child.right_dim);
     columns_capacity =
         DeviceMax(columns_capacity, 2 * child.right_dim + child.left_dim);
@@ -7556,36 +8035,34 @@ __global__ void FinalizeValueSuffixFromParentsKernel(
   ValueElement *composed_ptr = scratch.Take<ValueElement>(1);
   Scalar *composed_storage = scratch.Take<Scalar>(composed_entries);
   ValueElement &composed = *composed_ptr;
-  __shared__ int best_row;
   if (threadIdx.x == 0)
     BindValueElementScratch(&composed, composed_storage, left_capacity,
                             right_capacity);
-  WarpSynchronize();
+  BlockSynchronize();
   if (left + 1 >= count) {
     if (!InvalidScanValueElement(parent)) {
       ComposeScanValueBlock(leaves[left], parent, tolerance, &composed, status,
-                            left, augmented, factors, product, &best_row);
-      WarpSynchronize();
+                            left, augmented, factors, product);
+      BlockSynchronize();
       CopyValueElementBlock(composed, &leaves[left]);
     }
     return;
   }
   if (!InvalidScanValueElement(parent)) {
     ComposeScanValueBlock(leaves[right], parent, tolerance, &composed, status,
-                          right, augmented, factors, product, &best_row);
-    WarpSynchronize();
+                          right, augmented, factors, product);
+    BlockSynchronize();
     CopyValueElementBlock(composed, &leaves[right]);
-    WarpSynchronize();
+    BlockSynchronize();
   }
   ComposeValueElementsBlock(leaves[left], leaves[right], tolerance, &composed,
-                            status, left, augmented, factors, product,
-                            &best_row);
-  WarpSynchronize();
+                            status, left, augmented, factors, product);
+  BlockSynchronize();
   CopyValueElementBlock(composed, &leaves[left]);
 }
 
-__device__ void BuildMatrixFeedbackSystem(const ReducedStage &s,
-                                          const ValueElement &next,
+__device__ void BuildMatrixFeedbackSystem(const ReducedStage s,
+                                          const ValueElement next,
                                           Scalar *augmented, Scalar *product,
                                           int columns) {
   // Form J*[B,A] once. Both feedback blocks then use B^T times the relevant
@@ -7602,7 +8079,7 @@ __device__ void BuildMatrixFeedbackSystem(const ReducedStage &s,
     }
     product[row * columns + col] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < s.m * columns; linear += blockDim.x) {
     const int row = linear / columns;
     const int col = linear % columns;
@@ -7616,7 +8093,7 @@ __device__ void BuildMatrixFeedbackSystem(const ReducedStage &s,
   }
 }
 
-__device__ void ExtractMatrixFeedback(const ReducedStage &s,
+__device__ void ExtractMatrixFeedback(const ReducedStage s,
                                       const Scalar *augmented, int columns,
                                       Feedback *feedback) {
   if (threadIdx.x == 0) {
@@ -7629,7 +8106,7 @@ __device__ void ExtractMatrixFeedback(const ReducedStage &s,
     const int col = linear % s.n;
     feedback->K[row * s.n + col] = augmented[row * columns + s.m + col];
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < s.next_n * s.n;
        linear += blockDim.x) {
     const int row = linear / s.n;
@@ -7642,8 +8119,8 @@ __device__ void ExtractMatrixFeedback(const ReducedStage &s,
   }
 }
 
-__device__ bool SolveMatrixFeedbackBlock(const ReducedStage &stage,
-                                         const ValueElement &next,
+__device__ bool SolveMatrixFeedbackBlock(const ReducedStage stage,
+                                         const ValueElement next,
                                          Scalar tolerance, Feedback *feedback,
                                          Scalar *augmented, Scalar *product,
                                          int *positive_definite,
@@ -7666,7 +8143,7 @@ __device__ bool SolveMatrixFeedbackBlock(const ReducedStage &stage,
 
   const int columns = stage.m + stage.n;
   BuildMatrixFeedbackSystem(stage, next, augmented, product, columns);
-  WarpSynchronize();
+  BlockSynchronize();
   if (!FactorPositiveDefiniteBlock(augmented, columns, stage.m, tolerance,
                                    feedback->control_factor,
                                    positive_definite)) {
@@ -7691,8 +8168,8 @@ __global__ void MatrixFeedbackKernel(const ReducedStage *stages,
     return;
   if (!BlockEnabled(status))
     return;
-  const ReducedStage &s = stages[index];
-  const ValueElement &next = suffix[index + 1];
+  const ReducedStage s = stages[index];
+  const ValueElement next = suffix[index + 1];
   Feedback &out = feedback[index];
   const int columns = s.m + s.n;
   ScratchSize scratch_size;
@@ -7726,9 +8203,9 @@ __global__ void InitializeCostateMapsKernel(const ReducedStage *stages,
     return;
   if (!BlockEnabled(status))
     return;
-  const ReducedStage &stage = stages[index];
-  const ValueElement &next = suffix[index + 1];
-  const Feedback &fb = feedback[index];
+  const ReducedStage stage = stages[index];
+  const ValueElement next = suffix[index + 1];
+  const Feedback fb = feedback[index];
   AffineMap &map = maps[stage_count - 1 - index];
   const int shared_entries =
       static_cast<int>(SharedScalarEntries(stage.next_n));
@@ -7752,7 +8229,7 @@ __global__ void InitializeCostateMapsKernel(const ReducedStage *stages,
     }
     future_offset[row] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int row = threadIdx.x; row < stage.n; row += blockDim.x) {
     Scalar value = stage.q[row];
     for (int control = 0; control < stage.m; ++control)
@@ -7769,18 +8246,19 @@ __global__ void RecoverCostatesKernel(const AffineMap *prefix_maps,
                                       const int *reduced_state_offsets,
                                       int stage_count, Scalar *costates,
                                       DeviceStatus *status) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  // One block per node; threads stride over the costate rows.
+  const int index = blockIdx.x;
   if (index > stage_count)
     return;
   if (!BlockEnabled(status))
     return;
   if (index == stage_count) {
-    for (int row = 0; row < terminal->n; ++row)
+    for (int row = threadIdx.x; row < terminal->n; row += blockDim.x)
       costates[reduced_state_offsets[index] + row] = terminal->q[row];
     return;
   }
-  const AffineMap &map = prefix_maps[stage_count - 1 - index];
-  for (int row = 0; row < map.right_dim; ++row) {
+  const AffineMap map = prefix_maps[stage_count - 1 - index];
+  for (int row = threadIdx.x; row < map.right_dim; row += blockDim.x) {
     Scalar value = map.offset[row];
     for (int col = 0; col < map.left_dim; ++col)
       value += map.linear[row * map.left_dim + col] * terminal->q[col];
@@ -7801,8 +8279,8 @@ __global__ void FinalizeFeedbackKernel(const ReducedStage *stages,
     return;
   if (!BlockEnabled(status))
     return;
-  const ReducedStage &stage = stages[index];
-  const ValueElement &next = suffix[index + 1];
+  const ReducedStage stage = stages[index];
+  const ValueElement next = suffix[index + 1];
   Feedback &fb = feedback[index];
   const Scalar *next_costate =
       stage.next_n > 0 ? costates + reduced_state_offsets[index + 1] : nullptr;
@@ -7819,14 +8297,14 @@ __global__ void FinalizeFeedbackKernel(const ReducedStage *stages,
     }
     future[row] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int control = threadIdx.x; control < stage.m; control += blockDim.x) {
     Scalar value = -stage.r[control];
     for (int next_row = 0; next_row < stage.next_n; ++next_row)
       value -= stage.B[next_row * stage.m + control] * future[next_row];
     fb.k[control] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   if (stage.m > 0) {
     SolvePositiveDefiniteMultipleRhsBlock(fb.control_factor, stage.m, fb.k, 1,
                                           1);
@@ -7849,7 +8327,7 @@ namespace cuda {
 namespace detail {
 namespace {
 
-__device__ inline Scalar StageHessianEntry(const PackedStage &stage, int row,
+__device__ inline Scalar StageHessianEntry(const PackedStage stage, int row,
                                            int col) {
   if (row < stage.n) {
     return col < stage.n ? stage.Q[row * stage.n + col]
@@ -7859,9 +8337,9 @@ __device__ inline Scalar StageHessianEntry(const PackedStage &stage, int row,
                        : stage.R[(row - stage.n) * stage.m + col - stage.n];
 }
 
-__device__ inline Scalar StageReductionMapEntry(const PackedStage &stage,
-                                                const StateParam &state,
-                                                const ControlParam &control,
+__device__ inline Scalar StageReductionMapEntry(const PackedStage stage,
+                                                const StateParam state,
+                                                const ControlParam control,
                                                 int row, int col) {
   if (row < stage.n) {
     return col < state.reduced_dim ? state.T[row * state.reduced_dim + col]
@@ -7886,10 +8364,10 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
     return;
   if (!BlockEnabled(status))
     return;
-  const PackedStage &s = stages[index];
-  const StateParam &current = state_params[index];
-  const StateParam &next = state_params[index + 1];
-  const Relation &next_relation = suffix[index + 1];
+  const PackedStage s = stages[index];
+  const StateParam current = state_params[index];
+  const StateParam next = state_params[index + 1];
+  const Relation next_relation = suffix[index + 1];
   const int rows = s.mixed + next_relation.rows;
   const int columns = s.m + current.reduced_dim + 1;
   ScratchSize matrix_size;
@@ -7927,12 +8405,11 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
       static_cast<std::size_t>(s.next_n) * current.reduced_dim);
   Scalar *dynamics_offset = dynamics_scratch.Take<Scalar>(s.next_n);
   __shared__ int rank;
-  __shared__ int best_row;
   __shared__ int control_rank;
   __shared__ int local_ok;
   for (int i = threadIdx.x; i < rows * columns; i += blockDim.x)
     matrix[i] = Scalar{0};
-  WarpSynchronize();
+  BlockSynchronize();
 
   for (int linear = threadIdx.x; linear < s.next_n * current.reduced_dim;
        linear += blockDim.x) {
@@ -7950,7 +8427,7 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
       value += s.A[row * s.n + x] * current.t[x];
     dynamics_offset[row] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
 
   // Original mixed equalities after x = T*z + t.
   for (int linear = threadIdx.x; linear < s.mixed * s.m; linear += blockDim.x) {
@@ -8008,7 +8485,7 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
     }
     matrix[(s.mixed + row) * columns + columns - 1] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
 
   ScratchArena elimination_scratch{tail_storage};
   Scalar *factors = elimination_scratch.Take<Scalar>(rows);
@@ -8035,7 +8512,7 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
     }
     factors[row] = scale;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < rows * columns;
        linear += blockDim.x) {
     const int row = linear / columns;
@@ -8046,27 +8523,28 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
       matrix[linear] /= scale;
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int row = threadIdx.x; row < rows; row += blockDim.x) {
     Scalar scale = Scalar{0};
     for (int col = 0; col < columns; ++col)
       scale = fmax(scale, DeviceAbs(matrix[row * columns + col]));
     factors[row] = scale;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < rows * columns;
        linear += blockDim.x) {
     if (factors[linear / columns] <= rank_tolerance)
       matrix[linear] = Scalar{0};
   }
-  WarpSynchronize();
+  BlockSynchronize();
 
   RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
-            pivot_rows, &rank, &best_row, factors, Scalar{0}, s.m);
+            pivot_rows, &rank, factors, Scalar{0}, s.m);
+  const bool inconsistent = InconsistentRrefBlock(
+      matrix, rows, columns, columns - 1, rank_tolerance, consistency_tolerance);
   if (threadIdx.x == 0) {
     local_ok = 1;
-    if (InconsistentRref(matrix, rows, columns, columns - 1, rank_tolerance,
-                         consistency_tolerance)) {
+    if (inconsistent) {
       SetFailure(status, kDeviceInfeasible, index, 6);
       local_ok = 0;
     }
@@ -8102,7 +8580,7 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
       }
     }
   }
-  WarpSynchronize();
+  BlockSynchronize();
   if (!local_ok)
     return;
 
@@ -8121,29 +8599,36 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
     const int v = linear % initialized_control.reduced_dim;
     initialized_control.Z[u * initialized_control.reduced_dim + v] = Scalar{0};
   }
-  WarpSynchronize();
-  if (threadIdx.x == 0) {
-    for (int p = 0; p < control_rank; ++p) {
-      const int u = pivot_columns[p];
-      initialized_control.y[u] = matrix[p * columns + columns - 1];
-      for (int z = 0; z < current.reduced_dim; ++z) {
-        initialized_control.Y[u * initialized_control.state_dim + z] =
-            -matrix[p * columns + s.m + z];
-      }
-      for (int v = 0; v < initialized_control.reduced_dim; ++v) {
-        initialized_control.Z[u * initialized_control.reduced_dim + v] =
-            -matrix[p * columns + initialized_control.free_columns[v]];
-      }
-    }
-    for (int v = 0; v < initialized_control.reduced_dim; ++v) {
-      initialized_control.Z[initialized_control.free_columns[v] *
-                                initialized_control.reduced_dim +
-                            v] = Scalar{1};
-    }
+  BlockSynchronize();
+  // Pivot controls are affine in (z, v); free controls keep identity columns.
+  // Pivot rows and free rows are disjoint, so every entry is written once.
+  for (int p = threadIdx.x; p < control_rank; p += blockDim.x)
+    initialized_control.y[pivot_columns[p]] = matrix[p * columns + columns - 1];
+  for (int linear = threadIdx.x; linear < control_rank * current.reduced_dim;
+       linear += blockDim.x) {
+    const int p = linear / current.reduced_dim;
+    const int z = linear % current.reduced_dim;
+    initialized_control.Y[pivot_columns[p] * initialized_control.state_dim +
+                          z] = -matrix[p * columns + s.m + z];
   }
-  WarpSynchronize();
+  for (int linear = threadIdx.x;
+       linear < control_rank * initialized_control.reduced_dim;
+       linear += blockDim.x) {
+    const int p = linear / initialized_control.reduced_dim;
+    const int v = linear % initialized_control.reduced_dim;
+    initialized_control.Z[pivot_columns[p] * initialized_control.reduced_dim +
+                          v] =
+        -matrix[p * columns + initialized_control.free_columns[v]];
+  }
+  for (int v = threadIdx.x; v < initialized_control.reduced_dim;
+       v += blockDim.x) {
+    initialized_control.Z[initialized_control.free_columns[v] *
+                              initialized_control.reduced_dim +
+                          v] = Scalar{1};
+  }
+  BlockSynchronize();
 
-  const ControlParam &cp = control_params[index];
+  const ControlParam cp = control_params[index];
   ReducedStage &rs = reduced[index];
 
   // Reduced dynamics, selecting the free physical coordinates at node i+1.
@@ -8210,7 +8695,7 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
       }
       hessian_times_map[linear] = value;
     }
-    WarpSynchronize();
+    BlockSynchronize();
     for (int linear = threadIdx.x; linear < rs.n * rs.n; linear += blockDim.x) {
       const int row = linear / rs.n;
       const int col = linear % rs.n;
@@ -8241,7 +8726,7 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
       }
       rs.M[linear] = value;
     }
-    WarpSynchronize();
+    BlockSynchronize();
 
     // Reuse the product buffer after all Hessian blocks have consumed it.
     Scalar *gradient = hessian_times_map;
@@ -8254,7 +8739,7 @@ __global__ void ReduceStagesKernel(const PackedStage *stages, const Relation *su
       }
       gradient[row] = value;
     }
-    WarpSynchronize();
+    BlockSynchronize();
     for (int col = threadIdx.x; col < rs.n; col += blockDim.x) {
       Scalar value = Scalar{0};
       for (int row = 0; row < physical_variables; ++row) {
@@ -8280,8 +8765,8 @@ __global__ void ReduceTerminalKernel(const PackedTerminal *terminal_ptr,
                                      int terminal_index,
                                      ReducedTerminal *reduced
     CLQR_SCRATCH_PARAMS) {
-  const PackedTerminal &terminal = *terminal_ptr;
-  const StateParam &param = state_params[terminal_index];
+  const PackedTerminal terminal = *terminal_ptr;
+  const StateParam param = state_params[terminal_index];
   if (threadIdx.x == 0)
     reduced->n = param.reduced_dim;
   const std::size_t transform_entries =
@@ -8307,7 +8792,7 @@ __global__ void ReduceTerminalKernel(const PackedTerminal *terminal_ptr,
     }
     hessian_times_map[linear] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int linear = threadIdx.x; linear < param.reduced_dim * param.reduced_dim;
        linear += blockDim.x) {
     const int row = linear / param.reduced_dim;
@@ -8319,7 +8804,7 @@ __global__ void ReduceTerminalKernel(const PackedTerminal *terminal_ptr,
     }
     reduced->Q[linear] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   Scalar *gradient = hessian_times_map;
   for (int row = threadIdx.x; row < terminal.n; row += blockDim.x) {
     Scalar value = terminal.q[row];
@@ -8327,7 +8812,7 @@ __global__ void ReduceTerminalKernel(const PackedTerminal *terminal_ptr,
       value += terminal.Q[row * terminal.n + inner] * param.t[inner];
     gradient[row] = value;
   }
-  WarpSynchronize();
+  BlockSynchronize();
   for (int col = threadIdx.x; col < param.reduced_dim; col += blockDim.x) {
     Scalar value = Scalar{0};
     for (int row = 0; row < terminal.n; ++row)
@@ -8341,12 +8826,12 @@ __global__ void InitialReducedStateKernel(const StateParam *state_params,
                                           Scalar *reduced_initial,
                                           Scalar tolerance,
                                           DeviceStatus *status) {
-  const StateParam &param = state_params[0];
+  const StateParam param = state_params[0];
   for (int z = threadIdx.x; z < param.reduced_dim; z += blockDim.x) {
     const int physical = param.free_columns[z];
     reduced_initial[z] = initial_state[physical] - param.t[physical];
   }
-  WarpSynchronize();
+  BlockSynchronize();
   if (threadIdx.x == 0) {
     Scalar scale = Scalar{1};
     Scalar residual = Scalar{0};
@@ -8376,7 +8861,7 @@ BuildObjectiveTermsKernel(const PackedStage *stages, int stage_count,
   const Scalar *x = states + state_offsets[node];
   Scalar local = Scalar{0};
   if (node < stage_count) {
-    const PackedStage &stage = stages[node];
+    const PackedStage stage = stages[node];
     const Scalar *u = controls + control_offsets[node];
     for (int row = threadIdx.x; row < stage.n; row += blockDim.x)
       local += stage.q[row] * x[row];
@@ -8401,7 +8886,7 @@ BuildObjectiveTermsKernel(const PackedStage *stages, int stage_count,
       local += Scalar{0.5} * u[row] * stage.R[linear] * u[col];
     }
   } else {
-    const PackedTerminal &terminal = *terminal_ptr;
+    const PackedTerminal terminal = *terminal_ptr;
     for (int row = threadIdx.x; row < terminal.n; row += blockDim.x)
       local += terminal.q[row] * x[row];
     for (int linear = threadIdx.x; linear < terminal.n * terminal.n;
@@ -8411,7 +8896,7 @@ BuildObjectiveTermsKernel(const PackedStage *stages, int stage_count,
       local += Scalar{0.5} * x[row] * terminal.Q[linear] * x[col];
     }
   }
-  local = WarpSum(local);
+  local = BlockSum(local);
   if (threadIdx.x == 0)
     objective_tree[node] = local;
 }
@@ -8423,7 +8908,7 @@ __global__ void ReduceObjectiveTreeLevelKernel(Scalar *objective_tree,
                                                DeviceStatus *status) {
   const int parent = blockIdx.x * blockDim.x + threadIdx.x;
   const int parent_count = (child_count + 1) / 2;
-  if (!BlockEnabled(status) || parent >= parent_count)
+  if (!ThreadEnabled(status) || parent >= parent_count)
     return;
   const int left = 2 * parent;
   Scalar value = objective_tree[child_offset + left];

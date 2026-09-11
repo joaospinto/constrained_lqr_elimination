@@ -149,6 +149,19 @@ The fallback preserves the algorithm and numerical choices, but its memory
 traffic can cost performance. There is no capacity flag to rebuild; total
 device-memory availability still limits the problem size.
 
+Every dense kernel runs one thread block per stage or tree node, and all
+dense loops stride over the block, so the block size is chosen per workspace
+from the stage dimensions: two warps for tiny stages, up to eight warps for
+wide ones (`n = 24` and above). Block-wide barriers and reductions are used
+throughout; single-warp blocks reduce with shuffles only. The choice does not
+change device memory use (the bounded global scratch pool only shrinks with
+fewer, larger resident blocks), and `Options::block_threads` overrides it for
+tuning. Host-input solves pack the numerical problem into pinned memory on the
+host; for long horizons that packing dominates wall time, so workspaces whose
+packed problem exceeds a few MiB create up to eight persistent helper threads
+at `Reserve` and reuse them, keeping prepared solves allocation-free.
+`Options::host_pack_threads` forces serial packing or a fixed thread count.
+
 The CUDA benchmark uses `SolvePreparedView`, reuses reserved storage, and
 reports both end-to-end wall time and pure kernel time. Wall time includes host
 packing, all transfers, synchronization, kernels, and construction of the
@@ -158,7 +171,11 @@ outputs. The remaining columns separate input packing, compact-layout updates,
 device objective reduction, API setup, and synchronization or phase-control
 overhead. Multiplier consistency rejection is disabled only while timing so
 the final KKT residual can be reported rather than turning a numerical
-threshold crossing into a missing row.
+threshold crossing into a missing row. The default sweep uses `n = 8`; the
+`--n`, `--m`, `--p`, `--max-horizon`, `--block-threads`, and `--pack-threads`
+options select other dimensions, a shorter horizon sweep, a fixed CUDA block
+size, or a fixed host packing thread count. The paper benchmark accepts
+`--cuda-block-threads` for the block size.
 
 For a reproducible native-CUDA validation and benchmark run, open
 [`notebooks/kaggle_cuda_benchmark.ipynb`](notebooks/kaggle_cuda_benchmark.ipynb)

@@ -24,7 +24,9 @@ class SharedMemoryLaunchAudit(unittest.TestCase):
         )
         self.assertEqual(set(definitions), launches)
         self.assertNotRegex(source, r"<<<[^>]*scratch\.\w+")
-        self.assertIn("kernel<true><<<count, kThreads, 0, stream>>>", source)
+        self.assertIn(
+            "kernel<true><<<count, workspace.threads, 0, stream>>>", source
+        )
         self.assertTrue(
             re.search(r"ForEachGlobalScratchLaunch\(\s*clqr_launch, blocks,", source),
             "global scratch launches must use the bounded launch iterator",

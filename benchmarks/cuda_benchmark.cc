@@ -172,6 +172,13 @@ int main(int argc, char **argv) {
   }
   int repeats = 5;
   std::size_t cpu_max_horizon = std::numeric_limits<std::size_t>::max();
+  std::size_t max_horizon = 16384;
+  // Default problem dimensions; override for dimension-scaling diagnostics.
+  std::size_t n = 8;
+  std::size_t m = 4;
+  std::size_t p = 2;
+  int block_threads = 0;
+  int pack_threads = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string option = argv[i];
     if (option == "--repeats") {
@@ -179,16 +186,27 @@ int main(int argc, char **argv) {
     } else if (option == "--cpu-max-horizon") {
       cpu_max_horizon =
           static_cast<std::size_t>(std::max(0, std::atoi(argv[i + 1])));
+    } else if (option == "--max-horizon") {
+      max_horizon =
+          static_cast<std::size_t>(std::max(0, std::atoi(argv[i + 1])));
+    } else if (option == "--n") {
+      n = static_cast<std::size_t>(std::max(1, std::atoi(argv[i + 1])));
+    } else if (option == "--m") {
+      m = static_cast<std::size_t>(std::max(0, std::atoi(argv[i + 1])));
+    } else if (option == "--p") {
+      p = static_cast<std::size_t>(std::max(0, std::atoi(argv[i + 1])));
+    } else if (option == "--block-threads") {
+      block_threads = std::max(0, std::atoi(argv[i + 1]));
+    } else if (option == "--pack-threads") {
+      pack_threads = std::max(0, std::atoi(argv[i + 1]));
     } else {
       std::cerr << "unknown option: " << option << '\n';
       return 2;
     }
   }
-  const std::vector<std::size_t> horizons{32,   64,   128,  256,  512,
-                                          1024, 2048, 4096, 8192, 16384};
-  constexpr std::size_t n = 8;
-  constexpr std::size_t m = 4;
-  constexpr std::size_t p = 2;
+  std::vector<std::size_t> horizons;
+  for (std::size_t horizon = 32; horizon <= max_horizon; horizon *= 2)
+    horizons.push_back(horizon);
   std::cout << "# device=" << clqr::cuda::DeviceDescription() << "\n";
   std::cout << "# precision=" << clqr::kPrecisionName << "\n";
   std::cout << "# dimensions are runtime-sized; benchmark problem: n=" << n
@@ -248,6 +266,8 @@ int main(int argc, char **argv) {
     }
     clqr::cuda::Options cuda_options;
     cuda_options.enforce_multiplier_consistency = false;
+    cuda_options.block_threads = block_threads;
+    cuda_options.host_pack_threads = pack_threads;
     cuda_workspace.Reserve(problem, cuda_options);
     clqr::cuda::Solution gpu;
     clqr::cuda::SolutionView gpu_view =

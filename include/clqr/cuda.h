@@ -32,6 +32,16 @@ struct Options {
   // Keep enabled in applications. Benchmarks may disable this to inspect and
   // report the KKT residual of a best-effort multiplier reconstruction.
   bool enforce_multiplier_consistency = true;
+  // Threads per block for the dense per-stage kernels: zero selects a size
+  // from the stage dimensions; otherwise a multiple of 32 up to 1024. A
+  // prepared workspace keeps the size chosen at Reserve. Block size does not
+  // change device memory use.
+  int block_threads = 0;
+  // Host threads (including the caller) that pack a large host-input problem
+  // into pinned memory: zero selects automatically (serial below a few MiB of
+  // packed data, at most eight otherwise), one forces serial packing. Helper
+  // threads are created at Reserve and sleep between solves.
+  int host_pack_threads = 0;
 };
 
 struct Timings {

@@ -172,6 +172,10 @@ private:
   clqr::SolutionView result_;
 };
 
+// Zero keeps the CUDA backend's automatic block size; --cuda-block-threads
+// overrides it for tuning sweeps.
+int g_cuda_block_threads = 0;
+
 #ifdef CLQR_BENCHMARK_CUDA
 class CudaSolver {
 public:
@@ -179,6 +183,7 @@ public:
     // Compare native CUDA and JAX using the CPU/JAX rank tolerance, not the
     // different default of the native CUDA public API.
     options_.tolerance = clqr::SolveOptions{}.tolerance;
+    options_.block_threads = g_cuda_block_threads;
     workspace_.Reserve(p, options_);
   }
   void Solve() {
@@ -893,6 +898,8 @@ int main(int argc, char **argv) {
       backend = argv[++i];
     else if (option == "--case-index")
       case_index = std::stoi(argv[++i]);
+    else if (option == "--cuda-block-threads")
+      g_cuda_block_threads = std::stoi(argv[++i]);
     else
       throw std::invalid_argument("unknown option: " + option);
   }

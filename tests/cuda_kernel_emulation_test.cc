@@ -252,10 +252,9 @@ void TinyCoefficientRrefCase() {
   int pivot_columns[1]{};
   int pivot_rows[1]{};
   int rank = -1;
-  int best_row = -1;
   Scalar factors[1]{};
   RrefBlock(matrix, 1, 2, 1, rank_tolerance, pivot_columns, pivot_rows, &rank,
-            &best_row, factors, rank_tolerance);
+            factors, rank_tolerance);
   Expect(rank == 0, "RREF does not amplify a roundoff-level coefficient");
   Expect(matrix[0] == Scalar{0},
          "RREF removes a coefficient below its rank tolerance");
@@ -328,11 +327,10 @@ void PivotedLuMultiRhsCase() {
     }
   }
   Scalar factors[dimension]{};
-  int best_row = -1;
   threadIdx.x = 0;
   blockDim.x = 1;
   Expect(SolveGeneralMultipleRhsBlock(augmented, dimension, columns,
-                                      solve_tolerance, factors, &best_row),
+                                      solve_tolerance, factors),
          "pivoted LU multi-RHS solve");
   for (int row = 0; row < dimension; ++row) {
     for (int rhs = 0; rhs < right_hand_side_count; ++rhs) {
@@ -346,9 +344,8 @@ void PivotedLuMultiRhsCase() {
   Scalar singular[]{Scalar{1}, Scalar{2}, Scalar{3},
                     Scalar{2}, Scalar{4}, Scalar{6}};
   Scalar singular_factors[2]{};
-  best_row = -1;
   Expect(!SolveGeneralMultipleRhsBlock(singular, 2, 3, solve_tolerance,
-                                       singular_factors, &best_row),
+                                       singular_factors),
          "pivoted LU rejects a singular coefficient matrix");
 }
 
@@ -490,8 +487,9 @@ void DualResidualOrthogonalEchelonCase() {
                          kMinimumDualRelationRowScale);
   Expect(inconsistent_rank == 1,
          "dual residual QR identifies a repeated coefficient row");
-  Expect(InconsistentRref(inconsistent, inconsistent_rows, inconsistent_columns,
-                          inconsistent_variables, kTolerance, kTolerance),
+  Expect(InconsistentRrefBlock(inconsistent, inconsistent_rows,
+                               inconsistent_columns, inconsistent_variables,
+                               kTolerance, kTolerance),
          "dual residual QR retains the orthogonal consistency residual");
 
 #ifdef CLQR_USE_FLOAT
@@ -511,10 +509,10 @@ void DualResidualOrthogonalEchelonCase() {
   const Scalar tree_tolerance =
       kMultiplierConsistencyTolerancePerTreeLevel * Scalar{7};
   const Scalar leaf_tolerance = kMultiplierConsistencyTolerancePerTreeLevel;
-  Expect(!InconsistentRref(marginal, 2, 2, 1, kMinimumMultiplierRankTolerance,
+  Expect(!InconsistentRrefBlock(marginal, 2, 2, 1, kMinimumMultiplierRankTolerance,
                            tree_tolerance),
          "tree-accumulated tolerance admits a marginal leaf residual");
-  Expect(InconsistentRref(marginal, 2, 2, 1, kMinimumMultiplierRankTolerance,
+  Expect(InconsistentRrefBlock(marginal, 2, 2, 1, kMinimumMultiplierRankTolerance,
                           leaf_tolerance),
          "per-leaf tolerance rejects a marginal leaf residual");
 }
@@ -629,12 +627,11 @@ void FreeFixedFreeValueCompositionCase() {
   Scalar augmented[1]{};
   Scalar factors[1]{};
   Scalar product[1]{};
-  int best_row = -1;
   threadIdx.x = 0;
   blockDim.x = 1;
 
   ComposeValueElementsBlock(first, second, kTolerance, &output, &status, 0,
-                            augmented, factors, product, &best_row);
+                            augmented, factors, product);
 
   Expect(status.code == kDeviceOk, "free-fixed-free value composition status");
   Expect(output.left_dim == 2 && output.right_dim == 3,
@@ -682,11 +679,10 @@ void NonuniformValueCompositionCase() {
   Scalar factors[shared]{};
   Scalar product[shared * right]{};
   DeviceStatus status{kDeviceOk, -1, 0};
-  int best_row = -1;
   threadIdx.x = 0;
   blockDim.x = 1;
   ComposeValueElementsBlock(first, second, kTolerance, &output, &status, 0,
-                            augmented, factors, product, &best_row);
+                            augmented, factors, product);
   Expect(status.code == kDeviceOk,
          "nonuniform staged value composition status");
 
@@ -706,10 +702,8 @@ void NonuniformValueCompositionCase() {
           first_c[row * shared + col];
   }
   Scalar reference_factors[shared]{};
-  int reference_best_row = -1;
   Expect(SolveGeneralMultipleRhsBlock(reference_augmented, shared, columns,
-                                      kTolerance, reference_factors,
-                                      &reference_best_row),
+                                      kTolerance, reference_factors),
          "nonuniform reference value solve");
 
   Scalar reference_a[right * left]{};
@@ -2534,9 +2528,9 @@ void CoordinatePivotingCase() {
                      Scalar{0.3},  Scalar{0},  Scalar{1e-4}, Scalar{1},
                      Scalar{0.1},  Scalar{0.4}};
   Scalar factors[2];
-  int pivots[2], pivot_rows[2], rank = 0, best = 0;
+  int pivots[2], pivot_rows[2], rank = 0;
   Launch(1, [&] {
-    RrefBlock(matrix, 2, 5, 4, kTolerance, pivots, pivot_rows, &rank, &best,
+    RrefBlock(matrix, 2, 5, 4, kTolerance, pivots, pivot_rows, &rank,
               factors, Scalar{0}, 3);
   });
   Expect(rank == 2 && pivots[0] == 1 && pivots[1] == 2,
