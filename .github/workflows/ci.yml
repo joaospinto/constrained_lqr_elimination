@@ -74,6 +74,7 @@ jobs:
           //:workspace_allocation_test
           //:cpu_workspace_layout_test
           //:cuda_stub_test
+          //:cuda_buffer_test
           //:cuda_kernel_emulation_test
           //benchmarks/reference:quadratic_factor_test
           //benchmarks/reference:stationarity_audit_test

@@ -48,8 +48,13 @@ static_assert(!HasAffineLeftEndpoint<ValueElement>);
 
 // Test-only backing strides deliberately exceed the former production
 // capacities (8/8/8/8). They are not solver limits.
+#ifdef CLQR_EMULATION_RANK_REGRESSION
+constexpr int kTestStateCapacity = 32;
+constexpr int kTestControlCapacity = 16;
+#else
 constexpr int kTestStateCapacity = 24;
 constexpr int kTestControlCapacity = 12;
+#endif
 constexpr int kTestMixedCapacity = 10;
 constexpr int kTestStateConstraintCapacity = 10;
 constexpr int kTestDualCapacity = kTestStateCapacity + kTestMixedCapacity;
@@ -1681,7 +1686,8 @@ Scalar MaxResidual(const Problem &problem, const std::vector<Scalar> &states,
 void RunEmulation(const Problem &problem, const std::string &name,
                   bool expect_reduced_state, bool expect_reduced_control,
                   bool compare_cpu = true,
-                  Scalar kkt_tolerance_scale = Scalar{1}) {
+                  Scalar kkt_tolerance_scale = Scalar{1},
+                  Scalar rank_tolerance = kTolerance) {
   const AllowedDeviceFailure *allowed_failure = AllowedFailureForCase(name);
   const int horizon = static_cast<int>(problem.stages.size());
   const int nodes = horizon + 1;
@@ -1699,7 +1705,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
     initial[row] = problem.initial_state[row];
   DeviceStatus status{};
   Scalar feasibility_consistency_tolerance =
-      std::max(kTolerance, kMinimumFeasibilityConsistencyTolerance);
+      std::max(rank_tolerance, kMinimumFeasibilityConsistencyTolerance);
 
   std::vector<int> node_level_offsets{0};
   std::vector<int> node_level_counts{nodes};
@@ -1712,7 +1718,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
   const int feasibility_scan_levels =
       static_cast<int>(node_level_counts.size()) - 1;
   feasibility_consistency_tolerance = std::max(
-      kTolerance, kMinimumFeasibilityConsistencyTolerance *
+      rank_tolerance, kMinimumFeasibilityConsistencyTolerance *
                       static_cast<Scalar>(feasibility_scan_levels + 2));
   std::vector<Relation> relation_a(nodes),
       relation_b(std::max(node_tree_size - nodes, 1));
@@ -1733,7 +1739,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
                         kTestStateCapacity, kTestStateCapacity);
   }
   Launch(nodes, [&] {
-    BuildPrimalLeavesKernel(stages.data(), horizon, &terminal, kTolerance,
+    BuildPrimalLeavesKernel(stages.data(), horizon, &terminal, rank_tolerance,
                             feasibility_consistency_tolerance,
                             relation_a.data(), &status);
   });
@@ -1741,7 +1747,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
     const int first_parent_count = node_level_counts[1];
     Launch(first_parent_count, [&] {
       ReduceRelationLeavesKernel(relation_a.data(), nodes, first_parent_count,
-                                 kTolerance, feasibility_consistency_tolerance,
+                                 rank_tolerance, feasibility_consistency_tolerance,
                                  relation_b.data(), &status);
     });
     for (std::size_t level = 1; level + 1 < node_level_counts.size(); ++level) {
@@ -1749,7 +1755,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
         ReduceRelationTreeLevelKernel(
             relation_b.data(), node_level_offsets[level] - nodes,
             node_level_offsets[level + 1] - nodes, node_level_counts[level],
-            node_level_counts[level + 1], kTolerance,
+            node_level_counts[level + 1], rank_tolerance,
             feasibility_consistency_tolerance, &status);
       });
     }
@@ -1763,14 +1769,14 @@ void RunEmulation(const Problem &problem, const std::string &name,
         ExpandRelationContextLevelKernel(
             relation_b.data(), node_level_offsets[level] - nodes,
             node_level_offsets[level + 1] - nodes, node_level_counts[level],
-            node_level_counts[level + 1], kTolerance,
+            node_level_counts[level + 1], rank_tolerance,
             feasibility_consistency_tolerance, &status);
       });
     }
     Launch(first_parent_count, [&] {
       FinalizeRelationSuffixFromParentsKernel(
           relation_a.data(), nodes, relation_b.data(), first_parent_count,
-          kTolerance, feasibility_consistency_tolerance, &status);
+          rank_tolerance, feasibility_consistency_tolerance, &status);
     });
   }
   Relation *suffix = relation_a.data();
@@ -1793,7 +1799,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
   }
   Launch(nodes, [&] {
     StateParamKernel(suffix, nodes, state_params.data(), nullptr, &status,
-                     kTolerance);
+                     rank_tolerance);
   });
   if (FinishAllowedDeviceFailure(status, name, "feasibility scan",
                                  allowed_failure))
@@ -1857,7 +1863,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
   std::vector<Scalar> reduced_initial(kTestStateCapacity);
   Launch(horizon, [&] {
     ReduceStagesKernel(stages.data(), suffix, state_params.data(), horizon,
-                       kTolerance, feasibility_consistency_tolerance,
+                       rank_tolerance, feasibility_consistency_tolerance,
                        control_params.data(), reduced.data(), nullptr, &status);
   });
   Launch(1, [&] {
@@ -1866,7 +1872,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
   });
   Launch(1, [&] {
     InitialReducedStateKernel(state_params.data(), initial.data(),
-                              reduced_initial.data(), kTolerance, &status);
+                              reduced_initial.data(), rank_tolerance, &status);
   });
   if (FinishAllowedDeviceFailure(status, name, "independent reduction",
                                  allowed_failure))
@@ -1932,7 +1938,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
   }
   Launch(nodes, [&] {
     BuildValueElementsKernel(reduced.data(), &reduced_terminal, horizon,
-                             kTolerance, value_a.data(), &status);
+                             rank_tolerance, value_a.data(), &status);
   });
   if (FinishAllowedDeviceFailure(status, name, "value base", allowed_failure))
     return;
@@ -1943,14 +1949,14 @@ void RunEmulation(const Problem &problem, const std::string &name,
     const int first_parent_count = node_level_counts[1];
     Launch(first_parent_count, [&] {
       ReduceValueLeavesKernel(value_a.data(), nodes, first_parent_count,
-                              kTolerance, &status, value_b.data());
+                              rank_tolerance, &status, value_b.data());
     });
     for (std::size_t level = 1; level + 1 < node_level_counts.size(); ++level) {
       Launch(node_level_counts[level + 1], [&] {
         ReduceValueTreeLevelKernel(
             value_b.data(), node_level_offsets[level] - nodes,
             node_level_offsets[level + 1] - nodes, node_level_counts[level],
-            node_level_counts[level + 1], kTolerance, &status);
+            node_level_counts[level + 1], rank_tolerance, &status);
       });
     }
     Launch(1, [&] {
@@ -1963,13 +1969,13 @@ void RunEmulation(const Problem &problem, const std::string &name,
         ExpandValueContextLevelKernel(
             value_b.data(), node_level_offsets[level] - nodes,
             node_level_offsets[level + 1] - nodes, node_level_counts[level],
-            node_level_counts[level + 1], kTolerance, &status);
+            node_level_counts[level + 1], rank_tolerance, &status);
       });
     }
     Launch(first_parent_count, [&] {
       FinalizeValueSuffixFromParentsKernel(value_a.data(), nodes,
                                            value_b.data(), first_parent_count,
-                                           kTolerance, &status);
+                                           rank_tolerance, &status);
     });
   }
   if (FinishAllowedDeviceFailure(status, name, "value scan", allowed_failure))
@@ -1977,7 +1983,7 @@ void RunEmulation(const Problem &problem, const std::string &name,
   Expect(g_value_matrix_factorizations == g_value_matrix_combinations,
          name + " uses exactly one LU factorization per matrix composition");
   Launch(horizon, [&] {
-    MatrixFeedbackKernel(reduced.data(), value_suffix, horizon, kTolerance,
+    MatrixFeedbackKernel(reduced.data(), value_suffix, horizon, rank_tolerance,
                          feedback.data(), &status);
   });
   if (FinishAllowedDeviceFailure(status, name, "feedback solve",
@@ -2377,6 +2383,21 @@ bool FitsAdversarialEmulationStorage(const Problem &problem) {
 } // namespace
 
 int main(int argc, char **argv) {
+#ifdef CLQR_EMULATION_RANK_REGRESSION
+  if (argc == 2 && std::string(argv[1]) == "--rank-regression") {
+    const auto data = clqr::benchmark::MakeScalingProblem(2048, 32, 16, 4, 8);
+    // Fixed-column elimination lost a state constraint at stage 734 for
+    // 1e-10, despite succeeding at 1e-9. Check the entire solve, including
+    // original-coordinate feasibility and multiplier stationarity.
+    for (const Scalar tolerance : {1e-12, 1e-11, 1e-10, 1e-9, 1e-8}) {
+      std::cout << "rank tolerance=" << tolerance << '\n';
+      RunEmulation(data.problem, "paper-N2048-n32", false, false, true,
+                   Scalar{1e-8} / kLongHorizonKktComparisonTolerance,
+                   tolerance);
+    }
+    return 0;
+  }
+#endif
   bool extended = false;
   bool paper = false;
   for (int i = 1; i < argc; ++i) {

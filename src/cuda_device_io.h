@@ -59,6 +59,8 @@ struct DeviceTransferAudit {
 // Only compact structural/status metadata may cross to the host. The first
 // call reserves `workspace`; subsequent calls require the same structure,
 // matching SolvePreparedView's contract.
+// Device allocation failures throw with requested/free/total byte diagnostics;
+// the workspace can be retried and the FFI forwards the error to its caller.
 SolveStatus SolvePackedDevice(const Problem &structure, Workspace &workspace,
                               const PaddedDeviceProblem &input,
                               const PaddedDeviceSolution &output,

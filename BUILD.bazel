@@ -149,6 +149,17 @@ cc_library(
     }),
 )
 
+cc_test(
+    name = "cpu_rank_tolerance_test",
+    srcs = ["benchmarks/scaling_problem.h", "tests/cpu_rank_tolerance_test.cc"],
+    size = "large",
+    deps = [":clqr", ":adversarial_test_support"],
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)
+
 cc_binary(
     name = "clqr_paper_fixture",
     srcs = ["benchmarks/paper_fixture.cc", "benchmarks/paper_cases.h", "benchmarks/scaling_problem.h"],
@@ -335,6 +346,7 @@ cuda_library(
     hdrs = [
         "include/clqr/cuda.h",
         "src/cuda_device_io.h",
+        "src/cuda_buffer.h",
         "src/cuda_internal.h",
         "src/cuda_shared_memory.h",
     ],
@@ -465,6 +477,16 @@ cc_test(
     includes = ["tests/emulated_cuda"],
 )
 
+cc_test(
+    name = "cuda_buffer_test",
+    srcs = [
+        "src/cuda_buffer.h",
+        "tests/cuda_buffer_test.cc",
+        "tests/emulated_cuda/cuda_runtime.h",
+    ],
+    includes = ["tests/emulated_cuda"],
+)
+
 py_test(
     name = "cuda_shared_memory_source_audit_test",
     srcs = ["tests/cuda_shared_memory_source_audit_test.py"],
@@ -484,6 +506,32 @@ cc_test(
     copts = select({
         ":linux": ["-Wno-maybe-uninitialized"],
         ":macos": ["-Wno-sometimes-uninitialized"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":adversarial_test_support",
+        ":clqr",
+        ":cuda_kernel_emulation_sources",
+    ],
+)
+
+cc_test(
+    name = "cuda_feasibility_rank_test",
+    srcs = [
+        "benchmarks/cuda_benchmark_problem.h",
+        "tests/cuda_jax_problem.h",
+        "tests/cuda_kernel_emulation_test.cc",
+    ],
+    args = ["--rank-regression"],
+    size = "large",
+    local_defines = ["CLQR_EMULATION_RANK_REGRESSION"],
+    copts = select({
+        ":linux": ["-Wno-maybe-uninitialized"],
+        ":macos": ["-Wno-sometimes-uninitialized"],
+        "//conditions:default": [],
+    }),
+    target_compatible_with = select({
+        ":fp32": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
     deps = [

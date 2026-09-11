@@ -20,6 +20,7 @@
 #include "cuda_internal.h"
 
 #ifndef CLQR_CUDA_EMULATION
+#include "cuda_buffer.h"
 #include "cuda_shared_memory.h"
 #endif
 
@@ -2069,8 +2070,11 @@ __global__ void BuildPrimalLeavesKernel(const PackedStage *stages, int stage_cou
     }
   }
   WarpSynchronize();
+  // Choose stable pivots within the controls, without exchanging them with
+  // retained state variables. ExtractResidualRelation only needs the pivots
+  // grouped by eliminated/retained variables, not sorted within each group.
   RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
-            pivot_rows, &rank, &best_row, factors);
+            pivot_rows, &rank, &best_row, factors, Scalar{0}, eliminated);
   if (threadIdx.x == 0) {
     local_ok = !InconsistentRref(matrix, rows, columns, columns - 1,
                                  rank_tolerance, consistency_tolerance);
@@ -2147,8 +2151,11 @@ ComposeRelationsBlock(const RelationType &first, const RelationType &second,
     WarpSynchronize();
     return;
   }
+  // Fixed-column pivot order can amplify cancellation into a spurious rank
+  // in the shared endpoint and discard a genuine boundary constraint.
+  // Complete pivot selection within that endpoint preserves the projection.
   RrefBlock(matrix, rows, columns, columns - 1, rank_tolerance, pivot_columns,
-            pivot_rows, rank, best_row, factors);
+            pivot_rows, rank, best_row, factors, Scalar{0}, shared);
   if (threadIdx.x == 0) {
     *local_ok = !InconsistentRref(matrix, rows, columns, columns - 1,
                                   rank_tolerance, consistency_tolerance);
@@ -2683,64 +2690,6 @@ void CudaCheck(cudaError_t error, const char *operation) {
   throw std::runtime_error(std::string(operation) + ": " +
                            cudaGetErrorString(error));
 }
-
-template <typename T> class DeviceBuffer {
-public:
-  DeviceBuffer() = default;
-  explicit DeviceBuffer(std::size_t count) { Allocate(count); }
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-  DeviceBuffer(DeviceBuffer &&other) noexcept
-      : data_(std::exchange(other.data_, nullptr)),
-        count_(std::exchange(other.count_, 0)),
-        owns_(std::exchange(other.owns_, false)) {}
-  DeviceBuffer &operator=(DeviceBuffer &&other) noexcept {
-    if (this != &other) {
-      Release();
-      data_ = std::exchange(other.data_, nullptr);
-      count_ = std::exchange(other.count_, 0);
-      owns_ = std::exchange(other.owns_, false);
-    }
-    return *this;
-  }
-  ~DeviceBuffer() { Release(); }
-
-  void Allocate(std::size_t count) {
-    Release();
-    count_ = std::max<std::size_t>(count, 1);
-    if (count_ > std::numeric_limits<std::size_t>::max() / sizeof(T))
-      throw std::invalid_argument("CUDA device allocation size overflows");
-    CudaCheck(cudaMalloc(reinterpret_cast<void **>(&data_), count_ * sizeof(T)),
-              "cudaMalloc");
-    owns_ = true;
-  }
-  void Reserve(std::size_t count) {
-    const std::size_t required = std::max<std::size_t>(count, 1);
-    if (count_ < required)
-      Allocate(required);
-  }
-  void Bind(T *data, std::size_t count) {
-    Release();
-    data_ = data;
-    count_ = std::max<std::size_t>(count, 1);
-    owns_ = false;
-  }
-  void Release() {
-    if (owns_ && data_ != nullptr)
-      cudaFree(data_);
-    data_ = nullptr;
-    count_ = 0;
-    owns_ = false;
-  }
-  T *get() { return data_; }
-  const T *get() const { return data_; }
-  std::size_t count() const { return count_; }
-
-private:
-  T *data_ = nullptr;
-  std::size_t count_ = 0;
-  bool owns_ = false;
-};
 
 template <typename T> class PinnedBuffer {
 public:
@@ -5540,6 +5489,7 @@ SolutionView RunSolveView(const Problem &problem,
     result.status = SolveStatus::kInvalidInput;
     result.message = error.what();
   } catch (const std::exception &error) {
+    storage.structure_ready = false;
     result.status = SolveStatus::kNumericalFailure;
     result.message = error.what();
   }
@@ -5746,10 +5696,20 @@ SolveStatus SolvePackedDevice(const Problem &structure, Workspace &workspace,
       workspace.Reserve(structure, options);
     SolveImpl(structure, workspace.impl_->storage, result, options, true,
               stream, &input);
+  } catch (const DeviceAllocationError &error) {
+    workspace.impl_->storage.structure_ready = false;
+    result.status = SolveStatus::kNumericalFailure;
+    result.message = error.what();
+    // Finish any earlier phase before the FFI releases its arguments. Resource
+    // failures must reach the caller with their allocation diagnostics, not be
+    // disguised as a numerical status with empty stage/detail fields.
+    (void)cudaStreamSynchronize(stream);
+    throw;
   } catch (const std::invalid_argument &error) {
     result.status = SolveStatus::kInvalidInput;
     result.message = error.what();
   } catch (const std::exception &error) {
+    workspace.impl_->storage.structure_ready = false;
     result.status = SolveStatus::kNumericalFailure;
     result.message = error.what();
   }
